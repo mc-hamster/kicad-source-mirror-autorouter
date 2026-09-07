@@ -2943,6 +2943,13 @@ TOOL_ACTION PCB_ACTIONS::routeSingleTrack( TOOL_ACTION_ARGS()
         .Flags( AF_ACTIVATE )
         .Parameter( PNS::PNS_MODE_ROUTE_SINGLE ) );
 
+TOOL_ACTION PCB_ACTIONS::autorouteBoard( TOOL_ACTION_ARGS()
+        .Name( "pcbnew.Autorouter.Board" )
+        .Scope( AS_GLOBAL )
+        .FriendlyName( _( "Autoroute Board..." ) )
+        .Tooltip( _( "Route the complete board with the native Freerouting-derived autorouter" ) )
+        .Flags( AF_ACTIVATE ) );
+
 TOOL_ACTION PCB_ACTIONS::routeDiffPair( TOOL_ACTION_ARGS()
         .Name( "pcbnew.InteractiveRouter.DiffPair" )
         .Scope( AS_GLOBAL )

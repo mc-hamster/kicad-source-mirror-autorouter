@@ -38,6 +38,7 @@ set( QA_PCBNEW_SRCS
     test_board_design_settings.cpp
     test_board_item_index.cpp
     test_board_loader.cpp
+    test_autorouter_algorithm.cpp
     test_board_item.cpp
     test_board_commit.cpp
     test_text_var_reactive.cpp

@@ -266,6 +266,9 @@ public:
     /// Activation of the Push and Shove router
     static TOOL_ACTION routeSingleTrack;
 
+    /// Activation of the native full-board autorouter.
+    static TOOL_ACTION autorouteBoard;
+
     /// Activation of the Push and Shove router (differential pair mode)
     static TOOL_ACTION routeDiffPair;
 

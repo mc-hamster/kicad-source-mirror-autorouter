@@ -133,6 +133,7 @@
 #include <tools/match_properties_tool.h>
 #include <tools/graphic_edit_tool.h>
 #include <router/router_tool.h>
+#include <autorouter/AutorouterTool.h>
 #include <autorouter/autoplace_tool.h>
 #include <netlist_reader/netlist_reader.h>
 #include <dialog_drc.h>     // for DIALOG_DRC_WINDOW_NAME definition
@@ -1035,6 +1036,7 @@ void PCB_EDIT_FRAME::setupTools()
     m_toolManager->RegisterTool( new ZOOM_TOOL );
     m_toolManager->RegisterTool( new PCB_PICKER_TOOL );
     m_toolManager->RegisterTool( new ROUTER_TOOL );
+    m_toolManager->RegisterTool( new KICAD_AUTOROUTER::AUTOROUTER_TOOL );
     m_toolManager->RegisterTool( new EDIT_TOOL );
     m_toolManager->RegisterTool( new PCB_EDIT_TABLE_TOOL );
     m_toolManager->RegisterTool( new GLOBAL_EDIT_TOOL );

@@ -1,0 +1,50 @@
+# Corpus manifest for Freerouting-vs-native parity runs.
+# Board files are referenced in-place from KiCad's existing QA corpus rather than copied into
+# this feature.  Add an external board only when its redistribution terms permit it.
+reference_commit: a11c0a42d1b3827e5126429c5c9820c4ab5bec7c
+metrics:
+  - total_connections
+  - routed_connections
+  - unrouted_connections
+  - completion_percent
+  - drc_errors
+  - track_length_mm
+  - via_count
+  - runtime_ms
+  - ripups
+  - routing_passes
+  - optimization_passes
+  - kicad_drc_errors
+  - new_kicad_drc_errors
+cases:
+  - id: small_through_hole
+    class: small_tht
+    board: qa/data/pcbnew/pns_regressions/boards/simple.kicad_pcb
+    notes: small mixed through-hole/SMD smoke route and accept/reject transaction test
+  - id: mixed_smd
+    class: mixed_tht_smd
+    board: qa/data/cli/basic_test/basic_test.kicad_pcb
+    notes: small mixed SMD/through-hole board with multiple signal and power nets
+  - id: mcu_four_layer
+    class: moderate_density_mcu
+    board: qa/data/pcbnew/pns_regressions/boards/video-v10.kicad_pcb
+    notes: large four-layer multilayer board for via and preferred-direction comparison
+  - id: keepouts
+    class: keepout_heavy
+    board: qa/data/pcbnew/pns_regressions/boards/ultrasound.kicad_pcb
+    notes: dense multilayer board with copper zones and constrained routing regions
+  - id: congested_ripup
+    class: congestion
+    board: qa/data/pcbnew/issue14559.kicad_pcb
+    notes: routed, zoned board for retries, negotiated occupancy and rip-up
+  - id: large_reference
+    class: upper_practical_limit
+    board: qa/data/pcbnew/vme-wren.kicad_pcb
+    notes: large multilayer board for runtime and bounded-memory measurement
+
+procedure:
+  - start both runs from the same untouched board
+  - use equivalent layer, via, trace, congestion, rip-up, pass and optimization settings
+  - capture the metrics listed above
+  - verify accepted native output with KiCad DRC; compare new errors against the baseline when a fixture is not initially clean
+  - record intentional geometric differences, not just a pass/fail screenshot

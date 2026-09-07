@@ -411,6 +411,36 @@ set( PCBNEW_CLASS_SRCS
     autorouter/ar_autoplacer.cpp
     autorouter/ar_matrix.cpp
     autorouter/autoplace_tool.cpp
+    autorouter/AutorouterPreviewItem.cpp
+    autorouter/AutorouterDialogs.cpp
+    autorouter/AutorouterJob.cpp
+    autorouter/AutorouterTool.cpp
+    autorouter/DialogAutorouter.cpp
+    autorouter/board/KicadBoardAdapter.cpp
+    autorouter/drill/DrillPage.cpp
+    autorouter/drill/DrillPageArray.cpp
+    autorouter/drc/DesignRulesChecker.cpp
+    autorouter/expansion/ExpansionDoor.cpp
+    autorouter/expansion/ExpansionGraph.cpp
+    autorouter/expansion/ExpansionRoom.cpp
+    autorouter/expansion/SortedRoomNeighbours.cpp
+    autorouter/maze/AutorouteControl.cpp
+    autorouter/maze/AutorouteEngine.cpp
+    autorouter/maze/DestinationDistance.cpp
+    autorouter/maze/MazeExpansionEngine.cpp
+    autorouter/maze/MazeRipupResolver.cpp
+    autorouter/maze/MazeSearchEngine.cpp
+    autorouter/maze/MazeTraceShover.cpp
+    autorouter/path/Connection.cpp
+    autorouter/path/FoundConnectionInserter.cpp
+    autorouter/path/FoundConnectionLocator.cpp
+    autorouter/pipeline/AutorouteConnectionRouter.cpp
+    autorouter/pipeline/AutorouteAirlineCalculator.cpp
+    autorouter/pipeline/BatchAutorouterThread.cpp
+    autorouter/pipeline/BatchFanout.cpp
+    autorouter/pipeline/BatchAutorouter.cpp
+    autorouter/pipeline/BatchOptimizer.cpp
+    autorouter/pipeline/RoutingPipeline.cpp
 
     array_pad_number_provider.cpp
     board_loader.cpp

@@ -387,6 +387,8 @@ void PCB_EDIT_FRAME::doReCreateMenuBar()
     routeMenu->Add( PCB_ACTIONS::selectLayerPair );
 
     routeMenu->AppendSeparator();
+    routeMenu->Add( PCB_ACTIONS::autorouteBoard );
+    routeMenu->AppendSeparator();
     routeMenu->Add( PCB_ACTIONS::routeSingleTrack );
     routeMenu->Add( PCB_ACTIONS::routeDiffPair );
 
