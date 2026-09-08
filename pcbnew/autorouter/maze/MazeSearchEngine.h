@@ -21,8 +21,8 @@
  * Freerouting equivalent: autoroute/maze/MazeSearchEngine.java and
  * autoroute/maze/MazeExpansionEngine.java.
  *
- * The no-via path now tries the orthogonal free-room slice. Multi-layer search
- * and unsupported geometry still use the experimental grid/visibility engine;
+ * Single-layer and multilayer paths first try the rectangular room/drill slice.
+ * Unsupported or rejected proposals still use the experimental grid/visibility engine;
  * neither the combined implementation nor its cost model is at upstream parity.
  */
 
@@ -38,7 +38,7 @@
 
 #include "../board/facade/RoutingBoard.h"
 #include "AutorouteControl.h"
-#include "DestinationDistance.h"
+#include "LegacyDestinationDistance.h"
 #include "MazeExpansionEngine.h"
 #include "MazeSearchEngine90Degree.h"
 
@@ -88,6 +88,21 @@ public:
             const ROUTING_CONNECTION& aConnection ) const;
     const std::vector<ROUTING_CONNECTION>& Connections() const { return m_connections; }
 
+    /** One speculative edit spans copper IDs/contacts AND route/usage maps. */
+    class TRANSACTION
+    {
+    public:
+        explicit TRANSACTION( ROUTING_OCCUPANCY& aOccupancy );
+        ~TRANSACTION();
+        TRANSACTION( const TRANSACTION& ) = delete;
+        TRANSACTION& operator=( const TRANSACTION& ) = delete;
+        void Commit();
+    private:
+        struct STATE;
+        ROUTING_OCCUPANCY& m_occupancy;
+        std::unique_ptr<STATE> m_before;
+    };
+
     std::vector<ROUTER_CELL_KEY> CellsForSegment( const ROUTER_NODE& aStart,
                                                   const ROUTER_NODE& aEnd ) const;
 
@@ -122,6 +137,10 @@ public:
 
     bool CanUseSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
                         bool aForVia = false ) const;
+    /** Strict insertion check: never inherits a negotiated-search ripup flag.
+     * Endpoint copper is the new trace width, not the already-existing pad size.
+     */
+    bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd ) const;
     const ROOM_SEARCH_METRICS& LastRoomSearchMetrics() const { return m_roomMetrics; }
 
 private:
@@ -217,7 +236,7 @@ private:
     // the batch layer removes the specific conflicting connections from the
     // occupancy map when the candidate is accepted.
     mutable bool m_allowRipupOccupancy = false;
-    mutable DESTINATION_DISTANCE m_destinationDistance;
+    mutable LEGACY_DESTINATION_DISTANCE m_legacyDestinationDistance;
     std::unordered_map<int, std::vector<std::size_t>> m_obstaclesByLayer;
     std::unordered_map<ROUTER_CELL_KEY, std::vector<std::size_t>, ROUTER_CELL_HASH>
             m_obstaclesBySpatialCell;

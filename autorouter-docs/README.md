@@ -7,7 +7,9 @@ not be interpreted as proof that the named upstream algorithms are implemented.
 
 * [Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) — all sixteen remaining
   core/integration areas, production host validation/repair, and latest A/B evidence.
-* [Active multilayer room/drill search](DRILL-SEARCH-PARITY.md) — latest core
+* [Java → C++ destination translation audit](DESTINATION-DISTANCE-PARITY.md) —
+  latest method-level port, bit-exact Java oracle, plane start-set fix and remaining substitutions.
+* [Active multilayer room/drill search](DRILL-SEARCH-PARITY.md) — previous core
   port slice, pinned Java drill oracle, same-board A/B results and failed gates.
 * [Active room/door search](ROOM-DOOR-SEARCH.md) — rectangular no-via slice,
   pinned Java primitive oracles, real-board results and explicit remaining gaps.
@@ -93,13 +95,14 @@ not enter the routing algorithm and therefore do not need a Freerouting GUI coun
 source tree intentionally includes corresponding Freerouting filenames even where KiCad's
 immutable snapshot/transaction model replaces a mutable Java board event or thread pool.
 
-No-via/single-enabled-layer attempts now try an active rectangular room/door
-search with 90/45-degree corridor location and exact snapshot edge checking.
-Default multi-layer jobs and unsupported geometry retain the experimental
-visibility/grid engine. The new slice does not yet implement exact 45-degree
-room shapes, drill-frontier transitions, forced insertion or shove. The
-[room-search milestone](ROOM-DOOR-SEARCH.md) distinguishes primitive equivalence
-from end-to-end quality; naming a class does not establish parity.
+Single-layer and default multilayer attempts now try the active rectangular
+room/door/page/drill frontier with 90/45-degree corridor location and exact
+snapshot edge checks. The source destination estimate is translated and used
+by both frontiers; the remaining legacy grid/visibility fallback has a separately
+named heuristic. General convex geometry, full forced insertion, shove, fanout
+and optimization are not ported. See the
+[latest translation audit](DESTINATION-DISTANCE-PARITY.md): matching filenames
+or isolated numeric methods does not establish whole-engine parity.
 
 Drilled pads and existing vias are represented by separate hole obstacles.  The worker captures
 KiCad's copper-to-hole and hole-to-hole constraints: new via/drill collisions remain blocked,

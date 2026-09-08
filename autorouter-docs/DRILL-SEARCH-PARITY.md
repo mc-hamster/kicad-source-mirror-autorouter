@@ -1,5 +1,9 @@
 # Active rectangular room/drill search — parity slice, 2026-09-08
 
+**Historical milestone:** the later [destination translation audit](DESTINATION-DISTANCE-PARITY.md)
+supersedes the heuristic and plane start-set status below. These measurements
+and earlier limitations are preserved as evidence.
+
 **Not feature parity.** This pass moves default multilayer search from a
 standalone grid/visibility proposal to an active room/page/drill-layer frontier
 first. It does not replace the full Freerouting geometric, insertion, fanout,

@@ -16,6 +16,7 @@
 
 #include "../AutorouterTypes.h"
 #include "MazeSearchEngine.h"
+#include "../path/FoundConnectionInserter.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -39,6 +40,13 @@ public:
 
     std::vector<ROUTING_CONNECTION> FindConflictingConnections(
             const ROUTING_CONNECTION& aCandidate ) const;
+
+    FOUND_CONNECTION_INSERTER::RESULT InsertConnection(
+            const ROUTING_CONNECTION& aConnection, const std::vector<ROUTING_CONNECTION>& aRipups,
+            ROUTING_OCCUPANCY& aOccupancy, const ROUTER_CANCEL_CALLBACK& aCancel = {} ) const
+    {
+        return FOUND_CONNECTION_INSERTER::Insert( aConnection, aRipups, aOccupancy, m_search, aCancel );
+    }
 
 private:
     MAZE_SEARCH_ENGINE         m_search;

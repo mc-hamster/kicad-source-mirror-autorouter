@@ -18,6 +18,7 @@ struct ROOM_SEARCH_METRICS
     int drillPages = 0;
     int drills = 0;
     int layerTransitions = 0;
+    int destinationQueries = 0;
     bool routed = false;
 };
 

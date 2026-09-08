@@ -20,17 +20,15 @@
 namespace KICAD_AUTOROUTER
 {
 
-/**
- * Freerouting-compatible fanout seam.
- *
- * Filled zones are represented as plane targets by the KiCad adapter, so
- * those connections are scheduled by BatchAutorouter.  This helper keeps
- * target classification in the matching upstream filename and provides a
- * safe extension point for a direct SMD-escape port.
+/** Component/pin ordering follows pinned BatchFanout. Landing geometry remains
+ * the native synthetic-escape adapter, not reference RoutingBoard.fanout.
  */
 class BATCH_FANOUT
 {
 public:
+    static std::vector<std::size_t> OrderedPins( const BOARD_SNAPSHOT& aBoard,
+                                                FANOUT_PIN_ORDER aOrder,
+                                                const ROUTER_CANCEL_CALLBACK& aCancel = {} );
     /**
      * Prepare the worker snapshot for Freerouting's SMD fanout pre-pass.
      *

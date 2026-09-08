@@ -100,6 +100,8 @@ struct ROUTER_LAYER_SETTINGS
  * Freerouting's AutorouteControl and routing settings.  KiCad's board rules
  * remain authoritative for widths, clearances, via dimensions, and keepouts.
  */
+enum class FANOUT_PIN_ORDER { OUTER_FIRST, INNER_FIRST, CLOSEST_ON_NET, DENSEST_FIRST, PIN_INDEX };
+
 struct AUTOROUTER_SETTINGS
 {
     std::vector<ROUTER_LAYER_SETTINGS> layers;
@@ -123,6 +125,9 @@ struct AUTOROUTER_SETTINGS
     int  maxRipups = 128;
     int  maxExpandedNodes = 250000;
     int  maxFanoutPasses = 20;
+    // Landing sampling is still a native adapter, NOT a count of routing passes.
+    int  fanoutLandingSearchSteps = 20;
+    FANOUT_PIN_ORDER fanoutPinOrder = FANOUT_PIN_ORDER::OUTER_FIRST;
     // Global congestion/rip-up bias.  Positive values make the search more
     // conservative around already reserved cells; negative values tolerate
     // denser intermediate packing before a rip-up is attempted.
@@ -176,6 +181,10 @@ struct ROUTING_PAD
     // Physical host identity; synthetic routing terminals deliberately have none.
     std::string              sourceId;
     bool                     isExactTarget = false;
+    // Component ordinal and package-pad index, not net/ratsnest order.
+    // -1 identifies data-only input without host package metadata.
+    int                      componentId = -1;
+    int                      pinIndex = -1;
 };
 
 

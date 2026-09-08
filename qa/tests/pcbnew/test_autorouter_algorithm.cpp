@@ -36,6 +36,9 @@
 #include <autorouter/drc/DesignRulesChecker.h>
 #include <autorouter/maze/MazeSearchEngine.h>
 #include <autorouter/maze/AutorouteEngine.h>
+#include <autorouter/board/model/items/NormalContacts.h>
+#include <autorouter/geometry/planar/ContactGeometry.h>
+#include <autorouter/path/FoundConnectionInserter.h>
 #include <autorouter/maze/MazeSearchEngine90Degree.h>
 #include <autorouter/maze/MazeExpansionEngine.h>
 #include <autorouter/drill/DrillPageArray.h>
@@ -46,6 +49,8 @@
 #include <autorouter/expansion/CompleteFreeSpaceExpansionRoom.h>
 #include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
 #include <autorouter/maze/DestinationDistance.h>
+#include <autorouter/maze/LegacyDestinationDistance.h>
+#include <autorouter/maze/RoomCostSpace.h>
 #include <autorouter/BoardHistory.h>
 #include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
 #include <autorouter/pipeline/BatchFanout.h>
@@ -61,6 +66,7 @@
 #include <pcbnew_utils/board_file_utils.h>
 
 #include <boost/test/unit_test.hpp>
+#include <bit>
 #include <fstream>
 #include <sstream>
 #include <random>
@@ -214,7 +220,7 @@ BOOST_AUTO_TEST_CASE( SearchesEveryMemberOfTheStartSetWithoutInventingCopper )
 }
 
 
-BOOST_AUTO_TEST_CASE( DestinationLowerBoundConsidersCheaperOtherLayer )
+BOOST_AUTO_TEST_CASE( LegacyDestinationLowerBoundConsidersCheaperOtherLayer )
 {
     AUTOROUTER_SETTINGS settings = makeSettings();
     settings.viaCost = 1;
@@ -222,7 +228,7 @@ BOOST_AUTO_TEST_CASE( DestinationLowerBoundConsidersCheaperOtherLayer )
     ROUTING_PAD far;
     far.position = { 100000000, 0 };
     far.layers = { 0 };
-    DESTINATION_DISTANCE destination;
+    LEGACY_DESTINATION_DISTANCE destination;
     destination.Configure( settings, far );
     destination.Join( { 0, 0, 0, 0 }, 1 );
     BOOST_CHECK_LE( destination.Calculate( { 0, 0 }, 0 ), 1.0 );
@@ -1257,6 +1263,290 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterUsesRoundedRectangleCoreWithoutArcTessellation
     BOOST_CHECK_EQUAL( rounded.polygon[2].y, 3100000 );
 }
 
+
+BOOST_AUTO_TEST_CASE( FanoutPinOrderMatchesPinnedJavaComponents )
+{
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir() + "/autorouter/fanout-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    std::string tag;
+    int count = 0;
+    while( input >> tag )
+    {
+        BOOST_REQUIRE_EQUAL( tag, "FANOUT" );
+        int order, size;
+        input >> order >> size;
+        BOARD_SNAPSHOT board;
+        for( int i = 0; i < size; ++i )
+        {
+            ROUTING_PAD pin;
+            int smd;
+            input >> pin.componentId >> pin.pinIndex >> pin.netCode >> smd >> pin.position.x >> pin.position.y;
+            pin.isSmd = smd != 0;
+            pin.layers = smd ? std::vector<int>{ 0 } : std::vector<int>{ 0, 1 };
+            board.pads.push_back( pin );
+        }
+        int outputSize;
+        input >> outputSize;
+        std::vector<std::size_t> expected( outputSize );
+        for( auto& index : expected )
+            input >> index;
+        const auto actual = BATCH_FANOUT::OrderedPins( board, static_cast<FANOUT_PIN_ORDER>( order ) );
+        BOOST_TEST_CONTEXT( "Java fanout record " << count )
+        {
+            BOOST_REQUIRE( input.good() );
+            BOOST_CHECK_EQUAL_COLLECTIONS( actual.begin(), actual.end(), expected.begin(), expected.end() );
+        }
+        ++count;
+    }
+    BOOST_CHECK_EQUAL( count, 640 );
+    auto board = makeBoard();
+    board.pads[0].isSmd = true; board.pads[0].layers = { 0 };
+    BOOST_CHECK( BATCH_FANOUT::OrderedPins( board, FANOUT_PIN_ORDER::OUTER_FIRST, [] { return true; } ).empty() );
+}
+
+BOOST_AUTO_TEST_CASE( FanoutUsesPhysicalPadLayersAndDistinctPackagePinIndices )
+{
+    BOARD board;
+    board.SetCopperLayerCount( 2 );
+    auto* net = new NETINFO_ITEM( &board, "N", 1 ); board.Add( net );
+    auto* footprint = new FOOTPRINT( &board ); board.Add( footprint );
+    for( int i = 0; i < 3; ++i )
+    {
+        auto* pad = new PAD( footprint );
+        pad->SetNet( net ); pad->SetNumber( "1" ); // deliberately repeated host label
+        pad->SetPosition( { 1000000 + i * 2000000, 1000000 } );
+        pad->SetSize( PADSTACK::ALL_LAYERS, { 1000000, 1000000 } );
+        pad->SetAttribute( i == 0 ? PAD_ATTRIB::PTH : PAD_ATTRIB::SMD );
+        pad->SetLayerSet( i == 0 ? LSET::AllCuMask() : LSET( { F_Cu } ) );
+        footprint->Add( pad );
+    }
+    board.BuildConnectivity();
+    KICAD_BOARD_ADAPTER adapter( &board );
+    auto settings = adapter.CreateDefaultSettings();
+    for( auto& layer : settings.layers )
+        layer.enabled = layer.layerId == F_Cu;
+    const auto snapshot = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->pads.size(), 3 );
+    std::set<int> pins;
+    int smdCount = 0;
+    for( const auto& pad : snapshot->pads )
+    {
+        BOOST_CHECK_EQUAL( pad.componentId, 1 );
+        pins.insert( pad.pinIndex );
+        if( pad.isSmd ) ++smdCount;
+    }
+    BOOST_CHECK_EQUAL( pins.size(), 3 );
+    BOOST_CHECK_EQUAL( smdCount, 2 );
+}
+
+BOOST_AUTO_TEST_CASE( NormalContactsMatchPinnedJavaItems )
+{
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir() + "/autorouter/contacts-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    std::string tag;
+    int count = 0;
+    while( input >> tag )
+    {
+        BOOST_REQUIRE_EQUAL( tag, "CONTACT" );
+        NORMAL_CONTACT_ITEM items[2];
+        ROUTING_OBSTACLE areas[2];
+        int nets[2];
+        for( int i = 0; i < 2; ++i )
+        {
+            int kind, layer;
+            auto& item = items[i];
+            input >> kind >> nets[i] >> layer >> item.first.x >> item.first.y >> item.last.x >> item.last.y;
+            item.kind = kind == 0 ? NORMAL_CONTACT_ITEM::KIND::TRACE
+                      : kind == 1 ? NORMAL_CONTACT_ITEM::KIND::DRILL : NORMAL_CONTACT_ITEM::KIND::AREA;
+            item.layers = { layer };
+            auto& area = areas[i];
+            area.box = { item.first.x, item.first.y, item.last.x, item.last.y };
+            area.polygonHoles = { { { item.first.x + 25, item.first.y + 25 },
+                                   { item.last.x - 25, item.first.y + 25 },
+                                   { item.last.x - 25, item.last.y - 25 },
+                                   { item.first.x + 25, item.last.y - 25 } } };
+        }
+        bool left, right;
+        input >> std::boolalpha >> left >> right;
+        auto contains = [&]( ROUTER_POINT p )
+        { return CONTACT_GEOMETRY::ContainsArea( areas[items[0].kind == NORMAL_CONTACT_ITEM::KIND::AREA ? 0 : 1], p ); };
+        BOOST_TEST_CONTEXT( "Java contact record " << count )
+        {
+            BOOST_CHECK_EQUAL( nets[0] == nets[1] && items[0].Touches( items[1], contains ), left );
+            BOOST_CHECK_EQUAL( nets[0] == nets[1] && items[1].Touches( items[0], contains ), right );
+            for( int side = 0; side < 2; ++side )
+            {
+                int present;
+                input >> present;
+                const auto actual = items[side].Point( items[1 - side] );
+                BOOST_CHECK_EQUAL( actual.has_value(), present != 0 );
+                if( present )
+                {
+                    ROUTER_POINT expected;
+                    input >> expected.x >> expected.y;
+                    BOOST_REQUIRE( actual );
+                    BOOST_CHECK( *actual == expected );
+                }
+            }
+            BOOST_REQUIRE( input.good() );
+        }
+        ++count;
+    }
+    BOOST_CHECK_EQUAL( count, 2048 );
+}
+
+BOOST_AUTO_TEST_CASE( ExactJunctionGeometryNeverRoundsOrOverflows )
+{
+    using namespace CONTACT_GEOMETRY;
+    BOOST_CHECK( !Intersection( { 0, 0 }, { 3, 3 }, { 0, 3 }, { 3, 0 } ) );
+    const auto p = Intersection( { INT_MIN, INT_MIN }, { INT_MAX, INT_MAX },
+                                 { INT_MIN, INT_MAX }, { INT_MAX, INT_MIN } );
+    BOOST_CHECK( !p ); // exact crossing is (-0.5,-0.5), not (0,0)
+    const auto q = Intersection( { INT_MIN, 0 }, { INT_MAX, 0 },
+                                 { 0, INT_MIN }, { 0, INT_MAX } );
+    BOOST_REQUIRE( q );
+    BOOST_CHECK( ( *q == ROUTER_POINT{ 0, 0 } ) );
+    BOOST_CHECK( OnSegment( { INT_MIN, INT_MIN }, { INT_MAX, INT_MAX }, { 0, 0 } ) );
+    BOOST_CHECK( !OnSegment( { INT_MIN, INT_MIN }, { INT_MAX, INT_MAX }, { 0, 1 } ) );
+}
+
+BOOST_AUTO_TEST_CASE( NormalContactsSplitGeneratedBranchesAndRollbackIdentity )
+{
+    auto board = makeBoard(); auto settings = makeSettings();
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION trunk;
+    trunk.netCode = 1; trunk.complete = true;
+    trunk.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    copper.AddRoute( trunk );
+    const auto before = copper.RouteItems( trunk );
+    BOOST_REQUIRE_EQUAL( before.size(), 1 );
+    ROUTING_CONNECTION branch = trunk;
+    branch.nodes = { { { 3000000, 2500000 }, 0 }, { { 3000000, 1500000 }, 0 } };
+    std::vector<ROUTING_BOARD::ITEM_ID> split, branchIds;
+    {
+        ROUTING_BOARD::TRANSACTION transaction( copper );
+        copper.AddRoute( branch );
+        split = copper.RouteItems( trunk ); branchIds = copper.RouteItems( branch );
+        BOOST_REQUIRE_EQUAL( split.size(), 2 );
+        BOOST_CHECK_EQUAL( split.front(), before.front() );
+        BOOST_REQUIRE_EQUAL( branchIds.size(), 1 );
+        BOOST_CHECK( copper.GetNormalContacts( branchIds.front() ).contains( split[0] ) );
+        BOOST_CHECK( copper.GetNormalContacts( branchIds.front() ).contains( split[1] ) );
+        const auto p = copper.NormalContactPoint( split[0], branchIds[0] );
+        BOOST_REQUIRE( p );
+        BOOST_CHECK( *p == branch.nodes.back().point );
+        BOOST_CHECK( copper.NormalConnectedSet( *copper.PadItem( 0 ) ).contains( *copper.PadItem( 1 ) ) );
+    }
+    BOOST_CHECK( copper.RouteItems( trunk ) == before );
+    BOOST_CHECK( copper.RouteItems( branch ).empty() );
+    copper.AddRoute( branch );
+    BOOST_CHECK( copper.RouteItems( trunk ) == split );
+    BOOST_CHECK( copper.RouteItems( branch ) == branchIds );
+    copper.RemoveRoute( trunk );
+    BOOST_CHECK( copper.GetNormalContacts( branchIds[0] ).empty() );
+    // A pad-edge overlap is electrically connected, but NOT a normal contact.
+    copper.ClearRoutes();
+    trunk.nodes.back().point.x = board.pads[1].position.x - 50000;
+    copper.AddRoute( trunk );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    BOOST_CHECK( !copper.NormalConnectedSet( *copper.PadItem( 0 ) ).contains( *copper.PadItem( 1 ) ) );
+}
+
+BOOST_AUTO_TEST_CASE( RetainedTraceContactsSplitVirtuallyAndRestoreOnRejectedInsertion )
+{
+    auto board = makeBoard(); auto settings = makeSettings();
+    ROUTING_OBSTACLE retained;
+    retained.kind = ROUTER_OBSTACLE_KIND::SEGMENT; retained.netCode = 1;
+    retained.start = board.pads[0].position; retained.end = board.pads[1].position;
+    retained.layers = { 0 }; retained.radius = 50000;
+    retained.boardItemId = "retained-host-uuid"; retained.isExistingRoute = true;
+    board.obstacles.push_back( retained );
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION branch;
+    branch.netCode = 1; branch.complete = true;
+    branch.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 2500000 }, 0 } };
+    const auto before = copper.NormalConnectedSet( *copper.PadItem( 0 ) );
+    const auto count = copper.ItemCount();
+    {
+        ROUTING_BOARD::TRANSACTION transaction( copper );
+        copper.AddRoute( branch );
+        BOOST_CHECK_EQUAL( copper.ItemCount(), count + 2 ); // branch plus split half
+        const auto ids = copper.RouteItems( branch );
+        BOOST_REQUIRE_EQUAL( ids.size(), 1 );
+        BOOST_CHECK_EQUAL( copper.GetNormalContacts( ids[0] ).size(), 2 );
+        BOOST_CHECK( copper.NormalConnectedSet( *copper.PadItem( 0 ) ).contains( ids[0] ) );
+    }
+    BOOST_CHECK_EQUAL( copper.ItemCount(), count );
+    BOOST_CHECK( copper.NormalConnectedSet( *copper.PadItem( 0 ) ) == before );
+    BOOST_CHECK_EQUAL( board.obstacles[0].boardItemId, "retained-host-uuid" );
+    BOOST_CHECK( board.obstacles[0].start == retained.start );
+    BOOST_CHECK( board.obstacles[0].end == retained.end );
+}
+
+BOOST_AUTO_TEST_CASE( InsertionNeverInheritsNegotiatedCrossingPermission )
+{
+    auto board = makeBoard(); auto settings = makeSettings();
+    board.nets.push_back( board.nets[0] ); board.nets.back().netCode = 2;
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU ); occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2; victim.complete = true;
+    victim.nodes = { { { 3000000, 0 }, 0 }, { { 3000000, 3000000 }, 0 } };
+    occupancy.Add( victim );
+    int expanded = 0;
+    // Even cancellation during a retry leaves the maze's negotiated mode set.
+    engine.FindConnection( board.pads[0], board.pads[1], 1, expanded, [] { return true; } );
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1; candidate.complete = true;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto result = FOUND_CONNECTION_INSERTER::Insert( candidate, {}, occupancy, engine );
+    BOOST_CHECK( result.state == FOUND_CONNECTION_INSERTER::STATE::BLOCKED );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1 );
+    BOOST_CHECK_EQUAL( occupancy.Connections()[0].netCode, 2 );
+}
+
+BOOST_AUTO_TEST_CASE( CheckedInsertionRollsBackRipupUsageContactsAndCancellation )
+{
+    auto board = makeBoard(); auto settings = makeSettings();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU ); occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION original;
+    original.netCode = 1; original.complete = true;
+    original.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    occupancy.Add( original );
+    const auto ids = occupancy.Board()->RouteItems( original );
+    const auto cells = occupancy.CellsForSegment( original.nodes[0], original.nodes[1] );
+    ROUTING_CONNECTION invalid = original;
+    invalid.nodes.push_back( { { 8000000, 1500000 }, 0 } ); // later edge leaves outline
+    using INSERTER = FOUND_CONNECTION_INSERTER;
+    auto verify = [&]
+    {
+        BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1 );
+        BOOST_CHECK( occupancy.Connections()[0].nodes == original.nodes );
+        BOOST_CHECK( occupancy.Board()->RouteItems( original ) == ids );
+        BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+        for( const auto& cell : cells )
+            BOOST_CHECK_EQUAL( occupancy.Usage( cell, 2 ), 1 );
+    };
+    auto result = INSERTER::Insert( invalid, { original }, occupancy, engine );
+    BOOST_CHECK( result.state == INSERTER::STATE::BLOCKED );
+    BOOST_CHECK_EQUAL( result.edge, 2 ); verify();
+    for( int cancelAt = 1; cancelAt <= 4; ++cancelAt )
+    {
+        int calls = 0;
+        result = INSERTER::Insert( original, { original }, occupancy, engine,
+                                   [&] { return ++calls == cancelAt; } );
+        BOOST_CHECK( result.state == INSERTER::STATE::CANCELLED ); verify();
+    }
+    invalid.nodes.back() = { { 5000000, 1500000 }, 1 };
+    invalid.nodes[1].point.x = 4000000; // diagonal via forbidden
+    result = INSERTER::Insert( invalid, { original }, occupancy, engine );
+    BOOST_CHECK( result.state == INSERTER::STATE::BLOCKED ); verify();
+    result = INSERTER::Insert( original, { original }, occupancy, engine );
+    BOOST_CHECK( result.state == INSERTER::STATE::INSERTED );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
 
 BOOST_AUTO_TEST_CASE( CopperContactsDoNotTrustLogicalRouteEndpoints )
 {
@@ -2319,6 +2609,7 @@ BOOST_AUTO_TEST_CASE( ProductionMultilayerRoutingUsesTheRoomDrillFrontier )
     BOOST_REQUIRE( path ); BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
     BOOST_CHECK_GT( engine.LastRoomSearchMetrics().drillPages, 0 );
     BOOST_CHECK_GT( engine.LastRoomSearchMetrics().layerTransitions, 0 );
+    BOOST_CHECK_GT( engine.LastRoomSearchMetrics().destinationQueries, 0 );
     for( std::size_t i = 1; i < path->nodes.size(); ++i )
     {
         const auto& a = path->nodes[i - 1]; const auto& b = path->nodes[i];
@@ -2469,5 +2760,110 @@ BOOST_AUTO_TEST_CASE( DrillAllocationIsValidatedAndUnusedGridsAreNotConstructed 
     BOOST_CHECK( !engine.AutorouteConnection( board.pads[0], board.pads[1], 0, expanded, {} ) );
     BOOST_CHECK_LE( expanded, 1 );
 }
+
+BOOST_AUTO_TEST_CASE( DestinationDistanceMatchesPinnedJavaForAllLayerStates )
+{
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir() + "/autorouter/destination-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readBox = [&]()
+    {
+        ROUTER_BOX box;
+        input >> box.minX >> box.minY >> box.maxX >> box.maxY;
+        BOOST_REQUIRE( !input.fail() );
+        return box;
+    };
+    for( int record = 0; record < 7712; ++record )
+    {
+        BOOST_TEST_CONTEXT( "DestinationDistance Java record " << record )
+        {
+            std::string marker;
+            int count, activeMask;
+            double normal, cheap;
+            input >> marker >> count >> activeMask >> normal >> cheap;
+            BOOST_REQUIRE_EQUAL( marker, "DEST" );
+            BOOST_REQUIRE( count > 0 && count <= 6 );
+            std::vector<DESTINATION_DISTANCE::EXPANSION_COST_FACTOR> costs( count );
+            std::vector<bool> active( count );
+            for( int layer = 0; layer < count; ++layer )
+            {
+                input >> costs[layer].horizontal >> costs[layer].vertical;
+                active[layer] = ( activeMask & ( 1 << layer ) ) != 0;
+            }
+            DESTINATION_DISTANCE distance( costs, active, normal, cheap );
+            int targets;
+            input >> targets;
+            BOOST_REQUIRE( targets >= 0 && targets <= 18 );
+            for( int i = 0; i < targets; ++i )
+            {
+                int layer;
+                input >> layer;
+                distance.Join( readBox(), layer );
+            }
+            int layer;
+            input >> layer;
+            const auto box = readBox();
+            FLOAT_POINT point;
+            double expectedBox, expectedPoint, expectedCheap, expectedRestored;
+            input >> point.x >> point.y >> expectedBox >> expectedPoint >> expectedCheap >> expectedRestored;
+            BOOST_REQUIRE( !input.fail() );
+            auto check = []( double actual, double expected )
+            { BOOST_CHECK_EQUAL( std::bit_cast<std::uint64_t>( actual ), std::bit_cast<std::uint64_t>( expected ) ); };
+            check( distance.Calculate( box, layer ), expectedBox );
+            check( distance.Calculate( point, layer ), expectedPoint );
+            check( distance.CalculateCheapDistance( box, layer ), expectedCheap );
+            check( distance.Calculate( box, layer ), expectedRestored );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+BOOST_AUTO_TEST_CASE( DestinationDistanceUsesSourceUnionAndPointBoundingBox )
+{
+    DESTINATION_DISTANCE distance( { { 1, 4 }, { 3, 1 } }, { true, true }, 10, 8 );
+    BOOST_CHECK_EQUAL( distance.Calculate( FLOAT_POINT{ 50, 50 }, 0 ),
+                       DESTINATION_DISTANCE::REFERENCE_MAX_COST );
+    distance.Join( { 0, 100, 0, 100 }, 0 );
+    distance.Join( { 100, 0, 100, 0 }, 0 );
+    // Reference measures to the UNION box. The previous min-over-terminals
+    // substitute returned a positive value for this gap between targets.
+    BOOST_CHECK_EQUAL( distance.Calculate( FLOAT_POINT{ 50, 50 }, 0 ), 0 );
+    const auto box = FLOAT_POINT{ -0.5, 0.25 }.BoundingBox();
+    BOOST_CHECK_EQUAL( box.minX, -1 );
+    BOOST_CHECK_EQUAL( box.maxX, 0 );
+    BOOST_CHECK_EQUAL( box.minY, 0 );
+    BOOST_CHECK_EQUAL( box.maxY, 1 );
+    BOOST_CHECK_EQUAL( distance.Calculate( FLOAT_POINT{ -0.5, 0.25 }, 0 ), 0 );
+    BOOST_CHECK_THROW( distance.Join( { 0, 0, 1, 1 }, 2 ), std::out_of_range );
+    BOOST_CHECK_THROW( distance.Calculate( FLOAT_POINT{ 0, 0 }, -1 ), std::out_of_range );
+    BOOST_CHECK_THROW( DESTINATION_DISTANCE( {}, {}, 0, 0 ), std::invalid_argument );
+    BOOST_CHECK_THROW( DESTINATION_DISTANCE( { { 1, 1 } }, { true, true }, 0, 0 ), std::invalid_argument );
+}
+
+BOOST_AUTO_TEST_CASE( ReferenceCostAdapterPreservesUnitsAndEmptySentinels )
+{
+    const ROOM_COST_SPACE units( { -200000000, -200000000, 200000000, 200000000 } );
+    BOOST_CHECK_EQUAL( units.Scale(), 100 );
+    const auto box = units.ToReference( ROUTER_BOX{ -150, 25, -50, 75 } );
+    BOOST_CHECK_EQUAL( box.minX, -2 );
+    BOOST_CHECK_EQUAL( box.minY, 0 );
+    BOOST_CHECK_EQUAL( box.maxX, 0 );
+    BOOST_CHECK_EQUAL( box.maxY, 1 );
+    DESTINATION_DISTANCE distance( { { 1, 1 }, { 1, 1 } }, { true, true },
+            units.ToReferenceCost( 5000000 ), units.ToReferenceCost( 4000000 ) );
+    distance.Join( units.ToReference( ROUTER_BOX{ 100000000, 0, 100000000, 0 } ), 1 );
+    const double cost = units.ToNativeCost( distance.Calculate( units.ToReference( FLOAT_POINT{ 0, 0 } ), 0 ) );
+    BOOST_CHECK_EQUAL( cost, 105000000 );
+    BOOST_CHECK_THROW( units.ToReference( INT_BOX::Empty() ), std::invalid_argument );
+    // A raw IU query exceeds the Java EMPTY-box range. This is precisely why
+    // the unit conversion must not be folded into heuristic-specific branches.
+    const ROOM_COST_SPACE large( { std::numeric_limits<std::int64_t>::min(), 0,
+                                  std::numeric_limits<std::int64_t>::max(), 100 } );
+    BOOST_CHECK( std::isfinite( large.Scale() ) );
+    BOOST_CHECK_LT( std::abs( large.ToReference( FLOAT_POINT{ -9e18, 0 } ).x ) * 5,
+                    DESTINATION_DISTANCE::REFERENCE_COORDINATE_LIMIT );
+    BOOST_CHECK_THROW( ( ROOM_COST_SPACE{ INT_BOX::Empty() } ), std::invalid_argument );
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

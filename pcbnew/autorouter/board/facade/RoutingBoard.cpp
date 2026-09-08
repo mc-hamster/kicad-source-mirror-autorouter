@@ -17,6 +17,8 @@
 #include <geometry/shape_segment.h>
 
 #include "../../rules/ViaRule.h"
+#include "../model/items/NormalContacts.h"
+#include "../../geometry/planar/ContactGeometry.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -93,6 +95,10 @@ struct ROUTING_BOARD::IMPL
         bool conductionArea = false;
         std::vector<LAYER_SHAPE> shapes;
         std::set<ITEM_ID> contacts;
+        std::set<ITEM_ID> normalContacts;
+        NORMAL_CONTACT_ITEM normal;
+        std::optional<ROUTING_OBSTACLE> trace;
+        std::shared_ptr<const ROUTING_OBSTACLE> area;
         std::vector<ROUTING_TERMINAL> terminals;
     };
     struct ROUTE
@@ -117,7 +123,12 @@ struct ROUTING_BOARD::IMPL
         const auto geometry = shape( copper );
         auto layers = copper.layers.empty() ? VIA_RULE::ThroughLayers( settings ) : copper.layers;
         for( int layer : layers )
+        {
             item.shapes.push_back( { item.id, layer, geometry } );
+            if( std::find( item.normal.layers.begin(), item.normal.layers.end(), layer )
+                == item.normal.layers.end() )
+                item.normal.layers.push_back( layer );
+        }
     }
 
     ITEM& newItem( int net, bool dynamic = false )
@@ -153,12 +164,21 @@ struct ROUTING_BOARD::IMPL
                     continue;
                 for( const auto& otherPart : other.shapes )
                 {
-                    if( otherPart.layer == part.layer
-                        && part.geometry->Collide( otherPart.geometry.get(), 0 ) )
+                    if( otherPart.layer == part.layer )
                     {
-                        item.contacts.insert( other.id );
-                        other.contacts.insert( item.id );
-                        break;
+                        const auto& area = item.conductionArea ? item : other;
+                        auto contains = [&]( ROUTER_POINT p )
+                        { return area.area && CONTACT_GEOMETRY::ContainsArea( *area.area, p ); };
+                        if( item.normal.Touches( other.normal, contains ) )
+                        {
+                            item.normalContacts.insert( other.id );
+                            other.normalContacts.insert( item.id );
+                        }
+                        if( part.geometry->Collide( otherPart.geometry.get(), 0 ) )
+                        {
+                            item.contacts.insert( other.id );
+                            other.contacts.insert( item.id );
+                        }
                     }
                 }
             }
@@ -170,7 +190,10 @@ struct ROUTING_BOARD::IMPL
     {
         index.clear();
         for( auto& [id, item] : items )
+        {
             item.contacts.clear();
+            item.normalContacts.clear();
+        }
         for( auto& [id, item] : items )
             indexItem( item );
         // Retained host copper can include item types not yet copied as shapes.
@@ -202,9 +225,113 @@ struct ROUTING_BOARD::IMPL
             return;
         for( ITEM_ID contact : it->second.contacts )
             items.at( contact ).contacts.erase( id );
+        for( ITEM_ID contact : it->second.normalContacts )
+            items.at( contact ).normalContacts.erase( id );
         for( const auto& part : it->second.shapes )
             index.at( part.layer )->Remove( &part );
         items.erase( it );
+    }
+
+    // Split straight copper in the WORKER graph at exact centre-line contacts.
+    // Retained copper is split virtually only: the original host item is not
+    // edited/deleted, and these pieces never become result-emitter output.
+    void normalizeJunctions( const std::vector<ITEM_ID>& added )
+    {
+        using namespace CONTACT_GEOMETRY;
+        std::map<ITEM_ID, std::vector<ROUTER_POINT>> cuts;
+        auto cut = [&]( const ITEM& item, ROUTER_POINT p )
+        {
+            if( item.trace && p != item.normal.first && p != item.normal.last
+                && OnSegment( item.normal.first, item.normal.last, p ) )
+                cuts[item.id].push_back( p );
+        };
+        for( auto id : added )
+        {
+            const auto& item = items.at( id );
+            std::set<ITEM_ID> candidates;
+            for( const auto& part : item.shapes )
+            {
+                auto visitor = [&]( const LAYER_SHAPE* other )
+                {
+                    if( other->owner != id )
+                        candidates.insert( other->owner );
+                    return true;
+                };
+                index.at( part.layer )->Query( part.geometry.get(), 0, visitor );
+            }
+            for( auto otherId : candidates )
+            {
+                const auto& other = items.at( otherId );
+                if( item.net != other.net || !item.normal.SharesLayer( other.normal ) )
+                    continue;
+                const auto a = item.normal.first, b = item.normal.last;
+                const auto c = other.normal.first, d = other.normal.last;
+                using KIND = NORMAL_CONTACT_ITEM::KIND;
+                if( item.normal.kind == KIND::TRACE && other.normal.kind == KIND::TRACE )
+                {
+                    cut( item, c ); cut( item, d );
+                    cut( other, a ); cut( other, b );
+                    if( auto p = Intersection( a, b, c, d ) )
+                    {
+                        cut( item, *p );
+                        cut( other, *p );
+                    }
+                }
+                else if( item.normal.kind == KIND::DRILL && other.normal.kind == KIND::TRACE )
+                    cut( other, a );
+                else if( item.normal.kind == KIND::TRACE && other.normal.kind == KIND::DRILL )
+                    cut( item, c );
+            }
+        }
+        for( auto& [id, points] : cuts )
+        {
+            const auto original = items.at( id );
+            const auto start = original.normal.first, end = original.normal.last;
+            points.push_back( start );
+            points.push_back( end );
+            std::sort( points.begin(), points.end(), [&]( auto a, auto b )
+            {
+                if( start.x != end.x )
+                    return start.x < end.x ? a.x < b.x : a.x > b.x;
+                return start.y < end.y ? a.y < b.y : a.y > b.y;
+            } );
+            points.erase( std::unique( points.begin(), points.end() ), points.end() );
+            removeItem( id );
+            std::vector<ITEM_ID> replacements;
+            for( std::size_t i = 1; i < points.size(); ++i )
+            {
+                // Preserve the original identity on the first half. Only the
+                // additional halves allocate IDs; unrelated items never move.
+                ITEM piece = original;
+                piece.id = i == 1 ? id : nextId++;
+                piece.contacts.clear();
+                piece.normalContacts.clear();
+                piece.shapes.clear();
+                piece.normal.first = points[i - 1];
+                piece.normal.last = points[i];
+                piece.trace->start = points[i - 1];
+                piece.trace->end = points[i];
+                for( auto& terminal : piece.terminals )
+                {
+                    terminal.pad.position = points[i - 1];
+                    terminal.segmentEnd = points[i];
+                }
+                addShape( piece, *piece.trace );
+                auto [it, inserted] = items.emplace( piece.id, std::move( piece ) );
+                indexItem( it->second );
+                replacements.push_back( it->first );
+            }
+            for( auto& route : routes )
+            {
+                auto it = std::find( route.items.begin(), route.items.end(), id );
+                if( it == route.items.end() )
+                    continue;
+                const auto offset = it - route.items.begin();
+                route.items.erase( it );
+                route.items.insert( route.items.begin() + offset, replacements.begin(), replacements.end() );
+                break;
+            }
+        }
     }
 
     void updateComponents() const
@@ -281,6 +408,8 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
             continue;
         auto& item = state.newItem( pad.netCode );
         item.pad = i;
+        item.normal.kind = NORMAL_CONTACT_ITEM::KIND::DRILL;
+        item.normal.first = item.normal.last = pad.position;
         state.pads[i] = item.id;
         if( !pad.sourceId.empty() )
             hostItems[pad.sourceId] = item.id;
@@ -312,6 +441,16 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
         state.addShape( item, copper );
         if( copper.isExistingRoute && copper.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
         {
+            // A host arc tessellated into multiple shapes is not one straight trace.
+            item.normal.kind = !item.terminals.empty() ? NORMAL_CONTACT_ITEM::KIND::UNKNOWN
+                    : copper.start == copper.end ? NORMAL_CONTACT_ITEM::KIND::DRILL
+                                                  : NORMAL_CONTACT_ITEM::KIND::TRACE;
+            item.normal.first = copper.start;
+            item.normal.last = copper.end;
+            if( item.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE )
+                item.trace = copper;
+            else
+                item.trace.reset();
             for( int layer : copper.layers )
             {
                 ROUTING_PAD pad;
@@ -327,6 +466,8 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
     {
         auto& item = state.newItem( area.netCode );
         item.conductionArea = true;
+        item.area = std::make_shared<const ROUTING_OBSTACLE>( area );
+        item.normal.kind = NORMAL_CONTACT_ITEM::KIND::AREA;
         state.addShape( item, area );
     }
     state.reindex();
@@ -363,6 +504,7 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                  || !VIA_RULE::AllowsTransition( state.settings, route.nodes[i - 1].layer,
                                                  route.nodes[i].layer ) ) )
             throw std::invalid_argument( "Invalid routing-board via transition" );
+    TRANSACTION transaction( *this );
     for( std::size_t i = 1; i < route.nodes.size(); ++i )
     {
         const auto& from = route.nodes[i - 1];
@@ -378,6 +520,12 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         copper.radius = ( via ? diameter : width ) / 2;
         copper.layers = via ? VIA_RULE::ThroughLayers( state.settings )
                             : std::vector<int>{ from.layer };
+        item.normal.kind = via ? NORMAL_CONTACT_ITEM::KIND::DRILL
+                               : NORMAL_CONTACT_ITEM::KIND::TRACE;
+        item.normal.first = from.point;
+        item.normal.last = to.point;
+        if( !via )
+            item.trace = copper;
         state.addShape( item, copper );
         for( int layer : copper.layers )
         {
@@ -392,8 +540,11 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         record.items.push_back( item.id );
         state.indexItem( item );
     }
+    const auto addedItems = record.items;
     state.routes.push_back( std::move( record ) );
+    state.normalizeJunctions( addedItems );
     ++state.revision;
+    transaction.Commit();
 }
 
 void ROUTING_BOARD::RemoveRoute( const ROUTING_CONNECTION& route )
@@ -481,6 +632,51 @@ std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::ConnectedSet( ITEM_ID item ) con
         if( component == root )
             result.insert( id );
     return result;
+}
+
+std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::GetNormalContacts( ITEM_ID id ) const
+{
+    const auto it = m_impl->items.find( id );
+    return it == m_impl->items.end() ? std::set<ITEM_ID>{} : it->second.normalContacts;
+}
+
+std::optional<ROUTER_POINT> ROUTING_BOARD::NormalContactPoint( ITEM_ID first, ITEM_ID second ) const
+{
+    const auto a = m_impl->items.find( first ), b = m_impl->items.find( second );
+    if( a == m_impl->items.end() || b == m_impl->items.end() || first == second )
+        return {};
+    return a->second.normal.Point( b->second.normal );
+}
+
+std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
+{
+    if( !m_impl->items.contains( id ) )
+        return {};
+    std::set<ITEM_ID> result{ id };
+    std::vector<ITEM_ID> pending{ id };
+    while( !pending.empty() )
+    {
+        const auto current = pending.back();
+        pending.pop_back();
+        for( auto contact : m_impl->items.at( current ).normalContacts )
+            if( result.insert( contact ).second )
+                pending.push_back( contact );
+    }
+    return result;
+}
+
+std::vector<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::RouteItems( const ROUTING_CONNECTION& route ) const
+{
+    for( const auto& record : m_impl->routes )
+        if( record.connection.netCode == route.netCode && record.connection.nodes == route.nodes )
+            return record.items;
+    return {};
+}
+
+std::optional<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::PadItem( std::size_t pad ) const
+{
+    const auto it = m_impl->pads.find( pad );
+    return it == m_impl->pads.end() ? std::nullopt : std::optional( it->second );
 }
 
 bool ROUTING_BOARD::HasCopperAt( int net, ROUTER_NODE node, std::int64_t radius ) const

@@ -13,6 +13,7 @@
 #include "MazeSearchEngine90Degree.h"
 #include "MazeListElement.h"
 #include "RoomSearchContext.h"
+#include "RoomCostSpace.h"
 
 #include <deque>
 #include <map>
@@ -58,10 +59,24 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         || !std::isfinite( aVerticalCost ) || aVerticalCost <= 0
         || !std::isfinite( aBendCost ) || aBendCost < 0 )
         return std::nullopt;
+    ROUTER_BOX costBounds = aBounds;
     for( const auto& terminals : { &aStarts, &aTargets } )
         for( const auto& terminal : *terminals )
+        {
             if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
                 return std::nullopt; // A diagonal line is not its enclosing rectangle.
+            costBounds = INT_BOX::Union( costBounds, {
+                    std::min( terminal.start.x, terminal.end.x ), std::min( terminal.start.y, terminal.end.y ),
+                    std::max( terminal.start.x, terminal.end.x ), std::max( terminal.start.y, terminal.end.y ) } );
+        }
+    const ROOM_COST_SPACE costSpace( costBounds );
+    // This subproblem is strictly single-layer. Map its sole physical layer
+    // to source ordinal zero, not the arbitrary KiCad layer ID.
+    DESTINATION_DISTANCE destinationDistance( { { aHorizontalCost, aVerticalCost } }, { true }, 0, 0 );
+    for( const auto& target : aTargets )
+        destinationDistance.Join( costSpace.ToReference( ROUTER_BOX{
+                std::min( target.start.x, target.end.x ), std::min( target.start.y, target.end.y ),
+                std::max( target.start.x, target.end.x ), std::max( target.start.y, target.end.y ) } ), 0 );
     ROOM_SEARCH search( aBounds, aObstacles, aLayer, aNet, aSectionOffset,
                         aMaxExpanded, aExpanded, aMetrics, aCancel, aProgress );
     struct STATE
@@ -90,13 +105,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
     };
     auto distance = [&]( FLOAT_POINT from )
     {
-        double best = std::numeric_limits<double>::infinity();
-        for( const auto& target : aTargets )
-        {
-            const auto p = nearest( target, from.Round() );
-            best = std::min( best, cost( from, { static_cast<double>( p.x ), static_cast<double>( p.y ) } ) );
-        }
-        return best;
+        ++aMetrics.destinationQueries;
+        return costSpace.ToNativeCost( destinationDistance.Calculate( costSpace.ToReference( from ), 0 ) );
     };
     auto push = [&]( STATE state )
     {

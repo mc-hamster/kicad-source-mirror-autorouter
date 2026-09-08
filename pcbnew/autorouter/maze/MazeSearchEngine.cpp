@@ -388,8 +388,46 @@ void ROUTING_OCCUPANCY::InitializeBoard( const BOARD_SNAPSHOT& aBoard,
 }
 
 
+struct ROUTING_OCCUPANCY::TRANSACTION::STATE
+{
+    decltype( ROUTING_OCCUPANCY::m_usage ) usage;
+    std::vector<ROUTING_CONNECTION> connections;
+    std::unique_ptr<ROUTING_BOARD::TRANSACTION> board;
+};
+
+ROUTING_OCCUPANCY::TRANSACTION::TRANSACTION( ROUTING_OCCUPANCY& occupancy ) :
+        m_occupancy( occupancy ), m_before( std::make_unique<STATE>() )
+{
+    m_before->usage = occupancy.m_usage;
+    m_before->connections = occupancy.m_connections;
+    if( occupancy.m_board )
+        m_before->board = std::make_unique<ROUTING_BOARD::TRANSACTION>( *occupancy.m_board );
+}
+
+ROUTING_OCCUPANCY::TRANSACTION::~TRANSACTION()
+{
+    if( m_before )
+    {
+        m_occupancy.m_usage.swap( m_before->usage );
+        m_occupancy.m_connections.swap( m_before->connections );
+        // STATE destruction rolls back the pointer-bearing copper index too.
+    }
+}
+
+void ROUTING_OCCUPANCY::TRANSACTION::Commit()
+{
+    if( !m_before )
+        return;
+    if( m_before->board )
+        m_before->board->Commit();
+    m_before.reset();
+}
+
 void ROUTING_OCCUPANCY::Add( const ROUTING_CONNECTION& aConnection )
 {
+    if( !aConnection.complete )
+        throw std::invalid_argument( "Cannot insert an incomplete routing connection" );
+    TRANSACTION transaction( *this );
     if( m_board )
         m_board->AddRoute( aConnection );
     m_connections.push_back( aConnection );
@@ -405,6 +443,7 @@ void ROUTING_OCCUPANCY::Add( const ROUTING_CONNECTION& aConnection )
             ++m_usage[cell][aConnection.netCode];
         }
     }
+    transaction.Commit();
 }
 
 
@@ -1584,6 +1623,23 @@ bool MAZE_SEARCH_ENGINE::CanUseSegment( int aNetCode, const ROUTER_NODE& aStart,
 }
 
 
+bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
+                                            const ROUTER_NODE& end ) const
+{
+    struct RESTORE
+    {
+        bool& flag;
+        bool value;
+        ~RESTORE() { flag = value; }
+    } restore{ m_allowRipupOccupancy, m_allowRipupOccupancy };
+    m_allowRipupOccupancy = false;
+    if( start.layer != end.layer )
+        return CanUseSegment( net, start, end );
+    const auto radius = netTrackRadius( net );
+    return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius );
+}
+
+
 std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
         const ROUTING_CONNECTION& aCandidate ) const
 {
@@ -1874,7 +1930,7 @@ double MAZE_SEARCH_ENGINE::heuristic( const ROUTER_NODE& aNode, const ROUTER_POI
     (void) aTarget;
     (void) aTargetLayer;
     (void) aControl;
-    return m_destinationDistance.Calculate( aNode.point, aNode.layer );
+    return m_legacyDestinationDistance.Calculate( aNode.point, aNode.layer );
 }
 
 
@@ -1939,13 +1995,13 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     // Do not silently substitute a smaller budget on dense boards. The
     // caller's explicit budget is the limit reported in diagnostics/UI.
     const int effectiveMaxExpandedNodes = std::max( 0, m_settings.maxExpandedNodes );
-    m_destinationDistance.Configure( m_settings, targets.front().pad );
+    m_legacyDestinationDistance.Configure( m_settings, targets.front().pad );
     for( const auto& terminal : targets )
     {
         const ROUTER_POINT& point = terminal.pad.position;
         const auto end = terminal.segmentEnd.value_or( point );
         for( int layer : terminal.pad.layers )
-            m_destinationDistance.Join( { std::min( point.x, end.x ), std::min( point.y, end.y ),
+            m_legacyDestinationDistance.Join( { std::min( point.x, end.x ), std::min( point.y, end.y ),
                                          std::max( point.x, end.x ), std::max( point.y, end.y ) }, layer );
     }
     AUTOROUTE_CONTROL control( m_settings, aStart.netCode, aRetry,

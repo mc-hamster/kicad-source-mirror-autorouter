@@ -19,7 +19,9 @@
 namespace KICAD_AUTOROUTER
 {
 
-/** Snapshot-safe counterpart of Freerouting's BatchOptimizerMultiThreaded. */
+/** Legacy serial delegate. The reference's parallel optimizer is NOT ported.
+ * Retaining its filename does not supply its candidate scheduling or behavior.
+ */
 class BATCH_OPTIMIZER_MULTI_THREADED
 {
 public:

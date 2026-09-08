@@ -19,7 +19,10 @@ namespace KICAD_AUTOROUTER
 
 class MAZE_SEARCH_ENGINE;
 
-/** Freerouting equivalent: board/optimize/TraceShover. */
+/** Legacy line-of-sight shortening, NOT Freerouting's trace shove algorithm.
+ * The historical filename is retained for navigation; this cannot displace
+ * neighbouring traces/vias and must not be treated as a completed translation.
+ */
 class MAZE_TRACE_SHOVER
 {
 public:

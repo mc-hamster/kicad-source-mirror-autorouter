@@ -5,6 +5,7 @@
 #pragma once
 
 #include "../../AutorouterTypes.h"
+#include <cmath>
 
 namespace KICAD_AUTOROUTER::INT_BOX
 {
@@ -61,6 +62,23 @@ inline double Area( const ROUTER_BOX& aBox )
     // Match the reference's floating area comparison, without integer overflow.
     return ( static_cast<double>( aBox.maxX ) - aBox.minX )
            * ( static_cast<double>( aBox.maxY ) - aBox.minY );
+}
+
+// IntBox.weightedDistance, including the overlapping-axis fast paths.
+inline double WeightedDistance( const ROUTER_BOX& aBox, const ROUTER_BOX& aOther,
+                                double aHorizontalWeight, double aVerticalWeight )
+{
+    const double maxLlX = std::max( aBox.minX, aOther.minX );
+    const double maxLlY = std::max( aBox.minY, aOther.minY );
+    const double minUrX = std::min( aBox.maxX, aOther.maxX );
+    const double minUrY = std::min( aBox.maxY, aOther.maxY );
+    if( minUrX >= maxLlX )
+        return std::max( aVerticalWeight * ( maxLlY - minUrY ), 0.0 );
+    if( minUrY >= maxLlY )
+        return std::max( aHorizontalWeight * ( maxLlX - minUrX ), 0.0 );
+    const double dx = ( maxLlX - minUrX ) * aHorizontalWeight;
+    const double dy = ( maxLlY - minUrY ) * aVerticalWeight;
+    return std::sqrt( dx * dx + dy * dy );
 }
 
 // IntPoint/IntBox IDs use Java's defined 32-bit wrap, not signed C++ overflow.

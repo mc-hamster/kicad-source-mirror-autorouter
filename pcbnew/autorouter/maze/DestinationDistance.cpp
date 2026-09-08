@@ -1,184 +1,446 @@
 /*
- * This program source code file is part of KiCad, a free EDA application.
- *
- * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
- *
- * This program is free software: you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation, either version 3 of the License, or (at your
- * option) any later version.
+ * KiCad, GPL-3.0-or-later. Direct translation of Freerouting
+ * autoroute/maze/DestinationDistance.java at a11c0a42.
+ * Keep source branch and evaluation order, including inactive-layer defaults.
  */
-
+#if defined( __clang__ )
+// Java evaluates multiply and add separately. Contracting them to FMA changes
+// frontier tie values (first reproduced by destination oracle record 26).
+// Keep this before the inline geometry includes; CMake also covers GCC/MSVC.
+#pragma clang fp contract(off)
+#endif
 #include "DestinationDistance.h"
-
-#include <algorithm>
-#include <cmath>
-#include <iterator>
-
+#include <stdexcept>
 
 namespace KICAD_AUTOROUTER
 {
-
-namespace
+DESTINATION_DISTANCE::DESTINATION_DISTANCE( const std::vector<EXPANSION_COST_FACTOR>& traceCosts,
+        const std::vector<bool>& layerActive, double minNormalViaCost, double minCheapViaCost )
 {
-
-ROUTER_BOX unionBox( const ROUTER_BOX& aLeft, const ROUTER_BOX& aRight )
-{
-    return { std::min( aLeft.minX, aRight.minX ), std::min( aLeft.minY, aRight.minY ),
-             std::max( aLeft.maxX, aRight.maxX ), std::max( aLeft.maxY, aRight.maxY ) };
-}
-
-
-double axisDistance( const ROUTER_POINT& aPoint, const ROUTER_BOX& aBox )
-{
-    const double dx = aPoint.x < aBox.minX ? static_cast<double>( aBox.minX - aPoint.x )
-                                             : aPoint.x > aBox.maxX
-                                                       ? static_cast<double>( aPoint.x - aBox.maxX )
-                                                       : 0.0;
-    const double dy = aPoint.y < aBox.minY ? static_cast<double>( aBox.minY - aPoint.y )
-                                             : aPoint.y > aBox.maxY
-                                                       ? static_cast<double>( aPoint.y - aBox.maxY )
-                                                       : 0.0;
-    return std::sqrt( dx * dx + dy * dy );
-}
-
-
-double minimumTraceCost( const AUTOROUTER_SETTINGS& aSettings )
-{
-    return static_cast<double>( std::max( 0, aSettings.traceLengthCost ) );
-}
-
-} // namespace
-
-
-void DESTINATION_DISTANCE::Configure( const AUTOROUTER_SETTINGS& aSettings,
-                                      const ROUTING_PAD& aTarget )
-{
-    m_settings = &aSettings;
-    m_componentBox = { aTarget.position.x - aTarget.radius, aTarget.position.y - aTarget.radius,
-                       aTarget.position.x + aTarget.radius, aTarget.position.y + aTarget.radius };
-    m_innerBox = {};
-    m_solderBox = {};
-    m_firstOrdinal = 0;
-    m_lastOrdinal = 0;
-    m_hasComponentBox = false;
-    m_hasInnerBox = false;
-    m_hasSolderBox = false;
-
-    if( !aSettings.layers.empty() )
+    if( layerActive.empty() || traceCosts.size() != layerActive.size() )
+        throw std::invalid_argument( "DestinationDistance requires matching nonempty layer arrays" );
+    m_traceCosts = traceCosts;
+    m_layerActive = layerActive;
+    m_layerCount = m_layerActive.size();
+    m_minNormalViaCost = minNormalViaCost;
+    m_minCheapViaCost = minCheapViaCost;
+    int currentActiveLayerCount = 0;
+    for( int ind = 0; ind < m_layerCount; ind++ )
     {
-        m_firstOrdinal = std::numeric_limits<int>::max();
-        m_lastOrdinal = std::numeric_limits<int>::min();
-
-        for( std::size_t index = 0; index < aSettings.layers.size(); ++index )
+        if( m_layerActive[ind] )
         {
-            const ROUTER_LAYER_SETTINGS& layer = aSettings.layers[index];
-            const int ordinal = layer.layerOrdinal >= 0 ? layer.layerOrdinal
-                                                         : static_cast<int>( index );
-            m_firstOrdinal = std::min( m_firstOrdinal, ordinal );
-            m_lastOrdinal = std::max( m_lastOrdinal, ordinal );
+            ++currentActiveLayerCount;
         }
     }
+    m_activeLayerCount = currentActiveLayerCount;
 
-    for( int layer : aTarget.layers )
-        Join( m_componentBox, layer );
-}
-
-
-void DESTINATION_DISTANCE::Join( const ROUTER_BOX& aBox, int aLayer )
-{
-    if( !m_settings || m_settings->layers.empty() )
+    if( m_layerActive[0] )
     {
-        if( !m_hasInnerBox )
+        if( m_traceCosts[0].horizontal < m_traceCosts[0].vertical )
         {
-            m_innerBox = aBox;
-            m_hasInnerBox = true;
+            m_minComponentSideTraceCost = m_traceCosts[0].horizontal;
+            m_maxComponentSideTraceCost = m_traceCosts[0].vertical;
         }
         else
         {
-            m_innerBox = unionBox( m_innerBox, aBox );
+            m_minComponentSideTraceCost = m_traceCosts[0].vertical;
+            m_maxComponentSideTraceCost = m_traceCosts[0].horizontal;
         }
-
-        return;
     }
 
-    auto it = std::find_if( m_settings->layers.begin(), m_settings->layers.end(),
-                            [aLayer]( const ROUTER_LAYER_SETTINGS& aSetting )
-                            {
-                                return aSetting.layerId == aLayer;
-                            } );
-    const int ordinal = it != m_settings->layers.end() && it->layerOrdinal >= 0
-                                ? it->layerOrdinal
-                                : it == m_settings->layers.end()
-                                          ? aLayer
-                                          : static_cast<int>(
-                                                    std::distance( m_settings->layers.begin(), it ) );
-    const int firstOrdinal = m_firstOrdinal;
-    const int lastOrdinal = m_lastOrdinal;
-
-    bool* hasBox = &m_hasInnerBox;
-    ROUTER_BOX* box = &m_innerBox;
-
-    if( ordinal <= firstOrdinal )
+    if( m_layerActive[m_layerCount - 1] )
     {
-        hasBox = &m_hasComponentBox;
-        box = &m_componentBox;
-    }
-    else if( ordinal >= lastOrdinal )
-    {
-        hasBox = &m_hasSolderBox;
-        box = &m_solderBox;
+        const EXPANSION_COST_FACTOR& currentTraceCost = m_traceCosts[m_layerCount - 1];
+
+        if( currentTraceCost.horizontal < currentTraceCost.vertical )
+        {
+            m_minSolderSideTraceCost = currentTraceCost.horizontal;
+            m_maxSolderSideTraceCost = currentTraceCost.vertical;
+        }
+        else
+        {
+            m_minSolderSideTraceCost = currentTraceCost.vertical;
+            m_maxSolderSideTraceCost = currentTraceCost.horizontal;
+        }
     }
 
-    if( !*hasBox )
+    // Note: for inner layers we assume, that cost in preferred direction is 1
+    m_maxInnerSideTraceCost = std::min( m_maxComponentSideTraceCost, m_maxSolderSideTraceCost );
+    for( int ind2 = 1; ind2 < m_layerCount - 1; ind2++ )
     {
-        *box = aBox;
-        *hasBox = true;
+        if( !m_layerActive[ind2] )
+        {
+            continue;
+        }
+        double currentMaxCost = std::max( m_traceCosts[ind2].horizontal, m_traceCosts[ind2].vertical );
+
+        m_maxInnerSideTraceCost = std::min( m_maxInnerSideTraceCost, currentMaxCost );
+    }
+    m_minComponentInnerTraceCost = std::min( m_minComponentSideTraceCost, m_maxInnerSideTraceCost );
+    m_minSolderInnerTraceCost = std::min( m_minSolderSideTraceCost, m_maxInnerSideTraceCost );
+    m_minComponentSolderInnerTraceCost =
+            std::min( m_minComponentInnerTraceCost, m_minSolderInnerTraceCost );
+}
+
+void DESTINATION_DISTANCE::Join( ROUTER_BOX box, int layer )
+{
+    if( layer < 0 || layer >= m_layerCount )
+        throw std::out_of_range( "DestinationDistance layer" );
+    // Raw min/max union deliberately matches IntBox.union, including EMPTY.
+    auto join = [&]( ROUTER_BOX& target )
+    {
+        target = { std::min( target.minX, box.minX ), std::min( target.minY, box.minY ),
+                   std::max( target.maxX, box.maxX ), std::max( target.maxY, box.maxY ) };
+    };
+    if( layer == 0 )
+    {
+        join( m_componentSideBox );
+        m_componentSideBoxIsEmpty = false;
+    }
+    else if( layer == m_layerCount - 1 )
+    {
+        join( m_solderSideBox );
+        m_solderSideBoxIsEmpty = false;
     }
     else
     {
-        *box = unionBox( *box, aBox );
+        join( m_innerSideBox );
+        m_innerSideBoxIsEmpty = false;
     }
+    m_boxIsEmpty = false;
 }
 
-
-double DESTINATION_DISTANCE::Calculate( const ROUTER_POINT& aPoint, int aLayer ) const
+double DESTINATION_DISTANCE::Calculate( FLOAT_POINT point, int layer ) const
 {
-    if( !m_settings )
-        return std::numeric_limits<double>::max();
-
-    auto it = std::find_if( m_settings->layers.begin(), m_settings->layers.end(),
-                            [aLayer]( const ROUTER_LAYER_SETTINGS& aSetting )
-                            {
-                                return aSetting.layerId == aLayer;
-                            } );
-    const int ordinal = it != m_settings->layers.end() && it->layerOrdinal >= 0
-                                ? it->layerOrdinal
-                                : it == m_settings->layers.end()
-                                          ? aLayer
-                                          : static_cast<int>(
-                                                    std::distance( m_settings->layers.begin(), it ) );
-
-    const double grid = std::max( 1.0, static_cast<double>( m_settings->gridStepIU ) );
-    const double traceCost = minimumTraceCost( *m_settings );
-    // Use the minimum across destination regions. Preferring a distant
-    // same-layer box can overestimate a nearby destination one via away.
-    // The plane cost is a conservative lower bound for either route kind.
-    const double viaCost = std::max( 0, std::min( m_settings->viaCost,
-                                                  m_settings->planeViaCost ) );
-    double best = std::numeric_limits<double>::max();
-    const auto consider = [&]( const ROUTER_BOX& box, bool present, bool needsVia )
-    {
-        if( present && ( !needsVia || m_settings->allowVias ) )
-            best = std::min( best, axisDistance( aPoint, box ) / grid * traceCost
-                                       + ( needsVia ? viaCost : 0.0 ) );
-    };
-    consider( m_componentBox, m_hasComponentBox, ordinal != m_firstOrdinal );
-    consider( m_solderBox, m_hasSolderBox, ordinal != m_lastOrdinal );
-    // Inner boxes combine multiple layers, so no same-layer assertion is
-    // possible. Zero transition cost remains an admissible lower bound.
-    consider( m_innerBox, m_hasInnerBox, false );
-    return best;
+    return Calculate( point.BoundingBox(), layer );
 }
 
+double DESTINATION_DISTANCE::Calculate( ROUTER_BOX box, int layer ) const
+{
+    return calculate( box, layer, m_minNormalViaCost );
+}
+
+double DESTINATION_DISTANCE::CalculateCheapDistance( ROUTER_BOX box, int layer ) const
+{
+    return calculate( box, layer, m_minCheapViaCost );
+}
+
+double DESTINATION_DISTANCE::calculate( ROUTER_BOX box, int layer, double minNormalViaCost ) const
+{
+    if( layer < 0 || layer >= m_layerCount )
+        throw std::out_of_range( "DestinationDistance layer" );
+
+    if( m_boxIsEmpty )
+    {
+        return REFERENCE_MAX_COST;
+    }
+
+    double componentSideDeltaX;
+    double componentSideDeltaY;
+
+    if( box.minX > m_componentSideBox.maxX )
+    {
+        componentSideDeltaX = box.minX - m_componentSideBox.maxX;
+    }
+    else if( box.maxX < m_componentSideBox.minX )
+    {
+        componentSideDeltaX = m_componentSideBox.minX - box.maxX;
+    }
+    else
+    {
+        componentSideDeltaX = 0;
+    }
+
+    if( box.minY > m_componentSideBox.maxY )
+    {
+        componentSideDeltaY = box.minY - m_componentSideBox.maxY;
+    }
+    else if( box.maxY < m_componentSideBox.minY )
+    {
+        componentSideDeltaY = m_componentSideBox.minY - box.maxY;
+    }
+    else
+    {
+        componentSideDeltaY = 0;
+    }
+
+    double solderSideDeltaX;
+    double solderSideDeltaY;
+
+    if( box.minX > m_solderSideBox.maxX )
+    {
+        solderSideDeltaX = box.minX - m_solderSideBox.maxX;
+    }
+    else if( box.maxX < m_solderSideBox.minX )
+    {
+        solderSideDeltaX = m_solderSideBox.minX - box.maxX;
+    }
+    else
+    {
+        solderSideDeltaX = 0;
+    }
+
+    if( box.minY > m_solderSideBox.maxY )
+    {
+        solderSideDeltaY = box.minY - m_solderSideBox.maxY;
+    }
+    else if( box.maxY < m_solderSideBox.minY )
+    {
+        solderSideDeltaY = m_solderSideBox.minY - box.maxY;
+    }
+    else
+    {
+        solderSideDeltaY = 0;
+    }
+
+    double innerSideDeltaX;
+    double innerSideDeltaY;
+
+    if( box.minX > m_innerSideBox.maxX )
+    {
+        innerSideDeltaX = box.minX - m_innerSideBox.maxX;
+    }
+    else if( box.maxX < m_innerSideBox.minX )
+    {
+        innerSideDeltaX = m_innerSideBox.minX - box.maxX;
+    }
+    else
+    {
+        innerSideDeltaX = 0;
+    }
+
+    if( box.minY > m_innerSideBox.maxY )
+    {
+        innerSideDeltaY = box.minY - m_innerSideBox.maxY;
+    }
+    else if( box.maxY < m_innerSideBox.minY )
+    {
+        innerSideDeltaY = m_innerSideBox.minY - box.maxY;
+    }
+    else
+    {
+        innerSideDeltaY = 0;
+    }
+
+    double componentSideMaxDelta;
+    double componentSideMinDelta;
+
+    if( componentSideDeltaX > componentSideDeltaY )
+    {
+        componentSideMaxDelta = componentSideDeltaX;
+        componentSideMinDelta = componentSideDeltaY;
+    }
+    else
+    {
+        componentSideMaxDelta = componentSideDeltaY;
+        componentSideMinDelta = componentSideDeltaX;
+    }
+
+    double solderSideMaxDelta;
+    double solderSideMinDelta;
+
+    if( solderSideDeltaX > solderSideDeltaY )
+    {
+        solderSideMaxDelta = solderSideDeltaX;
+        solderSideMinDelta = solderSideDeltaY;
+    }
+    else
+    {
+        solderSideMaxDelta = solderSideDeltaY;
+        solderSideMinDelta = solderSideDeltaX;
+    }
+
+    double innerSideMaxDelta;
+    double innerSideMinDelta;
+
+    if( innerSideDeltaX > innerSideDeltaY )
+    {
+        innerSideMaxDelta = innerSideDeltaX;
+        innerSideMinDelta = innerSideDeltaY;
+    }
+    else
+    {
+        innerSideMaxDelta = innerSideDeltaY;
+        innerSideMinDelta = innerSideDeltaX;
+    }
+
+    double result = REFERENCE_MAX_COST;
+
+    if( layer == 0 )
+    { // calculate shortest distance to component side box
+        // calculate one layer distance
+
+        if( !m_componentSideBoxIsEmpty )
+        {
+            result =
+                    INT_BOX::WeightedDistance( box,
+                            m_componentSideBox, m_traceCosts[0].horizontal, m_traceCosts[0].vertical );
+        }
+
+        if( m_activeLayerCount <= 1 )
+        {
+            return result;
+        }
+
+        // calculate two layer distance on component and solder side
+
+        double tmpDistance;
+        if( m_minSolderSideTraceCost < m_minComponentSideTraceCost )
+        {
+            tmpDistance =
+                    m_minSolderSideTraceCost * solderSideMaxDelta
+                            + m_minComponentSideTraceCost * solderSideMinDelta
+                            + minNormalViaCost;
+        }
+        else
+        {
+            tmpDistance =
+                    m_minComponentSideTraceCost * solderSideMaxDelta
+                            + m_minSolderSideTraceCost * solderSideMinDelta
+                            + minNormalViaCost;
+        }
+
+        result = std::min( result, tmpDistance );
+
+        // calculate two layer distance on component and solde side
+        // with two vias
+
+        tmpDistance =
+                componentSideMaxDelta
+                        + componentSideMinDelta * m_minComponentInnerTraceCost
+                        + 2 * minNormalViaCost;
+
+        result = std::min( result, tmpDistance );
+
+        if( m_activeLayerCount == 2 )
+        {
+            return result;
+        }
+
+        // calculate two layer distance on component side and an inner side
+
+        tmpDistance =
+                innerSideMaxDelta + innerSideMinDelta * m_minComponentInnerTraceCost + minNormalViaCost;
+
+        result = std::min( result, tmpDistance );
+
+        // calculate three layer distance
+
+        tmpDistance =
+                solderSideMaxDelta
+                        + +m_minComponentSolderInnerTraceCost * solderSideMinDelta
+                        + 2 * minNormalViaCost;
+        result = std::min( result, tmpDistance );
+
+        tmpDistance = componentSideMaxDelta + componentSideMinDelta + 2 * minNormalViaCost;
+        result = std::min( result, tmpDistance );
+
+        if( m_activeLayerCount == 3 )
+        {
+            return result;
+        }
+
+        tmpDistance = innerSideMaxDelta + innerSideMinDelta + 2 * minNormalViaCost;
+
+        result = std::min( result, tmpDistance );
+
+        // calculate four layer distance
+
+        tmpDistance = solderSideMaxDelta + solderSideMinDelta + 3 * minNormalViaCost;
+
+        return std::min( result, tmpDistance );
+    }
+    if( layer == m_layerCount - 1 )
+    { // calculate the shortest distance to solder side box
+        // calculate one layer distance
+
+        if( !m_solderSideBoxIsEmpty )
+        {
+            result =
+                    INT_BOX::WeightedDistance( box,
+                            m_solderSideBox, m_traceCosts[layer].horizontal, m_traceCosts[layer].vertical );
+        }
+
+        // calculate two layer distance
+        double tmpDistance;
+        if( m_minComponentSideTraceCost < m_minSolderSideTraceCost )
+        {
+            tmpDistance =
+                    m_minComponentSideTraceCost * componentSideMaxDelta
+                            + m_minSolderSideTraceCost * componentSideMinDelta
+                            + minNormalViaCost;
+        }
+        else
+        {
+            tmpDistance =
+                    m_minSolderSideTraceCost * componentSideMaxDelta
+                            + m_minComponentSideTraceCost * componentSideMinDelta
+                            + minNormalViaCost;
+        }
+        result = std::min( result, tmpDistance );
+        tmpDistance =
+                solderSideMaxDelta + solderSideMinDelta * m_minSolderInnerTraceCost + 2 * minNormalViaCost;
+        result = std::min( result, tmpDistance );
+        if( m_activeLayerCount <= 2 )
+        {
+            return result;
+        }
+        tmpDistance =
+                innerSideMinDelta * m_minSolderInnerTraceCost + innerSideMaxDelta + minNormalViaCost;
+        result = std::min( result, tmpDistance );
+
+        // calculate three layer distance
+
+        tmpDistance =
+                componentSideMaxDelta
+                        + m_minComponentSolderInnerTraceCost * componentSideMinDelta
+                        + 2 * minNormalViaCost;
+        result = std::min( result, tmpDistance );
+        tmpDistance = solderSideMaxDelta + solderSideMinDelta + 2 * minNormalViaCost;
+        result = std::min( result, tmpDistance );
+        if( m_activeLayerCount == 3 )
+        {
+            return result;
+        }
+        tmpDistance = innerSideMaxDelta + innerSideMinDelta + 2 * minNormalViaCost;
+        result = std::min( result, tmpDistance );
+
+        // calculate four layer distance
+
+        tmpDistance = componentSideMaxDelta + componentSideMinDelta + 3 * minNormalViaCost;
+        return std::min( result, tmpDistance );
+    }
+
+    // calculate distance to inner layer box
+
+    // calculate one layer distance
+
+    if( !m_innerSideBoxIsEmpty )
+    {
+        result =
+                INT_BOX::WeightedDistance( box,
+                        m_innerSideBox, m_traceCosts[layer].horizontal, m_traceCosts[layer].vertical );
+    }
+
+    // calculate two layer distance
+
+    double tmpDistance = innerSideMaxDelta + innerSideMinDelta + minNormalViaCost;
+
+    result = std::min( result, tmpDistance );
+    tmpDistance =
+            componentSideMaxDelta
+                    + componentSideMinDelta * m_minComponentInnerTraceCost
+                    + minNormalViaCost;
+    result = std::min( result, tmpDistance );
+    tmpDistance =
+            solderSideMaxDelta + solderSideMinDelta * m_minSolderInnerTraceCost + minNormalViaCost;
+    result = std::min( result, tmpDistance );
+
+    // calculate three layer distance
+
+    tmpDistance = componentSideMaxDelta + componentSideMinDelta + 2 * minNormalViaCost;
+    result = std::min( result, tmpDistance );
+    tmpDistance = solderSideMaxDelta + solderSideMinDelta + 2 * minNormalViaCost;
+    return std::min( result, tmpDistance );
+}
 } // namespace KICAD_AUTOROUTER

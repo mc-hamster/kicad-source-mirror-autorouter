@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check native golden room/drill primitives against pinned Freerouting.
+"""Check native golden room/drill/destination primitives against pinned Freerouting.
 
 The JAR is QA-only. This tool never builds in, instruments, or modifies a
 Freerouting checkout. Outputs are written to a fresh native build directory.
@@ -54,7 +54,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--java", default="java")
     parser.add_argument("--javac", default="javac")
-    parser.add_argument("--oracle", choices=("room", "drill"), default="room")
+    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout"), default="room")
     args = parser.parse_args()
     jar, output = args.reference_jar.resolve(), args.output_dir.resolve()
     verify_reference(jar)
@@ -62,9 +62,10 @@ def main() -> int:
     classes = output / "classes"
     classes.mkdir()
     drill = args.oracle == "drill"
-    source = ROOT / "scripts/autorouter" / ("DrillSearchOracle.java" if drill else "RoomSearchOracle.java")
+    main_class = {"room": "RoomSearchOracle", "drill": "app.freerouting.autoroute.maze.DrillSearchOracle",
+                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle"}[args.oracle]
+    source = ROOT / "scripts/autorouter" / (main_class.rsplit(".", 1)[-1] + ".java")
     expected = ROOT / f"qa/data/pcbnew/autorouter/{args.oracle}-search-a11c0a42.txt"
-    main_class = "app.freerouting.autoroute.maze.DrillSearchOracle" if drill else "RoomSearchOracle"
     commands = [
         [args.javac, "-cp", str(jar), "-d", str(classes), str(source)],
         [args.java, "-cp", f"{jar}{os.pathsep}{classes}", main_class],

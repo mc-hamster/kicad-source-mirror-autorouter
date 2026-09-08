@@ -26,16 +26,27 @@
 namespace KICAD_AUTOROUTER
 {
 
-/**
- * Freerouting equivalent: autoroute/path/FoundConnectionInserter.
- *
- * This class only records the route result.  Creation of PCB_TRACK/PCB_VIA
- * remains an editor-thread adapter operation, preserving the proposal
- * transaction boundary.
+class MAZE_SEARCH_ENGINE;
+class ROUTING_OCCUPANCY;
+
+/** Checked, atomic insertion of the current straight-segment/through-via
+ * subset, plus result emission. Recursive forced shove, spring-over and
+ * neckdown from Java FoundConnectionInserter are NOT implemented by this API.
  */
 class FOUND_CONNECTION_INSERTER
 {
 public:
+    enum class STATE { INSERTED, BLOCKED, CANCELLED, INVALID };
+    struct RESULT
+    {
+        STATE state;
+        std::size_t edge = 0; // failed edge's end index; 0 for whole-input failure
+    };
+    static RESULT Insert( const ROUTING_CONNECTION& aConnection,
+                          const std::vector<ROUTING_CONNECTION>& aRipups,
+                          ROUTING_OCCUPANCY& aOccupancy, const MAZE_SEARCH_ENGINE& aEngine,
+                          const ROUTER_CANCEL_CALLBACK& aCancel = {} );
+
     static void Append( const ROUTING_CONNECTION& aConnection,
                         std::int64_t aTrackWidth,
                         std::int64_t aViaDiameter,

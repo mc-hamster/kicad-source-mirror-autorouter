@@ -12,7 +12,19 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — multilayer drills, 2026-09-08
+## Latest core milestone — direct destination translation, 2026-09-08
+
+[Java → C++ translation audit](DESTINATION-DISTANCE-PARITY.md) replaces the
+three substitute destination estimates in the room search with the pinned
+component/solder/inner-box algorithm. Its 7,712 Java oracle records are checked
+bit-for-bit, including non-binary weights; scoped floating contraction control
+closes the first numeric mismatch. Ordinary plane searches now start at the
+whole connected terminal set; exact host repair anchors remain explicit.
+The legacy fallback is separately named, not falsely described as translated.
+This closes a method-level gap, **not** full costs, geometry, insertion or maze
+parity. The detailed report records remaining substitutions and validation.
+
+## Previous core milestone — multilayer drills, 2026-09-08
 
 [Active multilayer room/drill search](DRILL-SEARCH-PARITY.md) now runs in the
 default production path before the remaining legacy fallback. It adds lazy
@@ -24,7 +36,7 @@ The unused eager drill grid in the old wrapper has been removed; the active
 array and candidate allocation have explicit work/size limits.
 
 This is **still not parity**: exact convex/45-degree free-space geometry,
-reference destination heuristics and UI cost mapping, forced insertion/shove,
+UI cost mapping and (at that milestone) destination heuristics, forced insertion/shove,
 real fanout/optimization, and mutable job ownership across refill remain open.
 The new report records same-board quality regressions as well as speed changes;
 no DRC, via-count, length, or timeout gate is waived.
@@ -130,7 +142,7 @@ Every row below is required or needs an explicit, justified host adaptation.
 | **5. Rooms and doors** | **Active rectangular subset.** Free/incomplete/complete rooms, sorted touching neighbours/gaps, overlap doors, section geometry and neighbour-completion lifecycle run in single-layer and multilayer attempts. Still need full convex/45 geometry, obstacle rooms, real item-region target doors, thin-room/acute-corner handling and nonrectangular drill reachability. Other similarly named classes remain shells. | Active path must actually visit rooms/door sections, with normalized reference traces—not a unit helper called only by tests. |
 | **6. Maze frontier/backtracking** | **Partial, not full equivalence.** The room/drill slice has door-section and drill-layer state, entry geometry, backtracking and the reference f/g/door-ID/section queue key (including equal-key suppression). Its target IDs are host-local, and its geometry/target regions are restricted. Default multilayer work uses this frontier first; unsupported/rejected proposals retain grid/visibility fallback. Need full target-region, rip-up/shove/alternative-padstack state and normalized end-to-end reference decision streams. | First normalized routing-decision divergence, repeated deterministic checkpoints, and boards with routes unavailable to the old grid. |
 | **7. Drill/via expansion** | **Partial.** Lazy rectangular drill pages, cutout ordering, full-stack room lookup, drill-layer expansion, SMD pin-centre substitution, and separate geometry invalidation/maze reset now run. Need nonrectangular/acute drill geometry, thin-room and forced-pad checks, masks, multiple via rules, blind/buried/microvia padstacks where upstream supports them, and incremental cross-attempt cache invalidation/reuse. | Multilayer fixtures with inactive layers, asymmetric pads, alternative via rules, blocked intermediate layers and drill spacing. |
-| **8. Routing costs and heuristic** | **Not equivalent overall.** The room frontier now uses reference weighted Euclidean distance and normalized bend detection; queue/distance primitives have Java oracles. Legacy batch score compatibility and UI direction/bend-unit mapping remain adaptations. The fallback retains grid-normalized lengths, fixed direction penalties and retry-scaled via costs, while the new drill frontier uses radius-scaled via cost (including the source-pin pure-SMD discount). The reference component/solder/inner-box destination estimate is not yet ported; a conservative geometric substitute and native UI cost mapping remain. Need exact preferred/nonpreferred costs, normal/plane via costs, rip-up costs, admissible destination estimates and ordering. Change them together with frontier state, not one coefficient at a time. | Numeric oracle plus path/order comparisons; no clearance/completion regression and measured time/memory. The prior isolated cost change was rejected for a large runtime regression. |
+| **8. Routing costs and heuristic** | **Not equivalent overall.** The room frontier now uses reference weighted Euclidean distance and normalized bend detection; queue/distance primitives have Java oracles. Legacy batch score compatibility and UI direction/bend-unit mapping remain adaptations. The fallback retains grid-normalized lengths, fixed direction penalties and retry-scaled via costs, while the new drill frontier uses radius-scaled via cost (including the source-pin pure-SMD discount). The component/solder/inner-box destination estimate is now a direct, bit-tested translation, wired into both room frontiers through an explicit IU adapter. LegacyDestinationDistance remains isolated to the raster fallback; native UI cost mapping and target-region modeling still differ. Need exact preferred/nonpreferred costs, normal/plane via costs, rip-up costs, admissible destination estimates and ordering. Change them together with frontier state, not one coefficient at a time. | Numeric oracle plus path/order comparisons; no clearance/completion regression and measured time/memory. The prior isolated cost change was rejected for a large runtime regression. |
 | **9. Path location** | **Active rectangular 90/45 subset.** `FoundConnectionLocator45Degree` is no longer an alias: it locates a backtracked rectangular corridor using nearest door/overlap entries and reference corner construction, without searching again. Still need full convex/acute/thin-room, pad/trace/area attachment, neckdown and nonrectangular/multiple-padstack reconstruction. Rectangular through-drill reconstruction is active. The legacy locator and any-angle alias remain unported. | Every reconstructed edge and contact agrees with reference constraints before insertion; adversarial short/acute/narrow corridors. |
 | **10. Forced insertion and speculative undo** | **Missing.** Current inserter materializes already-found coordinate edges. Need `insertForcedTracePolyline`/via-equivalent operations, trace contact splitting, partial insertion failure, atomic rollback of geometry, contacts, occupancy and all search caches. A private transaction exists but is not yet the production forced-insertion transaction. | Failed insertions restore all internal state; successful insertions update actual copper. Editor acceptance undo is tested separately. |
 | **11. Shove, spring-over, neckdown** | **Missing.** `MazeTraceShover::Shorten` is not shove. Need recursive local trace/via displacement, recursion/depth limits, fixed obstacles, alternate spring-over paths, pin escapes and neckdown where legal. KiCad rule compliance must not be relaxed to imitate reference violations. | Congested fixtures that require displacement rather than reroute alone, exact affected-item logs, and full DRC after each committed operation. |

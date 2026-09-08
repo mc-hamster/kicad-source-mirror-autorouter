@@ -18,11 +18,56 @@
  */
 
 #include "FoundConnectionInserter.h"
+#include "../maze/MazeSearchEngine.h"
 
 #include <utility>
 
 namespace KICAD_AUTOROUTER
 {
+
+FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
+        const ROUTING_CONNECTION& connection, const std::vector<ROUTING_CONNECTION>& ripups,
+        ROUTING_OCCUPANCY& occupancy, const MAZE_SEARCH_ENGINE& engine,
+        const ROUTER_CANCEL_CALLBACK& cancel )
+{
+    if( !occupancy.Board() || !connection.complete || connection.netCode <= 0
+        || connection.nodes.empty() )
+        return { STATE::INVALID };
+    if( cancel && cancel() )
+        return { STATE::CANCELLED };
+    ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+    for( const auto& victim : ripups )
+    {
+        // This entry point only removes generated connections in this worker,
+        // never original host copper or synthetic fanout's electrical bridge.
+        if( victim.isFanoutConnection
+            || std::none_of( occupancy.Connections().begin(), occupancy.Connections().end(),
+                [&]( const auto& route )
+                { return route.netCode == victim.netCode && route.nodes == victim.nodes; } ) )
+            return { STATE::INVALID };
+        occupancy.Remove( victim );
+        if( cancel && cancel() )
+            return { STATE::CANCELLED };
+    }
+    if( connection.nodes.size() == 1
+        && !engine.CanInsertSegment( connection.netCode, connection.nodes[0], connection.nodes[0] ) )
+        return { STATE::BLOCKED };
+    for( std::size_t i = 1; i < connection.nodes.size(); ++i )
+    {
+        if( cancel && cancel() )
+            return { STATE::CANCELLED, i };
+        if( !engine.CanInsertSegment( connection.netCode, connection.nodes[i - 1], connection.nodes[i] ) )
+            return { STATE::BLOCKED, i };
+    }
+    // Preflight uses the post-ripup board. Geometry/normal-contact splitting,
+    // generated route records and congestion cells then commit together.
+    occupancy.Add( connection );
+    if( cancel && cancel() )
+        return { STATE::CANCELLED };
+    transaction.Commit();
+    return { STATE::INSERTED };
+}
+
 
 void FOUND_CONNECTION_INSERTER::Append( const ROUTING_CONNECTION& aConnection,
                                         std::int64_t aTrackWidth,

@@ -33,6 +33,14 @@ namespace KICAD_AUTOROUTER
 class AUTOROUTE_CONTROL
 {
 public:
+    // Direct counterpart of AutorouteControl.ExpansionCostFactor. Room costs
+    // use geometric units, independently of the legacy grid cost methods below.
+    struct EXPANSION_COST_FACTOR
+    {
+        double horizontal;
+        double vertical;
+    };
+
     AUTOROUTE_CONTROL( const AUTOROUTER_SETTINGS& aSettings, int aNetCode, int aRetry,
                        bool aTargetIsPlane = false ) :
             m_settings( aSettings ),

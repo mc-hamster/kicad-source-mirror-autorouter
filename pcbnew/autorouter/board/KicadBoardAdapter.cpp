@@ -459,6 +459,17 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
     if( !m_board )
         return;
 
+    std::map<const PAD*, std::pair<int, int>> packagePins;
+    int component = 0;
+    // Match the footprint traversal used by the host DSN exporter. Duplicate
+    // pad numbers are distinct package pins; never use the displayed number.
+    for( const auto* footprint : m_board->Footprints() )
+    {
+        ++component;
+        int pin = 0;
+        for( const auto* pad : footprint->Pads() )
+            packagePins.emplace( pad, std::pair{ component, pin++ } );
+    }
     std::map<const BOARD_CONNECTED_ITEM*, std::size_t> padIndices;
     for( PAD* pad : m_board->GetPads() )
     {
@@ -677,6 +688,11 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         ROUTING_PAD routingPad;
         routingPad.netCode = pad->GetNetCode();
         routingPad.sourceId = pad->m_Uuid.AsString().ToStdString();
+        if( const auto it = packagePins.find( pad ); it != packagePins.end() )
+        {
+            routingPad.componentId = it->second.first;
+            routingPad.pinIndex = it->second.second;
+        }
         routingPad.position = point( pad->GetPosition() );
         routingPad.layers = routeLayers;
         routingPad.netClass = className;
@@ -687,7 +703,8 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         // KiCad's through-hole pad layer set spans the copper stack.  A
         // single-layer pad is therefore the stable host-side signal for
         // Freerouting's SMD fanout pre-pass.
-        routingPad.isSmd = routeLayers.size() == 1;
+        // An inactive trace layer does not turn a through-hole pin into SMD.
+        routingPad.isSmd = padLayers.size() == 1;
         const PCB_LAYER_ID clearanceLayer = static_cast<PCB_LAYER_ID>( routeLayers.front() );
         routingPad.clearance =
                 std::max<std::int64_t>( 0, pad->GetOwnClearance( clearanceLayer ) );

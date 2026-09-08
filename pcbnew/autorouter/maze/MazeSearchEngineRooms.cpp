@@ -182,6 +182,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         std::ostringstream log;
         log << "ROOM_SEARCH net=" << net << " rooms=" << m_roomMetrics.rooms
             << " doors=" << m_roomMetrics.doors << " sections=" << m_roomMetrics.sections
+            << " destination_queries=" << m_roomMetrics.destinationQueries
             << " expanded=" << aExpanded << " accepted=" << m_roomMetrics.routed
             << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - started ).count();
@@ -325,6 +326,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             << " doors=" << m_roomMetrics.doors << " sections=" << m_roomMetrics.sections
             << " pages=" << m_roomMetrics.drillPages << " drills=" << m_roomMetrics.drills
             << " transitions=" << m_roomMetrics.layerTransitions << " expanded=" << expanded
+            << " destination_queries=" << m_roomMetrics.destinationQueries
             << " accepted=" << m_roomMetrics.routed << " elapsed_ms="
             << std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - started ).count();

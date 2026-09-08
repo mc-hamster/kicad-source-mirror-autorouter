@@ -41,6 +41,14 @@ public:
     std::vector<ROUTER_POINT> TraceJunctions( int aNet, ROUTER_NODE aStart,
                                              ROUTER_NODE aEnd ) const;
     std::set<ITEM_ID> ConnectedSet( ITEM_ID aItem ) const;
+    /** Routing topology: exact endpoint/centre contacts, not copper overlap.
+     * Kept separate from ConnectedSet(), which answers host physical connectivity.
+     */
+    std::set<ITEM_ID> GetNormalContacts( ITEM_ID aItem ) const;
+    std::optional<ROUTER_POINT> NormalContactPoint( ITEM_ID aFirst, ITEM_ID aSecond ) const;
+    std::set<ITEM_ID> NormalConnectedSet( ITEM_ID aItem ) const;
+    std::vector<ITEM_ID> RouteItems( const ROUTING_CONNECTION& aRoute ) const;
+    std::optional<ITEM_ID> PadItem( std::size_t aPad ) const;
     std::size_t ItemCount() const;
     std::uint64_t Revision() const;
 

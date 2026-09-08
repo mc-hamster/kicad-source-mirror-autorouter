@@ -37,7 +37,7 @@ same change.
 |---|---|---|
 | `autoroute/maze/AutorouteControl.java` | `pcbnew/autorouter/maze/AutorouteControl.h/.cpp` | Substitute cost model; grid-normalized lengths, fixed per-edge direction/bend costs, and retry scaling differ from upstream. |
 | `autoroute/maze/AutorouteEngine.java` | `pcbnew/autorouter/maze/AutorouteEngine.h/.cpp` | Per-snapshot engine owner; `AUTOROUTER_JOB` owns the native thread and the search owns attempt-local drill/room state. The unused wrapper drill array has been removed; persistent reuse is not implemented. |
-| `autoroute/maze/DestinationDistance.java` | `pcbnew/autorouter/maze/DestinationDistance.h/.cpp` | Legacy layer-aware grid estimate. The room/drill frontier has a separate geometric substitute, not the full upstream destination-box heuristic. |
+| `autoroute/maze/DestinationDistance.java` | `pcbnew/autorouter/maze/DestinationDistance.h/.cpp` | Direct constructor/join/point/box/cheap-estimate translation, active in both room frontiers; 7,712 bit-tested Java records. `RoomCostSpace` is the explicit IU adapter. The grid substitute is now `LegacyDestinationDistance`, not this class. |
 | `autoroute/maze/MazeSearchEngine.java` | `pcbnew/autorouter/maze/MazeSearchEngine.h/.cpp` | Hybrid boundary: guarded rectangular single/multilayer room search first, experimental grid/visibility fallback, exact snapshot collision predicates. `MazeSearchEngine90Degree`, `MazeSearchEngineMultilayer`, `RoomSearchContext` and `MazeSearchEngineRooms` isolate core state and the host adapter. |
 | `autoroute/maze/MazeExpansionEngine.java` | `pcbnew/autorouter/maze/MazeExpansionEngine.h/.cpp` | Pinned-reference page/drill frontier cost operations and radius-scaled via cost. Legacy coordinate neighbours remain only for fallback. |
 | `autoroute/maze/MazeListElement.java` | `pcbnew/autorouter/maze/MazeListElement.h` | Pinned f/g/door-ID/section ordering key, including equal-key suppression. Host target/room identity remains an adaptation. |
@@ -51,11 +51,11 @@ same change.
 | `autoroute/pipeline/AutorouteAirlineCalculator.java` | `pcbnew/autorouter/pipeline/AutorouteAirlineCalculator.h/.cpp` | Computes topology lower bounds for metrics and future board scoring. |
 | `autoroute/pipeline/BatchFanout.java` | `pcbnew/autorouter/pipeline/BatchFanout.h/.cpp` | Snapshot-side SMD fanout and plane-target classification; fanout escapes are synthetic worker pads and become ordinary KiCad vias/tracks at acceptance. |
 | `autoroute/pipeline/BatchOptimizer.java` | `pcbnew/autorouter/pipeline/BatchOptimizer.h/.cpp` | Guarded visibility shortening plus contact-preserving terminal-via and exact-junction trace-tail/overlap cleanup; no upstream shove, pull-tight or via reposition/reroute optimizer. |
-| `autoroute/pipeline/BatchOptimizerMultiThreaded.java` | `pcbnew/autorouter/pipeline/BatchOptimizerMultiThreaded.h` | Snapshot-safe optimizer wrapper; candidate parallelism is deferred until occupancy copies are independent. |
+| `autoroute/pipeline/BatchOptimizerMultiThreaded.java` | `pcbnew/autorouter/pipeline/BatchOptimizerMultiThreaded.h` | Serial delegate only; no reference candidate scheduling, parallelism or scoring implementation. |
 | `autoroute/pipeline/OptimizeRouteTask.java` | `pcbnew/autorouter/pipeline/OptimizeRouteTask.h` | Data-only optimization candidate task; never deep-copies a live KiCad `BOARD`. |
 | `autoroute/pipeline/RoutingPipeline.java` | `pcbnew/autorouter/pipeline/RoutingPipeline.h/.cpp` | Stable orchestration seam for future fanout and diagnostics. |
 | `autoroute/path/Connection.java` | `pcbnew/autorouter/path/Connection.h/.cpp` plus `ROUTING_CONNECTION` | Data-only value wrapper; path nodes retain layer transitions. |
-| `autoroute/path/FoundConnectionInserter.java` | `BatchAutorouter.cpp` and `KicadBoardAdapter.cpp` | KiCad transaction creates ordinary tracks/vias after proposal acceptance. |
+| `autoroute/path/FoundConnectionInserter.java` | `pcbnew/autorouter/path/FoundConnectionInserter.h/.cpp` | Result-edge emitter only, not reference forced insertion, contact splitting/normalization, neckdown or transactional rollback. Host materialization remains in the KiCad adapter/session. |
 | `autoroute/path/FoundConnectionLocator.java` | `pcbnew/autorouter/path/FoundConnectionLocator.h/.cpp` | Unwired wrapper that invokes search again; not the upstream door-section backtrace locator. |
 | `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h/.cpp` | Active rectangular 90/45-degree corridor locator; composed with through-drill transitions. Full convex/acute/thin-room and pin-exit behavior remain unported. |
 | `autoroute/path/FoundConnectionLocatorAnyAngle.java` | `pcbnew/autorouter/path/FoundConnectionLocatorAnyAngle.h` | Alias of the generic locator, not an any-angle locator implementation. |
@@ -82,7 +82,7 @@ same change.
 | `RoutingBoardOperations` | Live edits use `BOARD_COMMIT` on the editor thread; a private `BOARD` is used by host validation on the worker. Neither implements reference forced insertion | `AutorouterTool.cpp`, `board/KicadRoutingSession.cpp` |
 | `RoutingBoardUndoFacade` / board history | `BOARD_COMMIT` | KiCad-provided API; one accepted proposal is one commit |
 | `board.trace.PolylineTrace*` | `PCB_TRACK` segments | `KicadBoardAdapter::CreatePreviewItems` |
-| `board.optimize.TraceShover` / tighteners | `MAZE_TRACE_SHOVER` called by `BatchOptimizer` | `maze/MazeTraceShover.cpp`; future direct ports must preserve the file mapping |
+| `autoroute.maze.MazeTraceShover`, `board.optimize.TraceShover` / tighteners | **Not ported.** The similarly named native class only shortens visible paths | `maze/MazeTraceShover.cpp` is legacy cleanup, not reference `checkShoveTraceLine` or recursive trace displacement |
 | `board.optimize.ViaOptimizer` | `ROUTING_VIA` cleanup seam | `pipeline/BatchOptimizer.cpp` and adapter |
 | planar `IntPoint`, `IntBox`, `TileShape`, polygon geometry | `VECTOR2I`, `BOX2I`, `SHAPE_LINE_CHAIN`, `SHAPE_POLY_SET` | Adapter conversion; all worker coordinates are integer KiCad IU |
 | `rules.Net`, `NetClass`, clearance matrix | `NETCLASS`, `BOARD_DESIGN_SETTINGS`, pad/track own clearance, layer settings | `board/KicadBoardAdapter.cpp` |
@@ -158,3 +158,13 @@ Additional drill milestone mapping:
 
 The Java executable is used only by `scripts/autorouter/{Room,Drill}SearchOracle.java`
 and A/B QA; it is not linked, launched, or required by the native editor.
+
+## Direct destination translation — 2026-09-08
+
+See [the current audit](DESTINATION-DISTANCE-PARITY.md) for exact source-method
+coverage, floating-point contraction diagnostics, native IU adaptation, and
+remaining active substitutions. `geometry/planar/FloatLine.h` currently hosts
+`FLOAT_POINT::BoundingBox`; `geometry/planar/IntBox.h` contains the translated
+weighted box distance. The source destination class itself preserves constructor,
+join and calculation branch structure; the old heuristic was moved to
+`LegacyDestinationDistance` to keep the reference filename unambiguous.

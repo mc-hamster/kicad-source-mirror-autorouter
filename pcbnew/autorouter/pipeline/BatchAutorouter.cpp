@@ -361,10 +361,19 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             // Upstream AutorouteConnectionRouter routes from the unconnected
             // set to the selected item's connected set for ordinary nets.
             // Preserve all legal pad terminals, not just the ratsnest pair.
-            // Fanout and plane tasks retain their explicit layer transitions.
+            // Fanout retains its explicit escape transition. Plane routing
+            // starts at the entire connected set (AutorouteConnectionRouter),
+            // not just the chosen synthetic landing on one layer.
             const bool fanoutTask = target.isFanoutTarget
                                     && target.fanoutSourcePadIndex == routeSourceIndex;
-            if( !fanoutTask && !targetIsPlane && aNet.planeTargetIndices.empty() )
+            if( !fanoutTask && targetIsPlane && !source.isExactTarget )
+            {
+                // Post-refill repair can request an exact island anchor. That
+                // host-only subproblem must retain its specified start point;
+                // it is not a general connected-set search request.
+                starts = aOccupancy.Board()->Terminals( routeSourceIndex );
+            }
+            else if( !fanoutTask && aNet.planeTargetIndices.empty() )
             {
                 const std::size_t connectedRoot = findRoot( routeSourceIndex );
                 destinations = aOccupancy.Board()->Terminals( routeSourceIndex );
@@ -448,87 +457,36 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         connection->isFanoutConnection = target.isFanoutTarget
                                         && target.fanoutSourcePadIndex == routeSourceIndex;
 
-        // On a negotiated-congestion retry the maze search may cross a
-        // committed route.  Remove only the concrete connections that the
-        // candidate actually occupies; arbitrary net-wide rip-up loses much
-        // more useful copper than Freerouting's item-level rip-up and causes
-        // large multi-pad nets to oscillate.
-        if( aSettings.allowRipupRouted )
+        // Ripup and insertion are ONE speculative edit. A late blocked edge,
+        // invalid via, cancellation or exception must not lose earlier routes.
+        const auto conflicts = aSettings.allowRipupRouted
+                ? aEngine.FindConflictingConnections( *connection )
+                : std::vector<ROUTING_CONNECTION>{};
+        if( conflicts.size() > static_cast<std::size_t>( std::max( 0, aSettings.maxRipups - aRipups ) ) )
+            continue;
+        const auto inserted = aEngine.InsertConnection(
+                *connection, conflicts, aOccupancy, aCancel );
+        if( inserted.state != FOUND_CONNECTION_INSERTER::STATE::INSERTED )
         {
-            const std::vector<ROUTING_CONNECTION> conflicts =
-                    aEngine.FindConflictingConnections( *connection );
-
-            // Fanout connections are the electrical bridge from an SMD pad
-            // to its synthetic landing.  Removing one during ordinary
-            // negotiated routing would leave later connections starting at a
-            // landing with no copper back to the real pad.  Treat those
-            // bridges as protected and let this edge be retried on a later
-            // pass instead of accepting a disconnected proposal.
-            if( conflicts.size() > static_cast<std::size_t>(
-                        std::max( 0, aSettings.maxRipups - aRipups ) )
-                || std::any_of( conflicts.begin(), conflicts.end(),
-                             []( const ROUTING_CONNECTION& aConflict )
-                             {
-                                 return aConflict.isFanoutConnection;
-                             } ) )
-            {
-                connection.reset();
-                continue;
-            }
-
-            for( const ROUTING_CONNECTION& conflict : conflicts )
-            {
-                bool removed = false;
-
-                for( std::size_t index = aConnections.size(); index > 0; --index )
-                {
-                    const ROUTING_CONNECTION& existing = aConnections[index - 1];
-                    if( existing.netCode != conflict.netCode || existing.nodes != conflict.nodes )
-                        continue;
-
-                    aOccupancy.Remove( existing );
-                    aConnections.erase( aConnections.begin()
-                                       + static_cast<std::ptrdiff_t>( index - 1 ) );
-                    removed = true;
-                    ++aRipups;
-                    break;
-                }
-
-                // A connection accepted earlier in this routeNet call has
-                // not been moved into aConnections yet, but it is already
-                // present in the shared occupancy map.  Remove it from the
-                // pending batch too so the result and occupancy stay in sync.
-                if( !removed )
-                {
-                    for( std::size_t index = newConnections.size(); index > 0; --index )
-                    {
-                        const ROUTING_CONNECTION& existing = newConnections[index - 1];
-                        if( existing.netCode != conflict.netCode
-                            || existing.nodes != conflict.nodes )
-                        {
-                            continue;
-                        }
-
-                        aOccupancy.Remove( existing );
-                        newConnections.erase( newConnections.begin()
-                                              + static_cast<std::ptrdiff_t>( index - 1 ) );
-                        removed = true;
-                        ++aRipups;
-                        break;
-                    }
-                }
-            }
-
-            if( autorouterDebugEnabled() && !conflicts.empty() )
+            if( autorouterDebugEnabled() )
             {
                 std::ostringstream message;
-                message << "negotiated ripup net=" << aNet.netCode
-                        << " conflicts=" << conflicts.size();
+                message << "insertion rejected net=" << aNet.netCode
+                        << " state=" << static_cast<int>( inserted.state )
+                        << " edge=" << inserted.edge;
                 autorouterDebugLog( message.str() );
             }
+            continue;
+        }
+        for( const auto& conflict : conflicts )
+        {
+            auto matches = [&]( const auto& route )
+            { return route.netCode == conflict.netCode && route.nodes == conflict.nodes; };
+            std::erase_if( aConnections, matches );
+            std::erase_if( newConnections, matches );
+            ++aRipups;
         }
 
-        aOccupancy.Add( *connection );
         newConnections.push_back( std::move( *connection ) );
 
         refreshContacts();
@@ -830,54 +788,84 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
 
     if( fanoutConnectionTotal > 0 )
     {
-        const std::vector<NET_ORDER_ENTRY> orderedFanoutNets = orderNets( fanoutBoard );
-
-        if( autorouterDebugEnabled() )
+        const auto orderedPins = BATCH_FANOUT::OrderedPins( fanoutBoard, aSettings.fanoutPinOrder, aCancel );
+        std::map<std::size_t, std::pair<const ROUTING_NET*, std::size_t>> tasks;
+        for( const auto& net : fanoutBoard.nets )
+            for( const auto& [source, target] : net.connections )
+                tasks.emplace( source, std::pair{ &net, target } );
+        std::optional<std::pair<int, std::size_t>> previousOutcome;
+        int identicalPasses = 0;
+        for( int pass = 0; pass < aSettings.maxFanoutPasses; ++pass )
         {
-            std::ostringstream message;
-            message << "BEGIN fanout pre-pass connections=" << fanoutConnectionTotal;
-            autorouterDebugLog( message.str() );
-        }
-
-        for( const NET_ORDER_ENTRY& entry : orderedFanoutNets )
-        {
-            if( aCancel && aCancel() )
+            int routedPins = 0;
+            const auto before = occupancy.Connections();
+            for( auto pin : orderedPins )
             {
-                result.cancelled = true;
-                result.message = "Autorouter cancelled";
+                if( aCancel && aCancel() )
+                {
+                    result.cancelled = true;
+                    result.message = "Autorouter cancelled";
+                    break;
+                }
+                const auto task = tasks.find( pin );
+                if( task == tasks.end() || occupancy.Board()->Connected( pin, task->second.second ) )
+                    continue;
+                ROUTING_NET net = *task->second.first;
+                net.connections = { { pin, task->second.second } };
+                int expanded = 0;
+                const bool routed = routeNet( fanoutBoard, aSettings, net, pass, occupancy,
+                                              routeEngine, connections, expanded, ripups, aCancel, nullptr );
+                totalExpandedNodes += expanded;
+                if( routed )
+                    ++routedPins;
+                else
+                    failedNets.insert( net.netCode );
+                result.metrics.routedConnections = routedConnectionCount();
+                if( autorouterDebugEnabled() )
+                {
+                    std::ostringstream message;
+                    const auto& pad = fanoutBoard.pads[pin];
+                    message << "FANOUT_PIN pass=" << pass + 1 << " component=" << pad.componentId
+                            << " pin=" << pad.pinIndex << " net=" << net.netCode << " routed=" << routed;
+                    autorouterDebugLog( message.str() );
+                }
+                if( aProgress )
+                {
+                    ROUTER_PROGRESS progress;
+                    progress.pass = pass + 1;
+                    progress.maxPasses = aSettings.maxFanoutPasses;
+                    progress.totalConnections = fanoutConnectionTotal;
+                    progress.routedConnections = routedPins;
+                    progress.expandedNodes = totalExpandedNodes;
+                    progress.elapsedMilliseconds = elapsedMilliseconds();
+                    progress.stage = "Routing SMD fanout";
+                    aProgress( progress );
+                }
+            }
+            // Pinned fanout loop: zero routed pins, three repeated (routed,
+            // via-count) outcomes, unchanged geometry, or cancellation stops.
+            if( result.cancelled || routedPins == 0 )
                 break;
-            }
-
-            int expanded = 0;
-            const bool routed = routeNet( fanoutBoard, aSettings, *entry.net, 1, occupancy,
-                                          routeEngine, connections, expanded, ripups, aCancel, nullptr );
-            totalExpandedNodes += expanded;
-
-            if( !routed )
-                failedNets.insert( entry.net->netCode );
-
-            result.metrics.routedConnections = routedConnectionCount();
-
-            if( aProgress )
+            std::set<std::pair<std::int64_t, std::int64_t>> vias;
+            for( const auto& route : occupancy.Connections() )
+                for( std::size_t i = 1; i < route.nodes.size(); ++i )
+                    if( route.nodes[i - 1].layer != route.nodes[i].layer )
+                        vias.emplace( route.nodes[i].point.x, route.nodes[i].point.y );
+            const auto outcome = std::pair{ routedPins, vias.size() };
+            if( previousOutcome == outcome )
             {
-                ROUTER_PROGRESS progress;
-                progress.pass = 0;
-                progress.maxPasses = std::max( 1, aSettings.maxPasses );
-                progress.totalConnections = totalConnections;
-                progress.routedConnections = result.metrics.routedConnections;
-                progress.expandedNodes = totalExpandedNodes;
-                progress.elapsedMilliseconds = elapsedMilliseconds();
-                progress.stage = "Routing SMD fanout";
-                aProgress( progress );
+                if( ++identicalPasses >= 3 )
+                    break;
             }
-        }
-
-        if( autorouterDebugEnabled() )
-        {
-            std::ostringstream message;
-            message << "END fanout pre-pass routed=" << routedConnectionCount()
-                    << " expanded=" << totalExpandedNodes;
-            autorouterDebugLog( message.str() );
+            else
+            {
+                identicalPasses = 0;
+                previousOutcome = outcome;
+            }
+            const auto& after = occupancy.Connections();
+            if( before.size() == after.size() && std::equal( before.begin(), before.end(), after.begin(),
+                    []( const auto& a, const auto& b ) { return a.netCode == b.netCode && a.nodes == b.nodes; } ) )
+                break;
         }
     }
 

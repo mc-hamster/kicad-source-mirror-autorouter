@@ -7,6 +7,7 @@
 #include "RoomSearchContext.h"
 #include "MazeExpansionEngine.h"
 #include "MazeListElement.h"
+#include "RoomCostSpace.h"
 #include "../drill/DrillPageArray.h"
 #include "../path/FoundConnectionLocator45Degree.h"
 #include <deque>
@@ -28,7 +29,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         || INT_BOX::Dimension( via.bounds ) != 2 || maxExpanded <= expanded )
         return std::nullopt;
     std::set<int> layerIds;
-    double minTraceCost = std::numeric_limits<double>::infinity();
+    std::vector<DESTINATION_DISTANCE::EXPANSION_COST_FACTOR> traceCosts;
+    std::vector<bool> layerActive;
+    ROUTER_BOX costBounds = via.bounds;
     std::size_t targetCount = 0;
     for( const auto& layer : layers )
     {
@@ -39,16 +42,33 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             return std::nullopt;
         for( const auto* terminals : { &layer.starts, &layer.targets } )
             for( const auto& terminal : *terminals )
+            {
                 if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
                     return std::nullopt;
+                costBounds = INT_BOX::Union( costBounds, {
+                        std::min( terminal.start.x, terminal.end.x ), std::min( terminal.start.y, terminal.end.y ),
+                        std::max( terminal.start.x, terminal.end.x ), std::max( terminal.start.y, terminal.end.y ) } );
+            }
+        costBounds = INT_BOX::Union( costBounds, layer.bounds );
+        traceCosts.push_back( { layer.horizontalCost, layer.verticalCost } );
+        layerActive.push_back( layer.active );
         if( layer.active )
         {
-            minTraceCost = std::min( { minTraceCost, layer.horizontalCost, layer.verticalCost } );
             targetCount += layer.targets.size();
         }
     }
     if( targetCount == 0 )
         return std::nullopt;
+    const ROOM_COST_SPACE costSpace( costBounds );
+    DESTINATION_DISTANCE destinationDistance( traceCosts, layerActive,
+            costSpace.ToReferenceCost( via.normalCost ), costSpace.ToReferenceCost( 0.8 * via.normalCost ) );
+    // Java joins every destination tree shape, including inactive layers;
+    // layerActive affects the estimate, not destination-box collection.
+    for( std::size_t layer = 0; layer < layers.size(); ++layer )
+        for( const auto& target : layers[layer].targets )
+            destinationDistance.Join( costSpace.ToReference( ROUTER_BOX{
+                    std::min( target.start.x, target.end.x ), std::min( target.start.y, target.end.y ),
+                    std::max( target.start.x, target.end.x ), std::max( target.start.y, target.end.y ) } ), layer );
     // Bound page allocation before construction, not after a potentially huge
     // array has already been allocated. This is an explicit resource failure.
     const double columns = std::ceil( ( static_cast<double>( via.bounds.maxX ) - via.bounds.minX ) / via.pageWidth );
@@ -71,16 +91,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     };
     auto remaining = [&]( FLOAT_POINT from, std::size_t fromLayer )
     {
-        // Conservative geometric bound in the SAME units as the room/drill
-        // frontier. Legacy grid-normalized DestinationDistance cannot be used.
-        // Full upstream component/solder/inner-box heuristic remains separate.
-        double best = std::numeric_limits<double>::infinity();
-        for( std::size_t layer = 0; layer < layers.size(); ++layer )
-            if( layers[layer].active )
-                for( const auto& target : layers[layer].targets )
-                    best = std::min( best, from.WeightedDistance( nearestTerminal( target, from ),
-                            minTraceCost, minTraceCost ) + ( layer == fromLayer ? 0 : via.normalCost ) );
-        return best;
+        ++metrics.destinationQueries;
+        return costSpace.ToNativeCost( destinationDistance.Calculate(
+                costSpace.ToReference( from ), fromLayer ) );
     };
     auto roomAt = [&]( std::size_t layer, ROUTER_POINT point ) -> ROOM*
     {

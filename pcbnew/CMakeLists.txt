@@ -397,6 +397,16 @@ set( ZONE_MANAGER_SRCS
     zone_manager/zone_preview_canvas.cpp
     )
 
+# Preserve Java's separate floating multiply/add rounding in the translated
+# destination estimate and fanout sorting. No global KiCad floating flag changes.
+if( CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" )
+    set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp APPEND
+                  PROPERTY COMPILE_OPTIONS -ffp-contract=off )
+elseif( MSVC )
+    set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp APPEND
+                  PROPERTY COMPILE_OPTIONS /fp:strict )
+endif()
+
 set( PCBNEW_CLASS_SRCS
     ${PCBNEW_DIALOGS}
     ${PCBNEW_EXPORTERS}
@@ -432,6 +442,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/maze/AutorouteControl.cpp
     autorouter/maze/AutorouteEngine.cpp
     autorouter/maze/DestinationDistance.cpp
+    autorouter/maze/LegacyDestinationDistance.cpp
     autorouter/maze/MazeExpansionEngine.cpp
     autorouter/maze/MazeRipupResolver.cpp
     autorouter/maze/MazeSearchEngine.cpp
