@@ -141,6 +141,11 @@ public:
      * Endpoint copper is the new trace width, not the already-existing pad size.
      */
     bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd ) const;
+    /** Fixed rectangular obstacle/orthogonal spring-over adapter. Unsupported
+     * geometry returns no proposal; all returned edges need strict preflight.
+     */
+    std::optional<ROUTING_CONNECTION> SpringOverConnection(
+            const ROUTING_CONNECTION& aConnection, const ROUTER_CANCEL_CALLBACK& aCancel ) const;
     const ROOM_SEARCH_METRICS& LastRoomSearchMetrics() const { return m_roomMetrics; }
 
 private:

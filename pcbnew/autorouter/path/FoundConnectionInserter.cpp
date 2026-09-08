@@ -52,20 +52,33 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
     if( connection.nodes.size() == 1
         && !engine.CanInsertSegment( connection.netCode, connection.nodes[0], connection.nodes[0] ) )
         return { STATE::BLOCKED };
+    std::optional<ROUTING_CONNECTION> replacement;
+    bool blocked = false;
     for( std::size_t i = 1; i < connection.nodes.size(); ++i )
     {
-        if( cancel && cancel() )
-            return { STATE::CANCELLED, i };
+        if( cancel && cancel() ) return { STATE::CANCELLED, i };
         if( !engine.CanInsertSegment( connection.netCode, connection.nodes[i - 1], connection.nodes[i] ) )
-            return { STATE::BLOCKED, i };
+        { blocked = true; break; }
+    }
+    if( blocked )
+    {
+        replacement = engine.SpringOverConnection( connection, cancel );
+        if( cancel && cancel() ) return { STATE::CANCELLED };
+        if( !replacement ) return { STATE::BLOCKED };
+        for( std::size_t i = 1; i < replacement->nodes.size(); ++i )
+        {
+            if( cancel && cancel() ) return { STATE::CANCELLED, i };
+            if( !engine.CanInsertSegment( replacement->netCode, replacement->nodes[i - 1], replacement->nodes[i] ) )
+                return { STATE::BLOCKED, i };
+        }
     }
     // Preflight uses the post-ripup board. Geometry/normal-contact splitting,
     // generated route records and congestion cells then commit together.
-    occupancy.Add( connection );
+    occupancy.Add( replacement ? *replacement : connection );
     if( cancel && cancel() )
         return { STATE::CANCELLED };
     transaction.Commit();
-    return { STATE::INSERTED };
+    return { STATE::INSERTED, 0, std::move( replacement ) };
 }
 
 

@@ -1304,6 +1304,46 @@ BOOST_AUTO_TEST_CASE( FanoutPinOrderMatchesPinnedJavaComponents )
     BOOST_CHECK( BATCH_FANOUT::OrderedPins( board, FANOUT_PIN_ORDER::OUTER_FIRST, [] { return true; } ).empty() );
 }
 
+BOOST_AUTO_TEST_CASE( FanoutLandingPlanningUsesGlobalComponentOrderNotNetOrder )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 20000000, 20000000 };
+    for( int i = 0; i < 4; ++i )
+    {
+        ROUTING_PAD pin;
+        pin.netCode = i == 0 || i == 3 ? 1 : 2;
+        pin.position = { 4000000 + ( i % 2 ) * 10000000, 4000000 + ( i / 2 ) * 10000000 };
+        pin.layers = { 0 }; pin.isSmd = true;
+        pin.trackWidth = 100000; pin.radius = 100000;
+        pin.componentId = i < 3 ? 1 : 2; pin.pinIndex = i;
+        board.pads.push_back( pin );
+    }
+    ROUTING_NET a; a.netCode = 1; a.padIndices = { 0, 3 }; a.connections = { { 0, 3 } };
+    ROUTING_NET b; b.netCode = 2; b.padIndices = { 1, 2 }; b.connections = { { 1, 2 } };
+    board.nets = { a, b };
+    auto settings = makeSettings(); settings.enableFanout = true;
+    const auto expected = BATCH_FANOUT::OrderedPins( board, settings.fanoutPinOrder );
+    const auto prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 8 );
+    for( std::size_t i = 0; i < expected.size(); ++i )
+        BOOST_CHECK_EQUAL( prepared.pads[4 + i].fanoutSourcePadIndex, expected[i] );
+    settings.maxFanoutPasses = 1;
+    const auto onePass = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( onePass.pads.size(), prepared.pads.size() );
+    for( std::size_t i = 4; i < onePass.pads.size(); ++i )
+        BOOST_CHECK( onePass.pads[i].position == prepared.pads[i].position );
+    // Every source bridge survived the single graph rewrite, including nets
+    // interleaved by component/pin priority.
+    for( const auto& net : prepared.nets )
+    {
+        BOOST_CHECK_EQUAL( net.connections.size(), 3 );
+        for( auto pin : net.padIndices )
+            BOOST_CHECK( std::any_of( net.connections.begin(), net.connections.end(),
+                    [&]( const auto& edge ) { return edge.first == pin
+                        && prepared.pads[edge.second].fanoutSourcePadIndex == pin; } ) );
+    }
+}
+
 BOOST_AUTO_TEST_CASE( FanoutUsesPhysicalPadLayersAndDistinctPackagePinIndices )
 {
     BOARD board;
@@ -1394,6 +1434,20 @@ BOOST_AUTO_TEST_CASE( NormalContactsMatchPinnedJavaItems )
         ++count;
     }
     BOOST_CHECK_EQUAL( count, 2048 );
+}
+
+BOOST_AUTO_TEST_CASE( OptimizerJunctionsRejectSubIuOffLineContacts )
+{
+    auto board = makeBoard();
+    auto pad = board.pads[0];
+    pad.position = { 1500001, 500000 }; // 0.316 IU from the queried centre-line
+    board.pads.push_back( pad );
+    pad.position = { 1500000, 500000 }; // actual contact, must be kept
+    board.pads.push_back( pad );
+    ROUTING_BOARD copper( board, makeSettings() );
+    const auto points = copper.TraceJunctions( 1, { { 0, 0 }, 0 }, { { 3000000, 1000000 }, 0 } );
+    BOOST_REQUIRE_EQUAL( points.size(), 1 );
+    BOOST_CHECK( points[0] == pad.position );
 }
 
 BOOST_AUTO_TEST_CASE( ExactJunctionGeometryNeverRoundsOrOverflows )

@@ -712,10 +712,11 @@ std::vector<ROUTER_POINT> ROUTING_BOARD::TraceJunctions(
         return true;
     };
     tree->second->Query( &probe, 0, visitor );
-    std::vector<VECTOR2I> points;
-    auto add = [&]( VECTOR2I p )
+    using namespace CONTACT_GEOMETRY;
+    std::vector<ROUTER_POINT> points;
+    auto add = [&]( ROUTER_POINT p )
     {
-        if( line.SquaredDistance( p ) == 0 )
+        if( OnSegment( start.point, end.point, p ) )
             points.push_back( p );
     };
     for( auto id : candidates )
@@ -724,24 +725,26 @@ std::vector<ROUTER_POINT> ROUTING_BOARD::TraceJunctions(
             if( std::find( terminal.pad.layers.begin(), terminal.pad.layers.end(), start.layer )
                     == terminal.pad.layers.end() )
                 continue;
-            const auto a = point( terminal.pad.position );
+            const auto a = terminal.pad.position;
             add( a );
             if( terminal.segmentEnd )
             {
-                const auto b = point( *terminal.segmentEnd );
+                const auto b = *terminal.segmentEnd;
                 add( b );
-                const SEG other( a, b );
-                if( const auto p = line.Intersect( other ); p && other.SquaredDistance( *p ) == 0 )
+                if( const auto p = Intersection( start.point, end.point, a, b ) )
                     add( *p );
             }
         }
+    // All points lie exactly on one line; order by the varying coordinate.
+    // No squared integer norm (overflow) or rounded KiMath distance predicate.
     std::sort( points.begin(), points.end(), [&]( auto a, auto b )
-    { return ( a - line.A ).SquaredEuclideanNorm() < ( b - line.A ).SquaredEuclideanNorm(); } );
+    {
+        if( start.point.x != end.point.x )
+            return start.point.x < end.point.x ? a.x < b.x : a.x > b.x;
+        return start.point.y < end.point.y ? a.y < b.y : a.y > b.y;
+    } );
     points.erase( std::unique( points.begin(), points.end() ), points.end() );
-    std::vector<ROUTER_POINT> result;
-    for( auto p : points )
-        result.push_back( { p.x, p.y } );
-    return result;
+    return points;
 }
 
 std::size_t ROUTING_BOARD::ItemCount() const { return m_impl->items.size(); }
@@ -752,23 +755,38 @@ struct ROUTING_BOARD::TRANSACTION::STATE
     std::map<ITEM_ID, IMPL::ITEM> items;
     std::vector<IMPL::ROUTE> routes;
     ITEM_ID nextId;
+    // Built before editing, pointing at the saved map nodes. Restoring during
+    // stack unwinding must never allocate/reindex (and throw a second failure).
+    decltype( IMPL::index ) index;
 };
 
 ROUTING_BOARD::TRANSACTION::TRANSACTION( ROUTING_BOARD& board ) : m_board( board ),
     m_before( std::make_unique<STATE>( STATE{ board.m_impl->items, board.m_impl->routes,
-                                             board.m_impl->nextId } ) )
-{}
+                                             board.m_impl->nextId, {} } ) )
+{
+    for( const auto& [id, item] : m_before->items )
+        for( const auto& part : item.shapes )
+        {
+            auto& tree = m_before->index[part.layer];
+            if( !tree )
+                tree = std::make_unique<SHAPE_INDEX<const IMPL::LAYER_SHAPE*>>( part.layer );
+            tree->Add( &part );
+        }
+}
 
 ROUTING_BOARD::TRANSACTION::~TRANSACTION()
 {
     if( !m_before )
         return;
-    // Remove pointer-bearing indexes before replacing their item storage.
-    m_board.m_impl->index.clear();
-    m_board.m_impl->items = std::move( m_before->items );
-    m_board.m_impl->routes = std::move( m_before->routes );
-    m_board.m_impl->nextId = m_before->nextId;
-    m_board.m_impl->reindex();
+    // std::map::swap preserves its nodes' addresses. Both pointer-bearing
+    // indexes therefore stay paired with exactly the item storage they index.
+    m_board.m_impl->index.swap( m_before->index );
+    m_board.m_impl->items.swap( m_before->items );
+    m_board.m_impl->routes.swap( m_before->routes );
+    std::swap( m_board.m_impl->nextId, m_before->nextId );
+    ++m_board.m_impl->revision;
+    m_board.m_impl->components.clear();
+    m_board.m_impl->componentRevision = std::numeric_limits<std::uint64_t>::max();
 }
 
 void ROUTING_BOARD::TRANSACTION::Commit() { m_before.reset(); }

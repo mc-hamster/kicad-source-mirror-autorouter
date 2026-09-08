@@ -1,5 +1,8 @@
 # Native autorouter engineering notes
 
+Latest core work: [normal contacts, transactional insertion, and fanout ordering](CORE-CONTACT-INSERTION-PARITY.md).
+This is still a partial implementation, not full forced-insertion/shove/neckdown parity.
+
 **Status: experimental; Freerouting parity has not been achieved.** See
 [Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) for the current implementation audit,
 actual port progress, and same-board KiCad validation. The mappings below must

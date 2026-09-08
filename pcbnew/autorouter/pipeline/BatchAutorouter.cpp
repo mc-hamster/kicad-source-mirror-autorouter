@@ -478,6 +478,9 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             }
             continue;
         }
+        if( inserted.connection )
+            *connection = *inserted.connection;
+
         for( const auto& conflict : conflicts )
         {
             auto matches = [&]( const auto& route )

@@ -22,6 +22,7 @@
  */
 
 #include "MazeSearchEngine.h"
+#include "../board/optimize/TraceShover.h"
 #include "../rules/ViaRule.h"
 
 #include "../AutorouterDebug.h"
@@ -1637,6 +1638,73 @@ bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
         return CanUseSegment( net, start, end );
     const auto radius = netTrackRadius( net );
     return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius );
+}
+
+
+std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
+        const ROUTING_CONNECTION& connection, const ROUTER_CANCEL_CALLBACK& cancel ) const
+{
+    if( connection.nodes.size() < 2 ) return {};
+    ROUTING_CONNECTION result = connection;
+    result.nodes.clear();
+    std::size_t begin = 0;
+    while( begin < connection.nodes.size() )
+    {
+        if( cancel && cancel() ) return {};
+        std::size_t end = begin;
+        const int layer = connection.nodes[begin].layer;
+        std::vector<ROUTER_POINT> points{ connection.nodes[begin].point };
+        while( end + 1 < connection.nodes.size() && connection.nodes[end + 1].layer == layer )
+        {
+            const auto a = connection.nodes[end].point, b = connection.nodes[end + 1].point;
+            // General-angle swept offsets and convex obstacle compensation are
+            // not yet mapped from the host. Do not substitute a bounding box.
+            if( a.x != b.x && a.y != b.y ) return {};
+            points.push_back( b ); ++end;
+        }
+        if( points.size() > 1 )
+        {
+            std::vector<TRACE_SHOVER::OBSTACLE> obstacles;
+            for( std::size_t i = m_board.obstacles.size(); i > 0; --i )
+            {
+                if( cancel && cancel() ) return {};
+                const auto& obstacle = m_board.obstacles[i - 1];
+                if( !obstacle.blocksTracks || obstacle.isHole
+                    || ( obstacle.netCode == connection.netCode && !obstacle.isKeepout )
+                    || std::find( obstacle.layers.begin(), obstacle.layers.end(), layer ) == obstacle.layers.end()
+                    || obstacle.kind != ROUTER_OBSTACLE_KIND::RECTANGLE || obstacle.radius != 0
+                    || !obstacle.polygonHoles.empty() ) continue;
+                const auto b = obstacle.box;
+                if( b.minX >= b.maxX || b.minY >= b.maxY ) continue;
+                const auto radius = obstacleExpansionRadius( obstacle, connection.netCode, layer, false );
+                // Host rule evaluation already supplies clearance. No Java
+                // class-0 broad-phase omission or hardcoded source-unit margin.
+                const auto expanded = [&]( std::int64_t extra )
+                {
+                    return PLANAR::SIMPLEX::Box( { b.minX - radius - extra, b.minY - radius - extra,
+                                                   b.maxX + radius + extra, b.maxY + radius + extra } );
+                };
+                obstacles.push_back( { i, b, expanded( 0 ), expanded( 1 ) } );
+            }
+            const auto path = PLANAR::POLYLINE::FromPoints( points );
+            if( path.Empty() ) return {};
+            auto wrapped = TRACE_SHOVER::SpringOverObstacles( path, obstacles, cancel );
+            if( wrapped.cancelled || !wrapped.polyline ) return {};
+            // The pinned spring-over method can lose an endpoint on a looping
+            // input. Preserve its oracle output, but NEVER accept that mutation.
+            if( !( wrapped.polyline->FirstCorner() == path.FirstCorner() )
+                || !( wrapped.polyline->LastCorner() == path.LastCorner() ) ) return {};
+            const auto corners = wrapped.polyline->IntegralCorners();
+            if( !corners ) return {};
+            for( const auto& point : *corners ) result.nodes.push_back( { point, layer } );
+        }
+        else result.nodes.push_back( connection.nodes[begin] );
+        begin = end + 1;
+    }
+    if( result.nodes == connection.nodes ) return {};
+    // Preserve endpoint identities, via transitions and metadata. Cost belongs
+    // to the original search; geometric quality is evaluated from actual nodes.
+    return result;
 }
 
 

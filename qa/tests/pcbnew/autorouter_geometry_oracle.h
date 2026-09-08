@@ -1,0 +1,71 @@
+/* QA-only differential reader. Expectations come from the pinned Java JAR. */
+#pragma once
+#include <autorouter/board/optimize/TraceShover.h>
+#include <sstream>
+
+namespace AUTOROUTER_GEOMETRY_QA
+{
+using namespace KICAD_AUTOROUTER;
+using namespace KICAD_AUTOROUTER::PLANAR;
+inline void Print( std::ostream& out, const POINT& p ) { out << p.x << ' ' << p.y << ' ' << p.z; }
+inline void Print( std::ostream& out, const POLYLINE& p )
+{
+    out << ( p.Empty() ? 0 : p.lines.size() - 1 );
+    for( std::size_t i = 0; i + 1 < p.lines.size(); ++i ) { out << ' '; Print( out, p.Corner( i ) ); }
+}
+inline LINE ReadLine( std::istream& in )
+{ ROUTER_POINT a, b; in >> a.x >> a.y >> b.x >> b.y; return { a, b }; }
+inline std::string CheckRecord( const std::string& record )
+{
+    std::istringstream in( record );
+    std::ostringstream actual;
+    std::string tag;
+    in >> tag;
+    if( tag == "LINE" )
+    {
+        const auto a = ReadLine( in ), b = ReadLine( in );
+        if( auto p = a.Intersection( b ) ) Print( actual, *p );
+        else actual << "INF";
+    }
+    else if( tag == "CONVEX" )
+    {
+        std::size_t n; in >> n;
+        std::vector<LINE> lines;
+        for( std::size_t i = 0; i < n; ++i ) lines.push_back( ReadLine( in ) );
+        POLYLINE path( std::move( lines ) );
+        in >> n;
+        std::vector<LINE> borders;
+        for( std::size_t i = 0; i < n; ++i ) borders.push_back( ReadLine( in ) );
+        SIMPLEX shape( std::move( borders ) );
+        Print( actual, path );
+        auto entries = shape.EntrancePoints( path );
+        actual << ' ' << entries.size();
+        for( auto [line, side] : entries ) actual << ' ' << line << ' ' << side;
+        auto pieces = shape.Cutout( path ); actual << ' ' << pieces.size();
+        for( const auto& piece : pieces ) { actual << ' '; Print( actual, piece ); }
+    }
+    else if( tag == "SPRING" )
+    {
+        int radius, clearance, n; in >> radius >> clearance >> n;
+        std::vector<TRACE_SHOVER::OBSTACLE> obstacles;
+        for( int i = 0; i < n; ++i )
+        {
+            std::uint64_t id; ROUTER_BOX b;
+            in >> id >> b.minX >> b.minY >> b.maxX >> b.maxY;
+            const auto inflate = [&]( int r )
+            { return SIMPLEX::Box( { b.minX - r, b.minY - r, b.maxX + r, b.maxY + r } ); };
+            obstacles.push_back( { id, b, inflate( radius ), inflate( radius + clearance + 1 ) } );
+        }
+        std::sort( obstacles.begin(), obstacles.end(), []( const auto& a, const auto& b ) { return a.id > b.id; } );
+        in >> n; std::vector<ROUTER_POINT> points( n );
+        for( auto& p : points ) in >> p.x >> p.y;
+        auto result = TRACE_SHOVER::SpringOverObstacles( POLYLINE::FromPoints( points ), obstacles );
+        if( result.polyline ) Print( actual, *result.polyline );
+        else actual << -1;
+    }
+    else throw std::runtime_error( "Unexpected oracle record: " + tag );
+    if( !in ) throw std::runtime_error( "Malformed oracle input" );
+    std::string expected; std::getline( in >> std::ws, expected );
+    return expected == actual.str() ? "" : "Expected: " + expected + "\nActual:   " + actual.str();
+}
+} // namespace AUTOROUTER_GEOMETRY_QA

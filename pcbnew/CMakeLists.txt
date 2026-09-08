@@ -451,6 +451,9 @@ set( PCBNEW_CLASS_SRCS
     autorouter/maze/MazeSearchEngineRooms.cpp
     autorouter/maze/MazeTraceShover.cpp
     autorouter/path/Connection.cpp
+    autorouter/geometry/planar/Polyline.cpp
+    autorouter/geometry/planar/Simplex.cpp
+    autorouter/board/optimize/TraceShover.cpp
     autorouter/path/FoundConnectionInserter.cpp
     autorouter/path/FoundConnectionLocator.cpp
     autorouter/path/FoundConnectionLocator45Degree.cpp

@@ -30,8 +30,8 @@ class MAZE_SEARCH_ENGINE;
 class ROUTING_OCCUPANCY;
 
 /** Checked, atomic insertion of the current straight-segment/through-via
- * subset, plus result emission. Recursive forced shove, spring-over and
- * neckdown from Java FoundConnectionInserter are NOT implemented by this API.
+ * subset, plus result emission. Recursive fixed-obstacle spring-over is supported for the mapped orthogonal
+ * slice. Movable-copper shove and neckdown are NOT implemented by this API.
  */
 class FOUND_CONNECTION_INSERTER
 {
@@ -41,6 +41,9 @@ public:
     {
         STATE state;
         std::size_t edge = 0; // failed edge's end index; 0 for whole-input failure
+        // Present only when insertion changed the path. Batch/result ownership
+        // must publish this route, not the search proposal it replaced.
+        std::optional<ROUTING_CONNECTION> connection;
     };
     static RESULT Insert( const ROUTING_CONNECTION& aConnection,
                           const std::vector<ROUTING_CONNECTION>& aRipups,

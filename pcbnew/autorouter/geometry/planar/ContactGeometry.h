@@ -4,6 +4,7 @@
 #pragma once
 #include <boost/multiprecision/cpp_int.hpp>
 #include "../../AutorouterTypes.h"
+#include "Line.h"
 
 namespace KICAD_AUTOROUTER::CONTACT_GEOMETRY
 {
@@ -57,21 +58,12 @@ inline bool ContainsArea( const ROUTING_OBSTACLE& area, ROUTER_POINT p )
 inline std::optional<ROUTER_POINT> Intersection( ROUTER_POINT a, ROUTER_POINT b,
                                                 ROUTER_POINT c, ROUTER_POINT d )
 {
-    WIDE rx = WIDE( b.x ) - a.x, ry = WIDE( b.y ) - a.y;
-    WIDE sx = WIDE( d.x ) - c.x, sy = WIDE( d.y ) - c.y;
-    WIDE den = rx * sy - ry * sx;
-    if( den == 0 )
-        return {}; // collinear endpoints are handled separately
-    WIDE t = ( WIDE( c.x ) - a.x ) * sy - ( WIDE( c.y ) - a.y ) * sx;
-    WIDE x = WIDE( a.x ) * den + rx * t, y = WIDE( a.y ) * den + ry * t;
-    if( x % den != 0 || y % den != 0 )
-        return {}; // rational contact unsupported: never manufacture a rounded split
-    x /= den;
-    y /= den;
-    if( x < std::min( a.x, b.x ) || x > std::max( a.x, b.x )
-        || y < std::min( a.y, b.y ) || y > std::max( a.y, b.y ) )
-        return {};
-    ROUTER_POINT p{ x.convert_to<std::int64_t>(), y.convert_to<std::int64_t>() };
-    return OnSegment( c, d, p ) ? std::optional( p ) : std::nullopt;
+    if( a == b || c == d ) return {};
+    const auto exact = PLANAR::LINE( a, b ).Intersection( PLANAR::LINE( c, d ) );
+    if( !exact ) return {};
+    const auto p = exact->Integral();
+    // Host copper still has integral vertices. The rational intersection is
+    // preserved by the planar kernel; never round it into a false junction.
+    return p && OnSegment( a, b, *p ) && OnSegment( c, d, *p ) ? p : std::nullopt;
 }
 } // namespace KICAD_AUTOROUTER::CONTACT_GEOMETRY

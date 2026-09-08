@@ -168,3 +168,11 @@ remaining active substitutions. `geometry/planar/FloatLine.h` currently hosts
 weighted box distance. The source destination class itself preserves constructor,
 join and calculation branch structure; the old heuristic was moved to
 `LegacyDestinationDistance` to keep the reference filename unambiguous.
+
+## Contact/insertion/fanout continuation
+
+See [the implementation and remaining-gap report](CORE-CONTACT-INSERTION-PARITY.md)
+for the same `a11c0a42` source pin. Added QA-only normal-contact and fanout-order
+oracles; no Java or network router was introduced into production. Normal
+contacts, integer splitting, checked atomic insertion and ordering are partial
+core capabilities, not completed forced shove, neckdown or full batch parity.
