@@ -33,7 +33,13 @@ public:
 
     std::optional<ROUTING_CONNECTION>
     AutorouteConnection( const ROUTING_PAD& aStart, const ROUTING_PAD& aTarget, int aRetry,
-                         int& aExpandedNodes, const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+                         int& aExpandedNodes, const ROUTER_CANCEL_CALLBACK& aCancel,
+                         const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
+                         const std::vector<ROUTING_TERMINAL>& aStarts = {},
+                         const std::vector<ROUTING_TERMINAL>& aTargets = {} ) const;
+
+    std::vector<ROUTING_CONNECTION> FindConflictingConnections(
+            const ROUTING_CONNECTION& aCandidate ) const;
 
     void Clear();
 

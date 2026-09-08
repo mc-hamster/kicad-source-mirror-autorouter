@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -29,10 +30,8 @@ METRICS = (
     "optimization_passes",
 )
 
-# These values are native-host health gates.  A Freerouting result cannot have
-# KiCad DRC counts, so they are checked only when the native JSON contains
-# them.  Keeping the check here prevents a parity run from passing on route
-# completeness while silently introducing new KiCad violations.
+# Both outputs are materialized in KiCad, including the imported reference
+# session. Missing/skipped host validation must never be treated as zero.
 NATIVE_DRC_METRICS = (
     "baseline_kicad_drc_errors",
     "kicad_drc_errors",
@@ -50,7 +49,10 @@ def load(path: Path) -> dict[str, object]:
 
 def number(data: dict[str, object], key: str) -> float | None:
     value = data.get(key)
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) and result >= 0 else None
 
 
 def main() -> int:
@@ -72,6 +74,34 @@ def main() -> int:
     reference = load(args.reference)
     native = load(args.native)
     failed = False
+    if (not reference.get("input_board_sha256")
+            or reference.get("input_board_sha256") != native.get("input_board_sha256")
+            or not reference.get("input_files_sha256")
+            or reference.get("input_files_sha256") != native.get("input_files_sha256")
+            or reference.get("strip_tracks") != native.get("strip_tracks")):
+        print("input identity/normalization mismatch", file=sys.stderr)
+        failed = True
+
+    # Synthetic fanout edges are implementation-specific work, not electrical
+    # completion. Both results must be measured with KiCad on materialized boards.
+    reference_remaining = number(reference, "kicad_unconnected")
+    native_remaining = number(native, "kicad_unconnected")
+    reference_initial = number(reference, "baseline_kicad_unconnected")
+    native_initial = number(native, "baseline_kicad_unconnected")
+    if (reference_remaining is None or native_remaining is None
+            or reference_initial is None or native_initial is None
+            or reference_initial != native_initial
+            or native_remaining > reference_remaining):
+        print("electrical connectivity check: FAILED (missing, incomparable, or regressed)",
+              file=sys.stderr)
+        failed = True
+    elif (100.0 * (reference_remaining - native_remaining) / max(1.0, native_initial)
+          < args.min_completion_delta):
+        failed = True
+
+    if reference.get("validation_complete") is not True or native.get("validation_complete") is not True:
+        print("KiCad validation was not completed for both results", file=sys.stderr)
+        failed = True
 
     print(f"{'metric':<24} {'reference':>14} {'native':>14} {'delta':>14}")
     print("-" * 70)
@@ -88,8 +118,8 @@ def main() -> int:
 
         if key == "drc_errors" and delta > args.max_drc_increase:
             failed = True
-        if key == "completion_percent" and delta < args.min_completion_delta:
-            failed = True
+        # Worker percentages have different denominators. Actual electrical
+        # completion is checked above, using the common KiCad connectivity model.
         if key == "via_count" and delta > args.max_via_increase:
             failed = True
         if key == "track_length_mm":
@@ -99,10 +129,13 @@ def main() -> int:
 
     for key in NATIVE_DRC_METRICS:
         actual = number(native, key)
-        if actual is None:
+        expected = number(reference, key)
+        if actual is None or expected is None:
+            print(f"{key}: missing or invalid", file=sys.stderr)
+            failed = True
             continue
 
-        print(f"{key:<24} {'n/a':>14} {actual:>14.3f} {'n/a':>14}")
+        print(f"{key:<24} {expected:>14.3f} {actual:>14.3f} {actual - expected:>14.3f}")
         if key == "new_kicad_drc_errors" and actual > args.max_new_kicad_drc:
             failed = True
 

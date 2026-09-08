@@ -21,9 +21,9 @@
  * Freerouting equivalent: autoroute/maze/MazeSearchEngine.java and
  * autoroute/maze/MazeExpansionEngine.java.
  *
- * This is a direct, data-oriented translation of the same responsibilities:
- * expand a layer-aware search frontier, score trace/via/direction/congestion
- * costs, and return a complete connection path without touching the host PCB.
+ * The current search is an experimental grid/visibility implementation, not
+ * a port of upstream's room/door search. Connected-set inputs are retained at
+ * this boundary so the replacement engine can preserve upstream topology.
  */
 
 #pragma once
@@ -76,7 +76,11 @@ public:
     void Remove( const ROUTING_CONNECTION& aConnection );
     void Clear();
     int  Usage( const ROUTER_CELL_KEY& aCell, int aNetCode ) const;
+    int  SegmentUsage( const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
+                       int aNetCode ) const;
     int  ProximityUsage( const ROUTER_CELL_KEY& aCell, int aNetCode ) const;
+    std::vector<ROUTING_CONNECTION> ConflictingConnections(
+            const ROUTING_CONNECTION& aConnection ) const;
     const std::vector<ROUTING_CONNECTION>& Connections() const { return m_connections; }
 
     std::vector<ROUTER_CELL_KEY> CellsForSegment( const ROUTER_NODE& aStart,
@@ -99,7 +103,16 @@ public:
                                                        const ROUTING_PAD& aTarget,
                                                        int aRetry,
                                                        int& aExpandedNodes,
-                                                       const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+                                                       const ROUTER_CANCEL_CALLBACK& aCancel,
+                                                       const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
+                                                       const std::vector<ROUTING_TERMINAL>& aStarts = {},
+                                                       const std::vector<ROUTING_TERMINAL>& aTargets = {} ) const;
+
+    // Retry searches may temporarily cross committed routes.  Resolve those
+    // crossings with the same netclass, layer-span, copper, and drill rules
+    // used by the search engine before the batch layer removes a victim.
+    std::vector<ROUTING_CONNECTION> FindConflictingConnections(
+            const ROUTING_CONNECTION& aCandidate ) const;
 
     bool CanUseSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
                         bool aForVia = false ) const;
@@ -179,6 +192,10 @@ private:
     const AUTOROUTER_SETTINGS& m_settings;
     ROUTING_OCCUPANCY&        m_occupancy;
     mutable std::int64_t       m_activeGridStep;
+    // Negotiated-congestion retries may temporarily cross committed copper;
+    // the batch layer removes the specific conflicting connections from the
+    // occupancy map when the candidate is accepted.
+    mutable bool m_allowRipupOccupancy = false;
     mutable DESTINATION_DISTANCE m_destinationDistance;
     std::unordered_map<int, std::vector<std::size_t>> m_obstaclesByLayer;
     std::unordered_map<ROUTER_CELL_KEY, std::vector<std::size_t>, ROUTER_CELL_HASH>
@@ -194,10 +211,27 @@ private:
     std::int64_t m_obstacleBucketSize = 1;
     std::int64_t m_maxObstacleSearchInflation = 0;
     std::vector<ROUTER_BOX> m_obstacleBounds;
+    // A visibility query can visit several spatial buckets containing the
+    // same obstacle.  Rebuilding and sorting a temporary candidate vector on
+    // every A* edge dominated large-board routing.  These marks let the query
+    // collect each obstacle once without allocating or sorting that vector.
+    mutable std::vector<std::uint32_t> m_obstacleQueryMarks;
+    mutable std::uint32_t              m_obstacleQueryGeneration = 0;
+    // Opt-in diagnostics only.  These counters make it possible to tell
+    // whether a difficult search is spending its time in spatial candidate
+    // collection or in the exact geometry predicates.
+    mutable std::uint64_t m_debugObstacleQueries = 0;
+    mutable std::uint64_t m_debugObstacleCandidates = 0;
+    mutable std::uint64_t m_debugPointChecks = 0;
+    mutable std::uint64_t m_debugSegmentChecks = 0;
     std::unordered_map<int, std::int64_t> m_trackRadii;
     std::unordered_map<int, std::int64_t> m_viaRadii;
     std::unordered_map<int, std::int64_t> m_viaDrillRadii;
     std::unordered_map<int, std::int64_t> m_netClearances;
+    // Pad centers are queried for almost every visibility candidate when
+    // distinguishing same-net holes from foreign drills.  Cache the result by
+    // net and position instead of rescanning every net's pad list per query.
+    std::unordered_map<ROUTER_CELL_KEY, std::int64_t, ROUTER_CELL_HASH> m_endpointRadii;
     // Obstacle corners, board boundaries, pad locations and drill-page
     // centres are independent of the connection being routed.  Keep one
     // immutable visibility-landmark set per search engine instead of

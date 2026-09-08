@@ -19,11 +19,14 @@
 
 #include "DesignRulesChecker.h"
 
+#include "../AutorouterDebug.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <set>
 #include <string>
+#include <sstream>
 #include <unordered_set>
 
 
@@ -572,9 +575,6 @@ bool segmentVsVia( const ROUTING_SEGMENT& aSegment, std::int64_t aSegmentRadius,
 bool viaVsVia( const ROUTING_VIA& aLeft, const ROUTING_VIA& aRight,
                const BOARD_SNAPSHOT& aBoard )
 {
-    if( aLeft.netCode == aRight.netCode )
-        return false;
-
     const std::vector<int> leftLayers = viaLayerSpan( aLeft );
     const std::vector<int> rightLayers = viaLayerSpan( aRight );
     std::vector<int> sharedLayers;
@@ -601,6 +601,11 @@ bool viaVsVia( const ROUTING_VIA& aLeft, const ROUTING_VIA& aRight,
             + viaDrillRadius( aBoard, aRight.netCode, aRight.drill )
             + aBoard.holeToHoleClearance );
 
+    if( centerDistance < drillRadius )
+        return true;
+    if( aLeft.netCode == aRight.netCode )
+        return false;
+
     // Net-pair rules may differ by copper layer.  Test every common layer
     // instead of using the first layer of one via as a proxy for the entire
     // span.
@@ -611,7 +616,7 @@ bool viaVsVia( const ROUTING_VIA& aLeft, const ROUTING_VIA& aRight,
                                            <= copperRadius
                                                       + pairClearance( aBoard, aLeft.netCode,
                                                                        aRight.netCode, aLayer )
-                                   || centerDistance <= drillRadius;
+                                   || centerDistance < drillRadius;
                         } );
 }
 
@@ -632,6 +637,13 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
     std::unordered_set<std::string> removedIds( aResult.removedBoardItemIds.begin(),
                                                 aResult.removedBoardItemIds.end() );
     int violations = 0;
+    int segmentBoundaryViolations = 0;
+    int segmentObstacleViolations = 0;
+    int viaBoundaryViolations = 0;
+    int viaObstacleViolations = 0;
+    int segmentPairViolations = 0;
+    int segmentViaViolations = 0;
+    int viaPairViolations = 0;
 
     for( const ROUTING_SEGMENT& segment : aResult.segments )
     {
@@ -643,7 +655,10 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                                                        radius );
         if( !segmentInsideBoard( aBoard, segment.start, segment.end, segment.netCode, radius,
                                  startMargin, endMargin, sampleStep ) )
+        {
             ++violations;
+            ++segmentBoundaryViolations;
+        }
 
         for( const ROUTING_OBSTACLE& obstacle : aBoard.obstacles )
         {
@@ -666,7 +681,10 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                 continue;
 
             if( segmentVsObstacle( segment, radius, obstacle, aBoard ) )
+            {
                 ++violations;
+                ++segmentObstacleViolations;
+            }
         }
 
         for( const ROUTING_OBSTACLE& obstacle : aBoard.removableExistingRoutes )
@@ -684,7 +702,10 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                 continue;
 
             if( segmentVsObstacle( segment, radius, obstacle, aBoard ) )
+            {
                 ++violations;
+                ++segmentObstacleViolations;
+            }
         }
     }
 
@@ -697,12 +718,17 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
             if( !insideBoard( aBoard, via.position, radius ) )
             {
                 ++violations;
+                ++viaBoundaryViolations;
                 break;
             }
 
             for( const ROUTING_OBSTACLE& obstacle : aBoard.obstacles )
             {
-            if( ( obstacle.netCode == via.netCode && !obstacle.isKeepout && !obstacle.isHole )
+                // A proposed via creates a new drill. Same-net copper may
+                // share existing copper, but a new drill cannot overlap an
+                // existing pad/via drill, even at the same position.
+                if( ( obstacle.netCode == via.netCode && !obstacle.isKeepout
+                      && !obstacle.isHole )
                     || !obstacle.blocksVias
                     || isRemoved( removedIds, obstacle.boardItemId )
                     || !layerContains( obstacle.layers, layer ) )
@@ -714,6 +740,17 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                 if( segmentVsObstacle( probe, radius, obstacle, aBoard ) )
                 {
                     ++violations;
+                    ++viaObstacleViolations;
+                    if( autorouterDebugEnabled() )
+                    {
+                        std::ostringstream message;
+                        message << "drc via obstacle net=" << via.netCode << " pos=("
+                                << via.position.x << ',' << via.position.y << ") layer=" << layer
+                                << " obstacleNet=" << obstacle.netCode << " kind="
+                                << static_cast<int>( obstacle.kind ) << " hole=" << obstacle.isHole
+                                << " existing=" << obstacle.isExistingRoute;
+                        autorouterDebugLog( message.str() );
+                    }
                     break;
                 }
             }
@@ -735,6 +772,17 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                 if( segmentVsObstacle( probe, radius, obstacle, aBoard ) )
                 {
                     ++violations;
+                    ++viaObstacleViolations;
+                    if( autorouterDebugEnabled() )
+                    {
+                        std::ostringstream message;
+                        message << "drc removable via obstacle net=" << via.netCode << " pos=("
+                                << via.position.x << ',' << via.position.y << ") layer=" << layer
+                                << " obstacleNet=" << obstacle.netCode << " kind="
+                                << static_cast<int>( obstacle.kind ) << " hole=" << obstacle.isHole
+                                << " existing=" << obstacle.isExistingRoute;
+                        autorouterDebugLog( message.str() );
+                    }
                     break;
                 }
             }
@@ -752,13 +800,17 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                                   trackRadius( aBoard, aResult.segments[j].netCode ), aBoard ) )
             {
                 ++violations;
+                ++segmentPairViolations;
             }
         }
 
         for( const ROUTING_VIA& via : aResult.vias )
         {
             if( segmentVsVia( left, leftRadius, via, aBoard ) )
+            {
                 ++violations;
+                ++segmentViaViolations;
+            }
         }
     }
 
@@ -767,8 +819,22 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
         for( std::size_t j = i + 1; j < aResult.vias.size(); ++j )
         {
             if( viaVsVia( aResult.vias[i], aResult.vias[j], aBoard ) )
+            {
                 ++violations;
+                ++viaPairViolations;
+            }
         }
+    }
+
+    if( autorouterDebugEnabled() && violations > 0 )
+    {
+        std::ostringstream message;
+        message << "drc violations=" << violations << " segmentBoundary="
+                << segmentBoundaryViolations << " segmentObstacle=" << segmentObstacleViolations
+                << " viaBoundary=" << viaBoundaryViolations << " viaObstacle="
+                << viaObstacleViolations << " segmentPair=" << segmentPairViolations
+                << " segmentVia=" << segmentViaViolations << " viaPair=" << viaPairViolations;
+        autorouterDebugLog( message.str() );
     }
 
     return violations;

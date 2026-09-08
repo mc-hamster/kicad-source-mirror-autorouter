@@ -17,8 +17,11 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
 
+#include "../AutorouterDebug.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -234,27 +237,123 @@ bool fanoutLayerApplies( const ROUTING_OBSTACLE& aObstacle, int aLayer )
 }
 
 
-std::int64_t fanoutPairClearance( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad,
-                                  const ROUTING_OBSTACLE& aObstacle, int aLayer )
+struct FANOUT_CLEARANCE_KEY
+{
+    int firstNetCode = 0;
+    int secondNetCode = 0;
+    int layer = -1;
+
+    bool operator==( const FANOUT_CLEARANCE_KEY& aOther ) const
+    {
+        return firstNetCode == aOther.firstNetCode && secondNetCode == aOther.secondNetCode
+               && layer == aOther.layer;
+    }
+};
+
+
+struct FANOUT_CLEARANCE_KEY_HASH
+{
+    std::size_t operator()( const FANOUT_CLEARANCE_KEY& aKey ) const
+    {
+        std::size_t result = std::hash<int>{}( aKey.firstNetCode );
+        result ^= std::hash<int>{}( aKey.secondNetCode ) + 0x9e3779b9 + ( result << 6 )
+                  + ( result >> 2 );
+        result ^= std::hash<int>{}( aKey.layer ) + 0x9e3779b9 + ( result << 6 )
+                  + ( result >> 2 );
+        return result;
+    }
+};
+
+
+FANOUT_CLEARANCE_KEY fanoutClearanceKey( int aFirstNetCode, int aSecondNetCode, int aLayer )
+{
+    if( aFirstNetCode > aSecondNetCode )
+        std::swap( aFirstNetCode, aSecondNetCode );
+
+    return { aFirstNetCode, aSecondNetCode, aLayer };
+}
+
+
+struct FANOUT_CLEARANCE_CONTEXT
+{
+    std::unordered_map<int, std::int64_t> netClearances;
+    std::unordered_map<int, std::int64_t> viaRadii;
+    std::unordered_map<FANOUT_CLEARANCE_KEY, std::int64_t, FANOUT_CLEARANCE_KEY_HASH>
+            pairClearances;
+    std::int64_t maximumClearance = 0;
+    std::int64_t maximumObstacleInflation = 0;
+};
+
+
+FANOUT_CLEARANCE_CONTEXT makeFanoutClearanceContext( const BOARD_SNAPSHOT& aBoard )
+{
+    FANOUT_CLEARANCE_CONTEXT result;
+    result.netClearances.reserve( aBoard.nets.size() );
+    result.viaRadii.reserve( aBoard.nets.size() );
+    result.pairClearances.reserve( aBoard.clearanceRules.size() );
+
+    for( const ROUTING_NET& net : aBoard.nets )
+    {
+        auto [clearanceIt, inserted] = result.netClearances.emplace( net.netCode, net.clearance );
+        if( !inserted )
+            clearanceIt->second = std::max( clearanceIt->second, net.clearance );
+
+        result.maximumClearance = std::max( result.maximumClearance, net.clearance );
+
+        // Net codes are unique in a board snapshot.  emplace preserves the
+        // old first-match behavior if a malformed snapshot contains a
+        // duplicate code.
+        result.viaRadii.emplace( net.netCode,
+                                 net.viaDiameter > 0 ? net.viaDiameter / 2 : 300000 );
+    }
+
+    for( const ROUTING_CLEARANCE_RULE& rule : aBoard.clearanceRules )
+    {
+        result.maximumClearance = std::max( result.maximumClearance, rule.clearance );
+        const FANOUT_CLEARANCE_KEY key = fanoutClearanceKey(
+                rule.firstNetCode, rule.secondNetCode, rule.layer < 0 ? -1 : rule.layer );
+        auto [clearanceIt, inserted] = result.pairClearances.emplace( key, rule.clearance );
+        if( !inserted )
+            clearanceIt->second = std::max( clearanceIt->second, rule.clearance );
+    }
+
+    for( const ROUTING_OBSTACLE& obstacle : aBoard.obstacles )
+    {
+        result.maximumObstacleInflation = std::max(
+                result.maximumObstacleInflation, obstacle.radius + obstacle.clearance );
+    }
+
+    return result;
+}
+
+
+std::int64_t fanoutPairClearance( const FANOUT_CLEARANCE_CONTEXT& aContext,
+                                  const ROUTING_PAD& aPad, const ROUTING_OBSTACLE& aObstacle,
+                                  int aLayer )
 {
     if( aObstacle.netCode == 0 || aObstacle.netCode == aPad.netCode )
         return std::max( aPad.clearance, aObstacle.clearance );
 
     std::int64_t result = std::max( aPad.clearance, aObstacle.clearance );
-    for( const ROUTING_CLEARANCE_RULE& rule : aBoard.clearanceRules )
-    {
-        const bool samePair =
-                ( rule.firstNetCode == aPad.netCode && rule.secondNetCode == aObstacle.netCode )
-                || ( rule.firstNetCode == aObstacle.netCode && rule.secondNetCode == aPad.netCode );
-        if( samePair && ( rule.layer < 0 || rule.layer == aLayer ) )
-            result = std::max( result, rule.clearance );
-    }
 
-    for( const ROUTING_NET& net : aBoard.nets )
-    {
-        if( net.netCode == aPad.netCode || net.netCode == aObstacle.netCode )
-            result = std::max( result, net.clearance );
-    }
+    const FANOUT_CLEARANCE_KEY pairKey =
+            fanoutClearanceKey( aPad.netCode, aObstacle.netCode, aLayer );
+    const auto layerIt = aContext.pairClearances.find( pairKey );
+    if( layerIt != aContext.pairClearances.end() )
+        result = std::max( result, layerIt->second );
+
+    const auto globalIt = aContext.pairClearances.find(
+            fanoutClearanceKey( aPad.netCode, aObstacle.netCode, -1 ) );
+    if( globalIt != aContext.pairClearances.end() )
+        result = std::max( result, globalIt->second );
+
+    const auto padNetIt = aContext.netClearances.find( aPad.netCode );
+    if( padNetIt != aContext.netClearances.end() )
+        result = std::max( result, padNetIt->second );
+
+    const auto obstacleNetIt = aContext.netClearances.find( aObstacle.netCode );
+    if( obstacleNetIt != aContext.netClearances.end() )
+        result = std::max( result, obstacleNetIt->second );
 
     return result;
 }
@@ -347,12 +446,19 @@ bool fanoutSegmentCollides( const ROUTING_OBSTACLE& aObstacle, const ROUTER_POIN
 
     if( aObstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
     {
-        return fanoutSegmentsIntersect( aStart, aEnd, aObstacle.start, aObstacle.end )
-               || fanoutPointToSegmentDistance( aStart, aObstacle.start, aObstacle.end )
-                          <= aRadius
-               || fanoutPointToSegmentDistance( aEnd, aObstacle.start, aObstacle.end ) <= aRadius
-               || fanoutPointToSegmentDistance( aObstacle.start, aStart, aEnd ) <= aRadius
-               || fanoutPointToSegmentDistance( aObstacle.end, aStart, aEnd ) <= aRadius;
+        const bool intersects = fanoutSegmentsIntersect( aStart, aEnd, aObstacle.start,
+                                                         aObstacle.end );
+        const long double startDistance =
+                fanoutPointToSegmentDistance( aStart, aObstacle.start, aObstacle.end );
+        const long double endDistance =
+                fanoutPointToSegmentDistance( aEnd, aObstacle.start, aObstacle.end );
+        const long double obstacleStartDistance =
+                fanoutPointToSegmentDistance( aObstacle.start, aStart, aEnd );
+        const long double obstacleEndDistance =
+                fanoutPointToSegmentDistance( aObstacle.end, aStart, aEnd );
+
+        return intersects || startDistance <= aRadius || endDistance <= aRadius
+               || obstacleStartDistance <= aRadius || obstacleEndDistance <= aRadius;
     }
 
     if( fanoutPointCollides( aObstacle, aStart, aRadius )
@@ -400,19 +506,18 @@ bool fanoutPointInsideBoard( const BOARD_SNAPSHOT& aBoard, const ROUTER_POINT& a
 bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad,
                            const ROUTER_POINT& aPoint, int aSourceLayer, int aTargetLayer,
                            const AUTOROUTER_SETTINGS& aSettings,
-                           const std::vector<std::size_t>& aNearbyObstacles )
+                           const std::vector<std::size_t>& aNearbyObstacles,
+                           const FANOUT_CLEARANCE_CONTEXT& aContext,
+                           const ROUTER_CANCEL_CALLBACK& aCancel, bool aCheckStub )
 {
+    if( aCancel && aCancel() )
+        return false;
+
     const std::int64_t trackRadius = std::max<std::int64_t>( 1, aPad.trackWidth / 2 );
-    const ROUTING_NET* net = nullptr;
-    for( const ROUTING_NET& candidate : aBoard.nets )
-    {
-        if( candidate.netCode == aPad.netCode )
-        {
-            net = &candidate;
-            break;
-        }
-    }
-    const std::int64_t viaRadius = net && net->viaDiameter > 0 ? net->viaDiameter / 2 : 300000;
+    const auto viaRadiusIt = aContext.viaRadii.find( aPad.netCode );
+    const std::int64_t viaRadius = viaRadiusIt != aContext.viaRadii.end()
+                                           ? viaRadiusIt->second
+                                           : 300000;
 
     const auto obstacleAllowed = [&]( const ROUTING_OBSTACLE& aObstacle, int aLayer,
                                       bool aForVia, std::int64_t aGeometryRadius )
@@ -436,7 +541,7 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
             return true;
 
         const std::int64_t radius = aObstacle.radius + aGeometryRadius
-                                    + fanoutPairClearance( aBoard, aPad, aObstacle, aLayer );
+                                    + fanoutPairClearance( aContext, aPad, aObstacle, aLayer );
         return !fanoutPointCollides( aObstacle, aPoint, radius );
     };
 
@@ -446,26 +551,32 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
         return false;
     }
 
-    for( std::size_t obstacleIndex : aNearbyObstacles )
+    if( aCheckStub )
     {
-        if( obstacleIndex >= aBoard.obstacles.size() )
-            continue;
-
-        const ROUTING_OBSTACLE& obstacle = aBoard.obstacles[obstacleIndex];
-        const bool sameNetExistingViaHole =
-                obstacle.isHole && obstacle.isExistingRoute && !obstacle.boardItemId.empty();
-        const bool sameNetPadHole = obstacle.isHole && obstacle.start == aPad.position;
-        if( fanoutLayerApplies( obstacle, aSourceLayer )
-            && obstacle.blocksTracks
-            && !( obstacle.netCode != 0 && obstacle.netCode == aPad.netCode
-                  && !obstacle.isKeepout
-                  && ( !obstacle.isHole || sameNetPadHole || sameNetExistingViaHole ) )
-            && fanoutSegmentCollides( obstacle, aPad.position, aPoint,
-                                      obstacle.radius + trackRadius
-                                              + fanoutPairClearance( aBoard, aPad, obstacle,
-                                                                     aSourceLayer ) ) )
+        for( std::size_t obstacleIndex : aNearbyObstacles )
         {
-            return false;
+            if( aCancel && aCancel() )
+                return false;
+
+            if( obstacleIndex >= aBoard.obstacles.size() )
+                continue;
+
+            const ROUTING_OBSTACLE& obstacle = aBoard.obstacles[obstacleIndex];
+            const bool sameNetExistingViaHole =
+                    obstacle.isHole && obstacle.isExistingRoute && !obstacle.boardItemId.empty();
+            const bool sameNetPadHole = obstacle.isHole && obstacle.start == aPad.position;
+            if( fanoutLayerApplies( obstacle, aSourceLayer )
+                && obstacle.blocksTracks
+                && !( obstacle.netCode != 0 && obstacle.netCode == aPad.netCode
+                      && !obstacle.isKeepout
+                      && ( !obstacle.isHole || sameNetPadHole || sameNetExistingViaHole ) )
+                && fanoutSegmentCollides( obstacle, aPad.position, aPoint,
+                                          obstacle.radius + trackRadius
+                                                  + fanoutPairClearance( aContext, aPad, obstacle,
+                                                                         aSourceLayer ) ) )
+            {
+                return false;
+            }
         }
     }
 
@@ -497,12 +608,17 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
 
         for( std::size_t obstacleIndex : aNearbyObstacles )
         {
+            if( aCancel && aCancel() )
+                return false;
+
             if( obstacleIndex >= aBoard.obstacles.size() )
                 continue;
 
             const ROUTING_OBSTACLE& obstacle = aBoard.obstacles[obstacleIndex];
             if( !obstacleAllowed( obstacle, layer.layerId, true, viaRadius ) )
+            {
                 return false;
+            }
         }
     }
 
@@ -513,8 +629,14 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
 std::optional<ROUTER_POINT> fanoutLandingPoint( const BOARD_SNAPSHOT& aBoard,
                                                 const ROUTING_PAD& aPad,
                                                 int aTargetLayer,
-                                                const AUTOROUTER_SETTINGS& aSettings )
+                                                const AUTOROUTER_SETTINGS& aSettings,
+                                                const FANOUT_CLEARANCE_CONTEXT& aContext,
+                                                const ROUTER_CANCEL_CALLBACK& aCancel,
+                                                bool& aDirectStub )
 {
+    if( aCancel && aCancel() )
+        return std::nullopt;
+
     // A fanout escape is a short straight stub, but a package edge is not
     // restricted to the eight compass directions.  Include the shallow
     // 1:2 and 2:1 directions as well; this is still deterministic while
@@ -565,33 +687,16 @@ std::optional<ROUTER_POINT> fanoutLandingPoint( const BOARD_SNAPSHOT& aBoard,
             1, aPad.radius + aPad.clearance + aPad.trackWidth / 2 );
     const std::int64_t gridStep = std::max<std::int64_t>( 1, aSettings.gridStepIU );
 
-    const ROUTING_NET* net = nullptr;
-    for( const ROUTING_NET& candidate : aBoard.nets )
-    {
-        if( candidate.netCode == aPad.netCode )
-        {
-            net = &candidate;
-            break;
-        }
-    }
-    const std::int64_t viaRadius = net && net->viaDiameter > 0 ? net->viaDiameter / 2 : 300000;
-
-    std::int64_t maximumClearance = aPad.clearance;
-    for( const ROUTING_NET& candidate : aBoard.nets )
-        maximumClearance = std::max( maximumClearance, candidate.clearance );
-    for( const ROUTING_CLEARANCE_RULE& rule : aBoard.clearanceRules )
-        maximumClearance = std::max( maximumClearance, rule.clearance );
-
-    std::int64_t maximumObstacleInflation = 0;
-    for( const ROUTING_OBSTACLE& obstacle : aBoard.obstacles )
-    {
-        maximumObstacleInflation = std::max( maximumObstacleInflation,
-                                             obstacle.radius + obstacle.clearance );
-    }
+    const auto viaRadiusIt = aContext.viaRadii.find( aPad.netCode );
+    const std::int64_t viaRadius = viaRadiusIt != aContext.viaRadii.end()
+                                           ? viaRadiusIt->second
+                                           : 300000;
+    const std::int64_t maximumClearance = std::max( aPad.clearance,
+                                                     aContext.maximumClearance );
 
     const std::int64_t maximumDistance = minimumEscape + 8 * gridStep;
     const std::int64_t nearbyPadding = viaRadius + maximumClearance
-                                       + maximumObstacleInflation + 2;
+                                       + aContext.maximumObstacleInflation + 2;
     const ROUTER_BOX nearbyBox{ aPad.position.x - maximumDistance - nearbyPadding,
                                 aPad.position.y - maximumDistance - nearbyPadding,
                                 aPad.position.x + maximumDistance + nearbyPadding,
@@ -600,6 +705,9 @@ std::optional<ROUTER_POINT> fanoutLandingPoint( const BOARD_SNAPSHOT& aBoard,
     nearbyObstacles.reserve( 256 );
     for( std::size_t index = 0; index < aBoard.obstacles.size(); ++index )
     {
+        if( aCancel && aCancel() )
+            return std::nullopt;
+
         const ROUTER_BOX bounds = fanoutObstacleBounds( aBoard.obstacles[index] );
         if( bounds.maxX >= nearbyBox.minX && bounds.minX <= nearbyBox.maxX
             && bounds.maxY >= nearbyBox.minY && bounds.minY <= nearbyBox.maxY )
@@ -613,34 +721,54 @@ std::optional<ROUTER_POINT> fanoutLandingPoint( const BOARD_SNAPSHOT& aBoard,
     // first open room without burdening the general maze frontier with a
     // synthetic pad-centre via attempt.
     const int maximumExpansions = std::clamp( aSettings.maxFanoutPasses, 1, 64 ) - 1;
-    for( int expansion = 0; expansion <= maximumExpansions; ++expansion )
+    const auto findCandidate = [&]( bool aCheckStub ) -> std::optional<ROUTER_POINT>
     {
-        const std::int64_t distance = minimumEscape + expansion * gridStep;
-        for( std::size_t directionIndex : directionOrder )
+        for( int expansion = 0; expansion <= maximumExpansions; ++expansion )
         {
-            const auto& direction = directions[directionIndex];
-            ROUTER_POINT candidate{ aPad.position.x + direction[0] * distance,
-                                    aPad.position.y + direction[1] * distance };
-            if( fanoutSegmentAllowed( aBoard, aPad, candidate, aPad.layers.front(), aTargetLayer,
-                                      aSettings, nearbyObstacles ) )
+            if( aCancel && aCancel() )
+                return std::nullopt;
+
+            const std::int64_t distance = minimumEscape + expansion * gridStep;
+            for( std::size_t directionIndex : directionOrder )
             {
-                return candidate;
+                if( aCancel && aCancel() )
+                    return std::nullopt;
+
+                const auto& direction = directions[directionIndex];
+                ROUTER_POINT candidate{ aPad.position.x + direction[0] * distance,
+                                        aPad.position.y + direction[1] * distance };
+                if( fanoutSegmentAllowed( aBoard, aPad, candidate, aPad.layers.front(),
+                                          aTargetLayer, aSettings, nearbyObstacles, aContext,
+                                          aCancel, aCheckStub ) )
+                {
+                    return candidate;
+                }
             }
         }
+        return std::nullopt;
+    };
+
+    if( const std::optional<ROUTER_POINT> direct = findCandidate( true ) )
+    {
+        aDirectStub = true;
+        return direct;
     }
 
-    // Do not manufacture a synthetic endpoint that the via/escape checks
-    // already prove to be illegal.  The maze can still route the original
-    // pad-to-pad connection and choose a farther via location; retaining an
-    // invalid landing here would make the endpoint impossible by construction.
-    return std::nullopt;
+    // If no straight stub fits between adjacent SMD pads, still reserve a
+    // legal via landing and let the maze search find a short bent escape.
+    // The reference router does this through its per-pin fanout search; a
+    // straight-only pre-pass would incorrectly discard the pad entirely.
+    aDirectStub = false;
+    return findCandidate( false );
+
 }
 
 } // namespace
 
 
 BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
-                                              const AUTOROUTER_SETTINGS& aSettings )
+                                              const AUTOROUTER_SETTINGS& aSettings,
+                                              const ROUTER_CANCEL_CALLBACK& aCancel )
 {
     if( !aSettings.enableFanout || !aSettings.allowVias || aSettings.maxFanoutPasses <= 0
         || aSettings.layers.size() < 2 )
@@ -649,6 +777,13 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
     }
 
     BOARD_SNAPSHOT result = aBoard;
+    const FANOUT_CLEARANCE_CONTEXT fanoutContext = makeFanoutClearanceContext( result );
+    // Landing-point selection happens before the worker occupancy map exists.
+    // Keep a planning-only obstacle list so a later fanout cannot select a
+    // via or escape stub through an earlier fanout.  These records are not
+    // copied to the returned snapshot; the real connection geometry is what
+    // owns the final collision model after the pre-pass.
+    BOARD_SNAPSHOT planningBoard = result;
     std::vector<std::size_t> landingForPad( result.pads.size(), invalidIndex() );
 
     // Create one deterministic landing pad for each SMD endpoint that still
@@ -660,6 +795,9 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
     // is used for widths, ordering and reporting.
     for( ROUTING_NET& net : result.nets )
     {
+        if( aCancel && aCancel() )
+            return result;
+
         // A single-layer SMD pad needs a legal source-layer escape when
         // via-in-pad is disabled.  If via-in-pad is explicitly allowed, keep
         // the original connection and let the maze place the transition at
@@ -670,6 +808,9 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
         std::vector<std::size_t> connectionPads;
         for( const auto& [source, target] : net.connections )
         {
+            if( aCancel && aCancel() )
+                return result;
+
             if( source < result.pads.size() && !result.pads[source].isPlaneTarget
                 && std::find( connectionPads.begin(), connectionPads.end(), source )
                            == connectionPads.end() )
@@ -688,6 +829,9 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
         std::vector<std::size_t> fanoutPads;
         for( std::size_t padIndex : net.padIndices )
         {
+            if( aCancel && aCancel() )
+                return result;
+
             if( padIndex >= result.pads.size() )
                 continue;
 
@@ -733,11 +877,42 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
 
             for( const int layer : fanoutLayers( aSettings, pad.layers.front() ) )
             {
+                if( aCancel && aCancel() )
+                    return result;
+
+                // result.pads grows below; keep the source value independent
+                // of vector reallocation while the planning obstacles are
+                // appended.
+                const ROUTING_PAD sourcePad = pad;
                 ROUTING_PAD landing = pad;
+                bool directStub = false;
                 const std::optional<ROUTER_POINT> landingPoint =
-                        fanoutLandingPoint( result, pad, layer, aSettings );
+                        fanoutLandingPoint( planningBoard, pad, layer, aSettings, fanoutContext,
+                                            aCancel, directStub );
                 if( !landingPoint )
+                {
+                    if( autorouterDebugEnabled() )
+                    {
+                        std::ostringstream message;
+                        message << "fanout no landing net=" << net.netCode << " pad=" << padIndex
+                                << " source=(" << pad.position.x << ',' << pad.position.y
+                                << ") targetLayer=" << layer
+                                << " planningObstacles=" << planningBoard.obstacles.size();
+                        autorouterDebugLog( message.str() );
+                    }
                     continue;
+                }
+
+                if( autorouterDebugEnabled() )
+                {
+                    std::ostringstream message;
+                    message << "fanout landing net=" << net.netCode << " pad=" << padIndex
+                            << " source=(" << pad.position.x << ',' << pad.position.y
+                            << ") targetLayer=" << layer << " target=(" << landingPoint->x << ','
+                            << landingPoint->y << ") planningObstacles="
+                            << planningBoard.obstacles.size() << " directStub=" << directStub;
+                    autorouterDebugLog( message.str() );
+                }
 
                 landing.position = *landingPoint;
                 // A plane fanout landing is shared by two stages.  Expose both
@@ -761,6 +936,7 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                 // the whole board looking for an arbitrary via location.
                 landing.fanoutSourceLayer = pad.layers.front();
                 landing.fanoutTargetLayer = layer;
+                landing.fanoutSourcePadIndex = padIndex;
                 // The synthetic endpoint represents a via landing, not a
                 // second copy of the entire SMD copper shape.  Keeping the
                 // source clearance while clearing the pad radius prevents the
@@ -773,6 +949,54 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                 landingForPad.resize( result.pads.size(), invalidIndex() );
                 landingForPad[padIndex] = landingIndex;
                 fanoutPads.push_back( padIndex );
+
+                // Reserve both the via stack and its source-layer escape in
+                // the planning copy.  Same-net fanouts remain mergeable, but
+                // foreign nets must see the exact copper/clearance envelope
+                // while choosing their own deterministic landing.
+                const std::int64_t viaRadius =
+                        std::max<std::int64_t>( 1, sourcePad.netCode > 0
+                                                      ? ( [&]()
+                                                          {
+                                                              const auto it = std::find_if(
+                                                                      result.nets.begin(),
+                                                                      result.nets.end(),
+                                                                      [&]( const ROUTING_NET& net )
+                                                                      {
+                                                                          return net.netCode
+                                                                                 == sourcePad.netCode;
+                                                                      } );
+                                                              return it != result.nets.end()
+                                                                             && it->viaDiameter > 0
+                                                                     ? it->viaDiameter / 2
+                                                                     : 300000;
+                                                          } )()
+                                                      : 300000 );
+
+                ROUTING_OBSTACLE viaObstacle;
+                viaObstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                viaObstacle.netCode = sourcePad.netCode;
+                viaObstacle.layers = { sourcePad.layers.front(), layer };
+                viaObstacle.start = *landingPoint;
+                viaObstacle.end = *landingPoint;
+                viaObstacle.radius = viaRadius;
+                viaObstacle.blocksTracks = true;
+                viaObstacle.blocksVias = true;
+                planningBoard.obstacles.push_back( std::move( viaObstacle ) );
+
+                if( directStub )
+                {
+                    ROUTING_OBSTACLE stubObstacle;
+                    stubObstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                    stubObstacle.netCode = sourcePad.netCode;
+                    stubObstacle.layers = { sourcePad.layers.front() };
+                    stubObstacle.start = sourcePad.position;
+                    stubObstacle.end = *landingPoint;
+                    stubObstacle.radius = std::max<std::int64_t>( 1, sourcePad.trackWidth / 2 );
+                    stubObstacle.blocksTracks = true;
+                    stubObstacle.blocksVias = true;
+                    planningBoard.obstacles.push_back( std::move( stubObstacle ) );
+                }
                 break;
             }
         }

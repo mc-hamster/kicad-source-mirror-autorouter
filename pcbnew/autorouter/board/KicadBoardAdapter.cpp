@@ -35,6 +35,7 @@
 #include <board_design_settings.h>
 #include <board_connected_item.h>
 #include <connectivity/connectivity_data.h>
+#include <connectivity/connectivity_algo.h>
 #include <connectivity/connectivity_items.h>
 #include <drc/drc_engine.h>
 #include <footprint.h>
@@ -457,6 +458,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
     if( !m_board )
         return;
 
+    std::map<const BOARD_CONNECTED_ITEM*, std::size_t> padIndices;
     for( PAD* pad : m_board->GetPads() )
     {
         if( !pad )
@@ -494,10 +496,38 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     diameter, drill );
         }
 
-        // Every pad remains a collision obstacle, including no-connect pads
-        // and pads belonging to filtered nets.  Filtering controls what is
-        // routed, not whether foreign copper is allowed to be crossed.
-        for( int layer : padLayers )
+        // Every pad remains a collision obstacle on the layers that can
+        // actually be routed.  Through-hole pads report all possible copper
+        // layers in GetLayerSet(), including disabled inner layers that are
+        // not present in this board's active stack.  Materialising one
+        // obstacle per such layer needlessly turns a two-layer board into
+        // thousands of unrelated search objects and makes dense-board
+        // routing appear to hang.  The disabled layers are never queried by
+        // the worker, so filtering them here is exact rather than a geometry
+        // relaxation.
+        std::vector<int> obstacleLayers = padLayers;
+        obstacleLayers.erase(
+                std::remove_if( obstacleLayers.begin(), obstacleLayers.end(),
+                                [&]( int aLayer )
+                                {
+                                    return std::none_of(
+                                            aSettings.layers.begin(), aSettings.layers.end(),
+                                            [aLayer]( const ROUTER_LAYER_SETTINGS& aSetting )
+                                            {
+                                                return aSetting.enabled
+                                                       && aSetting.layerId == aLayer;
+                                            } );
+                                } ),
+                obstacleLayers.end() );
+
+        // Keep an obstacle for a pad even when the settings filter has no
+        // matching layer; this preserves snapshot safety for callers that
+        // construct a deliberately minimal layer list.  Normal editor
+        // settings always take the first branch above.
+        if( obstacleLayers.empty() )
+            obstacleLayers = padLayers;
+
+        for( int layer : obstacleLayers )
         {
             const PCB_LAYER_ID layerId = static_cast<PCB_LAYER_ID>( layer );
             const BOX2I padBox = pad->GetBoundingBox( layerId );
@@ -604,6 +634,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                 std::max<std::int64_t>( 0, pad->GetOwnClearance( clearanceLayer ) );
         const std::size_t padIndex = aSnapshot.pads.size();
         aSnapshot.pads.push_back( std::move( routingPad ) );
+        padIndices.emplace( pad, padIndex );
 
         auto netIt = std::find_if( aSnapshot.nets.begin(), aSnapshot.nets.end(),
                                    [pad]( const ROUTING_NET& aNet )
@@ -694,12 +725,43 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                 } );
     }
 
+    const std::shared_ptr<CONNECTIVITY_DATA> connectivity = m_board->GetConnectivity();
+    if( connectivity && !aSettings.allowRipupExisting )
+    {
+        // Search once for the whole snapshot. Directly adjacent pads are not
+        // the connected set: tracks, vias and individual filled islands may
+        // join distant terminals. Do not union by zone object or net code.
+        const auto clusters = connectivity->GetConnectivityAlgo()->SearchClusters(
+                CN_CONNECTIVITY_ALGO::CSM_CONNECTIVITY_CHECK );
+        for( const auto& cluster : clusters )
+        {
+            std::vector<std::size_t> group;
+            for( const CN_ITEM* item : *cluster )
+            {
+                if( !item->Valid() )
+                    continue;
+                const auto it = padIndices.find( item->Parent() );
+                if( it != padIndices.end() )
+                    group.push_back( it->second );
+            }
+            std::sort( group.begin(), group.end() );
+            group.erase( std::unique( group.begin(), group.end() ), group.end() );
+            if( group.size() < 2 )
+                continue;
+            const int netCode = aSnapshot.pads[group.front()].netCode;
+            for( ROUTING_NET& net : aSnapshot.nets )
+            {
+                if( net.netCode == netCode )
+                    net.connectedPadGroups.push_back( group );
+            }
+        }
+    }
+
     for( ROUTING_NET& net : aSnapshot.nets )
     {
         if( net.padIndices.empty() )
             continue;
 
-        const std::shared_ptr<CONNECTIVITY_DATA> connectivity = m_board->GetConnectivity();
         auto endpointPad = [&]( const std::shared_ptr<const CN_ANCHOR>& aAnchor )
                 -> std::optional<std::size_t>
         {
@@ -713,8 +775,16 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             std::vector<PAD*> candidates;
             if( parent->Type() == PCB_PAD_T )
                 candidates.push_back( static_cast<PAD*>( parent ) );
-            else if( connectivity )
-                candidates = connectivity->GetConnectedPads( parent );
+            else if( aAnchor->GetCluster() )
+            {
+                // The nearest pad can be several traces/vias away. The
+                // anchor's cluster also preserves the particular zone island.
+                for( const CN_ITEM* item : *aAnchor->GetCluster() )
+                {
+                    if( item->Valid() && item->Parent()->Type() == PCB_PAD_T )
+                        candidates.push_back( static_cast<PAD*>( item->Parent() ) );
+                }
+            }
 
             if( candidates.empty() )
                 return std::nullopt;
@@ -724,7 +794,8 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
 
             for( PAD* candidate : candidates )
             {
-                if( !candidate || candidate->GetNetCode() != net.netCode )
+                if( !candidate || candidate->GetNetCode() != net.netCode
+                    || !padIndices.contains( candidate ) )
                     continue;
 
                 const int candidateDistance =
@@ -739,13 +810,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             if( !best )
                 return std::nullopt;
 
-            for( std::size_t index : net.padIndices )
-            {
-                if( aSnapshot.pads[index].position == point( best->GetPosition() ) )
-                    return index;
-            }
-
-            return std::nullopt;
+            return padIndices.at( best );
         };
 
         if( !net.planeTargetIndices.empty() )
@@ -1058,46 +1123,14 @@ void KICAD_BOARD_ADAPTER::addKeepouts( BOARD_SNAPSHOT& aSnapshot ) const
             continue;
         }
 
-        // Filled copper zones are foreign-net obstacles until proven to be
-        // the current net.  Treating the filled result, rather than only the
-        // zone outline, keeps the worker conservative around islands and
-        // thermal voids without importing KiCad's zone filler into the maze.
-        if( !zone->IsFilled() )
-            continue;
-
-        zone->GetLayerSet().RunOnLayers(
-                [&]( PCB_LAYER_ID aLayer )
-                {
-                    if( !IsCopperLayer( aLayer ) || !zone->HasFilledPolysForLayer( aLayer ) )
-                        return;
-
-                    const std::shared_ptr<SHAPE_POLY_SET> filled =
-                            zone->GetFilledPolysList( aLayer );
-
-                    if( !filled )
-                        return;
-
-                    for( int polygonIndex = 0; polygonIndex < filled->OutlineCount();
-                         ++polygonIndex )
-                    {
-                        ROUTING_OBSTACLE obstacle;
-                        obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
-                        obstacle.netCode = zone->GetNetCode();
-                        obstacle.layers = { static_cast<int>( aLayer ) };
-                        appendPolygon( obstacle.polygon, filled->Outline( polygonIndex ) );
-                        for( int hole = 0; hole < filled->HoleCount( polygonIndex ); ++hole )
-                        {
-                            std::vector<ROUTER_POINT> holePoints;
-                            appendPolygon( holePoints,
-                                           filled->CHole( polygonIndex, hole ) );
-                            obstacle.polygonHoles.push_back( std::move( holePoints ) );
-                        }
-                        obstacle.blocksTracks = true;
-                        obstacle.blocksVias = true;
-                        obstacle.clearance = std::max( 0, zone->GetLocalClearance().value_or( 0 ) );
-                        aSnapshot.obstacles.push_back( std::move( obstacle ) );
-                    }
-                } );
+        // A copper pour is a conduction area, not a hard foreign-net
+        // obstacle.  KiCad will refill the zone around the accepted tracks,
+        // while the autorouter must be able to cross the pour and let the
+        // resulting clearance void form normally.  Treating every filled
+        // polygon as solid copper strands unrelated nets behind the plane
+        // and also turns one large board into thousands of expensive polygon
+        // obstacles.  Filled polygons are still used above as synthetic
+        // same-net plane targets; only explicit rule areas are hard keepouts.
     }
 }
 

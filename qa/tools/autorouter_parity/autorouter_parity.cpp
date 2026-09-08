@@ -37,6 +37,10 @@
 
 #include <board.h>
 #include <board_design_settings.h>
+#include <connectivity/connectivity_data.h>
+#include <pcb_track.h>
+#include <commit.h>
+#include <zone_filler.h>
 #include <drc/drc_engine.h>
 #include <drc/drc_item.h>
 #include <pgm_base.h>
@@ -61,11 +65,59 @@ struct PARITY_PGM : public PGM_BASE
 PARITY_PGM g_program;
 
 
+// The reference importer stages ordinary board edits. This commit applies
+// them to a disposable QA board; it has no editor, view, or undo dependency.
+class REFERENCE_IMPORT_COMMIT : public COMMIT
+{
+public:
+    explicit REFERENCE_IMPORT_COMMIT( BOARD& aBoard ) : m_board( aBoard ) {}
+    ~REFERENCE_IMPORT_COMMIT() override { Revert(); }
+
+    void Push( const wxString&, int ) override
+    {
+        for( const COMMIT_LINE& line : m_entries )
+        {
+            BOARD_ITEM* item = static_cast<BOARD_ITEM*>( line.m_item );
+            switch( line.m_type & CHT_TYPE )
+            {
+            case CHT_ADD: m_board.Add( item ); break;
+            case CHT_REMOVE: m_board.Remove( item ); delete item; break;
+            default: break; // Modifications were applied after Stage().
+            }
+            delete line.m_copy;
+        }
+        clear();
+    }
+
+    void Revert() override
+    {
+        for( const COMMIT_LINE& line : m_entries )
+        {
+            if( ( line.m_type & CHT_TYPE ) == CHT_ADD )
+                delete line.m_item;
+            else if( ( line.m_type & CHT_TYPE ) == CHT_MODIFY && line.m_copy )
+                static_cast<BOARD_ITEM*>( line.m_item )->SwapItemData(
+                        static_cast<BOARD_ITEM*>( line.m_copy ) );
+            delete line.m_copy;
+        }
+        clear();
+    }
+
+private:
+    EDA_ITEM* undoLevelItem( EDA_ITEM* aItem ) const override { return aItem; }
+    EDA_ITEM* makeImage( EDA_ITEM* aItem ) const override { return aItem->Clone(); }
+    BOARD& m_board;
+};
+
+
 struct OPTIONS
 {
     std::string board;
     std::string output;
     std::string exportDsn;
+    std::string importSes;
+    std::string saveBoard;
+    bool        stripTracks = false;
     std::vector<std::string> includeNets;
     bool        dumpSnapshot = false;
     int         maxPasses = 4;
@@ -85,6 +137,7 @@ struct LIVE_DRC_RESULT
     int            count = -1;
     std::map<int, int> byCode;
     std::vector<std::string> details;
+    std::map<std::string, int> fingerprints;
 };
 
 
@@ -98,6 +151,8 @@ struct LIVE_DRC_RESULT
                                    " [--no-fanout] [--all-connections] [--no-live-drc]"
                                    " [--max-nets N] [--max-connections N]"
                                    " [--export-dsn FILE] [--include-net NET]"
+                                   " [--strip-tracks] [--import-ses FILE]"
+                                   " [--save-board NEW_FILE]"
                                    " [--dump-snapshot]" );
 }
 
@@ -148,6 +203,12 @@ OPTIONS parseOptions( int argc, char** argv )
             options.output = nextValue( "--out" );
         else if( argument == "--export-dsn" )
             options.exportDsn = nextValue( "--export-dsn" );
+        else if( argument == "--import-ses" )
+            options.importSes = nextValue( "--import-ses" );
+        else if( argument == "--save-board" )
+            options.saveBoard = nextValue( "--save-board" );
+        else if( argument == "--strip-tracks" )
+            options.stripTracks = true;
         else if( argument == "--include-net" )
             options.includeNets.push_back( nextValue( "--include-net" ) );
         else if( argument == "--dump-snapshot" )
@@ -232,6 +293,24 @@ LIVE_DRC_RESULT runLiveDrc( BOARD* aBoard )
                 {
                     ++result.count;
                     ++result.byCode[aItem->GetErrorCode()];
+                    // Compare actual violations, not just totals per error code:
+                    // repairing one old violation must not hide a new one.
+                    // Unconnected items are measured independently by connectivity.
+                    if( aItem->GetErrorCode() != DRCE_UNCONNECTED_ITEMS )
+                    {
+                        std::string key = wxString::Format( "%d@%d,%d/L%d:",
+                                aItem->GetErrorCode(), aPosition.x, aPosition.y, aLayer )
+                                                  .ToStdString();
+                        std::vector<std::string> ids = {
+                            aItem->GetMainItemID().AsString().ToStdString(),
+                            aItem->GetAuxItemID().AsString().ToStdString(),
+                            aItem->GetAuxItem2ID().AsString().ToStdString(),
+                            aItem->GetAuxItem3ID().AsString().ToStdString() };
+                        std::sort( ids.begin(), ids.end() );
+                        for( const std::string& id : ids )
+                            key += id + "/";
+                        ++result.fingerprints[key];
+                    }
                     result.details.push_back(
                             wxString::Format( "%d@(%d,%d)/L%d: %s", aItem->GetErrorCode(),
                                               aPosition.x, aPosition.y, aLayer,
@@ -240,16 +319,32 @@ LIVE_DRC_RESULT runLiveDrc( BOARD* aBoard )
                 }
             } );
     engine->RunTests( EDA_UNITS::MM, true, false );
+    engine->SetViolationHandler( {} );
     return result;
 }
 
 
-LIVE_DRC_RESULT countLiveDrc( BOARD* aBoard,
+void applyProposal( BOARD* aBoard,
                               const KICAD_AUTOROUTER::ROUTING_RESULT& aResult,
                               const KICAD_AUTOROUTER::KICAD_BOARD_ADAPTER& aAdapter )
 {
     if( !aBoard )
-        return {};
+        return;
+
+    // Apply the same removals as acceptance in the editor.
+    std::vector<PCB_TRACK*> removed;
+    for( PCB_TRACK* track : aBoard->Tracks() )
+    {
+        if( std::find( aResult.removedBoardItemIds.begin(), aResult.removedBoardItemIds.end(),
+                       track->m_Uuid.AsString().ToStdString() )
+            != aResult.removedBoardItemIds.end() )
+            removed.push_back( track );
+    }
+    for( PCB_TRACK* track : removed )
+    {
+        aBoard->Remove( track );
+        delete track;
+    }
 
     std::vector<std::unique_ptr<BOARD_ITEM>> preview = aAdapter.CreatePreviewItems( aResult );
     for( std::unique_ptr<BOARD_ITEM>& item : preview )
@@ -263,25 +358,27 @@ LIVE_DRC_RESULT countLiveDrc( BOARD* aBoard,
 
     // Connectivity-dependent DRC providers need the proposal in the board
     // connectivity index, just as it is after BOARD_COMMIT::Push in pcbnew.
+    if( !aBoard->Zones().empty() && !ZONE_FILLER( aBoard, nullptr ).Fill( aBoard->Zones() ) )
+        throw std::runtime_error( "proposal zone refill failed" );
     aBoard->BuildConnectivity();
-    return runLiveDrc( aBoard );
+    aBoard->GetConnectivity()->RecalculateRatsnest();
 }
 
 
 void writeJson( const std::string& aPath, const std::string& aBoardPath,
                 const KICAD_AUTOROUTER::ROUTING_RESULT& aResult,
                 const LIVE_DRC_RESULT& aBaselineDrc, const LIVE_DRC_RESULT& aLiveDrc,
-                std::int64_t aRuntimeMs )
+                std::int64_t aRuntimeMs, int aBaselineUnconnected, int aUnconnected )
 {
     const KICAD_AUTOROUTER::ROUTER_METRICS& metrics = aResult.metrics;
     int introducedDrcErrors = -1;
     if( aBaselineDrc.count >= 0 && aLiveDrc.count >= 0 )
     {
         introducedDrcErrors = 0;
-        for( const auto& [code, count] : aLiveDrc.byCode )
+        for( const auto& [key, count] : aLiveDrc.fingerprints )
         {
-            const auto baseline = aBaselineDrc.byCode.find( code );
-            introducedDrcErrors += std::max( 0, count - ( baseline == aBaselineDrc.byCode.end()
+            const auto baseline = aBaselineDrc.fingerprints.find( key );
+            introducedDrcErrors += std::max( 0, count - ( baseline == aBaselineDrc.fingerprints.end()
                                                                   ? 0
                                                                   : baseline->second ) );
         }
@@ -290,6 +387,10 @@ void writeJson( const std::string& aPath, const std::string& aBoardPath,
     std::ostringstream json;
     json << "{\n"
          << "  \"board\": \"" << jsonEscape( aBoardPath ) << "\",\n"
+         << "  \"baseline_kicad_unconnected\": " << aBaselineUnconnected << ",\n"
+         << "  \"kicad_unconnected\": " << aUnconnected << ",\n"
+         << "  \"electrically_complete\": " << ( aUnconnected == 0 ? "true" : "false" ) << ",\n"
+         << "  \"validation_complete\": " << ( aLiveDrc.count >= 0 ? "true" : "false" ) << ",\n"
          << "  \"total_connections\": " << metrics.totalConnections << ",\n"
          << "  \"routed_connections\": " << metrics.routedConnections << ",\n"
          << "  \"unrouted_connections\": " << metrics.unroutedConnections << ",\n"
@@ -360,7 +461,10 @@ void writeJson( const std::string& aPath, const std::string& aBoardPath,
          << "  \"expanded_nodes\": " << metrics.expandedNodes << ",\n"
          << "  \"segments\": " << metrics.segmentCount << ",\n"
          << "  \"fanout_connections\": " << metrics.fanoutConnections << ",\n"
-         << "  \"complete\": " << ( aResult.complete ? "true" : "false" ) << ",\n"
+         << "  \"complete\": "
+         << ( !aResult.cancelled && aUnconnected == 0 && introducedDrcErrors == 0
+                      ? "true" : "false" ) << ",\n"
+         << "  \"worker_complete\": " << ( aResult.complete ? "true" : "false" ) << ",\n"
          << "  \"cancelled\": " << ( aResult.cancelled ? "true" : "false" ) << ",\n"
          << "  \"message\": \"" << jsonEscape( aResult.message ) << "\"\n"
          << "}\n";
@@ -389,6 +493,8 @@ int main( int argc, char** argv )
     try
     {
         const OPTIONS options = parseOptions( argc, argv );
+        if( !options.saveBoard.empty() && std::filesystem::exists( options.saveBoard ) )
+            throw std::runtime_error( "--save-board refuses to overwrite an existing file" );
         wxStarted = wxInitialize( argc, argv );
         if( !wxStarted )
             throw std::runtime_error( "wxWidgets initialization failed" );
@@ -413,20 +519,18 @@ int main( int argc, char** argv )
         }
 
         board->BuildListOfNets();
-        board->BuildConnectivity();
-
-        // This option is deliberately limited to the QA parity harness.  It
-        // lets a pinned Freerouting build consume the exact board that the
-        // native adapter was given, without making DSN/SES conversion part of
-        // the editor's routing architecture.  Export before creating a DRC
-        // engine or snapshot so the reference input is not affected by the
-        // native worker settings.
-        if( !options.exportDsn.empty() )
+        if( options.stripTracks )
         {
-            DSN::ExportBoardToSpecctraFile(
-                    board.get(), wxString::FromUTF8( options.exportDsn.c_str() ) );
-            return cleanup( 0 );
+            std::vector<PCB_TRACK*> tracks( board->Tracks().begin(), board->Tracks().end() );
+            for( PCB_TRACK* track : tracks )
+            {
+                if( track->IsLocked() )
+                    continue;
+                board->Remove( track );
+                delete track;
+            }
         }
+        board->BuildConnectivity();
 
         // Board files loaded by the QA utility intentionally do not own a
         // DRC engine.  Install the same engine/constraint resolver that the
@@ -438,6 +542,20 @@ int main( int argc, char** argv )
         rules.SetExt( "kicad_dru" );
         drcEngine->InitEngine( rules.Exists() ? rules : wxFileName() );
         board->GetDesignSettings().m_DRCEngine = std::move( drcEngine );
+
+        // Pour geometry must describe the actual copper after optional strip,
+        // and both engines must receive this same freshly filled input.
+        if( !board->Zones().empty() && !ZONE_FILLER( board.get(), nullptr ).Fill( board->Zones() ) )
+            throw std::runtime_error( "input zone refill failed" );
+        board->BuildConnectivity();
+        if( !options.exportDsn.empty() )
+        {
+            DSN::ExportBoardToSpecctraFile(
+                    board.get(), wxString::FromUTF8( options.exportDsn.c_str() ) );
+            if( !options.saveBoard.empty() )
+                KI_TEST::DumpBoardToFile( *board, options.saveBoard );
+            return cleanup( 0 );
+        }
 
         KICAD_AUTOROUTER::KICAD_BOARD_ADAPTER adapter( board.get() );
         KICAD_AUTOROUTER::AUTOROUTER_SETTINGS settings = adapter.CreateDefaultSettings();
@@ -548,21 +666,49 @@ int main( int argc, char** argv )
         }
 
         LIVE_DRC_RESULT baselineDrc;
+        board->GetConnectivity()->RecalculateRatsnest();
+        const int baselineUnconnected = board->GetConnectivity()->GetUnconnectedCount( false );
         if( options.liveDrc )
             baselineDrc = runLiveDrc( board.get() );
 
         const auto start = std::chrono::steady_clock::now();
-        KICAD_AUTOROUTER::ROUTING_RESULT result =
-                KICAD_AUTOROUTER::ROUTING_PIPELINE().Run( *snapshot, settings, {}, {} );
+        KICAD_AUTOROUTER::ROUTING_RESULT result;
+        if( options.importSes.empty() )
+            result = KICAD_AUTOROUTER::ROUTING_PIPELINE().Run( *snapshot, settings, {}, {} );
+        else
+        {
+            REFERENCE_IMPORT_COMMIT commit( *board );
+            if( !DSN::ImportSpecctraSession( board.get(), wxString::FromUTF8( options.importSes ),
+                                            commit ) )
+                throw std::runtime_error( "reference session import failed" );
+            commit.Push( wxEmptyString, 0 );
+            result.message = "Reference session evaluated by KiCad";
+        }
         const auto end = std::chrono::steady_clock::now();
         const auto runtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>( end - start )
                                        .count();
 
         LIVE_DRC_RESULT liveDrc;
+        applyProposal( board.get(), result, adapter );
+        const int unconnected = board->GetConnectivity()->GetUnconnectedCount( false );
+        // Measure physical copper for either engine with the same host API.
+        // Do not compare native synthetic connection counts with Java items.
+        result.metrics.viaCount = 0;
+        result.metrics.routedLengthIU = 0;
+        for( PCB_TRACK* track : board->Tracks() )
+        {
+            if( track->Type() == PCB_VIA_T )
+                ++result.metrics.viaCount;
+            else
+                result.metrics.routedLengthIU += track->GetLength();
+        }
         if( options.liveDrc && !result.cancelled )
-            liveDrc = countLiveDrc( board.get(), result, adapter );
+            liveDrc = runLiveDrc( board.get() );
 
-        writeJson( options.output, options.board, result, baselineDrc, liveDrc, runtimeMs );
+        writeJson( options.output, options.board, result, baselineDrc, liveDrc, runtimeMs,
+                   baselineUnconnected, unconnected );
+        if( !options.saveBoard.empty() )
+            KI_TEST::DumpBoardToFile( *board, options.saveBoard );
         return cleanup( result.cancelled ? 3 : 0 );
     }
     catch( const std::exception& exception )

@@ -168,6 +168,18 @@ struct ROUTING_PAD
     // fields keep that connection-local intent in the data-only snapshot.
     int                     fanoutSourceLayer = -1;
     int                     fanoutTargetLayer = -1;
+    // Real-pad index for a synthetic fanout landing.  This lets the batch
+    // loop fall back to the original pad if the pre-pass cannot legally place
+    // the synthetic escape in the current congestion state.
+    std::size_t              fanoutSourcePadIndex = std::numeric_limits<std::size_t>::max();
+};
+
+
+/** One member of a search's electrical start/destination set. */
+struct ROUTING_TERMINAL
+{
+    ROUTING_PAD pad;
+    std::size_t padIndex = std::numeric_limits<std::size_t>::max();
 };
 
 
@@ -226,6 +238,10 @@ struct ROUTING_NET
     // applied.  Board metadata for excluded nets is still retained so those
     // nets remain obstacles and participate in pair-clearance resolution.
     bool routable = false;
+    // Physical pad components in retained input copper, captured from KiCad's
+    // connectivity clusters (not inferred from ratsnest pairs or positions).
+    // Empty when existing copper is scheduled for replacement.
+    std::vector<std::vector<std::size_t>> connectedPadGroups;
 };
 
 
@@ -370,6 +386,7 @@ struct ROUTING_RESULT
 
 
 using ROUTER_CANCEL_CALLBACK = std::function<bool()>;
+using ROUTER_SEARCH_PROGRESS_CALLBACK = std::function<void( int )>;
 using ROUTER_PROGRESS_CALLBACK = std::function<void( const ROUTER_PROGRESS& )>;
 
 } // namespace KICAD_AUTOROUTER

@@ -1,0 +1,37 @@
+{
+  "repository": "niyathiarun/Basic-PCB-Projects",
+  "commit": "e5cc029002b4a4d235bbfd185e011e9debdb73df",
+  "files": [
+    {
+      "case": "regulated-5v",
+      "path": "project 1/5V regulated power supply pcbdesign.kicad_pcb",
+      "url": "https://raw.githubusercontent.com/niyathiarun/Basic-PCB-Projects/e5cc029002b4a4d235bbfd185e011e9debdb73df/project%201/5V%20regulated%20power%20supply%20pcbdesign.kicad_pcb",
+      "sha256": "1510cd68b8b675ab75499ecc94777c995e5a724e18477dee62fe06ca2315f30f"
+    },
+    {
+      "case": "555-astable",
+      "path": "project 2/555 Astable multivibrator.kicad_pcb",
+      "url": "https://raw.githubusercontent.com/niyathiarun/Basic-PCB-Projects/e5cc029002b4a4d235bbfd185e011e9debdb73df/project%202/555%20Astable%20multivibrator.kicad_pcb",
+      "sha256": "4250ed5c94a9b27acc7ea680b867999e23c675c10ed6efe2599603cc8fd8e697"
+    },
+    {
+      "case": "bjt-astable",
+      "path": "project 3/astable vibrator(B).kicad_pcb",
+      "url": "https://raw.githubusercontent.com/niyathiarun/Basic-PCB-Projects/e5cc029002b4a4d235bbfd185e011e9debdb73df/project%203/astable%20vibrator%28B%29.kicad_pcb",
+      "sha256": "e92c460f31e2c7c936c286366a5300cb02d4c9c0b7d70a1d22c4d905e32f6379"
+    },
+    {
+      "case": "bjt-astable",
+      "path": "project 3/astable vibrator(B).kicad_pro",
+      "url": "https://raw.githubusercontent.com/niyathiarun/Basic-PCB-Projects/e5cc029002b4a4d235bbfd185e011e9debdb73df/project%203/astable%20vibrator%28B%29.kicad_pro",
+      "sha256": "161cb7ce3837e8fe0ef9b70b2b8e459eb3498c9a97b3d4768eeb510ae461ed51"
+    }
+  ],
+  "license_note": "No license found in source repository; download into ignored build artifacts for local evaluation. Do not vendor or redistribute board designs without permission.",
+  "reference": {
+    "release": "v2.3.0",
+    "url": "https://github.com/freerouting/freerouting/releases/download/v2.3.0/freerouting-2.3.0.jar",
+    "sha256": "3cf18d608437740bc497db6b8ef5888e2e60a08de0def20691d1bad0c0e0ee24",
+    "commit": "2d4de019aa89e9fa3dc1dc44e09bf509760cafc1"
+  }
+}

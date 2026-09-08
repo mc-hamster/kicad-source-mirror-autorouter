@@ -1,11 +1,18 @@
 # Native autorouter engineering notes
 
+**Status: experimental; Freerouting parity has not been achieved.** See
+[Rework status and acceptance procedure](REWORK.md) for the implementation audit,
+actual port progress, and same-board KiCad validation. The mappings below must
+not be interpreted as proof that the named upstream algorithms are implemented.
+
 * [Requirements](autorouter-requirements.txt) — product scope and acceptance criteria.
 * [Technical discovery](technical-discovery.md) — KiCad/Freerouting seams and risk analysis.
 * [UPSTREAM.md](UPSTREAM.md) — pinned source commit and filename-level mapping.
 * [Freerouting Codex sync runbook](FREEROUTING-CODEX-SYNC.md) — direct-from-GitHub PR inventory,
   autorouter-only porting rules, ledger format, validation gates, and target-PR traceability.
 * [Regression corpus](regression-corpus.yml) — parity cases and required measurements.
+* [Three small online-board benchmarks](BASIC-BOARD-BENCHMARK.md) — official
+  Freerouting 2.3.0 versus native, repeatable downloads, timings, DRC, and saved PCBs.
 
 Metric JSON emitted by a corpus harness can be compared with:
 

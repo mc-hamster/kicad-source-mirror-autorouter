@@ -62,26 +62,42 @@ MAZE_RIPUP_RESOLVER::SelectVictim( const std::vector<ROUTING_CONNECTION>& aConne
 {
     std::optional<std::size_t> victim;
     int bestPriority = std::numeric_limits<int>::max();
+    std::size_t bestPadCount = std::numeric_limits<std::size_t>::max();
     double highestValue = -1.0;
+
+    auto padCountFor = [&]( int aNetCode )
+    {
+        auto it = std::find_if( aNets.begin(), aNets.end(),
+                                [aNetCode]( const ROUTING_NET& aNet )
+                                {
+                                    return aNet.netCode == aNetCode;
+                                } );
+        return it == aNets.end() ? std::size_t{ 0 } : it->padIndices.size();
+    };
 
     for( std::size_t i = 0; i < aConnections.size(); ++i )
     {
         const ROUTING_CONNECTION& connection = aConnections[i];
 
-        if( !connection.complete || connection.netCode == aCurrentNet )
+        if( !connection.complete || connection.netCode == aCurrentNet
+            || connection.isFanoutConnection )
             continue;
 
         const int priority = priorityFor( connection.netCode, aNets );
+        const std::size_t padCount = padCountFor( connection.netCode );
         const double length = lengthFor( connection );
         const double value = length
                              * ( 1.0 + std::max( 0, aRipupCost ) / 1000.0 )
                              + std::max( 0.0, connection.cost );
 
         if( !victim || priority < bestPriority
-            || ( priority == bestPriority && value > highestValue ) )
+            || ( priority == bestPriority
+                 && ( padCount < bestPadCount
+                      || ( padCount == bestPadCount && value > highestValue ) ) ) )
         {
             victim = i;
             bestPriority = priority;
+            bestPadCount = padCount;
             highestValue = value;
         }
     }

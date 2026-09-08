@@ -27,13 +27,24 @@
 #include <autorouter/AutorouterTypes.h>
 #include <autorouter/board/KicadBoardAdapter.h>
 #include <autorouter/drc/DesignRulesChecker.h>
+#include <autorouter/maze/MazeSearchEngine.h>
+#include <autorouter/maze/DestinationDistance.h>
+#include <autorouter/BoardHistory.h>
+#include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
 #include <autorouter/pipeline/BatchFanout.h>
+#include <autorouter/pipeline/AutorouteUnroutedReport.h>
 #include <autorouter/pipeline/RoutingPipeline.h>
 
 #include <board.h>
+#include <connectivity/connectivity_data.h>
+#include <footprint.h>
+#include <pad.h>
+#include <pcb_track.h>
 #include <pcbnew_utils/board_file_utils.h>
 
 #include <boost/test/unit_test.hpp>
+#include <fstream>
+#include <sstream>
 
 
 using namespace KICAD_AUTOROUTER;
@@ -81,6 +92,284 @@ AUTOROUTER_SETTINGS makeSettings()
 
 
 BOOST_AUTO_TEST_SUITE( NativeAutorouter )
+
+
+BOOST_AUTO_TEST_CASE( OrthogonalRoomRestraintMatchesPinnedFreerouting )
+{
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/room-restraint-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    std::string line;
+    int cases = 0;
+    while( std::getline( input, line ) )
+    {
+        BOOST_TEST_CONTEXT( "Reference case " << cases )
+        {
+            std::istringstream values( line );
+            auto readBox = [&]()
+            {
+                ROUTER_BOX box;
+                values >> box.minX >> box.minY >> box.maxX >> box.maxY;
+                BOOST_REQUIRE( !values.fail() );
+                return box;
+            };
+            const auto room = readBox();
+            const auto contained = readBox();
+            const auto obstacle = readBox();
+            std::size_t expectedCount;
+            values >> expectedCount;
+            const auto actual = SHAPE_SEARCH_TREE_90_DEGREE::RestrainShape(
+                    { room, 2, contained }, obstacle );
+            BOOST_REQUIRE_EQUAL( actual.size(), expectedCount );
+            auto checkBox = [&]( const ROUTER_BOX& box )
+            {
+                const ROUTER_BOX expected = readBox();
+                BOOST_CHECK_EQUAL( box.minX, expected.minX );
+                BOOST_CHECK_EQUAL( box.minY, expected.minY );
+                BOOST_CHECK_EQUAL( box.maxX, expected.maxX );
+                BOOST_CHECK_EQUAL( box.maxY, expected.maxY );
+            };
+            for( const auto& result : actual )
+            {
+                checkBox( result.GetShape() );
+                checkBox( result.GetContainedShape() );
+                BOOST_CHECK_EQUAL( result.GetLayer(), 2 );
+            }
+            values >> std::ws;
+            BOOST_CHECK( values.eof() );
+        }
+        ++cases;
+    }
+    BOOST_CHECK_EQUAL( cases, 512 );
+}
+
+
+BOOST_AUTO_TEST_CASE( SearchesEveryMemberOfTheDestinationSet )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.allowVias = false;
+    settings.maxExpandedNodes = 20;
+    // The nominal destination is behind a wall. Another pad in its
+    // connected set is reachable without crossing that wall.
+    board.obstacles.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE, 2, {}, {}, {},
+                                { 3000000, 0, 3500000, 3000000 } } );
+    ROUTING_PAD reachable = board.pads[1];
+    reachable.position = { 2000000, 1500000 };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    int expanded = 0;
+    const auto result = search.FindConnection( board.pads[0], board.pads[1], 0, expanded, {}, {},
+            { { board.pads[0], 0 } }, { { board.pads[1], 1 }, { reachable, 2 } } );
+    BOOST_REQUIRE( result );
+    BOOST_CHECK_EQUAL( result->fromPadIndex, 0 );
+    BOOST_CHECK_EQUAL( result->toPadIndex, 2 );
+    BOOST_CHECK( result->nodes.back().point == reachable.position );
+}
+
+
+BOOST_AUTO_TEST_CASE( SearchesEveryMemberOfTheStartSetWithoutInventingCopper )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.allowVias = false;
+    settings.maxExpandedNodes = 20;
+    board.obstacles.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE, 2, {}, {}, {},
+                                { 3000000, 0, 3500000, 3000000 } } );
+    ROUTING_PAD reachable = board.pads[0];
+    reachable.position = { 4000000, 1500000 };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    int expanded = 0;
+    const auto result = search.FindConnection( board.pads[0], board.pads[1], 0, expanded, {}, {},
+            { { board.pads[0], 0 }, { reachable, 2 } }, { { board.pads[1], 1 } } );
+    BOOST_REQUIRE( result );
+    BOOST_CHECK_EQUAL( result->fromPadIndex, 2 );
+    BOOST_CHECK_EQUAL( result->toPadIndex, 1 );
+    BOOST_CHECK( result->nodes.front().point == reachable.position );
+    // Backtracking must not prepend an unchecked segment to the nominal
+    // source on the other side of the wall.
+    for( const auto& node : result->nodes )
+        BOOST_CHECK_GE( node.point.x, 3500000 );
+}
+
+
+BOOST_AUTO_TEST_CASE( DestinationLowerBoundConsidersCheaperOtherLayer )
+{
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.viaCost = 1;
+    settings.planeViaCost = 1;
+    ROUTING_PAD far;
+    far.position = { 100000000, 0 };
+    far.layers = { 0 };
+    DESTINATION_DISTANCE destination;
+    destination.Configure( settings, far );
+    destination.Join( { 0, 0, 0, 0 }, 1 );
+    BOOST_CHECK_LE( destination.Calculate( { 0, 0 }, 0 ), 1.0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( RetainedCopperComponentsOfferEveryPadToTheBatchSearch )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads.push_back( board.pads[1] );
+    board.pads[2].position = { 4000000, 1500000 };
+    board.nets[0].padIndices = { 0, 1, 2 };
+    board.nets[0].connectedPadGroups = { { 0, 1 } };
+    board.nets[0].connections = { { 0, 2 } };
+    // Retained copper already joins pads 0 and 1 on another layer. The
+    // missing connection can be completed on layer 0 only from pad 1.
+    board.obstacles.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE, 2, { 0 }, {}, {},
+                                { 3000000, 0, 3500000, 3000000 } } );
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    settings.maxExpandedNodes = 20;
+    const auto result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.connections.size(), 1 );
+    BOOST_CHECK_EQUAL( result.connections[0].fromPadIndex, 2 );
+    BOOST_CHECK_EQUAL( result.connections[0].toPadIndex, 1 );
+    for( const auto& segment : result.segments )
+    {
+        BOOST_CHECK_GT( segment.start.x, 3500000 );
+        BOOST_CHECK_GT( segment.end.x, 3500000 );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( DuplicateRoutesCannotHideMissingConnectivityOrARippedBridge )
+{
+    ROUTING_NET net;
+    net.netCode = 1;
+    net.padIndices = { 0, 1, 2 };
+    net.connections = { { 0, 1 }, { 0, 2 } };
+    ROUTING_CONNECTION first;
+    first.netCode = 1;
+    first.complete = true;
+    first.fromPadIndex = 0;
+    first.toPadIndex = 1;
+    first.nodes = { { { 0, 0 }, 0 }, { { 1000, 0 }, 0 } };
+    ROUTING_CONNECTION bridge = first;
+    bridge.fromPadIndex = 1;
+    bridge.toPadIndex = 2;
+    bridge.nodes = { { { 1000, 0 }, 0 }, { { 2000, 0 }, 0 } };
+    std::vector<ROUTING_CONNECTION> routes{ first, first, first };
+    BOOST_CHECK_EQUAL( AUTOROUTE_UNROUTED_REPORT::CountMissing( net, routes ), 1 );
+    routes.push_back( bridge );
+    BOOST_CHECK_EQUAL( AUTOROUTE_UNROUTED_REPORT::CountMissing( net, routes ), 0 );
+    routes.pop_back();
+    // A stale logical completion has no copper and cannot replace the bridge.
+    bridge.nodes.resize( 1 );
+    routes.push_back( bridge );
+    BOOST_CHECK_EQUAL( AUTOROUTE_UNROUTED_REPORT::CountMissing( net, routes ), 1 );
+    BOOST_REQUIRE_EQUAL( AUTOROUTE_UNROUTED_REPORT::Build( { net }, routes ).size(), 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutShortcutCannotOverrideAnExplicitTerminalSet )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.maxExpandedNodes = 20;
+    ROUTING_PAD landing = board.pads[1];
+    landing.isFanoutTarget = true;
+    landing.fanoutSourceLayer = 0;
+    landing.fanoutTargetLayer = 1;
+    ROUTING_PAD actualTarget = board.pads[1];
+    actualTarget.position = { 2000000, 1500000 };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    int expanded = 0;
+    const auto result = search.FindConnection( board.pads[0], landing, 0, expanded, {}, {},
+            { { board.pads[0], 0 } }, { { actualTarget, 2 } } );
+    BOOST_REQUIRE( result );
+    BOOST_CHECK_EQUAL( result->toPadIndex, 2 );
+    BOOST_CHECK( result->nodes.back().point == actualTarget.position );
+}
+
+
+BOOST_AUTO_TEST_CASE( HistoryNeverTradesClearanceForCompletion )
+{
+    BOARD_HISTORY history( 1 );
+    ROUTING_RESULT clean;
+    clean.metrics.unroutedConnections = 20;
+    clean.metrics.routedConnections = 1;
+    ROUTING_RESULT invalid;
+    invalid.metrics.routedConnections = 1000000;
+    invalid.metrics.drcViolations = 1;
+    history.Add( invalid );
+    history.Add( clean );
+    BOOST_REQUIRE( history.Best() );
+    BOOST_CHECK_EQUAL( history.Best()->metrics.drcViolations, 0 );
+    history.Add( invalid );
+    BOOST_CHECK_EQUAL( history.Best()->metrics.drcViolations, 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( PadEndpointDoesNotExemptForeignCopper )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    obstacle.netCode = 2;
+    obstacle.box = { 900000, 1400000, 5100000, 1600000 };
+    board.obstacles.push_back( obstacle );
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.allowVias = false;
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    BOOST_CHECK( !search.CanUseSegment( 1, { board.pads[0].position, 0 },
+                                             { board.pads[1].position, 0 } ) );
+    ROUTING_RESULT result;
+    result.segments.push_back( { 1, 0, board.pads[0].position, board.pads[1].position, 100000 } );
+    BOOST_CHECK_GT( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( NewViaCannotReuseAnExistingDrill )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    ROUTING_OBSTACLE hole;
+    hole.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    hole.netCode = 1;
+    hole.start = hole.end = board.pads[0].position;
+    hole.radius = 100000;
+    hole.isHole = true;
+    hole.isExistingRoute = true;
+    hole.boardItemId = "existing-via";
+    board.obstacles.push_back( hole );
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    BOOST_CHECK( !search.CanUseSegment( 1, { hole.start, 0 }, { hole.start, 1 }, true ) );
+    ROUTING_RESULT result;
+    result.vias.push_back( { 1, hole.start, 0, 1, 300000, 150000, { 0, 1 } } );
+    BOOST_CHECK_GT( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( SameNetProposedViasStillRequireDrillSpacing )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.holeToHoleClearance = 250000;
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    ROUTING_RESULT result;
+    result.vias.push_back( { 1, { 2500000, 1500000 }, 0, 1, 300000, 150000, { 0, 1 } } );
+    result.vias.push_back( { 1, { 2800000, 1500000 }, 0, 1, 300000, 150000, { 0, 1 } } );
+    BOOST_CHECK_GT( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    ROUTING_CONNECTION firstVia;
+    firstVia.netCode = 1;
+    firstVia.complete = true;
+    firstVia.nodes = { { result.vias[0].position, 0 }, { result.vias[0].position, 1 } };
+    occupancy.Add( firstVia );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    BOOST_CHECK( !search.CanUseSegment( 1, { result.vias[1].position, 0 },
+                                             { result.vias[1].position, 1 }, true ) );
+}
 
 
 BOOST_AUTO_TEST_CASE( RoutesSimpleConnectionDeterministically )
@@ -501,8 +790,26 @@ BOOST_AUTO_TEST_CASE( GrowsAConnectedSetForMultiPadNets )
     BOOST_CHECK_EQUAL( result.metrics.totalConnections, 2 );
     BOOST_CHECK_EQUAL( result.metrics.routedConnections, 2 );
     BOOST_REQUIRE_EQUAL( result.connections.size(), 2 );
-    BOOST_CHECK_EQUAL( result.connections[1].fromPadIndex, 1 );
-    BOOST_CHECK_EQUAL( result.connections[1].toPadIndex, 2 );
+    // A ratsnest edge is a connectivity requirement, not a mandated pair of
+    // routing endpoints. Either orientation/tree is legal if all pads join.
+    std::vector<std::size_t> parent{ 0, 1, 2 };
+    auto root = [&]( std::size_t index )
+    {
+        while( parent[index] != index )
+            index = parent[index];
+        return index;
+    };
+    for( const auto& connection : result.connections )
+    {
+        BOOST_REQUIRE_LT( connection.fromPadIndex, parent.size() );
+        BOOST_REQUIRE_LT( connection.toPadIndex, parent.size() );
+        BOOST_REQUIRE( !connection.nodes.empty() );
+        BOOST_CHECK( connection.nodes.front().point == board.pads[connection.fromPadIndex].position );
+        BOOST_CHECK( connection.nodes.back().point == board.pads[connection.toPadIndex].position );
+        parent[root( connection.fromPadIndex )] = root( connection.toPadIndex );
+    }
+    BOOST_CHECK_EQUAL( root( 0 ), root( 1 ) );
+    BOOST_CHECK_EQUAL( root( 1 ), root( 2 ) );
 }
 
 
@@ -567,6 +874,59 @@ BOOST_AUTO_TEST_CASE( NetAssignedKeepoutStillBlocksTheNet )
     BOOST_CHECK( !result.complete );
     BOOST_CHECK_EQUAL( result.metrics.routedConnections, 0 );
     BOOST_CHECK_EQUAL( result.metrics.unroutedConnections, 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesCopperClustersAcrossSeveralTracks )
+{
+    BOARD board;
+    auto* net = new NETINFO_ITEM( &board, "CLUSTER", 1 );
+    board.Add( net );
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    for( int x : { 1000000, 5000000, 8000000 } )
+    {
+        auto* pad = new PAD( footprint );
+        pad->SetAttribute( PAD_ATTRIB::SMD );
+        pad->SetLayerSet( LSET( { F_Cu } ) );
+        pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
+        pad->SetSize( PADSTACK::ALL_LAYERS, { 300000, 300000 } );
+        pad->SetPosition( { x, 1000000 } );
+        pad->SetNet( net );
+        footprint->Add( pad );
+    }
+    // The ratsnest anchor is at a dangling track end, not beside any pad.
+    for( const auto& [start, end] : std::vector<std::pair<int, int>>{
+                 { 1000000, 3000000 }, { 3000000, 5000000 }, { 5000000, 6000000 },
+                 { 6000000, 7000000 } } )
+    {
+        auto* track = new PCB_TRACK( &board );
+        track->SetStart( { start, 1000000 } );
+        track->SetEnd( { end, 1000000 } );
+        track->SetWidth( 100000 );
+        track->SetLayer( F_Cu );
+        track->SetNet( net );
+        board.Add( track );
+    }
+    board.BuildConnectivity();
+    board.GetConnectivity()->RecalculateRatsnest();
+    BOOST_REQUIRE_EQUAL( board.GetConnectivity()->GetUnconnectedCount( false ), 1 );
+    KICAD_BOARD_ADAPTER adapter( &board );
+    auto settings = adapter.CreateDefaultSettings();
+    const auto snapshot = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->nets.size(), 1 );
+    const auto& captured = snapshot->nets.front();
+    BOOST_REQUIRE_EQUAL( captured.connectedPadGroups.size(), 1 );
+    BOOST_CHECK_EQUAL( captured.connectedPadGroups.front().size(), 2 );
+    BOOST_CHECK_EQUAL( captured.connections.size(), 1 );
+    for( const auto index : captured.connectedPadGroups.front() )
+        BOOST_CHECK_LE( snapshot->pads[index].position.x, 5000000 );
+    settings.allowRipupExisting = true;
+    const auto reroute = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( reroute );
+    BOOST_CHECK( reroute->nets.front().connectedPadGroups.empty() );
+    BOOST_CHECK_EQUAL( board.Tracks().size(), 4 );
 }
 
 

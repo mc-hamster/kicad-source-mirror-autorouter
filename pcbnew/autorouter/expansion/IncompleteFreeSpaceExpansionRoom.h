@@ -29,6 +29,19 @@ class INCOMPLETE_FREE_SPACE_EXPANSION_ROOM : public FREE_SPACE_EXPANSION_ROOM
 {
 public:
     using FREE_SPACE_EXPANSION_ROOM::FREE_SPACE_EXPANSION_ROOM;
+
+    INCOMPLETE_FREE_SPACE_EXPANSION_ROOM( ROUTER_BOX aShape, int aLayer,
+                                          ROUTER_BOX aContainedShape ) :
+            FREE_SPACE_EXPANSION_ROOM( 0, aLayer, aShape ),
+            m_containedShape( aContainedShape )
+    {
+    }
+
+    const ROUTER_BOX& GetContainedShape() const { return m_containedShape; }
+    void SetContainedShape( ROUTER_BOX aShape ) { m_containedShape = aShape; }
+
+private:
+    ROUTER_BOX m_containedShape{ 1, 1, 0, 0 };
 };
 
 } // namespace KICAD_AUTOROUTER

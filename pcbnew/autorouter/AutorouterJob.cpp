@@ -23,6 +23,7 @@
 
 #include "AutorouterJob.h"
 
+#include <algorithm>
 #include <exception>
 #include <utility>
 
@@ -35,6 +36,19 @@ AUTOROUTER_JOB::AUTOROUTER_JOB( std::shared_ptr<const BOARD_SNAPSHOT> aSnapshot,
         m_snapshot( std::move( aSnapshot ) ),
         m_settings( std::move( aSettings ) )
 {
+    // Seed the dialog before the worker thread gets scheduled.  Without this
+    // initial snapshot the first paint shows "0 of 0" even though the job is
+    // already preparing a board, which looks like the autorouter is hung.
+    if( m_snapshot )
+    {
+        m_progress.maxPasses = std::max( 1, m_settings.maxPasses );
+        m_progress.totalConnections = 0;
+
+        for( const ROUTING_NET& net : m_snapshot->nets )
+            m_progress.totalConnections += static_cast<int>( net.connections.size() );
+
+        m_progress.stage = "Preparing SMD fanout";
+    }
 }
 
 

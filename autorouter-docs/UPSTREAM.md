@@ -1,5 +1,11 @@
 # Freerouting upstream mapping
 
+**Correction:** the table records intended responsibility/file correspondence.
+Entries labelled "port" historically include experimental substitutes. In
+particular, the active search is grid/visibility based, the shover only shortens
+paths, and the room classes do not form an active upstream-equivalent search.
+[REWORK.md](REWORK.md) is authoritative for implementation and validation status.
+
 This document is the synchronization contract for the native KiCad autorouter.  The KiCad
 implementation keeps the Freerouting package layout where it is useful: `maze`, `pipeline`, and
 the board-facing `board` adapter are separate directories, and the principal C++ filenames use

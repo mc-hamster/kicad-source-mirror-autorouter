@@ -52,8 +52,9 @@ private:
     bool routeNet( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
                    const ROUTING_NET& aNet, int aRetry, ROUTING_OCCUPANCY& aOccupancy,
                    const AUTOROUTE_ENGINE& aEngine,
-                   std::vector<ROUTING_CONNECTION>& aConnections, int& aExpandedNodes,
-                   const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+                   std::vector<ROUTING_CONNECTION>& aConnections, int& aExpandedNodes, int& aRipups,
+                   const ROUTER_CANCEL_CALLBACK& aCancel,
+                   const ROUTER_SEARCH_PROGRESS_CALLBACK& aSearchProgress ) const;
 
     void buildGeometry( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
                         const std::vector<ROUTING_CONNECTION>& aConnections,
@@ -61,8 +62,6 @@ private:
 
     const ROUTING_PAD* firstPad( const BOARD_SNAPSHOT& aBoard, const ROUTING_NET& aNet ) const;
     double netHalfPerimeter( const BOARD_SNAPSHOT& aBoard, const ROUTING_NET& aNet ) const;
-    bool isAlreadyRouted( const std::vector<ROUTING_CONNECTION>& aConnections,
-                          int aNetCode, std::size_t aExpectedConnections ) const;
 };
 
 } // namespace KICAD_AUTOROUTER

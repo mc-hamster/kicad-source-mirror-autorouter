@@ -37,9 +37,20 @@ AUTOROUTE_ENGINE::AUTOROUTE_ENGINE( const BOARD_SNAPSHOT& aBoard,
 
 std::optional<ROUTING_CONNECTION> AUTOROUTE_ENGINE::AutorouteConnection(
         const ROUTING_PAD& aStart, const ROUTING_PAD& aTarget, int aRetry, int& aExpandedNodes,
-        const ROUTER_CANCEL_CALLBACK& aCancel ) const
+        const ROUTER_CANCEL_CALLBACK& aCancel,
+        const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress,
+        const std::vector<ROUTING_TERMINAL>& aStarts,
+        const std::vector<ROUTING_TERMINAL>& aTargets ) const
 {
-    return m_search.FindConnection( aStart, aTarget, aRetry, aExpandedNodes, aCancel );
+    return m_search.FindConnection( aStart, aTarget, aRetry, aExpandedNodes, aCancel, aProgress,
+                                    aStarts, aTargets );
+}
+
+
+std::vector<ROUTING_CONNECTION> AUTOROUTE_ENGINE::FindConflictingConnections(
+        const ROUTING_CONNECTION& aCandidate ) const
+{
+    return m_search.FindConflictingConnections( aCandidate );
 }
 
 

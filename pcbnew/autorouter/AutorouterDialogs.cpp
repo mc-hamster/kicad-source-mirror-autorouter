@@ -90,7 +90,7 @@ void DIALOG_AUTOROUTER_PROGRESS::updateProgress( wxTimerEvent& )
     m_gauge->SetValue( std::clamp( progress.routedConnections, 0, total ) );
     m_stage->SetLabel( progress.stage.empty() ? _( "Routing..." )
                                                : wxString::FromUTF8( progress.stage.c_str() ) );
-    m_counts->SetLabel( wxString::Format( _( "%d of %d connections, %d expanded nodes, %d rip-ups, %lld ms" ),
+    m_counts->SetLabel( wxString::Format( _( "%d of %d routing tasks, %d expanded nodes, %d rip-ups, %lld ms" ),
                                           progress.routedConnections, progress.totalConnections,
                                           progress.expandedNodes, progress.ripups,
                                           static_cast<long long>( progress.elapsedMilliseconds ) ) );
@@ -159,7 +159,7 @@ DIALOG_AUTOROUTER_REVIEW::DIALOG_AUTOROUTER_REVIEW( wxWindow* aParent,
                                     metrics.drcViolations > 0
                                             ? _( "The proposal contains design-rule violations." )
                                             : aResult.complete
-                                                      ? _( "The board was routed completely." )
+                                                      ? _( "Routing tasks finished. Verify board connectivity and design rules after acceptance." )
                                                       : _( "The proposal contains unrouted connections." ) );
     title->Wrap( FromDIP( 420 ) );
     outer->Add( title, 0, wxEXPAND | wxALL, FromDIP( 10 ) );
@@ -181,9 +181,9 @@ DIALOG_AUTOROUTER_REVIEW::DIALOG_AUTOROUTER_REVIEW( wxWindow* aParent,
 
     auto* details = new wxStaticText(
             this, wxID_ANY,
-            wxString::Format( _( "Routed connections: %d / %d\n"
-                                 "Completion: %.1f%%\n"
-                                 "Unrouted connections: %d\n"
+            wxString::Format( _( "Finished routing tasks: %d / %d\n"
+                                 "Routing task completion: %.1f%%\n"
+                                 "Unfinished routing tasks: %d\n"
                                  "Segments: %d\n"
                                  "Vias: %d\n"
                                  "SMD fanout connections: %d\n"

@@ -41,7 +41,8 @@ public:
      * via/trace is materialized by the normal proposal path.
      */
     static BOARD_SNAPSHOT PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
-                                           const AUTOROUTER_SETTINGS& aSettings );
+                                           const AUTOROUTER_SETTINGS& aSettings,
+                                           const ROUTER_CANCEL_CALLBACK& aCancel = {} );
 
     static std::vector<std::size_t> PlaneTargetsFor( const BOARD_SNAPSHOT& aBoard,
                                                      const ROUTING_NET& aNet );

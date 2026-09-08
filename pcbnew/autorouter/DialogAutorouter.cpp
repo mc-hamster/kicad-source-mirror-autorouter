@@ -83,9 +83,13 @@ DIALOG_AUTOROUTER_SETTINGS::DIALOG_AUTOROUTER_SETTINGS(
         m_board( aBoard )
 {
     auto* outer = new wxBoxSizer( wxVERTICAL );
+    auto* content = new wxScrolledWindow( this, wxID_ANY, wxDefaultPosition, wxDefaultSize,
+                                          wxVSCROLL | wxTAB_TRAVERSAL );
+    content->SetScrollRate( 0, FromDIP( 10 ) );
+    auto* contentSizer = new wxBoxSizer( wxVERTICAL );
 
-    auto* layerBox = new wxStaticBoxSizer( wxVERTICAL, this, _( "Routing layers" ) );
-    auto* layerScroll = new wxScrolledWindow( this, wxID_ANY, wxDefaultPosition,
+    auto* layerBox = new wxStaticBoxSizer( wxVERTICAL, content, _( "Routing layers" ) );
+    auto* layerScroll = new wxScrolledWindow( content, wxID_ANY, wxDefaultPosition,
                                               FromDIP( wxSize( 560, 190 ) ), wxVSCROLL );
     layerScroll->SetScrollRate( 0, FromDIP( 10 ) );
 
@@ -129,61 +133,65 @@ DIALOG_AUTOROUTER_SETTINGS::DIALOG_AUTOROUTER_SETTINGS(
     layerScroll->SetSizer( layerGrid );
     layerScroll->FitInside();
     layerBox->Add( layerScroll, 1, wxEXPAND | wxALL, FromDIP( 6 ) );
-    outer->Add( layerBox, 1, wxEXPAND | wxALL, FromDIP( 8 ) );
+    contentSizer->Add( layerBox, 0, wxEXPAND | wxALL, FromDIP( 8 ) );
 
-    auto* costBox = new wxStaticBoxSizer( wxVERTICAL, this, _( "Routing costs and limits" ) );
+    auto* costBox = new wxStaticBoxSizer( wxVERTICAL, content, _( "Routing costs and limits" ) );
     auto* costGrid = new wxFlexGridSizer( 0, 2, 6, 6 );
     costGrid->AddGrowableCol( 1, 1 );
 
-    costGrid->Add( new wxStaticText( this, wxID_ANY, _( "Search grid (mm)" ) ), 0,
+    costGrid->Add( new wxStaticText( content, wxID_ANY, _( "Search grid (mm)" ) ), 0,
                    wxALIGN_CENTER_VERTICAL );
-    m_gridStep = new wxSpinCtrlDouble( this, wxID_ANY, wxEmptyString, wxDefaultPosition,
+    m_gridStep = new wxSpinCtrlDouble( content, wxID_ANY, wxEmptyString, wxDefaultPosition,
                                        wxDefaultSize, wxSP_ARROW_KEYS, 0.001, 10.0,
                                        pcbIUScale.IUTomm( m_settings.gridStepIU ), 0.001 );
     m_gridStep->SetDigits( 3 );
     costGrid->Add( m_gridStep, 0, wxEXPAND );
 
-    m_viaCost = addIntegerControl( this, costGrid, _( "Via cost" ), m_settings.viaCost, 0, 1000000 );
-    m_planeViaCost = addIntegerControl( this, costGrid, _( "Plane via cost" ),
+    m_viaCost = addIntegerControl( content, costGrid, _( "Via cost" ), m_settings.viaCost, 0,
+                                   1000000 );
+    m_planeViaCost = addIntegerControl( content, costGrid, _( "Plane via cost" ),
                                         m_settings.planeViaCost, 0, 1000000 );
-    m_traceLengthCost = addIntegerControl( this, costGrid, _( "Trace length cost" ),
+    m_traceLengthCost = addIntegerControl( content, costGrid, _( "Trace length cost" ),
                                            m_settings.traceLengthCost, 0, 1000000 );
-    m_congestionCost = addIntegerControl( this, costGrid, _( "Congestion cost" ),
+    m_congestionCost = addIntegerControl( content, costGrid, _( "Congestion cost" ),
                                           m_settings.congestionCost, 0, 1000000 );
-    m_bendCost = addIntegerControl( this, costGrid, _( "Bend cost" ), m_settings.bendCost, 0, 1000000 );
-    m_startRipupCost = addIntegerControl( this, costGrid, _( "Start rip-up cost" ),
+    m_bendCost = addIntegerControl( content, costGrid, _( "Bend cost" ), m_settings.bendCost, 0,
+                                    1000000 );
+    m_startRipupCost = addIntegerControl( content, costGrid, _( "Start rip-up cost" ),
                                           m_settings.startRipupCost, 0, 1000000 );
-    m_maxIterations = addIntegerControl( this, costGrid, _( "Maximum iterations" ),
+    m_maxIterations = addIntegerControl( content, costGrid, _( "Maximum iterations" ),
                                          m_settings.maxIterations, 1, 1000000 );
-    m_maxPasses = addIntegerControl( this, costGrid, _( "Routing passes" ), m_settings.maxPasses, 1,
+    m_maxPasses = addIntegerControl( content, costGrid, _( "Routing passes" ), m_settings.maxPasses, 1,
                                      1000000 );
-    m_optimizationPasses = addIntegerControl( this, costGrid, _( "Optimization passes" ),
+    m_optimizationPasses = addIntegerControl( content, costGrid, _( "Optimization passes" ),
                                               m_settings.optimizationPasses, 0, 1000000 );
-    m_maxOptimizationItems = addIntegerControl( this, costGrid, _( "Maximum optimization items" ),
+    m_maxOptimizationItems = addIntegerControl( content, costGrid, _( "Maximum optimization items" ),
                                                 m_settings.maxOptimizationItems, 0, 100000000 );
-    m_maxRipups = addIntegerControl( this, costGrid, _( "Maximum rip-ups" ), m_settings.maxRipups, 0,
+    m_maxRipups = addIntegerControl( content, costGrid, _( "Maximum rip-ups" ), m_settings.maxRipups, 0,
                                      1000000 );
-    m_maxExpandedNodes = addIntegerControl( this, costGrid, _( "Maximum expanded nodes" ),
+    m_maxExpandedNodes = addIntegerControl( content, costGrid, _( "Maximum expanded nodes" ),
                                             m_settings.maxExpandedNodes, 1, 100000000 );
-    m_maxFanoutPasses = addIntegerControl( this, costGrid, _( "Maximum fanout passes" ),
+    m_maxFanoutPasses = addIntegerControl( content, costGrid, _( "Maximum fanout passes" ),
                                            m_settings.maxFanoutPasses, 0, 1000000 );
-    m_routingPriority = addIntegerControl( this, costGrid, _( "Routing priority" ),
+    m_routingPriority = addIntegerControl( content, costGrid, _( "Routing priority" ),
                                             m_settings.routingPriority, -1000000, 1000000 );
 
     costBox->Add( costGrid, 0, wxEXPAND | wxALL, FromDIP( 8 ) );
-    outer->Add( costBox, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP( 8 ) );
+    contentSizer->Add( costBox, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP( 8 ) );
 
-    auto* behaviorBox = new wxStaticBoxSizer( wxVERTICAL, this, _( "Routing behavior" ) );
-    m_allowRipupExisting = new wxCheckBox( this, wxID_ANY, _( "Allow rip-up of existing tracks and vias" ) );
-    m_allowViaInSmdPad = new wxCheckBox( this, wxID_ANY,
+    auto* behaviorBox = new wxStaticBoxSizer( wxVERTICAL, content, _( "Routing behavior" ) );
+    m_allowRipupExisting = new wxCheckBox( content, wxID_ANY,
+                                           _( "Allow rip-up of existing tracks and vias" ) );
+    m_allowViaInSmdPad = new wxCheckBox( content, wxID_ANY,
                                         _( "Allow vias directly in SMD pads" ) );
-    m_allowRipupRouted = new wxCheckBox( this, wxID_ANY, _( "Allow rip-up of autorouted connections" ) );
-    m_allowVias = new wxCheckBox( this, wxID_ANY, _( "Allow via insertion" ) );
-    m_enableFanout = new wxCheckBox( this, wxID_ANY, _( "Run SMD fanout pre-pass" ) );
-    m_stopAfterFirstComplete = new wxCheckBox( this, wxID_ANY,
+    m_allowRipupRouted = new wxCheckBox( content, wxID_ANY,
+                                         _( "Allow rip-up of autorouted connections" ) );
+    m_allowVias = new wxCheckBox( content, wxID_ANY, _( "Allow via insertion" ) );
+    m_enableFanout = new wxCheckBox( content, wxID_ANY, _( "Run SMD fanout pre-pass" ) );
+    m_stopAfterFirstComplete = new wxCheckBox( content, wxID_ANY,
                                                _( "Stop after the first complete route" ) );
-    m_optimizeAfterComplete = new wxCheckBox( this, wxID_ANY, _( "Optimize after routing" ) );
-    m_routeOnlyUnconnected = new wxCheckBox( this, wxID_ANY,
+    m_optimizeAfterComplete = new wxCheckBox( content, wxID_ANY, _( "Optimize after routing" ) );
+    m_routeOnlyUnconnected = new wxCheckBox( content, wxID_ANY,
                                              _( "Route only currently unconnected nets" ) );
 
     m_allowVias->SetValue( m_settings.allowVias );
@@ -203,37 +211,44 @@ DIALOG_AUTOROUTER_SETTINGS::DIALOG_AUTOROUTER_SETTINGS(
     behaviorBox->Add( m_stopAfterFirstComplete, 0, wxBOTTOM, FromDIP( 3 ) );
     behaviorBox->Add( m_optimizeAfterComplete, 0, wxBOTTOM, FromDIP( 3 ) );
     behaviorBox->Add( m_routeOnlyUnconnected, 0 );
-    outer->Add( behaviorBox, 0, wxEXPAND | wxALL, FromDIP( 8 ) );
+    contentSizer->Add( behaviorBox, 0, wxEXPAND | wxALL, FromDIP( 8 ) );
 
-    auto* netBox = new wxStaticBoxSizer( wxVERTICAL, this, _( "Net and netclass filters" ) );
+    auto* netBox = new wxStaticBoxSizer( wxVERTICAL, content, _( "Net and netclass filters" ) );
     auto* netGrid = new wxFlexGridSizer( 0, 2, 5, 5 );
     netGrid->AddGrowableCol( 1, 1 );
-    netGrid->Add( new wxStaticText( this, wxID_ANY, _( "Include netclasses (comma separated)" ) ), 0,
+    netGrid->Add( new wxStaticText( content, wxID_ANY,
+                                    _( "Include netclasses (comma separated)" ) ), 0,
                   wxALIGN_CENTER_VERTICAL );
-    m_includeNetClasses = new wxTextCtrl( this, wxID_ANY );
+    m_includeNetClasses = new wxTextCtrl( content, wxID_ANY );
     setTextValue( m_includeNetClasses, m_settings.includeNetClasses );
     netGrid->Add( m_includeNetClasses, 1, wxEXPAND );
-    netGrid->Add( new wxStaticText( this, wxID_ANY, _( "Exclude netclasses (comma separated)" ) ), 0,
+    netGrid->Add( new wxStaticText( content, wxID_ANY,
+                                    _( "Exclude netclasses (comma separated)" ) ), 0,
                   wxALIGN_CENTER_VERTICAL );
-    m_excludeNetClasses = new wxTextCtrl( this, wxID_ANY );
+    m_excludeNetClasses = new wxTextCtrl( content, wxID_ANY );
     setTextValue( m_excludeNetClasses, m_settings.excludeNetClasses );
     netGrid->Add( m_excludeNetClasses, 1, wxEXPAND );
-    netGrid->Add( new wxStaticText( this, wxID_ANY, _( "Include nets (comma separated)" ) ), 0,
+    netGrid->Add( new wxStaticText( content, wxID_ANY, _( "Include nets (comma separated)" ) ), 0,
                   wxALIGN_CENTER_VERTICAL );
-    m_includeNets = new wxTextCtrl( this, wxID_ANY );
+    m_includeNets = new wxTextCtrl( content, wxID_ANY );
     setTextValue( m_includeNets, m_settings.includeNets );
     netGrid->Add( m_includeNets, 1, wxEXPAND );
-    netGrid->Add( new wxStaticText( this, wxID_ANY, _( "Exclude nets (comma separated)" ) ), 0,
+    netGrid->Add( new wxStaticText( content, wxID_ANY, _( "Exclude nets (comma separated)" ) ), 0,
                   wxALIGN_CENTER_VERTICAL );
-    m_excludeNets = new wxTextCtrl( this, wxID_ANY );
+    m_excludeNets = new wxTextCtrl( content, wxID_ANY );
     setTextValue( m_excludeNets, m_settings.excludeNets );
     netGrid->Add( m_excludeNets, 1, wxEXPAND );
     netBox->Add( netGrid, 0, wxEXPAND | wxALL, FromDIP( 8 ) );
-    outer->Add( netBox, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP( 8 ) );
+    contentSizer->Add( netBox, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP( 8 ) );
+
+    content->SetSizer( contentSizer );
+    content->FitInside();
+    content->SetMinSize( FromDIP( wxSize( 600, 500 ) ) );
+    outer->Add( content, 1, wxEXPAND | wxLEFT | wxRIGHT, FromDIP( 8 ) );
 
     outer->Add( CreateStdDialogButtonSizer( wxOK | wxCANCEL ), 0,
                 wxEXPAND | wxALL, FromDIP( 8 ) );
-    SetSizerAndFit( outer );
+    SetSizer( outer );
     SetMinSize( FromDIP( wxSize( 600, 600 ) ) );
     SetupStandardButtons();
     finishDialogSettings();

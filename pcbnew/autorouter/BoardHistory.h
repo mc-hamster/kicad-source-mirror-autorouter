@@ -53,7 +53,6 @@ public:
         std::lock_guard lock( m_mutex );
         BOARD_HISTORY_ENTRY entry;
         entry.result = aResult;
-        entry.score = score( aResult );
 
         if( m_entries.size() >= m_maximum )
         {
@@ -61,9 +60,9 @@ public:
                     m_entries.begin(), m_entries.end(),
                     []( const BOARD_HISTORY_ENTRY& aLeft, const BOARD_HISTORY_ENTRY& aRight )
                     {
-                        return aLeft.score < aRight.score;
+                        return better( aRight.result, aLeft.result );
                     } );
-            if( worst != m_entries.end() && worst->score >= entry.score )
+            if( worst != m_entries.end() && !better( entry.result, worst->result ) )
                 return;
             if( worst != m_entries.end() )
                 m_entries.erase( worst );
@@ -82,7 +81,7 @@ public:
                 m_entries.begin(), m_entries.end(),
                 []( const BOARD_HISTORY_ENTRY& aLeft, const BOARD_HISTORY_ENTRY& aRight )
                 {
-                    return aLeft.score < aRight.score;
+                    return better( aRight.result, aLeft.result );
                 } );
         return best->result;
     }
@@ -100,16 +99,18 @@ public:
     }
 
 private:
-    static double score( const ROUTING_RESULT& aResult )
+    static bool better( const ROUTING_RESULT& aLeft, const ROUTING_RESULT& aRight )
     {
-        // Completion dominates; clean, short and via-light routes break ties.
-        // Completion is the primary Freerouting objective.  A single extra
-        // routed connection must dominate cosmetic length/via improvements,
-        // while DRC violations remain a strong (but secondary) penalty.
-        return static_cast<double>( aResult.metrics.routedConnections ) * 1.0e12
-               - static_cast<double>( aResult.metrics.drcViolations ) * 1.0e9
-               - static_cast<double>( aResult.metrics.viaCount ) * 1.0e4
-               - aResult.metrics.routedLengthIU * 1.0e-3;
+        // Lexicographic priorities cannot be overturned by arbitrary board
+        // size or length. Never restore more connectivity at the expense of
+        // additional clearance violations.
+        if( aLeft.metrics.drcViolations != aRight.metrics.drcViolations )
+            return aLeft.metrics.drcViolations < aRight.metrics.drcViolations;
+        if( aLeft.metrics.unroutedConnections != aRight.metrics.unroutedConnections )
+            return aLeft.metrics.unroutedConnections < aRight.metrics.unroutedConnections;
+        if( aLeft.metrics.viaCount != aRight.metrics.viaCount )
+            return aLeft.metrics.viaCount < aRight.metrics.viaCount;
+        return aLeft.metrics.routedLengthIU < aRight.metrics.routedLengthIU;
     }
 
     std::size_t                    m_maximum;

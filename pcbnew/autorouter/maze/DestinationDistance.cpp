@@ -159,34 +159,26 @@ double DESTINATION_DISTANCE::Calculate( const ROUTER_POINT& aPoint, int aLayer )
                                           : static_cast<int>(
                                                     std::distance( m_settings->layers.begin(), it ) );
 
-    const ROUTER_BOX* bestBox = nullptr;
-    if( ordinal <= m_firstOrdinal && m_hasComponentBox )
-        bestBox = &m_componentBox;
-    else if( ordinal >= m_lastOrdinal && m_hasSolderBox )
-        bestBox = &m_solderBox;
-    else if( m_hasInnerBox )
-        bestBox = &m_innerBox;
-
-    if( !bestBox )
-    {
-        if( m_hasComponentBox )
-            bestBox = &m_componentBox;
-        else if( m_hasSolderBox )
-            bestBox = &m_solderBox;
-        else if( m_hasInnerBox )
-            bestBox = &m_innerBox;
-    }
-
-    if( !bestBox )
-        return std::numeric_limits<double>::max();
-
     const double grid = std::max( 1.0, static_cast<double>( m_settings->gridStepIU ) );
     const double traceCost = minimumTraceCost( *m_settings );
-    const double viaCost = std::max( 0, m_settings->viaCost );
-    return axisDistance( aPoint, *bestBox ) / grid * traceCost + viaCost *
-           ( ( bestBox == &m_componentBox && ordinal != m_firstOrdinal )
-             || ( bestBox == &m_solderBox
-                          && ordinal != m_lastOrdinal ) );
+    // Use the minimum across destination regions. Preferring a distant
+    // same-layer box can overestimate a nearby destination one via away.
+    // The plane cost is a conservative lower bound for either route kind.
+    const double viaCost = std::max( 0, std::min( m_settings->viaCost,
+                                                  m_settings->planeViaCost ) );
+    double best = std::numeric_limits<double>::max();
+    const auto consider = [&]( const ROUTER_BOX& box, bool present, bool needsVia )
+    {
+        if( present && ( !needsVia || m_settings->allowVias ) )
+            best = std::min( best, axisDistance( aPoint, box ) / grid * traceCost
+                                       + ( needsVia ? viaCost : 0.0 ) );
+    };
+    consider( m_componentBox, m_hasComponentBox, ordinal != m_firstOrdinal );
+    consider( m_solderBox, m_hasSolderBox, ordinal != m_lastOrdinal );
+    // Inner boxes combine multiple layers, so no same-layer assertion is
+    // possible. Zero transition cost remains an admissible lower bound.
+    consider( m_innerBox, m_hasInnerBox, false );
+    return best;
 }
 
 } // namespace KICAD_AUTOROUTER

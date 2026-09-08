@@ -417,6 +417,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/AutorouterTool.cpp
     autorouter/DialogAutorouter.cpp
     autorouter/board/KicadBoardAdapter.cpp
+    autorouter/board/searchtree/ShapeSearchTree90Degree.cpp
     autorouter/drill/DrillPage.cpp
     autorouter/drill/DrillPageArray.cpp
     autorouter/drc/DesignRulesChecker.cpp

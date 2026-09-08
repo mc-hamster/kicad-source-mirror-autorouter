@@ -141,6 +141,22 @@ add_executable( kicad-cli WIN32
     ${KICAD_RESOURCES}
     )
 
+if( APPLE )
+    # Keep the in-tree macOS bundle runnable without requiring developers to set
+    # KICAD_RUN_FROM_BUILD_DIR.  bitmap_store loads this archive from the bundle's
+    # SharedSupport/resources directory; without it every toolbar bitmap degrades
+    # to the built-in question-mark placeholder.
+    add_dependencies( kicad bitmap_archive_build )
+    add_custom_command( TARGET kicad POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${OSX_BUNDLE_BUILD_DIR}/${OSX_BUNDLE_SUP_DIR}/resources"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_BINARY_DIR}/resources/images.tar.gz"
+                "${OSX_BUNDLE_BUILD_DIR}/${OSX_BUNDLE_SUP_DIR}/resources/images.tar.gz"
+        COMMENT "Copying bitmap archive into the in-tree KiCad bundle"
+        )
+endif()
+
 if( MSVC )
    # The cli needs subsystem:console or else we can't link wmain/main
    set_target_properties(kicad-cli PROPERTIES COMPILE_DEFINITIONS_DEBUG "_CONSOLE")
