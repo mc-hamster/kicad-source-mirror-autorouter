@@ -372,10 +372,13 @@ public:
 
     /** Serialize a BOARD to an OUTPUTFORMATTER without file I/O or Prettify.
      *  Handles init(), EmbedFonts/ClearEmbeddedFonts, header, Format(), and footer.
+     *  Set aUpdateEmbeddedFonts to false for a snapshot that must not change
+     *  the source board's embedded font state.
      *  The caller owns the formatter and is responsible for flushing/closing it.
      *  Skips GroupsSanityCheck (no UI interaction allowed from timer callbacks). */
     void FormatBoardToFormatter( OUTPUTFORMATTER* aOut, BOARD* aBoard,
-                                 const std::map<std::string, UTF8>* aProperties = nullptr );
+                                 const std::map<std::string, UTF8>* aProperties = nullptr,
+                                 bool aUpdateEmbeddedFonts = true );
 
     void DoLoad( LINE_READER& aReader, BOARD& aBoard, bool aIsNewLoad, const std::map<std::string, UTF8>* aProperties,
                  PROGRESS_REPORTER* aProgressReporter, unsigned aLineCount );

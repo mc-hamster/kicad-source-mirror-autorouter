@@ -101,7 +101,9 @@ void DIALOG_AUTOROUTER_PROGRESS::updateProgress( wxTimerEvent& )
         m_cancelButton->Disable();
         m_reviewButton->Enable();
         m_reviewButton->SetLabel( _( "Review proposal" ) );
-        m_stage->SetLabel( _( "Routing finished" ) );
+        const auto result = m_job.GetResult();
+        m_stage->SetLabel( result && result->complete && result->hostValidated
+                                  ? _( "Proposal validated" ) : _( "Routing stopped; review result" ) );
     }
 }
 
@@ -156,11 +158,18 @@ DIALOG_AUTOROUTER_REVIEW::DIALOG_AUTOROUTER_REVIEW( wxWindow* aParent,
     const ROUTER_METRICS& metrics = aResult.metrics;
     auto* outer = new wxBoxSizer( wxVERTICAL );
     auto* title = new wxStaticText( this, wxID_ANY,
-                                    metrics.drcViolations > 0
+                                    !aResult.hostValidated
+                                            ? _( "Unvalidated proposal: board connectivity and design rules have not been checked." )
+                                            : metrics.drcViolations > 0
                                             ? _( "The proposal contains design-rule violations." )
                                             : aResult.complete
-                                                      ? _( "Routing tasks finished. Verify board connectivity and design rules after acceptance." )
+                                                      ? _( "Proposal passed KiCad connectivity and design-rule checks." )
                                                       : _( "The proposal contains unrouted connections." ) );
+    if( aResult.hostValidated )
+        outer->Add( new wxStaticText( this, wxID_ANY,
+                    wxString::Format( _( "KiCad: %d missing connections, %d new DRC violations; %d repair passes" ),
+                                      aResult.hostUnconnected, aResult.hostNewDrcViolations,
+                                      aResult.hostRepairPasses ) ), 0, wxEXPAND | wxALL, FromDIP( 10 ) );
     title->Wrap( FromDIP( 420 ) );
     outer->Add( title, 0, wxEXPAND | wxALL, FromDIP( 10 ) );
 
@@ -187,7 +196,7 @@ DIALOG_AUTOROUTER_REVIEW::DIALOG_AUTOROUTER_REVIEW( wxWindow* aParent,
                                  "Segments: %d\n"
                                  "Vias: %d\n"
                                  "SMD fanout connections: %d\n"
-                                 "Worker DRC violations: %d\n"
+                                 "New DRC violations: %d\n"
                                  "Track length: %.3f mm\n"
                                  "Airline length: %.3f mm\n"
                                  "Passes: %d, rip-ups: %d, optimization passes: %d\n"
@@ -208,14 +217,14 @@ DIALOG_AUTOROUTER_REVIEW::DIALOG_AUTOROUTER_REVIEW( wxWindow* aParent,
     auto* buttons = new wxStdDialogButtonSizer();
     auto* reject = new wxButton( this, wxID_CANCEL, _( "Reject" ) );
     m_acceptButton = new wxButton( this, wxID_OK, _( "Accept" ) );
-    if( metrics.drcViolations > 0 )
+    if( !aResult.CanAcceptProposal() )
         m_acceptButton->Disable();
 
-    if( metrics.drcViolations > 0 )
+    if( !aResult.CanAcceptProposal() )
     {
         auto* warning = new wxStaticText(
                 this, wxID_ANY,
-                _( "Accept is disabled because the worker found design-rule violations."
+                _( "Accept is disabled because the proposal has not passed KiCad design-rule validation."
                    " Reject the proposal and adjust the board or routing settings." ) );
         warning->Wrap( FromDIP( 420 ) );
         outer->Add( warning, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP( 10 ) );

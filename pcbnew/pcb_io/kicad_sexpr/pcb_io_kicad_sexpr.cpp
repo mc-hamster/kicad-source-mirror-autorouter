@@ -308,7 +308,8 @@ void PCB_IO_KICAD_SEXPR::SaveBoard( const wxString& aFileName, BOARD& aBoard,
 
 
 void PCB_IO_KICAD_SEXPR::FormatBoardToFormatter( OUTPUTFORMATTER* aOut, BOARD* aBoard,
-                                                  const std::map<std::string, UTF8>* aProperties )
+                                                  const std::map<std::string, UTF8>* aProperties,
+                                                  bool aUpdateEmbeddedFonts )
 {
     init( aProperties );
 
@@ -316,10 +317,14 @@ void PCB_IO_KICAD_SEXPR::FormatBoardToFormatter( OUTPUTFORMATTER* aOut, BOARD* a
 
     // If the user wants fonts embedded, make sure that they are added to the board.  Otherwise,
     // remove any fonts that were previously embedded.
-    if( m_board->GetAreFontsEmbedded() )
-        m_board->EmbedFonts();
-    else
-        m_board->GetEmbeddedFiles()->ClearEmbeddedFonts();
+    // Snapshot callers must not mutate the live board while serializing it.
+    if( aUpdateEmbeddedFonts )
+    {
+        if( m_board->GetAreFontsEmbedded() )
+            m_board->EmbedFonts();
+        else
+            m_board->GetEmbeddedFiles()->ClearEmbeddedFonts();
+    }
 
     m_out = aOut;
 

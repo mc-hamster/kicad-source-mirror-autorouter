@@ -19,12 +19,36 @@
 
 #pragma once
 
-#include "SortedRoomNeighbours.h"
+#include <array>
+#include "../datastructures/MinAreaTree.h"
+#include "IncompleteFreeSpaceExpansionRoom.h"
 
 namespace KICAD_AUTOROUTER
 {
 
-/** Freerouting-compatible name for the orthogonal neighbour ordering. */
-using SORTED_ORTHOGONAL_ROOM_NEIGHBOURS = SORTED_ROOM_NEIGHBOURS;
+/** Freerouting a11c0a42: boundary ordering/gaps for free (not shove) rooms. */
+class SORTED_ORTHOGONAL_ROOM_NEIGHBOURS
+{
+public:
+    struct NEIGHBOUR
+    {
+        SHAPE_TREE_ENTRY entry;
+        ROUTER_BOX intersection;
+        int firstSide = -1;
+        int lastSide = -1;
+    };
+
+    SORTED_ORTHOGONAL_ROOM_NEIGHBOURS( ROUTER_BOX aRoom,
+                                     const std::vector<SHAPE_TREE_ENTRY>& aEntries );
+    const std::vector<NEIGHBOUR>& Neighbours() const { return m_neighbours; }
+    int FirstUnrestrainedSide() const;
+    std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> IncompleteRooms(
+            ROUTER_BOX aBounds, int aLayer ) const;
+
+private:
+    ROUTER_BOX m_room;
+    std::array<bool, 4> m_edgeTouches{};
+    std::vector<NEIGHBOUR> m_neighbours;
+};
 
 } // namespace KICAD_AUTOROUTER

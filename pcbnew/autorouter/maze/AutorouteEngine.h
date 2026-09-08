@@ -15,7 +15,6 @@
 #include <optional>
 
 #include "../AutorouterTypes.h"
-#include "../drill/DrillPageArray.h"
 #include "MazeSearchEngine.h"
 
 
@@ -41,13 +40,8 @@ public:
     std::vector<ROUTING_CONNECTION> FindConflictingConnections(
             const ROUTING_CONNECTION& aCandidate ) const;
 
-    void Clear();
-
-    const DRILL_PAGE_ARRAY& DrillPages() const { return m_drillPages; }
-
 private:
     MAZE_SEARCH_ENGINE         m_search;
-    mutable DRILL_PAGE_ARRAY   m_drillPages;
 };
 
 } // namespace KICAD_AUTOROUTER

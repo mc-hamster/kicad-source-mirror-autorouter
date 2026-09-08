@@ -82,6 +82,11 @@ void drcPrintDebugMessage( int level, const wxString& msg, const char *function,
 }
 
 
+// Providers are process-wide mutable singletons. Different private proposal
+// boards must not rebind them during another engine's test run.
+static std::recursive_mutex s_drcProviderMutex;
+
+
 DRC_ENGINE::DRC_ENGINE( BOARD* aBoard, BOARD_DESIGN_SETTINGS *aSettings ) :
         UNITS_PROVIDER( pcbIUScale, EDA_UNITS::MM ),
         m_designSettings ( aSettings ),
@@ -778,6 +783,8 @@ void DRC_ENGINE::compileRules()
 
 void DRC_ENGINE::InitEngine( const std::shared_ptr<DRC_RULE>& rule )
 {
+    std::lock_guard<std::recursive_mutex> providerLock( s_drcProviderMutex );
+
     m_testProviders = DRC_SHOWMATCHES_PROVIDER_REGISTRY::Instance().GetShowMatchesProviders();
 
     for( DRC_TEST_PROVIDER* provider : m_testProviders )
@@ -833,6 +840,8 @@ void DRC_ENGINE::InitEngine( const std::shared_ptr<DRC_RULE>& rule )
 
 void DRC_ENGINE::InitEngine( const wxFileName& aRulePath )
 {
+    std::lock_guard<std::recursive_mutex> providerLock( s_drcProviderMutex );
+
     m_testProviders = DRC_TEST_PROVIDER_REGISTRY::Instance().GetTestProviders();
 
     for( DRC_TEST_PROVIDER* provider : m_testProviders )
@@ -912,6 +921,16 @@ void DRC_ENGINE::InitEngine( const wxFileName& aRulePath )
 void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aTestFootprints,
                            BOARD_COMMIT* aCommit )
 {
+    std::lock_guard<std::recursive_mutex> providerLock( s_drcProviderMutex );
+
+    // InitEngine is not a lifetime binding: another board may have run since
+    // then, or even been destroyed. Restore our engine for this entire run.
+    // Preserve the provider set selected by InitEngine, including the
+    // single-rule/show-matches mode. Only its mutable owner needs rebinding.
+    for( auto* provider : m_testProviders )
+        provider->SetDRCEngine( this );
+
+    m_testsCompleted = false;
     PROF_TIMER timer;
 
     SetUserUnits( aUnits );
@@ -952,7 +971,7 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
         PROF_TIMER providerTimer;
 
         if( !provider->RunTests( aUnits ) )
-            break;
+            return;
 
         providerTimer.Stop();
         wxLogTrace( traceDrcProfile, "DRC provider '%s' took %0.3f ms", provider->GetName(), providerTimer.msecs() );
@@ -964,6 +983,7 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
     // DRC tests are multi-threaded; anything that causes us to attempt to re-generate the
     // caches while DRC is running is problematic.
     wxASSERT( timestamp == m_board->GetTimeStamp() );
+    m_testsCompleted = !IsCancelled();
 }
 
 

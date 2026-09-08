@@ -290,6 +290,7 @@ public:
     bool ReportProgress( double aProgress );
     bool ReportPhase( const wxString& aMessage );
     bool IsCancelled() const;
+    bool TestsCompleted() const { return m_testsCompleted; }
 
     REPORTER* GetLogReporter() const { return m_logReporter; }
 
@@ -376,6 +377,7 @@ protected:
     bool                                    m_rulesValid;
     std::vector<DRC_TEST_PROVIDER*>         m_testProviders;
 
+    bool                      m_testsCompleted = false;
     std::vector<int>           m_errorLimits;
     mutable std::mutex         m_errorLimitsMutex;
     bool                       m_reportAllTrackErrors;

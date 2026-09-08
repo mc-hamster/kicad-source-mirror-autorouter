@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -172,6 +173,9 @@ struct ROUTING_PAD
     // loop fall back to the original pad if the pre-pass cannot legally place
     // the synthetic escape in the current congestion state.
     std::size_t              fanoutSourcePadIndex = std::numeric_limits<std::size_t>::max();
+    // Physical host identity; synthetic routing terminals deliberately have none.
+    std::string              sourceId;
+    bool                     isExactTarget = false;
 };
 
 
@@ -180,6 +184,9 @@ struct ROUTING_TERMINAL
 {
     ROUTING_PAD pad;
     std::size_t padIndex = std::numeric_limits<std::size_t>::max();
+    // A connected trace is a target region, not just its endpoints. Its start
+    // is pad.position; padIndex identifies a real pad in that copper component.
+    std::optional<ROUTER_POINT> segmentEnd;
 };
 
 
@@ -279,6 +286,8 @@ struct BOARD_SNAPSHOT
     // used by the worker algorithm; the tool uses it to refuse acceptance if
     // the live board changed while a proposal was being reviewed.
     int sourceBoardTimestamp = 0;
+    // Separate physical filled regions. Never union different islands by net name.
+    std::vector<ROUTING_OBSTACLE> conductionAreas;
 };
 
 
@@ -382,6 +391,19 @@ struct ROUTING_RESULT
     bool complete = false;
     bool cancelled = false;
     std::string message;
+    bool hostValidated = false;
+    int hostUnconnected = -1;
+    int hostNewDrcViolations = -1;
+    int hostRepairPasses = 0;
+    std::int64_t hostValidationMilliseconds = 0;
+
+    // A partial route may be accepted deliberately, but an unchecked or
+    // design-rule-violating proposal must never be committed to the editor.
+    bool CanAcceptProposal() const
+    {
+        return hostValidated && !cancelled && hostUnconnected >= 0
+                && hostNewDrcViolations == 0 && metrics.drcViolations == 0;
+    }
 };
 
 

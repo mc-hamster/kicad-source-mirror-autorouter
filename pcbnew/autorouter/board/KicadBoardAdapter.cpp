@@ -50,6 +50,7 @@
 #include <project/net_settings.h>
 #include <ratsnest/ratsnest_data.h>
 #include <zone.h>
+#include <trigo.h>
 
 
 namespace KICAD_AUTOROUTER
@@ -496,15 +497,9 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     diameter, drill );
         }
 
-        // Every pad remains a collision obstacle on the layers that can
-        // actually be routed.  Through-hole pads report all possible copper
-        // layers in GetLayerSet(), including disabled inner layers that are
-        // not present in this board's active stack.  Materialising one
-        // obstacle per such layer needlessly turns a two-layer board into
-        // thousands of unrelated search objects and makes dense-board
-        // routing appear to hang.  The disabled layers are never queried by
-        // the worker, so filtering them here is exact rather than a geometry
-        // relaxation.
+        // Keep copper on every physical layer, including layers disabled for
+        // trace routing: through-vias must still clear those pads. Exclude
+        // nonexistent layers reported by through-hole pad layer masks.
         std::vector<int> obstacleLayers = padLayers;
         obstacleLayers.erase(
                 std::remove_if( obstacleLayers.begin(), obstacleLayers.end(),
@@ -514,8 +509,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                                             aSettings.layers.begin(), aSettings.layers.end(),
                                             [aLayer]( const ROUTER_LAYER_SETTINGS& aSetting )
                                             {
-                                                return aSetting.enabled
-                                                       && aSetting.layerId == aLayer;
+                                                return aSetting.layerId == aLayer;
                                             } );
                                 } ),
                 obstacleLayers.end() );
@@ -543,32 +537,96 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
 
             ROUTING_OBSTACLE obstacle;
             obstacle.netCode = pad->GetNetCode();
+            obstacle.boardItemId = pad->m_Uuid.AsString().ToStdString();
             obstacle.layers = { layer };
-
-            if( pad->GetShape( layerId ) == PAD_SHAPE::CIRCLE )
-            {
-                // A zero-length segment is the worker's circle primitive.  It
-                // is materially less conservative than treating a round pad
-                // as its axis-aligned bounding square.
-                obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
-                obstacle.start = point( shapePos );
-                obstacle.end = obstacle.start;
-                obstacle.radius = std::max( shapeSize.x, shapeSize.y ) / 2;
-            }
-            else
-            {
-                obstacle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
-                obstacle.box = box( padBox );
-                // padBox already contains the complete pad copper shape.  Its
-                // rule clearance is kept separate so the pair resolver applies
-                // it once alongside the candidate net's clearance.
-                obstacle.radius = 0;
-            }
 
             obstacle.blocksTracks = true;
             obstacle.blocksVias = true;
             obstacle.clearance = std::max<std::int64_t>( 0, clearance );
-            aSnapshot.obstacles.push_back( std::move( obstacle ) );
+
+            if( pad->GetShape( layerId ) == PAD_SHAPE::CIRCLE )
+            {
+                obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                obstacle.start = point( shapePos );
+                obstacle.end = obstacle.start;
+                obstacle.radius = std::max( shapeSize.x, shapeSize.y ) / 2;
+                aSnapshot.obstacles.push_back( std::move( obstacle ) );
+            }
+            else if( pad->GetShape( layerId ) == PAD_SHAPE::OVAL )
+            {
+                // Match PAD::buildEffectiveShapes: an oval is an exact capsule,
+                // not a many-edge polygon or its bounding rectangle.
+                const VECTOR2I halfSize = shapeSize / 2;
+                const int halfWidth = std::min( halfSize.x, halfSize.y );
+                VECTOR2I halfLength( halfSize.x - halfWidth, halfSize.y - halfWidth );
+                RotatePoint( halfLength, pad->GetOrientation() );
+                obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                obstacle.start = point( shapePos - halfLength );
+                obstacle.end = point( shapePos + halfLength );
+                obstacle.radius = halfWidth;
+                aSnapshot.obstacles.push_back( std::move( obstacle ) );
+            }
+            else if( pad->GetShape( layerId ) == PAD_SHAPE::RECTANGLE
+                     && pad->GetOrientation().IsCardinal() )
+            {
+                // Only in this case is the AABB the actual copper rectangle.
+                obstacle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+                obstacle.box = box( padBox );
+                aSnapshot.obstacles.push_back( std::move( obstacle ) );
+            }
+            else if( pad->GetShape( layerId ) == PAD_SHAPE::ROUNDRECT )
+            {
+                // A rounded rectangle is a rectangular core swept by a disk.
+                // The worker already represents polygon + radius exactly;
+                // avoid testing dozens of tessellated arc edges at every probe.
+                const int radius = pad->GetRoundRectCornerRadius( layerId );
+                const VECTOR2I halfCore = shapeSize / 2 - VECTOR2I( radius, radius );
+                obstacle.radius = radius;
+                if( halfCore.x <= 0 || halfCore.y <= 0 )
+                {
+                    VECTOR2I halfLength( std::max( 0, halfCore.x ),
+                                         std::max( 0, halfCore.y ) );
+                    RotatePoint( halfLength, pad->GetOrientation() );
+                    obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                    obstacle.start = point( shapePos - halfLength );
+                    obstacle.end = point( shapePos + halfLength );
+                }
+                else
+                {
+                    obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+                    for( VECTOR2I corner : { VECTOR2I( -halfCore.x, -halfCore.y ),
+                                             VECTOR2I( halfCore.x, -halfCore.y ),
+                                             VECTOR2I( halfCore.x, halfCore.y ),
+                                             VECTOR2I( -halfCore.x, halfCore.y ) } )
+                    {
+                        RotatePoint( corner, pad->GetOrientation() );
+                        obstacle.polygon.push_back( point( shapePos + corner ) );
+                    }
+                }
+                aSnapshot.obstacles.push_back( std::move( obstacle ) );
+            }
+            else
+            {
+                // Preserve rotated, chamfered and custom copper
+                // contours instead of closing legal channels with their AABB.
+                // Clearance is applied by the pair resolver, not baked into
+                // this polygon. Approximate arcs outward by at most 1 um.
+                SHAPE_POLY_SET copper;
+                pad->TransformShapeToPolygon( copper, layerId, 0, 1000, ERROR_OUTSIDE );
+                for( int outline = 0; outline < copper.OutlineCount(); ++outline )
+                {
+                    ROUTING_OBSTACLE part = obstacle;
+                    part.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+                    appendPolygon( part.polygon, copper.Outline( outline ) );
+                    for( int hole = 0; hole < copper.HoleCount( outline ); ++hole )
+                    {
+                        std::vector<ROUTER_POINT> points;
+                        appendPolygon( points, copper.CHole( outline, hole ) );
+                        part.polygonHoles.push_back( std::move( points ) );
+                    }
+                    aSnapshot.obstacles.push_back( std::move( part ) );
+                }
+            }
         }
 
         if( pad->HasHole() )
@@ -618,6 +676,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
 
         ROUTING_PAD routingPad;
         routingPad.netCode = pad->GetNetCode();
+        routingPad.sourceId = pad->m_Uuid.AsString().ToStdString();
         routingPad.position = point( pad->GetPosition() );
         routingPad.layers = routeLayers;
         routingPad.netClass = className;
@@ -682,13 +741,30 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                                 return aSetting.enabled && aSetting.layerId == aLayer;
                             } );
 
-                    if( !layerEnabled )
-                        return;
-
                     const std::shared_ptr<SHAPE_POLY_SET> filled =
                             zone->GetFilledPolysList( aLayer );
 
                     if( !filled )
+                        return;
+
+                    for( int region = 0; region < filled->OutlineCount(); ++region )
+                    {
+                        ROUTING_OBSTACLE area;
+                        area.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+                        area.netCode = zone->GetNetCode();
+                        area.layers = { static_cast<int>( aLayer ) };
+                        appendPolygon( area.polygon, filled->Outline( region ) );
+                        for( int hole = 0; hole < filled->HoleCount( region ); ++hole )
+                        {
+                            std::vector<ROUTER_POINT> points;
+                            appendPolygon( points, filled->CHole( region, hole ) );
+                            area.polygonHoles.push_back( std::move( points ) );
+                        }
+                        aSnapshot.conductionAreas.push_back( std::move( area ) );
+                    }
+
+                    // Disabled trace layers still carry physical plane contacts.
+                    if( !layerEnabled )
                         return;
 
                     const std::vector<VECTOR2I> targets = findInteriorPoints( *filled );
@@ -813,97 +889,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             return padIndices.at( best );
         };
 
-        if( !net.planeTargetIndices.empty() )
-        {
-            std::set<std::size_t> unconnectedPads;
-            RN_NET*               ratsnest =
-                    connectivity ? connectivity->GetRatsnestForNet( net.netCode ) : nullptr;
-
-            if( !aSettings.routeOnlyUnconnected || aSettings.allowRipupExisting || !ratsnest )
-            {
-                unconnectedPads.insert( net.padIndices.begin(), net.padIndices.end() );
-            }
-            else
-            {
-                const std::vector<CN_EDGE>& edges = ratsnest->GetEdges();
-                for( const CN_EDGE& edge : edges )
-                {
-                    const std::optional<std::size_t> source =
-                            endpointPad( edge.GetSourceNode() );
-                    const std::optional<std::size_t> target =
-                            endpointPad( edge.GetTargetNode() );
-
-                    if( source )
-                        unconnectedPads.insert( *source );
-                    if( target )
-                        unconnectedPads.insert( *target );
-                }
-
-                // A non-empty ratsnest that cannot be mapped to pads is
-                // still evidence of missing connectivity.  Fall back to all
-                // pads rather than silently declaring the plane net done.
-                if( !edges.empty() && unconnectedPads.empty() )
-                    unconnectedPads.insert( net.padIndices.begin(), net.padIndices.end() );
-            }
-
-            // Plane targets are selected deterministically.  Prefer a target
-            // already on the pad's layer to avoid an unnecessary via, then
-            // use geometric distance and finally the snapshot index as a
-            // stable tie-breaker.
-            for( std::size_t padIndex : net.padIndices )
-            {
-                if( !unconnectedPads.contains( padIndex ) )
-                    continue;
-
-                const ROUTING_PAD& source = aSnapshot.pads[padIndex];
-                std::size_t        bestTarget = net.planeTargetIndices.front();
-                bool                bestSharesLayer = false;
-                std::int64_t       bestDistance = std::numeric_limits<std::int64_t>::max();
-
-                for( std::size_t targetIndex : net.planeTargetIndices )
-                {
-                    if( targetIndex >= aSnapshot.pads.size() )
-                        continue;
-
-                    const ROUTING_PAD& target = aSnapshot.pads[targetIndex];
-                    const bool sharesLayer = std::any_of(
-                            source.layers.begin(), source.layers.end(),
-                            [&]( int aSourceLayer )
-                            {
-                                return std::find( target.layers.begin(), target.layers.end(),
-                                                  aSourceLayer )
-                                       != target.layers.end();
-                            } );
-                    const std::int64_t dx = source.position.x - target.position.x;
-                    const std::int64_t dy = source.position.y - target.position.y;
-                    const long double distanceSquared = static_cast<long double>( dx ) * dx
-                                                        + static_cast<long double>( dy ) * dy;
-                    const std::int64_t boundedDistance =
-                            distanceSquared
-                                            >= static_cast<long double>(
-                                                    std::numeric_limits<std::int64_t>::max() )
-                                    ? std::numeric_limits<std::int64_t>::max()
-                                    : static_cast<std::int64_t>( distanceSquared );
-
-                    if( sharesLayer > bestSharesLayer
-                        || ( sharesLayer == bestSharesLayer
-                             && ( boundedDistance < bestDistance
-                                  || ( boundedDistance == bestDistance
-                                       && targetIndex < bestTarget ) ) ) )
-                    {
-                        bestTarget = targetIndex;
-                        bestSharesLayer = sharesLayer;
-                        bestDistance = boundedDistance;
-                    }
-                }
-
-                net.connections.emplace_back( padIndex, bestTarget );
-            }
-
-            continue;
-        }
-
-        if( net.padIndices.size() < 2 )
+        if( net.padIndices.size() < 2 && net.planeTargetIndices.empty() )
             continue;
 
         // Allowing existing copper to be ripped up changes the operation from
@@ -933,11 +919,54 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             continue;
         }
 
+        auto endpointTerminal = [&]( const std::shared_ptr<const CN_ANCHOR>& anchor ) -> std::optional<std::size_t>
+        {
+            if( !anchor || !anchor->Parent() )
+                return std::nullopt;
+            if( auto* region = dynamic_cast<CN_ZONE_LAYER*>( anchor->Item() ) )
+            {
+                ROUTING_PAD terminal;
+                terminal.netCode = net.netCode;
+                terminal.netClass = net.netClass;
+                terminal.trackWidth = net.padIndices.empty() ? 150000
+                        : aSnapshot.pads[net.padIndices.front()].trackWidth;
+                terminal.layers = { static_cast<int>( region->GetLayer() ) };
+                terminal.isPlaneTarget = true;
+                terminal.isExactTarget = true;
+                VECTOR2I landing = anchor->Pos();
+                // Move just inside this *specific* island, never toward an
+                // arbitrary same-net fill sample (which may be another island).
+                const int step = std::max<std::int64_t>( 1000, terminal.trackWidth / 2 );
+                bool found = false;
+                for( int radius : { step, 2 * step, 4 * step } )
+                {
+                    for( const VECTOR2I& direction : { VECTOR2I( 1, 0 ), VECTOR2I( 0, 1 ),
+                            VECTOR2I( -1, 0 ), VECTOR2I( 0, -1 ), VECTOR2I( 1, 1 ),
+                            VECTOR2I( -1, 1 ), VECTOR2I( -1, -1 ), VECTOR2I( 1, -1 ) } )
+                    {
+                        const VECTOR2I candidate = anchor->Pos() + direction * radius;
+                        if( region->ContainsPoint( candidate )
+                            && region->GetOutline().Distance( candidate, true ) > step + 1000 )
+                        { landing = candidate; found = true; break; }
+                    }
+                    if( found )
+                        break;
+                }
+                terminal.position = point( landing );
+                const auto index = aSnapshot.pads.size();
+                aSnapshot.pads.push_back( terminal );
+                // Do not add to planeTargetIndices: that list would let a
+                // failed search substitute an unrelated region of the net.
+                return index;
+            }
+            return endpointPad( anchor );
+        };
+
         std::set<std::pair<std::size_t, std::size_t>> uniqueConnections;
         for( const CN_EDGE& edge : ratsnest->GetEdges() )
         {
-            const std::optional<std::size_t> source = endpointPad( edge.GetSourceNode() );
-            const std::optional<std::size_t> target = endpointPad( edge.GetTargetNode() );
+            const std::optional<std::size_t> source = endpointTerminal( edge.GetSourceNode() );
+            const std::optional<std::size_t> target = endpointTerminal( edge.GetTargetNode() );
 
 
             if( !source || !target || *source == *target )
@@ -991,17 +1020,17 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
 
         if( track->Type() == PCB_VIA_T )
         {
-            ROUTING_OBSTACLE obstacle = makeObstacle();
-            obstacle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
-            obstacle.box = box( track->GetBoundingBox() );
-            // The bounding box already describes the complete via copper.  A
-            // rectangle is intentionally conservative here because the
-            // worker must also protect layers that are not enabled for track
-            // routing but are still crossed by a through-via.
-            obstacle.radius = 0;
-            obstacles.push_back( std::move( obstacle ) );
-
             const PCB_VIA* via = static_cast<const PCB_VIA*>( track );
+            for( PCB_LAYER_ID layer : via->GetLayerSet().Seq() )
+            {
+                ROUTING_OBSTACLE obstacle = makeObstacle();
+                obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                obstacle.start = obstacle.end = point( via->GetPosition() );
+                obstacle.radius = halfWidth( via->GetWidth( layer ) );
+                obstacle.layers = { static_cast<int>( layer ) };
+                obstacles.push_back( std::move( obstacle ) );
+            }
+
             if( via->GetDrill() > 0 )
             {
                 ROUTING_OBSTACLE hole = makeObstacle();

@@ -22,6 +22,7 @@
  */
 
 #include "BatchAutorouter.h"
+#include "../rules/ViaRule.h"
 
 #include <algorithm>
 #include <chrono>
@@ -64,59 +65,6 @@ std::int64_t viaValue( const ROUTING_NET& aNet, std::int64_t aFallback )
     return aNet.viaDiameter > 0 ? aNet.viaDiameter : aFallback;
 }
 
-
-int layerOrdinal( const AUTOROUTER_SETTINGS& aSettings, int aLayer )
-{
-    auto it = std::find_if( aSettings.layers.begin(), aSettings.layers.end(),
-                            [aLayer]( const ROUTER_LAYER_SETTINGS& aSetting )
-                            {
-                                return aSetting.layerId == aLayer;
-                            } );
-
-    if( it == aSettings.layers.end() )
-        return aLayer;
-
-    return it->layerOrdinal >= 0
-                   ? it->layerOrdinal
-                   : static_cast<int>( std::distance( aSettings.layers.begin(), it ) );
-}
-
-
-std::vector<int> viaLayers( const AUTOROUTER_SETTINGS& aSettings, int aFirstLayer,
-                            int aSecondLayer )
-{
-    const int firstOrdinal = layerOrdinal( aSettings, aFirstLayer );
-    const int secondOrdinal = layerOrdinal( aSettings, aSecondLayer );
-    const int low = std::min( firstOrdinal, secondOrdinal );
-    const int high = std::max( firstOrdinal, secondOrdinal );
-
-    std::vector<int> result;
-    for( const ROUTER_LAYER_SETTINGS& layer : aSettings.layers )
-    {
-        if( !layer.enabled )
-            continue;
-
-        const int ordinal = layerOrdinal( aSettings, layer.layerId );
-        if( ordinal >= low && ordinal <= high )
-            result.push_back( layer.layerId );
-    }
-
-    if( result.empty() )
-    {
-        result.push_back( aFirstLayer );
-        if( aSecondLayer != aFirstLayer )
-            result.push_back( aSecondLayer );
-    }
-
-    std::stable_sort( result.begin(), result.end(),
-                      [&]( int aLeft, int aRight )
-                      {
-                          return layerOrdinal( aSettings, aLeft )
-                                 < layerOrdinal( aSettings, aRight );
-                      } );
-    result.erase( std::unique( result.begin(), result.end() ), result.end() );
-    return result;
-}
 
 } // namespace
 
@@ -228,13 +176,6 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
     // away the whole net here made a large net (notably the Arduino board's
     // ground net) oscillate: every retry paid to rediscover hundreds of good
     // paths before it could make progress on the one blocked edge.
-    std::set<std::pair<std::size_t, std::size_t>> existingConnections;
-
-    auto normalizedPair = []( std::size_t aLeft, std::size_t aRight )
-    {
-        return std::pair<std::size_t, std::size_t>{ std::min( aLeft, aRight ),
-                                                    std::max( aLeft, aRight ) };
-    };
 
     auto findRoot = [&]( std::size_t aIndex )
     {
@@ -260,41 +201,30 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             parent[rightRoot] = leftRoot;
     };
 
-    for( const auto& group : aNet.connectedPadGroups )
+    // The disjoint-set is only a routing-order view of actual copper contacts.
+    // Rebuild after every insertion/rip-up; endpoint labels are not connectivity.
+    auto refreshContacts = [&]()
     {
-        for( std::size_t index : group )
+        parent.clear();
+        activePads.clear();
+        for( std::size_t index : aNet.padIndices )
+            parent[index] = index;
+        for( const auto& [from, to] : aNet.connections )
         {
-            if( index >= aBoard.pads.size() || aBoard.pads[index].netCode != aNet.netCode )
-                return false;
-            parent.try_emplace( index, index );
-            unite( group.front(), index );
-            activePads.insert( index );
+            parent.try_emplace( from, from );
+            parent.try_emplace( to, to );
         }
-    }
-
-    for( const ROUTING_CONNECTION& existing : aConnections )
-    {
-        if( existing.netCode != aNet.netCode || !existing.complete
-            || existing.fromPadIndex >= aBoard.pads.size()
-            || existing.toPadIndex >= aBoard.pads.size() )
+        for( const auto& group : aOccupancy.Board()->ConnectedPadGroups( aNet.netCode ) )
         {
-            continue;
+            for( std::size_t index : group )
+            {
+                parent.try_emplace( index, index );
+                unite( group.front(), index );
+                activePads.insert( index );
+            }
         }
-
-        const auto pair = normalizedPair( existing.fromPadIndex, existing.toPadIndex );
-        existingConnections.insert( pair );
-        parent.try_emplace( existing.fromPadIndex, existing.fromPadIndex );
-        parent.try_emplace( existing.toPadIndex, existing.toPadIndex );
-        activePads.insert( existing.fromPadIndex );
-        activePads.insert( existing.toPadIndex );
-
-        // Plane targets are terminal regions rather than ordinary electrical
-        // pads.  They do not participate in the pad-to-pad union, but keeping
-        // the target in activePads lets the exact connection be skipped on a
-        // later pass without attempting to grow a second stub.
-        if( !aBoard.pads[existing.toPadIndex].isPlaneTarget )
-            unite( existing.fromPadIndex, existing.toPadIndex );
-    }
+    };
+    refreshContacts();
 
     // A ratsnest is an electrical graph, not a routing order.  On a large
     // multi-pad net (the Arduino board's ground net is a good example), the
@@ -366,8 +296,7 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         if( sourceIndex >= aBoard.pads.size() || targetIndex >= aBoard.pads.size() )
             return false;
 
-        const auto connectionPair = normalizedPair( sourceIndex, targetIndex );
-        if( existingConnections.contains( connectionPair ) )
+        if( aOccupancy.Board()->Connected( sourceIndex, targetIndex ) )
             continue;
 
         std::size_t routeSourceIndex = sourceIndex;
@@ -409,7 +338,7 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         // the pad unroutable; Freerouting treats a conduction area as a
         // connected destination region rather than a single coordinate.
         std::vector<std::size_t> targetCandidates{ routeTargetIndex };
-        if( targetIsPlane )
+        if( targetIsPlane && !aBoard.pads[routeTargetIndex].isExactTarget )
         {
             for( std::size_t candidate : aNet.planeTargetIndices )
             {
@@ -438,23 +367,14 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             if( !fanoutTask && !targetIsPlane && aNet.planeTargetIndices.empty() )
             {
                 const std::size_t connectedRoot = findRoot( routeSourceIndex );
-                // Include both ends of completed fanouts. The real pad is
-                // still usable copper: forcing every subsequent connection
-                // to use its artificial landing loses same-layer routes.
-                // Failed/uninserted landings must never seed a search.
-                std::set<std::size_t> terminals( aNet.padIndices.begin(), aNet.padIndices.end() );
-                terminals.insert( activePads.begin(), activePads.end() );
-                for( std::size_t index : terminals )
+                destinations = aOccupancy.Board()->Terminals( routeSourceIndex );
+                std::set<std::size_t> visited{ connectedRoot };
+                for( std::size_t index : aNet.padIndices )
                 {
-                    if( index >= aBoard.pads.size() )
+                    if( index >= aBoard.pads.size() || !visited.insert( findRoot( index ) ).second )
                         continue;
-                    ROUTING_TERMINAL terminal{ aBoard.pads[index], index };
-                    if( terminal.pad.isFanoutTarget && terminal.pad.fanoutTargetLayer >= 0 )
-                        terminal.pad.layers = { terminal.pad.fanoutTargetLayer };
-                    if( findRoot( index ) == connectedRoot )
-                        destinations.push_back( std::move( terminal ) );
-                    else
-                        starts.push_back( std::move( terminal ) );
+                    auto terminals = aOccupancy.Board()->Terminals( index );
+                    starts.insert( starts.end(), terminals.begin(), terminals.end() );
                 }
             }
 
@@ -610,14 +530,8 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
 
         aOccupancy.Add( *connection );
         newConnections.push_back( std::move( *connection ) );
-        existingConnections.insert( normalizedPair( routeSourceIndex, routeTargetIndex ) );
 
-        if( !targetIsPlane )
-        {
-            activePads.insert( routeSourceIndex );
-            activePads.insert( routeTargetIndex );
-            unite( routeSourceIndex, routeTargetIndex );
-        }
+        refreshContacts();
     }
 
     const std::size_t newConnectionCount = newConnections.size();
@@ -626,7 +540,7 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                          std::make_move_iterator( newConnections.end() ) );
 
     const bool allConnectionsRouted =
-            AUTOROUTE_UNROUTED_REPORT::CountMissing( aNet, aConnections ) == 0;
+            aOccupancy.Board()->CountMissing( aNet ) == 0;
 
     if( autorouterDebugEnabled() )
     {
@@ -694,7 +608,7 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
                 FOUND_CONNECTION_INSERTER::AppendEdge(
                         connection.netCode, previous, current, netWidths[connection.netCode],
                         netViaDiameters[connection.netCode], netViaDrills[connection.netCode],
-                        viaLayers( aSettings, previous.layer, current.layer ), aResult );
+                        VIA_RULE::ThroughLayers( aSettings ), aResult );
             }
         }
     }
@@ -726,10 +640,13 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
 
     std::set<std::string> removed;
     std::set<int> completeNets;
+    ROUTING_BOARD copper( aBoard, aSettings );
+    for( const auto& connection : aConnections )
+        copper.AddRoute( connection );
     for( const ROUTING_NET& net : aBoard.nets )
     {
         if( !net.connections.empty()
-            && AUTOROUTE_UNROUTED_REPORT::CountMissing( net, aConnections ) == 0 )
+            && copper.CountMissing( net ) == 0 )
         {
             completeNets.insert( net.netCode );
         }
@@ -853,6 +770,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
 
     result.metrics.totalConnections = totalConnections;
     ROUTING_OCCUPANCY occupancy( aSettings.gridStepIU );
+    occupancy.InitializeBoard( board, aSettings );
     // The search engine builds the immutable obstacle/spatial index once per
     // engine.  Reuse it for every connection in a pass; reconstructing it for
     // each net makes large boards spend most of their runtime re-indexing the
@@ -878,7 +796,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     {
         int missing = 0;
         for( const ROUTING_NET& net : board.nets )
-            missing += AUTOROUTE_UNROUTED_REPORT::CountMissing( net, connections );
+            missing += occupancy.Board()->CountMissing( net );
         return totalConnections - missing;
     };
 
@@ -1129,7 +1047,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             }
 
             const bool completeNet =
-                    AUTOROUTE_UNROUTED_REPORT::CountMissing( *entry.net, connections ) == 0;
+                    occupancy.Board()->CountMissing( *entry.net ) == 0;
             const bool retryFailedNet = failedNets.contains( entry.net->netCode );
 
             // Keep successful nets stable while negotiated-congestion passes
@@ -1289,6 +1207,21 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         // failed late optimization from degrading an otherwise complete route.
         checkpoint();
         restoreBestCheckpoint();
+        // Fanout landings are temporary routing stages, not final electrical
+        // terminals. Return requests to their real pads before normalizing
+        // redundant via tails, otherwise virtual landings force unused vias.
+        for( auto& net : board.nets )
+            for( auto& [from, to] : net.connections )
+                for( auto* index : { &from, &to } )
+                    if( *index < board.pads.size() && board.pads[*index].isFanoutTarget )
+                        *index = board.pads[*index].fanoutSourcePadIndex;
+        BATCH_OPTIMIZER( board, aSettings, occupancy ).RemoveRedundantViaTails( connections, aCancel );
+        if( aCancel && aCancel() )
+        {
+            result.cancelled = true;
+            result.message = "Autorouter cancelled";
+            return result;
+        }
         buildGeometry( board, aSettings, connections, result );
         result.metrics.routedConnections = routedConnectionCount();
         result.metrics.drcViolations =
@@ -1315,7 +1248,9 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             result.message = "Routing tasks finished; verify KiCad connectivity and design rules";
         }
 
-        result.unroutedNetCodes = AUTOROUTE_UNROUTED_REPORT::Build( board.nets, connections );
+        for( const auto& net : board.nets )
+            if( occupancy.Board()->CountMissing( net ) > 0 )
+                result.unroutedNetCodes.push_back( net.netCode );
     }
 
     const auto endTime = std::chrono::steady_clock::now();

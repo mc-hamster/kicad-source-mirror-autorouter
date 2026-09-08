@@ -20,11 +20,14 @@
 #pragma once
 
 #include "../AutorouterTypes.h"
+#include "../geometry/planar/IntBox.h"
 
 namespace KICAD_AUTOROUTER
 {
 
-/** Freerouting equivalent: autoroute/drill/ExpansionDrill. */
+class EXPANSION_ROOM;
+
+/** Layer-change object: one maze section and expansion room per physical layer. */
 struct EXPANSION_DRILL
 {
     ROUTER_POINT location;
@@ -32,6 +35,16 @@ struct EXPANSION_DRILL
     int          firstLayer = -1;
     int          lastLayer = -1;
     bool         valid = true;
+    std::vector<EXPANSION_ROOM*> rooms;
+    std::vector<bool> occupied;
+
+    int GetId() const
+    {
+        return static_cast<std::int32_t>( 31u * ( 31u * static_cast<std::uint32_t>(
+                INT_BOX::PointId( location ) ) + static_cast<std::uint32_t>( firstLayer ) )
+                + static_cast<std::uint32_t>( lastLayer ) );
+    }
+    void Reset() { std::fill( occupied.begin(), occupied.end(), false ); }
 };
 
 } // namespace KICAD_AUTOROUTER

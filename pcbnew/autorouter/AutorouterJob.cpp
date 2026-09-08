@@ -22,6 +22,7 @@
  */
 
 #include "AutorouterJob.h"
+#include "board/KicadRoutingSession.h"
 
 #include <algorithm>
 #include <exception>
@@ -32,7 +33,9 @@ namespace KICAD_AUTOROUTER
 {
 
 AUTOROUTER_JOB::AUTOROUTER_JOB( std::shared_ptr<const BOARD_SNAPSHOT> aSnapshot,
-                                AUTOROUTER_SETTINGS aSettings ) :
+                                AUTOROUTER_SETTINGS aSettings,
+                                std::unique_ptr<KICAD_ROUTING_SESSION> aHostSession ) :
+        m_hostSession( std::move( aHostSession ) ),
         m_snapshot( std::move( aSnapshot ) ),
         m_settings( std::move( aSettings ) )
 {
@@ -113,18 +116,14 @@ void AUTOROUTER_JOB::run()
     {
         try
         {
-            ROUTING_PIPELINE pipeline;
-            result = pipeline.Run(
-                    *m_snapshot, m_settings,
-                    [this]
-                    {
-                        return m_cancel.load();
-                    },
-                    [this]( const ROUTER_PROGRESS& aProgress )
-                    {
-                        std::lock_guard lock( m_mutex );
-                        m_progress = aProgress;
-                    } );
+            const ROUTER_CANCEL_CALLBACK cancel = [this] { return m_cancel.load(); };
+            const ROUTER_PROGRESS_CALLBACK progress = [this]( const ROUTER_PROGRESS& state )
+            {
+                std::lock_guard lock( m_mutex );
+                m_progress = state;
+            };
+            result = m_hostSession ? m_hostSession->Run( m_settings, cancel, progress )
+                    : ROUTING_PIPELINE().Run( *m_snapshot, m_settings, cancel, progress );
         }
         catch( const std::exception& e )
         {
@@ -138,13 +137,10 @@ void AUTOROUTER_JOB::run()
 
     if( m_cancel.load() )
     {
+        // Cancellation can arrive just after validation. Do not retain the
+        // validation flag or any materialized proposal from that race.
+        result = ROUTING_RESULT{};
         result.cancelled = true;
-        result.complete = false;
-        result.connections.clear();
-        result.segments.clear();
-        result.vias.clear();
-        result.removedBoardItemIds.clear();
-        result.unroutedNetCodes.clear();
         result.message = "Autorouter cancelled";
     }
 

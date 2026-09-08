@@ -10,6 +10,7 @@
  */
 
 #include "BatchFanout.h"
+#include "../rules/ViaRule.h"
 
 #include <algorithm>
 #include <array>
@@ -64,8 +65,8 @@ std::vector<int> fanoutLayers( const AUTOROUTER_SETTINGS& aSettings, int aSource
     if( enabled.empty() )
         return {};
 
-    // Prefer the nearest physical layer.  This is the deterministic native
-    // equivalent of Freerouting's first legal via mask for a fanout pin.
+    // Prefer a nearby trace landing layer. The manufactured through-via
+    // still occupies the entire stack; this is not a partial-via mask.
     std::stable_sort( enabled.begin(), enabled.end(),
                       [&]( const ROUTER_LAYER_SETTINGS& aLeft,
                             const ROUTER_LAYER_SETTINGS& aRight )
@@ -580,32 +581,11 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
         }
     }
 
-    const auto layerOrdinal = [&]( int aLayerId )
-    {
-        const auto it = std::find_if(
-                aSettings.layers.begin(), aSettings.layers.end(),
-                [aLayerId]( const ROUTER_LAYER_SETTINGS& aLayer )
-                {
-                    return aLayer.layerId == aLayerId;
-                } );
-        if( it == aSettings.layers.end() )
-            return aLayerId;
-        return it->layerOrdinal >= 0
-                       ? it->layerOrdinal
-                       : static_cast<int>( std::distance( aSettings.layers.begin(), it ) );
-    };
-    const int sourceIndex = layerOrdinal( aSourceLayer );
-    const int targetIndex = layerOrdinal( aTargetLayer );
+    if( !VIA_RULE::AllowsTransition( aSettings, aSourceLayer, aTargetLayer ) )
+        return false;
 
     for( const ROUTER_LAYER_SETTINGS& layer : aSettings.layers )
     {
-        const int ordinal = layerOrdinal( layer.layerId );
-        if( ordinal < std::min( sourceIndex, targetIndex )
-            || ordinal > std::max( sourceIndex, targetIndex ) )
-        {
-            continue;
-        }
-
         for( std::size_t obstacleIndex : aNearbyObstacles )
         {
             if( aCancel && aCancel() )
@@ -976,7 +956,7 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                 ROUTING_OBSTACLE viaObstacle;
                 viaObstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
                 viaObstacle.netCode = sourcePad.netCode;
-                viaObstacle.layers = { sourcePad.layers.front(), layer };
+                viaObstacle.layers = VIA_RULE::ThroughLayers( aSettings );
                 viaObstacle.start = *landingPoint;
                 viaObstacle.end = *landingPoint;
                 viaObstacle.radius = viaRadius;

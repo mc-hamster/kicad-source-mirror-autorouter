@@ -18,9 +18,9 @@
  */
 
 /*
- * Freerouting equivalent: board/facade/RoutingBoard and the board operation
- * facades.  The interface deliberately contains only snapshot operations;
- * worker-thread routing must never mutate a KiCad BOARD.
+ * KiCad input-capture boundary, NOT a port of Freerouting RoutingBoard.
+ * Worker-thread routing must never mutate the live KiCad BOARD, but the
+ * core still needs its own mutable items, connectivity, search tree and undo.
  */
 
 #pragma once

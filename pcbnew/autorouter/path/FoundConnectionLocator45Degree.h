@@ -19,12 +19,31 @@
 
 #pragma once
 
-#include "FoundConnectionLocator.h"
+#include "../geometry/planar/FloatLine.h"
 
 namespace KICAD_AUTOROUTER
 {
 
-/** Freerouting-compatible locator name for the orthogonal/45-degree engine. */
-using FOUND_CONNECTION_LOCATOR_45_DEGREE = FOUND_CONNECTION_LOCATOR;
+struct RECTANGULAR_CORRIDOR_STEP
+{
+    ROUTER_BOX room;                 // Already compensated trace-centre space.
+    std::optional<ROUTER_BOX> door;   // Absent for the final target point.
+    FLOAT_LINE section;
+};
+
+/**
+ * Active rectangular subset of the reference 90/45-degree locator. This is
+ * not the general convex, thin-room or pad-neckdown locator. The multilayer
+ * maze composes these same-layer corridors with physical through drills.
+ */
+class FOUND_CONNECTION_LOCATOR_45_DEGREE
+{
+public:
+    static FLOAT_POINT CalculateAdditionalCorner( FLOAT_POINT aFrom, FLOAT_POINT aTo,
+                                                   bool aHorizontalFirst, bool aOrthogonal );
+    static std::optional<std::vector<ROUTER_POINT>> LocateRectangular(
+            ROUTER_POINT aStart, const std::vector<RECTANGULAR_CORRIDOR_STEP>& aSteps,
+            bool aOrthogonal );
+};
 
 } // namespace KICAD_AUTOROUTER

@@ -12,22 +12,37 @@
 #pragma once
 
 #include <cstddef>
+#include <tuple>
 
-#include "../AutorouterTypes.h"
+#include "../geometry/planar/FloatLine.h"
 
 
 namespace KICAD_AUTOROUTER
 {
 
-/** Freerouting equivalent: autoroute/maze/MazeListElement. */
+/** Freerouting a11c0a42 frontier ordering key; backtracking lives with each state. */
 struct MAZE_LIST_ELEMENT
 {
-    ROUTER_NODE node;
-    ROUTER_NODE backtrackNode;
     double      expansionValue = 0.0;
     double      sortingValue = 0.0;
-    std::size_t sequence = 0;
-    bool        isVia = false;
+    int         doorId = 0;
+    std::size_t sectionNoOfDoor = 0;
+
+    auto SortKey() const
+    {
+        return std::tuple{ sortingValue, expansionValue, doorId, sectionNoOfDoor };
+    }
+
+    static double BendPenalty( FLOAT_POINT aPreviousDoorCentre, FLOAT_POINT aFrom,
+                                FLOAT_POINT aTo, double aCost )
+    {
+        const double px = aFrom.x - aPreviousDoorCentre.x, py = aFrom.y - aPreviousDoorCentre.y;
+        const double nx = aTo.x - aFrom.x, ny = aTo.y - aFrom.y;
+        const double cross = px * ny - py * nx;
+        const double previousLength = px * px + py * py, nextLength = nx * nx + ny * ny;
+        return previousLength > 0 && nextLength > 0
+                       && cross * cross > 0.01 * previousLength * nextLength ? aCost : 0;
+    }
 };
 
 
@@ -35,13 +50,7 @@ struct MAZE_LIST_ELEMENT_COMPARE
 {
     bool operator()( const MAZE_LIST_ELEMENT& aLeft, const MAZE_LIST_ELEMENT& aRight ) const
     {
-        if( aLeft.sortingValue != aRight.sortingValue )
-            return aLeft.sortingValue > aRight.sortingValue;
-
-        if( aLeft.expansionValue != aRight.expansionValue )
-            return aLeft.expansionValue > aRight.expansionValue;
-
-        return aLeft.sequence > aRight.sequence;
+        return aLeft.SortKey() > aRight.SortKey();
     }
 };
 

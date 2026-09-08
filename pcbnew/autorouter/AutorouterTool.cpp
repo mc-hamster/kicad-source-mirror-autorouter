@@ -24,6 +24,7 @@
 #include "AutorouterTool.h"
 
 #include "DialogAutorouter.h"
+#include "board/KicadRoutingSession.h"
 
 #include <algorithm>
 
@@ -103,15 +104,17 @@ int AUTOROUTER_TOOL::AutorouteBoard( const TOOL_EVENT& )
     settings = settingsDialog.GetSettings();
     const std::shared_ptr<const BOARD_SNAPSHOT> snapshot = adapter.CreateSnapshot( settings );
 
-    const bool hasRoutableConnection = snapshot
+    // The live ratsnest can be stale until refill. Let the private host
+    // session decide whether work remains even when it initially has no edges.
+    const bool hasRoutableNet = snapshot
                                        && std::any_of(
                                                snapshot->nets.begin(), snapshot->nets.end(),
                                                []( const ROUTING_NET& aNet )
                                                {
-                                                   return !aNet.connections.empty();
+                                                   return aNet.routable;
                                                } );
 
-    if( !snapshot || !hasRoutableConnection )
+    if( !snapshot || !hasRoutableNet )
     {
         wxMessageBox( _( "No routable nets were found on the board." ), _( "Autoroute Board" ),
                       wxOK | wxICON_INFORMATION, frame() );
@@ -120,7 +123,16 @@ int AUTOROUTER_TOOL::AutorouteBoard( const TOOL_EVENT& )
 
     m_proposalBoardTimestamp = snapshot->sourceBoardTimestamp;
 
-    m_job = std::make_unique<AUTOROUTER_JOB>( snapshot, std::move( settings ) );
+    std::unique_ptr<KICAD_ROUTING_SESSION> hostSession;
+    try { hostSession = std::make_unique<KICAD_ROUTING_SESSION>( *board() ); }
+    catch( const std::exception& error )
+    {
+        wxMessageBox( wxString::FromUTF8( error.what() ), _( "Autoroute Board" ),
+                      wxOK | wxICON_ERROR, frame() );
+        m_proposalBoardTimestamp = -1;
+        return 0;
+    }
+    m_job = std::make_unique<AUTOROUTER_JOB>( snapshot, std::move( settings ), std::move( hostSession ) );
     m_job->Start();
 
     DIALOG_AUTOROUTER_PROGRESS progressDialog( frame(), *m_job );
@@ -251,6 +263,11 @@ void AUTOROUTER_TOOL::restoreHiddenItems()
 void AUTOROUTER_TOOL::acceptProposal()
 {
     if( !m_proposalActive || !m_result )
+        return;
+
+    // Enforce the same gate as the button even if acceptance was dispatched
+    // programmatically, or the dialog changes in a future refactor.
+    if( !m_result->CanAcceptProposal() )
         return;
 
     if( !board() || board()->GetTimeStamp() != m_proposalBoardTimestamp )

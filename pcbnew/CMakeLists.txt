@@ -417,7 +417,10 @@ set( PCBNEW_CLASS_SRCS
     autorouter/AutorouterTool.cpp
     autorouter/DialogAutorouter.cpp
     autorouter/board/KicadBoardAdapter.cpp
+    autorouter/board/KicadRoutingSession.cpp
+    autorouter/board/facade/RoutingBoard.cpp
     autorouter/board/searchtree/ShapeSearchTree90Degree.cpp
+    autorouter/datastructures/MinAreaTree.cpp
     autorouter/drill/DrillPage.cpp
     autorouter/drill/DrillPageArray.cpp
     autorouter/drc/DesignRulesChecker.cpp
@@ -425,16 +428,21 @@ set( PCBNEW_CLASS_SRCS
     autorouter/expansion/ExpansionGraph.cpp
     autorouter/expansion/ExpansionRoom.cpp
     autorouter/expansion/SortedRoomNeighbours.cpp
+    autorouter/expansion/SortedOrthogonalRoomNeighbours.cpp
     autorouter/maze/AutorouteControl.cpp
     autorouter/maze/AutorouteEngine.cpp
     autorouter/maze/DestinationDistance.cpp
     autorouter/maze/MazeExpansionEngine.cpp
     autorouter/maze/MazeRipupResolver.cpp
     autorouter/maze/MazeSearchEngine.cpp
+    autorouter/maze/MazeSearchEngine90Degree.cpp
+    autorouter/maze/MazeSearchEngineMultilayer.cpp
+    autorouter/maze/MazeSearchEngineRooms.cpp
     autorouter/maze/MazeTraceShover.cpp
     autorouter/path/Connection.cpp
     autorouter/path/FoundConnectionInserter.cpp
     autorouter/path/FoundConnectionLocator.cpp
+    autorouter/path/FoundConnectionLocator45Degree.cpp
     autorouter/pipeline/AutorouteConnectionRouter.cpp
     autorouter/pipeline/AutorouteAirlineCalculator.cpp
     autorouter/pipeline/BatchAutorouterThread.cpp

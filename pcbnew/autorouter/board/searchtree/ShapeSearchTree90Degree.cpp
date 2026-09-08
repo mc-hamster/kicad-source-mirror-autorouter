@@ -26,6 +26,51 @@ ROUTER_BOX intersection( const ROUTER_BOX& left, const ROUTER_BOX& right )
 }
 } // namespace
 
+std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> SHAPE_SEARCH_TREE_90_DEGREE::CompleteShape(
+        const INCOMPLETE_FREE_SPACE_EXPANSION_ROOM& aRoom, int aNet,
+        std::optional<int> aIgnoreObject, std::optional<ROUTER_BOX> aIgnoreShape,
+        const ROUTER_CANCEL_CALLBACK& aCancel ) const
+{
+    std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> result;
+    if( m_tree.Size() == 0 || dimension( aRoom.GetContainedShape() ) < 0 )
+        return result;
+    ROUTER_BOX bounding = intersection( m_bounds, aRoom.GetShape() );
+    result.emplace_back( bounding, aRoom.GetLayer(), aRoom.GetContainedShape() );
+    const bool finished = m_tree.Visit( bounding, [&]( const SHAPE_TREE_ENTRY& entry )
+    {
+        if( aCancel && aCancel() )
+            return false;
+        if( !entry.IsTraceObstacle( aNet ) || entry.layer != aRoom.GetLayer()
+            || ( aIgnoreObject && entry.objectId == *aIgnoreObject ) )
+            return true;
+        std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> next;
+        for( const auto& room : result )
+        {
+            if( INT_BOX::Overlaps( room.GetShape(), entry.shape ) )
+            {
+                // Preserve the upstream skip semantics; it drops this candidate,
+                // rather than retaining a shape hidden by a previous overlap door.
+                if( entry.isRoom && aIgnoreShape
+                    && INT_BOX::Contains( *aIgnoreShape,
+                                          intersection( room.GetShape(), entry.shape ) ) )
+                    continue;
+                const auto restrained = RestrainShape( room, entry.shape );
+                next.insert( next.end(), restrained.begin(), restrained.end() );
+            }
+            else
+                next.push_back( room );
+        }
+        result = std::move( next );
+        bounding = INT_BOX::Empty();
+        for( const auto& room : result )
+            bounding = INT_BOX::Union( bounding, room.GetShape() );
+        return true;
+    } );
+    if( !finished )
+        result.clear();
+    return result;
+}
+
 std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> SHAPE_SEARCH_TREE_90_DEGREE::RestrainShape(
         const INCOMPLETE_FREE_SPACE_EXPANSION_ROOM& aRoom, const ROUTER_BOX& obstacle )
 {

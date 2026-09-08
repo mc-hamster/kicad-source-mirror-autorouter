@@ -13,6 +13,7 @@
 
 #include "ExpandableObject.h"
 #include "ExpansionRoom.h"
+#include "../geometry/planar/FloatLine.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -31,6 +32,10 @@ public:
     bool                  Connects( const EXPANSION_ROOM* aRoom ) const;
     int                   GetDimension() const { return m_dimension; }
     ROUTER_BOX            GetShape() const;
+    // Tolerance is explicit because KiCad IU and reference coordinates differ.
+    std::vector<FLOAT_LINE> GetSectionSegments( double aOffset, double aTolerance = 2,
+                                               double aMaxSectionWidth = 0,
+                                               std::size_t aMaxSections = std::numeric_limits<std::size_t>::max() ) const;
     int                   GetId() const override;
     void                  Reset() override {}
 

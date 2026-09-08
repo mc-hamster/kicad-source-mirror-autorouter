@@ -46,7 +46,13 @@ public:
     int Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                   const ROUTER_CANCEL_CALLBACK& aCancel ) const;
 
+    void RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& aConnections,
+                                  const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+
 private:
+    void removeTraceTails( std::vector<ROUTING_CONNECTION>& aConnections,
+                           const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+
     void simplifyConnection( ROUTING_CONNECTION& aConnection,
                               const MAZE_SEARCH_ENGINE& aSearch ) const;
 

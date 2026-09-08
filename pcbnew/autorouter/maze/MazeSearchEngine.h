@@ -21,9 +21,9 @@
  * Freerouting equivalent: autoroute/maze/MazeSearchEngine.java and
  * autoroute/maze/MazeExpansionEngine.java.
  *
- * The current search is an experimental grid/visibility implementation, not
- * a port of upstream's room/door search. Connected-set inputs are retained at
- * this boundary so the replacement engine can preserve upstream topology.
+ * The no-via path now tries the orthogonal free-room slice. Multi-layer search
+ * and unsupported geometry still use the experimental grid/visibility engine;
+ * neither the combined implementation nor its cost model is at upstream parity.
  */
 
 #pragma once
@@ -36,9 +36,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../board/facade/RoutingBoard.h"
 #include "AutorouteControl.h"
 #include "DestinationDistance.h"
 #include "MazeExpansionEngine.h"
+#include "MazeSearchEngine90Degree.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -72,6 +74,9 @@ public:
     {
     }
 
+    void InitializeBoard( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings );
+    ROUTING_BOARD* Board() const { return m_board.get(); }
+
     void Add( const ROUTING_CONNECTION& aConnection );
     void Remove( const ROUTING_CONNECTION& aConnection );
     void Clear();
@@ -87,6 +92,7 @@ public:
                                                   const ROUTER_NODE& aEnd ) const;
 
 private:
+    std::unique_ptr<ROUTING_BOARD> m_board;
     std::int64_t m_gridStep;
     std::unordered_map<ROUTER_CELL_KEY, std::map<int, int>, ROUTER_CELL_HASH> m_usage;
     std::vector<ROUTING_CONNECTION> m_connections;
@@ -116,8 +122,23 @@ public:
 
     bool CanUseSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
                         bool aForVia = false ) const;
+    const ROOM_SEARCH_METRICS& LastRoomSearchMetrics() const { return m_roomMetrics; }
 
 private:
+    std::vector<SHAPE_TREE_ENTRY> roomObstacles( int aNet, int aLayer, bool aForVia,
+                                               const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+    std::optional<ROUTING_CONNECTION> findMultilayerRoomConnection(
+            const std::vector<ROUTING_TERMINAL>& aStarts,
+            const std::vector<ROUTING_TERMINAL>& aTargets, int aRetry, int& aExpanded,
+            const ROUTER_CANCEL_CALLBACK& aCancel,
+            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const;
+    std::optional<ROUTING_CONNECTION> findRoomConnection(
+            const std::vector<ROUTING_TERMINAL>& aStarts,
+            const std::vector<ROUTING_TERMINAL>& aTargets, int aRetry, int& aExpanded,
+            const ROUTER_CANCEL_CALLBACK& aCancel,
+            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const;
+    mutable ROOM_SEARCH_METRICS m_roomMetrics;
+
     struct OPEN_NODE
     {
         ROUTER_NODE node;

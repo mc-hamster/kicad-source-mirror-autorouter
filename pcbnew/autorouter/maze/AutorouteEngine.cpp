@@ -22,16 +22,12 @@ namespace KICAD_AUTOROUTER
 AUTOROUTE_ENGINE::AUTOROUTE_ENGINE( const BOARD_SNAPSHOT& aBoard,
                                     const AUTOROUTER_SETTINGS& aSettings,
                                     ROUTING_OCCUPANCY& aOccupancy ) :
-        m_search( aBoard, aSettings, aOccupancy ),
-        m_drillPages( aBoard.bounds,
-                      std::max<std::int64_t>(
-                              10000,
-                              aBoard.nets.empty()
-                                      ? 10000
-                                      : std::max<std::int64_t>( 10000,
-                                                                aBoard.nets.front().viaDiameter
-                                                                        * 5 ) ) )
+        m_search( aBoard, aSettings, aOccupancy )
 {
+    // The active multilayer search owns its budgeted page/room lifetime.
+    // The old wrapper allocated a second, unused array before cancellation
+    // or work limits were checked (millions of pages for a default via size).
+    // Persistent per-net invalidation/reuse is a separate parity milestone.
 }
 
 
@@ -53,10 +49,5 @@ std::vector<ROUTING_CONNECTION> AUTOROUTE_ENGINE::FindConflictingConnections(
     return m_search.FindConflictingConnections( aCandidate );
 }
 
-
-void AUTOROUTE_ENGINE::Clear()
-{
-    m_drillPages.Reset();
-}
 
 } // namespace KICAD_AUTOROUTER

@@ -22,6 +22,7 @@
  */
 
 #include "MazeSearchEngine.h"
+#include "../rules/ViaRule.h"
 
 #include "../AutorouterDebug.h"
 #include "../expansion/ExpansionGraph.h"
@@ -53,6 +54,24 @@ std::int64_t squaredDistance( const ROUTER_POINT& aLeft, const ROUTER_POINT& aRi
     return value >= static_cast<long double>( std::numeric_limits<std::int64_t>::max() )
                    ? std::numeric_limits<std::int64_t>::max()
                    : static_cast<std::int64_t>( value );
+}
+
+
+// Project onto existing copper, not onto the representative pad's centre.
+ROUTER_POINT terminalPoint( const ROUTING_TERMINAL& aTerminal, const ROUTER_POINT& aFrom )
+{
+    if( !aTerminal.segmentEnd )
+        return aTerminal.pad.position;
+    const auto& start = aTerminal.pad.position;
+    const auto& end = *aTerminal.segmentEnd;
+    const long double dx = static_cast<long double>( end.x ) - start.x;
+    const long double dy = static_cast<long double>( end.y ) - start.y;
+    const long double lengthSquared = dx * dx + dy * dy;
+    const long double t = lengthSquared == 0 ? 0 : std::clamp(
+            ( ( static_cast<long double>( aFrom.x ) - start.x ) * dx
+              + ( static_cast<long double>( aFrom.y ) - start.y ) * dy ) / lengthSquared,
+            0.0L, 1.0L );
+    return { std::llround( start.x + t * dx ), std::llround( start.y + t * dy ) };
 }
 
 
@@ -359,8 +378,20 @@ std::vector<ROUTER_CELL_KEY> ROUTING_OCCUPANCY::CellsForSegment( const ROUTER_NO
 }
 
 
+void ROUTING_OCCUPANCY::InitializeBoard( const BOARD_SNAPSHOT& aBoard,
+                                           const AUTOROUTER_SETTINGS& aSettings )
+{
+    auto board = std::make_unique<ROUTING_BOARD>( aBoard, aSettings );
+    for( const auto& connection : m_connections )
+        board->AddRoute( connection );
+    m_board = std::move( board );
+}
+
+
 void ROUTING_OCCUPANCY::Add( const ROUTING_CONNECTION& aConnection )
 {
+    if( m_board )
+        m_board->AddRoute( aConnection );
     m_connections.push_back( aConnection );
 
     for( std::size_t i = 1; i < aConnection.nodes.size(); ++i )
@@ -387,23 +418,29 @@ void ROUTING_OCCUPANCY::Remove( const ROUTING_CONNECTION& aConnection )
                        && aExisting.nodes == aConnection.nodes;
             } );
 
-    if( connectionIt != m_connections.end() )
-        m_connections.erase( connectionIt );
+    if( connectionIt == m_connections.end() )
+        return;
 
-    for( std::size_t i = 1; i < aConnection.nodes.size(); ++i )
+    // Copy first: callers may pass a reference into Connections().
+    const ROUTING_CONNECTION removed = *connectionIt;
+    if( m_board )
+        m_board->RemoveRoute( removed );
+    m_connections.erase( connectionIt );
+
+    for( std::size_t i = 1; i < removed.nodes.size(); ++i )
     {
-        if( aConnection.nodes[i - 1].layer != aConnection.nodes[i].layer )
+        if( removed.nodes[i - 1].layer != removed.nodes[i].layer )
             continue;
 
-        for( const ROUTER_CELL_KEY& cell : CellsForSegment( aConnection.nodes[i - 1],
-                                                             aConnection.nodes[i] ) )
+        for( const ROUTER_CELL_KEY& cell : CellsForSegment( removed.nodes[i - 1],
+                                                             removed.nodes[i] ) )
         {
             auto usageIt = m_usage.find( cell );
 
             if( usageIt == m_usage.end() )
                 continue;
 
-            auto netIt = usageIt->second.find( aConnection.netCode );
+            auto netIt = usageIt->second.find( removed.netCode );
 
             if( netIt == usageIt->second.end() )
                 continue;
@@ -420,6 +457,8 @@ void ROUTING_OCCUPANCY::Remove( const ROUTING_CONNECTION& aConnection )
 
 void ROUTING_OCCUPANCY::Clear()
 {
+    if( m_board )
+        m_board->ClearRoutes();
     m_usage.clear();
     m_connections.clear();
 }
@@ -1096,8 +1135,8 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
 
     if( aForVia )
     {
-        // A through-via occupies every modeled copper layer in its span.  A
-        // disabled layer is not an allowed part of the autoroute span.
+        // Inactive routing layers still carry the copper/drill of a through-via.
+        // Only trace entry/exit is gated by layer enablement.
         const auto layerIt = std::find_if(
                 m_settings.layers.begin(), m_settings.layers.end(),
                 [aLayer]( const ROUTER_LAYER_SETTINGS& aSetting )
@@ -1105,7 +1144,7 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                     return aSetting.layerId == aLayer;
                 } );
 
-        if( layerIt == m_settings.layers.end() || !layerIt->enabled )
+        if( layerIt == m_settings.layers.end() )
         {
             return false;
         }
@@ -1210,11 +1249,8 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                 const ROUTER_NODE& second = connection.nodes[index];
                 if( first.layer == second.layer || first.point == aPoint )
                     continue;
-                const int low = std::min( layerOrdinal( first.layer ), layerOrdinal( second.layer ) );
-                const int high = std::max( layerOrdinal( first.layer ), layerOrdinal( second.layer ) );
-                if( layerOrdinal( aLayer ) >= low && layerOrdinal( aLayer ) <= high
-                    && distance( aPoint, first.point ) < 2 * netViaDrillRadius( aNetCode )
-                                                            + m_board.holeToHoleClearance )
+                if( distance( aPoint, first.point ) < 2 * netViaDrillRadius( aNetCode )
+                                                        + m_board.holeToHoleClearance )
                     return false;
             }
         }
@@ -1529,25 +1565,14 @@ bool MAZE_SEARCH_ENGINE::CanUseSegment( int aNetCode, const ROUTER_NODE& aStart,
 {
     if( aStart.layer != aEnd.layer )
     {
-        const int top = std::min( layerOrdinal( aStart.layer ), layerOrdinal( aEnd.layer ) );
-        const int bottom = std::max( layerOrdinal( aStart.layer ), layerOrdinal( aEnd.layer ) );
+        if( aStart.point != aEnd.point
+            || !VIA_RULE::AllowsTransition( m_settings, aStart.layer, aEnd.layer ) )
+            return false;
 
-        for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
+        for( const auto& layer : m_settings.layers )
         {
-            if( layer.layerOrdinal >= 0 && layer.layerOrdinal >= top
-                && layer.layerOrdinal <= bottom
-                && !isPointAllowed( aStart.point, layer.layerId, aNetCode, true ) )
-            {
+            if( !isPointAllowed( aStart.point, layer.layerId, aNetCode, true ) )
                 return false;
-            }
-
-            if( layer.layerOrdinal < 0
-                && layerOrdinal( layer.layerId ) >= top
-                && layerOrdinal( layer.layerId ) <= bottom
-                && !isPointAllowed( aStart.point, layer.layerId, aNetCode, true ) )
-            {
-                return false;
-            }
         }
 
         return true;
@@ -1564,15 +1589,6 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
 {
     std::vector<ROUTING_CONNECTION> result;
 
-    const auto layerInSpan = [&]( int aLayer, int aFirstLayer, int aSecondLayer )
-    {
-        const int layerOrdinalValue = layerOrdinal( aLayer );
-        const int firstOrdinal = std::min( layerOrdinal( aFirstLayer ),
-                                           layerOrdinal( aSecondLayer ) );
-        const int lastOrdinal = std::max( layerOrdinal( aFirstLayer ),
-                                          layerOrdinal( aSecondLayer ) );
-        return layerOrdinalValue >= firstOrdinal && layerOrdinalValue <= lastOrdinal;
-    };
 
     const auto edgeConflicts = [&]( const ROUTER_NODE& aLeftStart,
                                     const ROUTER_NODE& aLeftEnd,
@@ -1600,13 +1616,6 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
 
         if( leftVia && rightVia )
         {
-            const bool commonLayer = layerInSpan( aLeftStart.layer, aRightStart.layer,
-                                                  aRightEnd.layer )
-                                     || layerInSpan( aRightStart.layer, aLeftStart.layer,
-                                                     aLeftEnd.layer );
-            if( !commonLayer )
-                return false;
-
             const std::int64_t copperClearance = netViaRadius( aLeftNetCode )
                                                  + netViaRadius( aRightNetCode )
                                                  + pairClearance( aLeftNetCode, aRightNetCode );
@@ -1618,14 +1627,10 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
         }
 
         const ROUTER_NODE& viaStart = leftVia ? aLeftStart : aRightStart;
-        const ROUTER_NODE& viaEnd = leftVia ? aLeftEnd : aRightEnd;
         const int viaNetCode = leftVia ? aLeftNetCode : aRightNetCode;
         const ROUTER_NODE& trackStart = leftVia ? aRightStart : aLeftStart;
         const ROUTER_NODE& trackEnd = leftVia ? aRightEnd : aLeftEnd;
         const int trackNetCode = leftVia ? aRightNetCode : aLeftNetCode;
-
-        if( !layerInSpan( trackStart.layer, viaStart.layer, viaEnd.layer ) )
-            return false;
 
         const std::int64_t clearance = netViaRadius( viaNetCode )
                                        + netTrackRadius( trackNetCode )
@@ -1896,6 +1901,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                                     const std::vector<ROUTING_TERMINAL>& aTargets ) const
 {
     aExpandedNodes = 0;
+    m_roomMetrics = {};
     const std::vector<ROUTING_TERMINAL> starts = aStarts.empty()
             ? std::vector<ROUTING_TERMINAL>{ { aStart } } : aStarts;
     const std::vector<ROUTING_TERMINAL> targets = aTargets.empty()
@@ -1937,8 +1943,10 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     for( const auto& terminal : targets )
     {
         const ROUTER_POINT& point = terminal.pad.position;
+        const auto end = terminal.segmentEnd.value_or( point );
         for( int layer : terminal.pad.layers )
-            m_destinationDistance.Join( { point.x, point.y, point.x, point.y }, layer );
+            m_destinationDistance.Join( { std::min( point.x, end.x ), std::min( point.y, end.y ),
+                                         std::max( point.x, end.x ), std::max( point.y, end.y ) }, layer );
     }
     AUTOROUTE_CONTROL control( m_settings, aStart.netCode, aRetry,
                                aTarget.isPlaneTarget );
@@ -1959,23 +1967,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         const ROUTER_NODE source{ aStart.position, aTarget.fanoutSourceLayer };
         const ROUTER_NODE landing{ aTarget.position, aTarget.fanoutSourceLayer };
         const ROUTER_NODE destination{ aTarget.position, aTarget.fanoutTargetLayer };
-        bool viaAllowed = true;
-        const int sourceOrdinal = layerOrdinal( aTarget.fanoutSourceLayer );
-        const int targetOrdinal = layerOrdinal( aTarget.fanoutTargetLayer );
-        const int firstOrdinal = std::min( sourceOrdinal, targetOrdinal );
-        const int lastOrdinal = std::max( sourceOrdinal, targetOrdinal );
-
-        for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
-        {
-            const int ordinal = layerOrdinal( layer.layerId );
-            const bool layerAllowed = isPointAllowed( landing.point, layer.layerId,
-                                                      aStart.netCode, true );
-            if( ordinal >= firstOrdinal && ordinal <= lastOrdinal && !layerAllowed )
-            {
-                viaAllowed = false;
-                break;
-            }
-        }
+        const bool viaAllowed = CanUseSegment( aStart.netCode, landing, destination, true );
 
         const bool stubAllowed = isSegmentAllowed(
                 source.point, landing.point, source.layer, aStart.netCode, false,
@@ -2012,23 +2004,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         const ROUTER_NODE source{ aStart.position, aStart.fanoutTargetLayer };
         const ROUTER_NODE landing{ aStart.position, aStart.fanoutSourceLayer };
         const ROUTER_NODE destination{ aTarget.position, aStart.fanoutSourceLayer };
-        bool viaAllowed = true;
-        const int sourceOrdinal = layerOrdinal( aStart.fanoutTargetLayer );
-        const int targetOrdinal = layerOrdinal( aStart.fanoutSourceLayer );
-        const int firstOrdinal = std::min( sourceOrdinal, targetOrdinal );
-        const int lastOrdinal = std::max( sourceOrdinal, targetOrdinal );
-
-        for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
-        {
-            const int ordinal = layerOrdinal( layer.layerId );
-            const bool layerAllowed = isPointAllowed( landing.point, layer.layerId,
-                                                      aStart.netCode, true );
-            if( ordinal >= firstOrdinal && ordinal <= lastOrdinal && !layerAllowed )
-            {
-                viaAllowed = false;
-                break;
-            }
-        }
+        const bool viaAllowed = CanUseSegment( aStart.netCode, source, landing, true );
 
         const bool stubAllowed = isSegmentAllowed(
                 landing.point, destination.point, destination.layer, aStart.netCode, false,
@@ -2049,6 +2025,19 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         }
     }
 
+    // The rectangular room frontier now compares same-layer routes and
+    // through-drill alternatives in one queue. Unsupported/rejected geometry
+    // retains the legacy fallback with the same work budget and cancellation.
+    const auto enabledLayers = std::count_if( m_settings.layers.begin(), m_settings.layers.end(),
+                                             []( const auto& layer ) { return layer.enabled; } );
+    const auto roomPath = !m_settings.allowVias || enabledLayers == 1
+            ? findRoomConnection( starts, targets, aRetry, aExpandedNodes, aCancel, aProgress )
+            : findMultilayerRoomConnection( starts, targets, aRetry, aExpandedNodes, aCancel, aProgress );
+    if( roomPath )
+        return roomPath;
+    if( aCancel && aCancel() )
+        return std::nullopt;
+
     std::priority_queue<OPEN_NODE, std::vector<OPEN_NODE>, OPEN_NODE_COMPARE> open;
     std::unordered_map<ROUTER_NODE, double, NODE_KEY_HASH> bestCost;
     std::unordered_map<ROUTER_NODE, ROUTER_NODE, NODE_KEY_HASH> cameFrom;
@@ -2059,23 +2048,34 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
 
     for( const ROUTING_TERMINAL& terminal : starts )
     {
-    for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
-    {
-        if( !layer.enabled || !isOnPadLayer( terminal.pad, layer.layerId )
-            || !isPointAllowed( terminal.pad.position, layer.layerId, aStart.netCode, false,
-                                netTrackRadius( aStart.netCode ) ) )
+        std::vector<ROUTER_POINT> seeds{ terminal.pad.position };
+        if( terminal.segmentEnd )
         {
-            continue;
+            seeds.push_back( *terminal.segmentEnd );
+            for( const auto& target : targets )
+            {
+                seeds.push_back( terminalPoint( terminal, target.pad.position ) );
+                if( target.segmentEnd )
+                    seeds.push_back( terminalPoint( terminal, *target.segmentEnd ) );
+            }
         }
-
-        ROUTER_NODE start{ terminal.pad.position, layer.layerId };
-        if( bestCost.contains( start ) )
-            continue;
-        const double h = heuristic( start, aTarget.position, layer.layerId, control );
-        open.push( { start, 0.0, h, sequence++ } );
-        bestCost[start] = 0.0;
-        startOwners[start] = terminal.padIndex;
-    }
+        for( const auto& point : seeds )
+        {
+            for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
+            {
+                if( !layer.enabled || !isOnPadLayer( terminal.pad, layer.layerId )
+                    || !isPointAllowed( point, layer.layerId, aStart.netCode, false,
+                                       netTrackRadius( aStart.netCode ) ) )
+                    continue;
+                ROUTER_NODE start{ point, layer.layerId };
+                if( bestCost.contains( start ) )
+                    continue;
+                const double h = heuristic( start, aTarget.position, layer.layerId, control );
+                open.push( { start, 0.0, h, sequence++ } );
+                bestCost[start] = 0.0;
+                startOwners[start] = terminal.padIndex;
+            }
+        }
     }
 
     auto logSearchState = [&]( const char* aState )
@@ -2123,11 +2123,12 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         if( bestIt == bestCost.end() || current.g > bestIt->second )
             continue;
 
-        if( ++aExpandedNodes > effectiveMaxExpandedNodes )
+        if( aExpandedNodes >= effectiveMaxExpandedNodes )
         {
             logSearchState( "END search expansion limit" );
             return std::nullopt;
         }
+        ++aExpandedNodes;
 
         // A difficult connection may expand tens of thousands of nodes before
         // it either succeeds or exhausts its budget.  Report at a bounded
@@ -2139,7 +2140,9 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         const auto destination = std::find_if( targets.begin(), targets.end(),
                 [&]( const ROUTING_TERMINAL& terminal )
                 {
-                    return canFinish( current.node, terminal.pad, aStart.netCode );
+                    ROUTING_PAD target = terminal.pad;
+                    target.position = terminalPoint( terminal, current.node.point );
+                    return canFinish( current.node, target, aStart.netCode );
                 } );
         if( destination != targets.end() )
         {
@@ -2148,9 +2151,9 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             result.complete = true;
             result.isPlaneConnection = destination->pad.isPlaneTarget;
             result.toPadIndex = destination->padIndex;
-            result.cost = current.g
-                          + control.TraceCost( distance( current.node.point, destination->pad.position ) );
-            result.nodes.push_back( { destination->pad.position, current.node.layer } );
+            const ROUTER_POINT finish = terminalPoint( *destination, current.node.point );
+            result.cost = current.g + control.TraceCost( distance( current.node.point, finish ) );
+            result.nodes.push_back( { finish, current.node.layer } );
 
             ROUTER_NODE cursor = current.node;
 
@@ -2211,7 +2214,9 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         auto nextNodes = adaptiveNeighbours( current.node, aTarget, landmarks, aStart.netCode );
         for( const ROUTING_TERMINAL& terminal : targets )
         {
-            const ROUTER_NODE node{ terminal.pad.position, current.node.layer };
+            if( !isOnPadLayer( terminal.pad, current.node.layer ) )
+                continue;
+            const ROUTER_NODE node{ terminalPoint( terminal, current.node.point ), current.node.layer };
             if( node != current.node
                 && std::find( nextNodes.begin(), nextNodes.end(), node ) == nextNodes.end() )
                 nextNodes.push_back( node );
@@ -2235,30 +2240,8 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                     continue;
                 }
 
-                bool viaAllowed = true;
-
-                const int currentOrdinal = layerOrdinal( current.node.layer );
-                const int nextOrdinal = layerOrdinal( next.layer );
-                const int firstOrdinal = std::min( currentOrdinal, nextOrdinal );
-                const int lastOrdinal = std::max( currentOrdinal, nextOrdinal );
-
-                for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
-                {
-                    const int ordinal = layerOrdinal( layer.layerId );
-                    if( ordinal < firstOrdinal || ordinal > lastOrdinal )
-                        continue;
-
-                    if( !isPointAllowed( current.node.point, layer.layerId, aStart.netCode, true ) )
-                    {
-                        viaAllowed = false;
-                        break;
-                    }
-                }
-
-                if( !viaAllowed )
-                {
+                if( !CanUseSegment( aStart.netCode, current.node, next, true ) )
                     continue;
-                }
             }
             else if( !isSegmentAllowedFromKnownStart( current.node.point, next.point, next.layer,
                                                       aStart.netCode, false ) )

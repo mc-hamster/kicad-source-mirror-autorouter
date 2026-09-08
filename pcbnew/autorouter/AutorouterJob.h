@@ -20,9 +20,9 @@
 /*
  * Worker orchestration for the native autorouter.
  *
- * The worker receives an immutable BOARD_SNAPSHOT and never touches a BOARD,
- * a VIEW, or wxWidgets.  This is the same separation used by Freerouting's
- * headless routing pipeline and keeps cancellation/progress deterministic.
+ * The algorithm receives a data-only snapshot. The optional host session owns
+ * an isolated KiCad board for refill/validation; neither path accesses the live
+ * editor board, views or UI objects.
  */
 
 #pragma once
@@ -39,11 +39,14 @@
 namespace KICAD_AUTOROUTER
 {
 
+class KICAD_ROUTING_SESSION;
+
 class AUTOROUTER_JOB
 {
 public:
     AUTOROUTER_JOB( std::shared_ptr<const BOARD_SNAPSHOT> aSnapshot,
-                    AUTOROUTER_SETTINGS aSettings );
+                    AUTOROUTER_SETTINGS aSettings,
+                    std::unique_ptr<KICAD_ROUTING_SESSION> aHostSession = nullptr );
     ~AUTOROUTER_JOB();
 
     AUTOROUTER_JOB( const AUTOROUTER_JOB& ) = delete;
@@ -64,6 +67,7 @@ private:
     void run();
 
 private:
+    std::unique_ptr<KICAD_ROUTING_SESSION> m_hostSession;
     std::shared_ptr<const BOARD_SNAPSHOT> m_snapshot;
     AUTOROUTER_SETTINGS                    m_settings;
     std::atomic<bool>                      m_cancel{ false };

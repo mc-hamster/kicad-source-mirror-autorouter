@@ -33,8 +33,8 @@ namespace KICAD_AUTOROUTER
 
 double AUTOROUTE_CONTROL::ViaCost() const
 {
-    // Freerouting applies retry-dependent penalties to discourage repeatedly
-    // selecting the same congested layer transition.
+    // Experimental retry penalty; this is not upstream padstack-radius-scaled
+    // minNormalViaCost. See the core parity review before changing units.
     const int configuredCost = m_targetIsPlane && m_settings.planeViaCost > 0
                                        ? m_settings.planeViaCost
                                        : m_settings.viaCost;
@@ -45,9 +45,9 @@ double AUTOROUTE_CONTROL::ViaCost() const
 
 double AUTOROUTE_CONTROL::TraceCost( double aLength ) const
 {
-    // Freerouting's expansion costs are expressed per search-resolution unit,
-    // not per absolute board coordinate.  Normalize KiCad IU here so the
-    // default via cost remains meaningful on millimeter-sized boards.
+    // Experimental grid-normalized units. Upstream instead uses geometric
+    // distances weighted per axis and scales via costs by padstack radius.
+    // These models must be replaced together, not described as equivalent.
     const double resolution = std::max( 1, m_settings.gridStepIU );
     return std::max( 0, m_settings.traceLengthCost ) * ( aLength / resolution );
 }
