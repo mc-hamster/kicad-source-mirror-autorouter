@@ -400,10 +400,14 @@ set( ZONE_MANAGER_SRCS
 # Preserve Java's separate floating multiply/add rounding in the translated
 # destination estimate and fanout sorting. No global KiCad floating flag changes.
 if( CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" )
-    set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp APPEND
+    set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp
+        autorouter/geometry/planar/Polyline.cpp autorouter/geometry/planar/Simplex.cpp
+        autorouter/board/optimize/TraceShover.cpp APPEND
                   PROPERTY COMPILE_OPTIONS -ffp-contract=off )
 elseif( MSVC )
-    set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp APPEND
+    set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp
+        autorouter/geometry/planar/Polyline.cpp autorouter/geometry/planar/Simplex.cpp
+        autorouter/board/optimize/TraceShover.cpp APPEND
                   PROPERTY COMPILE_OPTIONS /fp:strict )
 endif()
 

@@ -17,6 +17,8 @@ public:
     POINT Corner( std::size_t i ) const { return lines.at( i ).Intersection( lines.at( i + 1 ) ).value(); }
     POINT FirstCorner() const { return Corner( 0 ); }
     POINT LastCorner() const { return Corner( lines.size() - 2 ); }
+    bool HasSameEndpoints( const POLYLINE& other ) const
+    { return !Empty() && !other.Empty() && FirstCorner() == other.FirstCorner() && LastCorner() == other.LastCorner(); }
     POLYLINE Reverse() const;
     POLYLINE Combine( const POLYLINE& aOther ) const;
     double LengthApprox() const;

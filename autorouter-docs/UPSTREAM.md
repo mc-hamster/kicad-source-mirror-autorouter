@@ -176,3 +176,12 @@ for the same `a11c0a42` source pin. Added QA-only normal-contact and fanout-orde
 oracles; no Java or network router was introduced into production. Normal
 contacts, integer splitting, checked atomic insertion and ordering are partial
 core capabilities, not completed forced shove, neckdown or full batch parity.
+
+### Exact geometry / fixed-obstacle contour insertion
+
+`geometry/planar/{Point,Line,Polyline,Simplex}` and
+`board/optimize/TraceShover` retain source filenames and package boundaries.
+See [geometry/spring-over report](CONVEX-SPRING-OVER-PARITY.md) for the finite
+bounded geometry and production orthogonal/rectangle limits, the 2,432-record
+Java oracle, endpoint-loss guard and remaining full-port dependencies. This is
+not `TraceShover.check/insert`, neckdown, or general forced insertion.

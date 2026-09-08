@@ -54,7 +54,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--java", default="java")
     parser.add_argument("--javac", default="javac")
-    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout"), default="room")
+    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "spring"), default="room")
     args = parser.parse_args()
     jar, output = args.reference_jar.resolve(), args.output_dir.resolve()
     verify_reference(jar)
@@ -63,15 +63,20 @@ def main() -> int:
     classes.mkdir()
     drill = args.oracle == "drill"
     main_class = {"room": "RoomSearchOracle", "drill": "app.freerouting.autoroute.maze.DrillSearchOracle",
-                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle"}[args.oracle]
+                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle", "convex": "ConvexGeometryOracle",
+                  "spring": "SpringOverOracle"}[args.oracle]
     source = ROOT / "scripts/autorouter" / (main_class.rsplit(".", 1)[-1] + ".java")
     expected = ROOT / f"qa/data/pcbnew/autorouter/{args.oracle}-search-a11c0a42.txt"
+    sources = [source]
+    if args.oracle == "spring":
+        sources.append(ROOT / "scripts/autorouter/ConvexGeometryOracle.java")
     commands = [
-        [args.javac, "-cp", str(jar), "-d", str(classes), str(source)],
+        [args.javac, "-cp", str(jar), "-d", str(classes), *map(str, sources)],
         [args.java, "-cp", f"{jar}{os.pathsep}{classes}", main_class],
     ]
     metadata = {"reference_revision": REFERENCE_REVISION, "reference_jar_sha256": sha256(jar),
                 "oracle_source_sha256": sha256(source), "expected_sha256": sha256(expected),
+                "source_sha256": {str(path.relative_to(ROOT)): sha256(path) for path in sources},
                 "commands": commands, "oracle": args.oracle}
     try:
         with (output / "compile.log").open("w") as log:

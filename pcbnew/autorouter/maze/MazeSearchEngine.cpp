@@ -1692,8 +1692,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
             if( wrapped.cancelled || !wrapped.polyline ) return {};
             // The pinned spring-over method can lose an endpoint on a looping
             // input. Preserve its oracle output, but NEVER accept that mutation.
-            if( !( wrapped.polyline->FirstCorner() == path.FirstCorner() )
-                || !( wrapped.polyline->LastCorner() == path.LastCorner() ) ) return {};
+            if( !wrapped.polyline->HasSameEndpoints( path ) ) return {};
             const auto corners = wrapped.polyline->IntegralCorners();
             if( !corners ) return {};
             for( const auto& point : *corners ) result.nodes.push_back( { point, layer } );

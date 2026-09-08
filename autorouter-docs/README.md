@@ -1,6 +1,6 @@
 # Native autorouter engineering notes
 
-Latest core work: [normal contacts, transactional insertion, and fanout ordering](CORE-CONTACT-INSERTION-PARITY.md).
+Latest core work: [exact line/convex geometry and recursive fixed-obstacle spring-over](CONVEX-SPRING-OVER-PARITY.md).
 This is still a partial implementation, not full forced-insertion/shove/neckdown parity.
 
 **Status: experimental; Freerouting parity has not been achieved.** See

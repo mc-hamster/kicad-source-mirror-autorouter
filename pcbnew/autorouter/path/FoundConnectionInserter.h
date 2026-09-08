@@ -43,7 +43,7 @@ public:
         std::size_t edge = 0; // failed edge's end index; 0 for whole-input failure
         // Present only when insertion changed the path. Batch/result ownership
         // must publish this route, not the search proposal it replaced.
-        std::optional<ROUTING_CONNECTION> connection;
+        std::optional<ROUTING_CONNECTION> connection = std::nullopt;
     };
     static RESULT Insert( const ROUTING_CONNECTION& aConnection,
                           const std::vector<ROUTING_CONNECTION>& aRipups,

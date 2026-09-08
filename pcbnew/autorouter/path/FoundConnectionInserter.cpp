@@ -28,8 +28,14 @@ namespace KICAD_AUTOROUTER
 FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
         const ROUTING_CONNECTION& connection, const std::vector<ROUTING_CONNECTION>& ripups,
         ROUTING_OCCUPANCY& occupancy, const MAZE_SEARCH_ENGINE& engine,
-        const ROUTER_CANCEL_CALLBACK& cancel )
+        const ROUTER_CANCEL_CALLBACK& requestedCancel )
 {
+    bool cancelled = false;
+    const ROUTER_CANCEL_CALLBACK cancel = [&]
+    {
+        cancelled = cancelled || ( requestedCancel && requestedCancel() );
+        return cancelled;
+    };
     if( !occupancy.Board() || !connection.complete || connection.netCode <= 0
         || connection.nodes.empty() )
         return { STATE::INVALID };
@@ -53,23 +59,23 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
         && !engine.CanInsertSegment( connection.netCode, connection.nodes[0], connection.nodes[0] ) )
         return { STATE::BLOCKED };
     std::optional<ROUTING_CONNECTION> replacement;
-    bool blocked = false;
+    std::size_t blockedEdge = 0;
     for( std::size_t i = 1; i < connection.nodes.size(); ++i )
     {
         if( cancel && cancel() ) return { STATE::CANCELLED, i };
         if( !engine.CanInsertSegment( connection.netCode, connection.nodes[i - 1], connection.nodes[i] ) )
-        { blocked = true; break; }
+        { blockedEdge = i; break; }
     }
-    if( blocked )
+    if( blockedEdge != 0 )
     {
         replacement = engine.SpringOverConnection( connection, cancel );
         if( cancel && cancel() ) return { STATE::CANCELLED };
-        if( !replacement ) return { STATE::BLOCKED };
+        if( !replacement ) return { STATE::BLOCKED, blockedEdge };
         for( std::size_t i = 1; i < replacement->nodes.size(); ++i )
         {
             if( cancel && cancel() ) return { STATE::CANCELLED, i };
             if( !engine.CanInsertSegment( replacement->netCode, replacement->nodes[i - 1], replacement->nodes[i] ) )
-                return { STATE::BLOCKED, i };
+                return { STATE::BLOCKED, blockedEdge };
         }
     }
     // Preflight uses the post-ripup board. Geometry/normal-contact splitting,

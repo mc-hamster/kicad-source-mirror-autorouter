@@ -1602,6 +1602,90 @@ BOOST_AUTO_TEST_CASE( CheckedInsertionRollsBackRipupUsageContactsAndCancellation
     BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
 }
 
+BOOST_AUTO_TEST_CASE( ForcedSpringOverPublishesCheckedReplacementAtomically )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.gridStepIU = 100000;
+    ROUTING_OBSTACLE box;
+    box.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    box.netCode = 2;
+    box.layers = { 0 };
+    box.box = { 2700000, 1200000, 3300000, 1800000 };
+    board.obstacles.push_back( box );
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
+    auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( inserted.connection );
+    BOOST_CHECK( inserted.connection->nodes != route.nodes );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1 );
+    BOOST_CHECK( occupancy.Connections()[0].nodes == inserted.connection->nodes );
+    BOOST_CHECK( inserted.connection->nodes.front() == route.nodes.front() );
+    BOOST_CHECK( inserted.connection->nodes.back() == route.nodes.back() );
+    BOOST_CHECK_EQUAL( inserted.connection->fromPadIndex, 0 );
+    BOOST_CHECK_EQUAL( inserted.connection->toPadIndex, 1 );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( *inserted.connection, 100000, 300000, 150000, { 0, 1 }, emitted );
+    BOOST_CHECK_EQUAL( emitted.segments.size(), inserted.connection->nodes.size() - 1 );
+    occupancy.Remove( *inserted.connection );
+    BOOST_CHECK( occupancy.Connections().empty() );
+    BOOST_CHECK( !occupancy.Board()->Connected( 0, 1 ) );
+
+    // Every cancellation boundary, including after a speculative ripup and
+    // after adding replacement geometry, must leave the original IDs intact.
+    occupancy.Add( *inserted.connection );
+    int polls = 0;
+    auto countCancel = [&] { ++polls; return false; };
+    const auto success = FOUND_CONNECTION_INSERTER::Insert( route, { *inserted.connection }, occupancy, engine, countCancel );
+    BOOST_REQUIRE( success.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( success.connection );
+    const int totalPolls = polls;
+    // Reestablish identical allocator state for every cancelled attempt.
+    for( int boundary = 1; boundary <= totalPolls; ++boundary )
+    {
+        const auto beforeIds = occupancy.Board()->RouteItems( *success.connection );
+        int calls = 0;
+        auto cancelled = FOUND_CONNECTION_INSERTER::Insert( route, { *success.connection }, occupancy, engine,
+                                                           [&] { return ++calls == boundary; } );
+        BOOST_CHECK( cancelled.state == FOUND_CONNECTION_INSERTER::STATE::CANCELLED );
+        BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1 );
+        BOOST_CHECK( occupancy.Connections()[0].nodes == success.connection->nodes );
+        BOOST_CHECK( occupancy.Board()->RouteItems( *success.connection ) == beforeIds );
+        BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    }
+}
+
+BOOST_AUTO_TEST_CASE( SpringOverRejectsUnsupportedShapesAndInvalidVias )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION via;
+    via.netCode = 1; via.complete = true;
+    via.nodes = { { { 1000000, 1000000 }, 0 }, { { 2000000, 1000000 }, 1 } };
+    BOOST_CHECK( FOUND_CONNECTION_INSERTER::Insert( via, {}, occupancy, engine ).state
+                  == FOUND_CONNECTION_INSERTER::STATE::BLOCKED );
+    BOOST_CHECK( occupancy.Connections().empty() );
+    // The production adapter does not round rational/diagonal corners or
+    // pretend that its rectangle snapshot mapping supports arbitrary offsets.
+    via.nodes = { { { 1000000, 1000000 }, 0 }, { { 2000000, 2000000 }, 0 } };
+    BOOST_CHECK( !engine.SpringOverConnection( via, {} ) );
+
+
+}
+
 BOOST_AUTO_TEST_CASE( CopperContactsDoNotTrustLogicalRouteEndpoints )
 {
     auto board = makeBoard();
