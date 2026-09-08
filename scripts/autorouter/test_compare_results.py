@@ -72,6 +72,36 @@ class ParityGateTests(unittest.TestCase):
         native["new_kicad_drc_errors"] = 1
         self.assertNotEqual(self.compare(self.result(), native), 0)
 
+    def test_different_via_constraints_cannot_pass(self):
+        reference, native = self.result(), self.result()
+        reference["routing_constraints"] = {"allow_vias": True}
+        native["routing_constraints"] = {"allow_vias": False}
+        self.assertNotEqual(self.compare(reference, native), 0)
+
+    def test_matching_no_via_constraints_can_pass(self):
+        reference, native = self.result(), self.result()
+        reference["routing_constraints"] = native["routing_constraints"] = {"allow_vias": False}
+        self.assertEqual(self.compare(reference, native), 0)
+
+    def test_raw_worker_run_is_not_production_parity(self):
+        native = self.result()
+        native.update(host_validated=False, host_unconnected=-1)
+        self.assertNotEqual(self.compare(self.result(), native), 0)
+
+    def test_production_and_materialized_connectivity_must_agree(self):
+        native = self.result()
+        native.update(host_validated=True, host_unconnected=1)
+        self.assertNotEqual(self.compare(self.result(), native), 0)
+        native["host_unconnected"] = 0
+        self.assertEqual(self.compare(self.result(), native), 0)
+        native["host_new_drc_violations"] = 1
+        self.assertNotEqual(self.compare(self.result(), native), 0)
+
+    def test_extra_vias_still_fail_when_drc_is_clean(self):
+        native = self.result()
+        native["via_count"] = 1
+        self.assertNotEqual(self.compare(self.result(), native), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

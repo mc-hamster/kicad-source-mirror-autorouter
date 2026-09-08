@@ -1,10 +1,20 @@
 # Native autorouter engineering notes
 
 **Status: experimental; Freerouting parity has not been achieved.** See
-[Rework status and acceptance procedure](REWORK.md) for the implementation audit,
+[Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) for the current implementation audit,
 actual port progress, and same-board KiCad validation. The mappings below must
 not be interpreted as proof that the named upstream algorithms are implemented.
 
+* [Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) — all sixteen remaining
+  core/integration areas, production host validation/repair, and latest A/B evidence.
+* [Active multilayer room/drill search](DRILL-SEARCH-PARITY.md) — latest core
+  port slice, pinned Java drill oracle, same-board A/B results and failed gates.
+* [Active room/door search](ROOM-DOOR-SEARCH.md) — rectangular no-via slice,
+  pinned Java primitive oracles, real-board results and explicit remaining gaps.
+* [Mutable copper rework](MUTABLE-COPPER-REWORK.md) — preceding contact-model,
+  trace-interior-targeting and fanout-cleanup milestone.
+* [Core parity review and changes](CORE-ROUTING-PARITY-REVIEW.md) — historical active-path audit,
+  verified fixes, rejected performance experiment, and remaining replacement work.
 * [Requirements](autorouter-requirements.txt) — product scope and acceptance criteria.
 * [Technical discovery](technical-discovery.md) — KiCad/Freerouting seams and risk analysis.
 * [UPSTREAM.md](UPSTREAM.md) — pinned source commit and filename-level mapping.
@@ -30,6 +40,7 @@ python3 scripts/autorouter/run_native_corpus.py \
 ```
 
 `qa_autorouter_parity` also accepts `--include-net NET` for bounded diagnosis,
+`--no-vias` for a constrained room-search run,
 `--max-nets N` for a stable bounded smoke slice, `--max-connections N` for a bounded
 multi-pad/plane-net diagnosis, and `--dump-snapshot` for inspecting the immutable adapter input.
 The QA-only
@@ -65,21 +76,30 @@ pcbnew/autorouter/
   drill/      # Snapshot-safe drill pages and via-expansion data
   path/       # Connection and found-path locator/inserter seams
   pipeline/   # BatchAutorouter, pass/thread/fanout/optimizer/pipeline classes
-  board/      # KiCad adapter and RoutingBoard boundary
+  board/      # KiCad adapter, private host session, mutable copper facade/search tree
+  datastructures/ # Ported minimum-area tree
+  geometry/planar/ # Rectangle and floating geometry primitives
   events/     # Immutable worker event values/listener aliases
 ```
+
+The host session constructs an isolated native in-memory board copy on the editor
+thread. The worker runs data-only routing plus private-board refill/DRC and bounded
+repairs. No live editor geometry, view, or undo state is touched. Acceptance is
+blocked unless host validation completed and no new design-rule violations were
+found; an explicitly reviewed, safe partial route can still be accepted.
 
 The remaining files at the root are KiCad UI, worker, proposal and preview integration.  They do
 not enter the routing algorithm and therefore do not need a Freerouting GUI counterpart.  The
 source tree intentionally includes corresponding Freerouting filenames even where KiCad's
 immutable snapshot/transaction model replaces a mutable Java board event or thread pool.
 
-The current native search combines deterministic layer-aware maze expansion with an obstacle
-visibility graph and retry-dependent negotiated congestion.  The batch pipeline also has a
-bounded best-state history, repeated negotiated passes, a Freerouting-style SMD fanout snapshot
-stage, plane-via costs, and route cleanup.  The expansion-room classes are real synchronization
-seams, not a claim that empirical parity has already been demonstrated.  The corpus manifest is
-the release gate for that claim.
+No-via/single-enabled-layer attempts now try an active rectangular room/door
+search with 90/45-degree corridor location and exact snapshot edge checking.
+Default multi-layer jobs and unsupported geometry retain the experimental
+visibility/grid engine. The new slice does not yet implement exact 45-degree
+room shapes, drill-frontier transitions, forced insertion or shove. The
+[room-search milestone](ROOM-DOOR-SEARCH.md) distinguishes primitive equivalence
+from end-to-end quality; naming a class does not establish parity.
 
 Drilled pads and existing vias are represented by separate hole obstacles.  The worker captures
 KiCad's copper-to-hole and hole-to-hole constraints: new via/drill collisions remain blocked,

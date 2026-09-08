@@ -3,7 +3,10 @@
 **Rework correction:** this document overstated behavioral preservation. The
 immutable adapter and similarly named classes did not preserve Freerouting's
 mutable routing geometry, room search, or shove/insertion operations. Its
-conclusions are superseded by [REWORK.md](REWORK.md); the engine is not at parity.
+conclusions are superseded by the [complete parity checklist](PARITY-CLOSURE-CHECKLIST.md);
+the engine is not at parity. Production now also uses an isolated host-board
+session for refill, full DRC and bounded plane repair; see the current architecture
+in that checklist rather than the original immutable-worker-only plan below.
 
 This is the first engineering deliverable for the native full-board autorouter.  It records the
 current source-level seams before the port is expanded and is intentionally kept next to the

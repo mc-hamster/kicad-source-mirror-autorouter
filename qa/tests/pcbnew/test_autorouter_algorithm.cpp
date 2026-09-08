@@ -25,13 +25,31 @@
  */
 
 #include <autorouter/AutorouterTypes.h>
+#include <autorouter/AutorouterJob.h>
+#include <autorouter/board/KicadRoutingSession.h>
+#include <board_design_settings.h>
+#include <drc/drc_engine.h>
+#include <drc/drc_item.h>
+#include <zone.h>
+#include <pcb_shape.h>
 #include <autorouter/board/KicadBoardAdapter.h>
 #include <autorouter/drc/DesignRulesChecker.h>
 #include <autorouter/maze/MazeSearchEngine.h>
+#include <autorouter/maze/AutorouteEngine.h>
+#include <autorouter/maze/MazeSearchEngine90Degree.h>
+#include <autorouter/maze/MazeExpansionEngine.h>
+#include <autorouter/drill/DrillPageArray.h>
+#include <autorouter/geometry/planar/PolylineArea.h>
+#include <autorouter/maze/MazeListElement.h>
+#include <autorouter/path/FoundConnectionLocator45Degree.h>
+#include <autorouter/expansion/ExpansionDoor.h>
+#include <autorouter/expansion/CompleteFreeSpaceExpansionRoom.h>
+#include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
 #include <autorouter/maze/DestinationDistance.h>
 #include <autorouter/BoardHistory.h>
 #include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
 #include <autorouter/pipeline/BatchFanout.h>
+#include <autorouter/pipeline/BatchOptimizer.h>
 #include <autorouter/pipeline/AutorouteUnroutedReport.h>
 #include <autorouter/pipeline/RoutingPipeline.h>
 
@@ -45,6 +63,8 @@
 #include <boost/test/unit_test.hpp>
 #include <fstream>
 #include <sstream>
+#include <random>
+#include <queue>
 
 
 using namespace KICAD_AUTOROUTER;
@@ -580,6 +600,12 @@ BOOST_AUTO_TEST_CASE( RoutesSinglePadToPlaneTarget )
     net.planeTargetIndices = { 1 };
     net.connections = { { 0, 1 } };
     board.nets.push_back( net );
+    ROUTING_OBSTACLE plane;
+    plane.netCode = 1;
+    plane.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    plane.box = { 4500000, 1000000, 5500000, 2000000 };
+    plane.layers = board.pads[1].layers;
+    board.conductionAreas.push_back( plane );
 
     ROUTING_PIPELINE pipeline;
     const ROUTING_RESULT result = pipeline.Run( board, makeSettings(), {}, {} );
@@ -607,6 +633,12 @@ BOOST_AUTO_TEST_CASE( PlaneSmdPadsFanoutBeforeChangingLayers )
     net.planeTargetIndices = { 1 };
     net.connections = { { 0, 1 } };
     board.nets.push_back( net );
+    ROUTING_OBSTACLE plane;
+    plane.netCode = 1;
+    plane.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    plane.box = { 4500000, 1000000, 5500000, 2000000 };
+    plane.layers = board.pads[1].layers;
+    board.conductionAreas.push_back( plane );
 
     AUTOROUTER_SETTINGS settings = makeSettings();
     settings.allowViaInSmdPad = false;
@@ -643,6 +675,12 @@ BOOST_AUTO_TEST_CASE( PlaneTargetOnPadLayerDoesNotCreateAnUnusedVia )
     net.planeTargetIndices = { 1 };
     net.connections = { { 0, 1 } };
     board.nets.push_back( net );
+    ROUTING_OBSTACLE plane;
+    plane.netCode = 1;
+    plane.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    plane.box = { 4500000, 1000000, 5500000, 2000000 };
+    plane.layers = board.pads[1].layers;
+    board.conductionAreas.push_back( plane );
 
     const BOARD_SNAPSHOT fanned = BATCH_FANOUT::PrepareSnapshot( board, makeSettings() );
     BOOST_REQUIRE_EQUAL( fanned.nets.size(), 1 );
@@ -681,8 +719,28 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
 
     BOOST_REQUIRE( result.complete );
     BOOST_CHECK_EQUAL( result.metrics.routedConnections, 3 );
-    BOOST_CHECK_EQUAL( result.metrics.fanoutConnections, 2 );
-    BOOST_CHECK_EQUAL( result.vias.size(), 2 );
+    const auto prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_CHECK_EQUAL( prepared.pads.size() - board.pads.size(), 2 );
+    // The connected-set frontier may retain either escape stub as useful
+    // same-layer copper. Count that retained work, not a legacy path ordering.
+    BOOST_CHECK_LE( result.metrics.fanoutConnections, 2 );
+    BOOST_CHECK_EQUAL( result.metrics.fanoutConnections,
+            std::count_if( result.connections.begin(), result.connections.end(),
+                           []( const auto& c ) { return c.isFanoutConnection; } ) );
+    // Both layer transitions are bypassed; no dangling vias may be exported.
+    BOOST_CHECK_EQUAL( result.vias.size(), 0 );
+    ROUTING_BOARD copper( board, settings );
+    for( const auto& route : result.connections )
+        copper.AddRoute( route );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    for( const auto& route : result.connections )
+    {
+        BOOST_REQUIRE_GT( route.nodes.size(), 1 );
+        copper.RemoveRoute( route );
+        BOOST_CHECK( copper.HasCopperAt( 1, route.nodes.front(), 50000 ) );
+        BOOST_CHECK( copper.HasCopperAt( 1, route.nodes.back(), 50000 ) );
+        copper.AddRoute( route );
+    }
     for( const ROUTING_VIA& via : result.vias )
     {
         BOOST_CHECK( via.position != board.pads[0].position );
@@ -721,12 +779,12 @@ BOOST_AUTO_TEST_CASE( ViaInSmdPadSettingDisablesSyntheticFanout )
 }
 
 
-BOOST_AUTO_TEST_CASE( UsesVisibilityLandmarksWhenGridDoesNotAlign )
+BOOST_AUTO_TEST_CASE( RoutesAroundOffGridObstaclesOnEveryEnabledLayer )
 {
     BOARD_SNAPSHOT board = makeBoard();
     board.obstacles.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE,
                                  0,
-                                 { 0 },
+                                 { 0, 1 },
                                  {},
                                  {},
                                  { 2450000, 1250000, 3550000, 1750000 },
@@ -992,5 +1050,1424 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterCreatesOrdinaryPreviewBoardItems )
     BOOST_CHECK_EQUAL( board->Tracks().size(), trackCount );
 }
 
+
+BOOST_AUTO_TEST_CASE( ThroughViasOccupyInactiveLayersOutsideSearchTransition )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    // Deliberately non-numeric stack order, with an inactive outer layer.
+    settings.layers = { { 20, false, 0, 0, 0 }, { 5, true, 0, 0, 1 },
+                        { 18, true, 0, 0, 2 }, { 10, true, 0, 0, 3 } };
+    const ROUTER_POINT position{ 3000000, 1500000 };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE freeSearch( board, settings, occupancy );
+    BOOST_CHECK( freeSearch.CanUseSegment( 1, { position, 5 }, { position, 18 }, true ) );
+    BOOST_CHECK( !freeSearch.CanUseSegment( 1, { position, 5 }, { position, 20 }, true ) );
+    BOOST_CHECK( !freeSearch.CanUseSegment( 1, { position, 5 },
+                                             { { 3100000, 1500000 }, 18 }, true ) );
+
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    obstacle.netCode = 2;
+    obstacle.layers = { 20 };
+    obstacle.start = obstacle.end = position;
+    obstacle.radius = 100000;
+    board.obstacles.push_back( obstacle );
+    MAZE_SEARCH_ENGINE blockedSearch( board, settings, occupancy );
+    BOOST_CHECK( !blockedSearch.CanUseSegment( 1, { position, 5 }, { position, 18 }, true ) );
+
+    // A via already proposed between two inner layers also occupies the outside.
+    board.obstacles.clear();
+    ROUTING_CONNECTION existing;
+    existing.netCode = 2;
+    existing.complete = true;
+    existing.nodes = { { position, 5 }, { position, 18 } };
+    occupancy.Add( existing );
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.nodes = { { { 2500000, 1500000 }, 10 }, { { 3500000, 1500000 }, 10 } };
+    MAZE_SEARCH_ENGINE occupiedSearch( board, settings, occupancy );
+    BOOST_CHECK_EQUAL( occupiedSearch.FindConflictingConnections( candidate ).size(), 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( DirectFanoutChecksTheWholeSelectedViaPadstack )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 20, false, 0, 0, 0 }, { 5, true, 0, 0, 1 },
+                        { 18, true, 0, 0, 2 }, { 10, false, 0, 0, 3 } };
+    settings.maxExpandedNodes = 100;
+    board.pads[0].layers = { 5 };
+    auto landing = board.pads[1];
+    landing.layers = { 18 };
+    landing.isFanoutTarget = true;
+    landing.fanoutSourceLayer = 5;
+    landing.fanoutTargetLayer = 18;
+    ROUTING_OBSTACLE blocker;
+    blocker.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    blocker.layers = { 20 };
+    blocker.box = board.bounds;
+    blocker.blocksTracks = false;
+    board.obstacles.push_back( blocker );
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE blocked( board, settings, occupancy );
+    int expanded = 0;
+    BOOST_CHECK( !blocked.FindConnection( board.pads[0], landing, 0, expanded, {} ) );
+    BOOST_CHECK( !blocked.FindConnection( landing, board.pads[0], 0, expanded, {} ) );
+    board.obstacles.clear();
+    MAZE_SEARCH_ENGINE clear( board, settings, occupancy );
+    BOOST_CHECK( clear.FindConnection( board.pads[0], landing, 0, expanded, {} ) );
+    BOOST_CHECK( clear.FindConnection( landing, board.pads[0], 0, expanded, {} ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( InnerLayerRouteInsertsTheSelectedThroughPadstack )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 20, false, 0, 0, 0 }, { 5, true, 0, 0, 1 },
+                        { 18, true, 0, 0, 2 }, { 10, false, 0, 0, 3 } };
+    board.pads[0].layers = { 5 };
+    board.pads[1].layers = { 18 };
+    const auto result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1 );
+    BOOST_CHECK_EQUAL( result.vias[0].topLayer, 20 );
+    BOOST_CHECK_EQUAL( result.vias[0].bottomLayer, 10 );
+    const std::vector<int> expected{ 20, 5, 18, 10 };
+    BOOST_CHECK( result.vias[0].layers == expected );
+    BOOST_CHECK_EQUAL( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesRotatedCopperAndInactiveLayerObstacles )
+{
+    BOARD board;
+    board.SetCopperLayerCount( 4 );
+    auto* net = new NETINFO_ITEM( &board, "OBSTACLE", 2 );
+    board.Add( net );
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    auto* pad = new PAD( footprint );
+    pad->SetAttribute( PAD_ATTRIB::SMD );
+    pad->SetLayerSet( LSET( { F_Cu } ) );
+    pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::RECTANGLE );
+    pad->SetSize( PADSTACK::ALL_LAYERS, { 3000000, 400000 } );
+    pad->SetPosition( { 3000000, 3000000 } );
+    pad->SetOrientation( EDA_ANGLE( 45, DEGREES_T ) );
+    pad->SetNet( net );
+    footprint->Add( pad );
+    board.BuildConnectivity();
+    KICAD_BOARD_ADAPTER adapter( &board );
+    auto settings = adapter.CreateDefaultSettings();
+    auto snapshot = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
+    BOOST_CHECK( snapshot->obstacles[0].kind == ROUTER_OBSTACLE_KIND::POLYGON );
+    BOOST_CHECK_EQUAL( snapshot->obstacles[0].polygon.size(), 4 );
+    BOARD_SNAPSHOT routingBoard = *snapshot;
+    routingBoard.bounds = { 0, 0, 6000000, 6000000 };
+    routingBoard.boardOutline.clear();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( routingBoard, settings, occupancy );
+    // This point lies inside the old axis-aligned bounding box but well
+    // outside the rotated copper. The centre must remain blocked.
+    const ROUTER_NODE freePoint{ { 2200000, 2200000 }, F_Cu };
+    const ROUTER_NODE blockedPoint{ { 3000000, 3000000 }, F_Cu };
+    BOOST_CHECK( search.CanUseSegment( 999, freePoint, freePoint ) );
+    BOOST_CHECK( !search.CanUseSegment( 999, blockedPoint, blockedPoint ) );
+
+    for( auto& layer : settings.layers )
+        if( layer.layerId == F_Cu )
+            layer.enabled = false;
+    snapshot = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
+    BOOST_CHECK_EQUAL( snapshot->obstacles[0].layers.front(), F_Cu );
+}
+
+
+BOOST_AUTO_TEST_CASE( KiCadAdapterUsesExactOvalCapsules )
+{
+    BOARD board;
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    auto* pad = new PAD( footprint );
+    pad->SetAttribute( PAD_ATTRIB::SMD );
+    pad->SetLayerSet( LSET( { F_Cu } ) );
+    pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::OVAL );
+    pad->SetSize( PADSTACK::ALL_LAYERS, { 3000000, 400000 } );
+    pad->SetPosition( { 3000000, 3000000 } );
+    footprint->Add( pad );
+    KICAD_BOARD_ADAPTER adapter( &board );
+    const auto settings = adapter.CreateDefaultSettings();
+    for( int angle : { 0, 90 } )
+    {
+        pad->SetOrientation( EDA_ANGLE( angle, DEGREES_T ) );
+        const auto snapshot = adapter.CreateSnapshot( settings );
+        BOOST_REQUIRE( snapshot );
+        BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
+        const auto& oval = snapshot->obstacles.front();
+        BOOST_CHECK( oval.kind == ROUTER_OBSTACLE_KIND::SEGMENT );
+        BOOST_CHECK_EQUAL( oval.radius, 200000 );
+        BOOST_CHECK( oval.polygon.empty() );
+        if( angle == 0 )
+        {
+            BOOST_CHECK_EQUAL( oval.start.y, 3000000 );
+            BOOST_CHECK_EQUAL( oval.end.y, 3000000 );
+            BOOST_CHECK_EQUAL( std::min( oval.start.x, oval.end.x ), 1700000 );
+            BOOST_CHECK_EQUAL( std::max( oval.start.x, oval.end.x ), 4300000 );
+        }
+        else
+        {
+            BOOST_CHECK_EQUAL( oval.start.x, 3000000 );
+            BOOST_CHECK_EQUAL( oval.end.x, 3000000 );
+            BOOST_CHECK_EQUAL( std::min( oval.start.y, oval.end.y ), 1700000 );
+            BOOST_CHECK_EQUAL( std::max( oval.start.y, oval.end.y ), 4300000 );
+        }
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( KiCadAdapterUsesRoundedRectangleCoreWithoutArcTessellation )
+{
+    BOARD board;
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    auto* pad = new PAD( footprint );
+    pad->SetAttribute( PAD_ATTRIB::SMD );
+    pad->SetLayerSet( LSET( { F_Cu } ) );
+    pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::ROUNDRECT );
+    pad->SetSize( PADSTACK::ALL_LAYERS, { 3000000, 400000 } );
+    pad->SetRoundRectRadiusRatio( PADSTACK::ALL_LAYERS, 0.25 );
+    pad->SetPosition( { 3000000, 3000000 } );
+    footprint->Add( pad );
+    KICAD_BOARD_ADAPTER adapter( &board );
+    const auto snapshot = adapter.CreateSnapshot( adapter.CreateDefaultSettings() );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
+    const auto& rounded = snapshot->obstacles.front();
+    BOOST_CHECK( rounded.kind == ROUTER_OBSTACLE_KIND::POLYGON );
+    BOOST_REQUIRE_EQUAL( rounded.polygon.size(), 4 );
+    BOOST_CHECK_EQUAL( rounded.radius, 100000 );
+    BOOST_CHECK_EQUAL( rounded.polygon[0].x, 1600000 );
+    BOOST_CHECK_EQUAL( rounded.polygon[0].y, 2900000 );
+    BOOST_CHECK_EQUAL( rounded.polygon[2].x, 4400000 );
+    BOOST_CHECK_EQUAL( rounded.polygon[2].y, 3100000 );
+}
+
+
+BOOST_AUTO_TEST_CASE( CopperContactsDoNotTrustLogicalRouteEndpoints )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { { 3000000, 1500000 }, 0 } };
+    copper.AddRoute( route );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+    BOOST_CHECK_EQUAL( copper.CountMissing( board.nets[0] ), 1 );
+    copper.RemoveRoute( route );
+    route.nodes.back().point = board.pads[1].position;
+    copper.AddRoute( route );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    BOOST_CHECK_EQUAL( copper.CountMissing( board.nets[0] ), 0 );
+}
+
+BOOST_AUTO_TEST_CASE( CopperTJunctionsSurviveRollbackAndDisconnectOnRipup )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads.push_back( board.pads[0] );
+    board.pads.back().position = { 3000000, 2500000 };
+    board.nets[0].padIndices.push_back( 2 );
+    board.nets[0].connections.push_back( { 0, 2 } );
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION trunk;
+    trunk.netCode = 1;
+    trunk.complete = true;
+    trunk.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    ROUTING_CONNECTION branch = trunk;
+    branch.nodes = { { board.pads[2].position, 0 }, { { 3000000, 1500000 }, 0 } };
+    copper.AddRoute( trunk );
+    copper.AddRoute( branch );
+    BOOST_REQUIRE( copper.Connected( 0, 2 ) );
+    const auto count = copper.ItemCount();
+    const auto revision = copper.Revision();
+    {
+        ROUTING_BOARD::TRANSACTION attempt( copper );
+        copper.RemoveRoute( trunk );
+        BOOST_CHECK( !copper.Connected( 0, 2 ) );
+        copper.AddRoute( trunk );
+        copper.RemoveRoute( branch );
+    }
+    BOOST_CHECK_GT( copper.Revision(), revision );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), count );
+    BOOST_REQUIRE( copper.Connected( 0, 2 ) );
+    const auto terminals = copper.Terminals( 2 );
+    BOOST_CHECK( std::any_of( terminals.begin(), terminals.end(),
+                             []( const auto& t ) { return t.segmentEnd.has_value(); } ) );
+    {
+        ROUTING_BOARD::TRANSACTION attempt( copper );
+        copper.RemoveRoute( branch );
+        attempt.Commit();
+    }
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    BOOST_CHECK( !copper.Connected( 0, 2 ) );
+    copper.ClearRoutes();
+    BOOST_CHECK_EQUAL( copper.ItemCount(), 3 );
+}
+
+BOOST_AUTO_TEST_CASE( SyntheticLandingsRequireRealViasAndValidTransitions )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads[0].layers = { 0 };
+    board.pads[1].position = board.pads[0].position;
+    board.pads[1].layers = { 0, 1 };
+    board.pads[1].isFanoutTarget = true;
+    board.pads[1].fanoutTargetLayer = 1;
+    ROUTING_BOARD copper( board, settings );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+    BOOST_CHECK( copper.Terminals( 1 ).empty() );
+    ROUTING_CONNECTION via;
+    via.netCode = 1;
+    via.complete = true;
+    via.nodes = { { board.pads[0].position, 0 }, { board.pads[0].position, 1 } };
+    auto malformed = via;
+    malformed.nodes.back().point.x += 100000;
+    const auto revision = copper.Revision();
+    BOOST_CHECK_THROW( copper.AddRoute( malformed ), std::invalid_argument );
+    BOOST_CHECK_EQUAL( copper.Revision(), revision );
+    auto outOfRange = via;
+    outOfRange.nodes.push_back( { { std::numeric_limits<std::int64_t>::max(), 0 }, 1 } );
+    BOOST_CHECK_THROW( copper.AddRoute( outOfRange ), std::out_of_range );
+    BOOST_CHECK_EQUAL( copper.Revision(), revision );
+    copper.AddRoute( via );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    copper.RemoveRoute( via );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+}
+
+BOOST_AUTO_TEST_CASE( ConductionIslandsAndHolesAreNotVirtualConnections )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads.push_back( board.pads[0] );
+    board.pads.back().position = { 3000000, 1500000 };
+    for( auto& pad : board.pads )
+        pad.layers = { 0 };
+    ROUTING_OBSTACLE area;
+    area.netCode = 1;
+    area.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    area.layers = { 0 };
+    area.polygon = { { 500000, 500000 }, { 4000000, 500000 },
+                     { 4000000, 2500000 }, { 500000, 2500000 } };
+    area.polygonHoles = { { { 2500000, 1000000 }, { 3500000, 1000000 },
+                           { 3500000, 2000000 }, { 2500000, 2000000 } } };
+    board.conductionAreas.push_back( area );
+    area.polygon = { { 4500000, 500000 }, { 5500000, 500000 },
+                     { 5500000, 2500000 }, { 4500000, 2500000 } };
+    area.polygonHoles.clear();
+    board.conductionAreas.push_back( area );
+    ROUTING_BOARD copper( board, settings );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+    BOOST_CHECK( !copper.Connected( 0, 2 ) );
+    ROUTING_CONNECTION stub;
+    stub.netCode = 1;
+    stub.complete = true;
+    stub.nodes = { { board.pads[2].position, 0 }, { { 2000000, 1500000 }, 0 } };
+    copper.AddRoute( stub );
+    BOOST_CHECK( copper.Connected( 0, 2 ) );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+}
+
+BOOST_AUTO_TEST_CASE( PipelineRoutesToRetainedTraceInterior )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    board.pads.push_back( board.pads[0] );
+    board.pads.back().position = { 3000000, 2500000 };
+    board.nets[0].padIndices.push_back( 2 );
+    board.nets[0].connections = { { 0, 2 } };
+    ROUTING_OBSTACLE trunk;
+    trunk.netCode = 1;
+    trunk.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    trunk.start = board.pads[0].position;
+    trunk.end = board.pads[1].position;
+    trunk.radius = 50000;
+    trunk.layers = { 0 };
+    trunk.isExistingRoute = true;
+    board.obstacles.push_back( trunk );
+    const auto result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.connections.size(), 1 );
+    const auto& nodes = result.connections.front().nodes;
+    BOOST_REQUIRE( !nodes.empty() );
+    const auto onInterior = []( const ROUTER_POINT& p )
+    { return p.y == 1500000 && p.x > 1000000 && p.x < 5000000; };
+    BOOST_CHECK( onInterior( nodes.front().point ) || onInterior( nodes.back().point ) );
+    ROUTING_BOARD copper( board, settings );
+    copper.AddRoute( result.connections.front() );
+    BOOST_CHECK( copper.Connected( 0, 2 ) );
+}
+
+BOOST_AUTO_TEST_CASE( OptimizerCannotShortenAwayBranchContacts )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads.push_back( board.pads[0] );
+    board.pads.back().position = { 3000000, 2700000 };
+    board.nets[0].padIndices.push_back( 2 );
+    ROUTING_CONNECTION trunk;
+    trunk.netCode = 1;
+    trunk.complete = true;
+    trunk.nodes = { { board.pads[0].position, 0 }, { { 3000000, 2200000 }, 0 },
+                    { board.pads[1].position, 0 } };
+    ROUTING_CONNECTION branch = trunk;
+    branch.nodes = { { board.pads[2].position, 0 }, { { 3000000, 2200000 }, 0 } };
+    std::vector<ROUTING_CONNECTION> routes{ trunk, branch };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( trunk );
+    occupancy.Add( branch );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 2 ) );
+    BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 2 ) );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    BOOST_CHECK( routes.front().nodes == trunk.nodes );
+    // Removing an absent route must not decrement another route's congestion.
+    occupancy.Remove( trunk );
+    occupancy.Remove( trunk );
+    BOOST_CHECK_EQUAL( occupancy.Connections().size(), 1 );
+    BOOST_CHECK( !occupancy.Board()->Connected( 0, 2 ) );
+}
+
+BOOST_AUTO_TEST_CASE( ARouteCannotInventCopperAtAVirtualPlaneTarget )
+{
+    auto board = makeBoard();
+    board.pads[1].isPlaneTarget = true;
+    ROUTING_BOARD copper( board, makeSettings() );
+    ROUTING_CONNECTION stub;
+    stub.netCode = 1;
+    stub.complete = true;
+    stub.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    copper.AddRoute( stub );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+    BOOST_CHECK_EQUAL( copper.CountMissing( board.nets[0] ), 1 );
+}
+
+namespace
+{
+std::unique_ptr<BOARD> makeHostRoutingBoard( bool withPlane )
+{
+    auto board = std::make_unique<BOARD>();
+    board->SetCopperLayerCount( 2 );
+    auto* net = new NETINFO_ITEM( board.get(), "SIGNAL", 17 );
+    board->Add( net );
+    auto* ground = new NETINFO_ITEM( board.get(), "GND", 23 );
+    board->Add( ground );
+    auto* footprint = new FOOTPRINT( board.get() );
+    footprint->SetReference( "TEST1" );
+    footprint->Reference().SetVisible( false );
+    footprint->Value().SetVisible( false );
+    board->Add( footprint );
+    auto addPad = [&]( VECTOR2I position, NETINFO_ITEM* n, int diameter )
+    {
+        auto* pad = new PAD( footprint );
+        pad->SetAttribute( PAD_ATTRIB::SMD );
+        pad->SetLayerSet( LSET( { F_Cu, F_Mask } ) );
+        pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
+        pad->SetSize( PADSTACK::ALL_LAYERS, { diameter, diameter } );
+        pad->SetPosition( position );
+        pad->SetNumber( wxString::Format( "%zu", footprint->Pads().size() + 1 ) );
+        pad->SetNet( n );
+        footprint->Add( pad );
+    };
+    if( withPlane )
+    {
+        addPad( { 15000000, 1400000 }, net, 1600000 );
+        addPad( { 15000000, 28600000 }, net, 1600000 );
+        addPad( { 5000000, 15000000 }, ground, 1000000 );
+        addPad( { 25000000, 15000000 }, ground, 1000000 );
+        auto* zone = new ZONE( board.get() );
+        zone->SetLayer( F_Cu );
+        zone->SetNet( ground );
+        zone->SetLocalClearance( 200000 );
+        zone->SetMinThickness( 200000 );
+        zone->SetPadConnection( ZONE_CONNECTION::FULL );
+        zone->SetIslandRemovalMode( ISLAND_REMOVAL_MODE::NEVER );
+        zone->Outline()->NewOutline();
+        for( auto p : { VECTOR2I( 0, 0 ), VECTOR2I( 30000000, 0 ),
+                       VECTOR2I( 30000000, 30000000 ), VECTOR2I( 0, 30000000 ) } )
+            zone->Outline()->Append( p );
+        board->Add( zone );
+    }
+    else
+    {
+        addPad( { 5000000, 15000000 }, net, 1000000 );
+        addPad( { 25000000, 15000000 }, net, 1000000 );
+    }
+    const std::vector<VECTOR2I> corners{ { 0, 0 }, { 30000000, 0 },
+                                        { 30000000, 30000000 }, { 0, 30000000 } };
+    for( std::size_t i = 0; i < corners.size(); ++i )
+    {
+        auto* edge = new PCB_SHAPE( board.get() );
+        edge->SetShape( SHAPE_T::SEGMENT );
+        edge->SetStart( corners[i] );
+        edge->SetEnd( corners[( i + 1 ) % corners.size()] );
+        edge->SetLayer( Edge_Cuts );
+        edge->SetWidth( 50000 );
+        board->Add( edge );
+    }
+    board->BuildConnectivity();
+    return board;
+}
+}
+
+BOOST_AUTO_TEST_CASE( HostSessionValidatesWithoutChangingSourceOrNetCodes )
+{
+    auto board = makeHostRoutingBoard( false );
+    const auto time = board->GetTimeStamp();
+    const auto netSettings = board->GetDesignSettings().m_NetSettings;
+    const int code = board->FindNet( "SIGNAL" )->GetNetCode();
+    auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    settings.enableFanout = false;
+    settings.maxIterations = 1;
+    settings.maxPasses = 1;
+    settings.optimizationPasses = 0;
+    auto result = KICAD_ROUTING_SESSION( *board ).Run( settings );
+    BOOST_REQUIRE_MESSAGE( result.hostValidated, result.message );
+    BOOST_REQUIRE_MESSAGE( result.complete, result.message );
+    BOOST_CHECK_EQUAL( result.hostUnconnected, 0 );
+    BOOST_CHECK_EQUAL( result.hostNewDrcViolations, 0 );
+    BOOST_REQUIRE( !result.segments.empty() );
+    for( const auto& segment : result.segments )
+        BOOST_CHECK_EQUAL( segment.netCode, code );
+    BOOST_CHECK( board->Tracks().empty() );
+    BOOST_CHECK_EQUAL( board->GetTimeStamp(), time );
+    BOOST_CHECK( board->GetDesignSettings().m_NetSettings == netSettings );
+    BOOST_CHECK( !board->GetDesignSettings().m_DRCEngine );
+    // Re-running DRC on the source must not use the destroyed private engine.
+    auto drc = std::make_shared<DRC_ENGINE>( board.get(), &board->GetDesignSettings() );
+    drc->InitEngine( wxFileName() );
+    board->GetDesignSettings().m_DRCEngine = drc;
+    { KICAD_ROUTING_SESSION other( *board ); other.Run( settings ); }
+    int missing = 0;
+    drc->SetViolationHandler( [&]( const std::shared_ptr<DRC_ITEM>& item, const VECTOR2I&, int,
+                                  const std::function<void( PCB_MARKER* )>& )
+    { if( item->GetErrorCode() == DRCE_UNCONNECTED_ITEMS ) ++missing; } );
+    drc->RunTests( EDA_UNITS::MM, true, false );
+    drc->ClearViolationHandler();
+    BOOST_CHECK( drc->TestsCompleted() );
+    BOOST_CHECK_EQUAL( missing, 1 );
+}
+
+BOOST_AUTO_TEST_CASE( HostSessionRepairsAPlaneSplitByTheNewRouting )
+{
+    auto board = makeHostRoutingBoard( true );
+    auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    settings.enableFanout = false;
+    settings.maxPasses = 2;
+    settings.maxIterations = 2;
+    settings.optimizationPasses = 0;
+    settings.maxExpandedNodes = 10000;
+    const auto stamp = board->GetTimeStamp();
+    auto result = KICAD_ROUTING_SESSION( *board ).Run( settings );
+    BOOST_REQUIRE_MESSAGE( result.hostValidated, result.message );
+    BOOST_REQUIRE_MESSAGE( result.complete, result.message );
+    BOOST_CHECK_EQUAL( result.hostUnconnected, 0 );
+    BOOST_CHECK_EQUAL( result.hostNewDrcViolations, 0 );
+    BOOST_CHECK_GT( result.hostRepairPasses, 0 );
+    BOOST_CHECK( board->Tracks().empty() );
+    BOOST_CHECK_EQUAL( board->GetTimeStamp(), stamp );
+    BOOST_CHECK( !board->Zones().front()->IsFilled() );
+}
+
+BOOST_AUTO_TEST_CASE( HostSessionCancellationDiscardsThePrivateProposal )
+{
+    auto board = makeHostRoutingBoard( false );
+    auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    auto snapshot = KICAD_BOARD_ADAPTER( board.get() ).CreateSnapshot( settings );
+    AUTOROUTER_JOB job( snapshot, settings, std::make_unique<KICAD_ROUTING_SESSION>( *board ) );
+    job.Cancel();
+    job.Start();
+    job.Join();
+    BOOST_REQUIRE( job.GetResult().has_value() );
+    BOOST_CHECK( job.GetResult()->cancelled );
+    BOOST_CHECK( !job.GetResult()->complete );
+    BOOST_CHECK( !job.GetResult()->hostValidated );
+    BOOST_CHECK( job.GetResult()->segments.empty() );
+    BOOST_CHECK( board->Tracks().empty() );
+}
+
+BOOST_AUTO_TEST_CASE( HostSessionRunsRefillAndRepairOnTheJobWorker )
+{
+    auto board = makeHostRoutingBoard( true );
+    auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    settings.enableFanout = false;
+    settings.maxPasses = 2;
+    settings.maxIterations = 2;
+    settings.optimizationPasses = 0;
+    settings.maxExpandedNodes = 10000;
+    auto snapshot = KICAD_BOARD_ADAPTER( board.get() ).CreateSnapshot( settings );
+    const auto stamp = board->GetTimeStamp();
+    AUTOROUTER_JOB job( snapshot, settings, std::make_unique<KICAD_ROUTING_SESSION>( *board ) );
+    job.Start();
+    job.Join();
+    const auto result = job.GetResult();
+    BOOST_REQUIRE( result.has_value() );
+    BOOST_REQUIRE_MESSAGE( result->complete, result->message );
+    BOOST_CHECK( result->CanAcceptProposal() );
+    BOOST_CHECK_GT( result->hostRepairPasses, 0 );
+    BOOST_CHECK_EQUAL( result->hostUnconnected, 0 );
+    BOOST_CHECK( board->Tracks().empty() );
+    BOOST_CHECK_EQUAL( board->GetTimeStamp(), stamp );
+    BOOST_CHECK( !board->Zones().front()->IsFilled() );
+}
+
+BOOST_AUTO_TEST_CASE( HostSessionDoesNotHideAnUnrepairablePlaneSplit )
+{
+    auto board = makeHostRoutingBoard( true );
+    auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    settings.enableFanout = false;
+    settings.allowVias = false;
+    settings.maxPasses = 1;
+    settings.maxIterations = 1;
+    settings.optimizationPasses = 0;
+    settings.maxExpandedNodes = 2000;
+    const auto result = KICAD_ROUTING_SESSION( *board ).Run( settings );
+    BOOST_REQUIRE_MESSAGE( result.hostValidated, result.message );
+    BOOST_CHECK( !result.complete );
+    BOOST_CHECK_GT( result.hostUnconnected, 0 );
+    BOOST_CHECK_EQUAL( result.hostNewDrcViolations, 0 );
+    BOOST_CHECK_EQUAL( result.hostRepairPasses, 0 );
+    BOOST_CHECK( result.vias.empty() );
+    BOOST_CHECK( board->Tracks().empty() );
+    BOOST_CHECK( !board->Zones().front()->IsFilled() );
+}
+
+BOOST_AUTO_TEST_CASE( HostSessionCanCancelAfterRoutingBeforePlaneRepair )
+{
+    auto board = makeHostRoutingBoard( true );
+    auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    settings.enableFanout = false;
+    settings.maxPasses = 1;
+    settings.maxIterations = 1;
+    settings.optimizationPasses = 0;
+    settings.maxExpandedNodes = 10000;
+    const auto stamp = board->GetTimeStamp();
+    KICAD_ROUTING_SESSION session( *board );
+    bool cancelled = false;
+    BOOST_CHECK_THROW( session.Run( settings, [&] { return cancelled; },
+            [&]( const ROUTER_PROGRESS& state )
+            {
+                if( state.stage == "Repairing connections found after zone refill" )
+                    cancelled = true;
+            } ), std::runtime_error );
+    BOOST_CHECK( cancelled );
+    BOOST_CHECK( board->Tracks().empty() );
+    BOOST_CHECK_EQUAL( board->GetTimeStamp(), stamp );
+    BOOST_CHECK( !board->Zones().front()->IsFilled() );
+    BOOST_CHECK_THROW( session.Run( settings ), std::logic_error );
+}
+
+BOOST_AUTO_TEST_CASE( ProposalAcceptanceRequiresHostValidationNotWorkerTaskSuccess )
+{
+    ROUTING_RESULT result;
+    result.complete = true;
+    BOOST_CHECK( !result.CanAcceptProposal() );
+    result.hostValidated = true;
+    result.hostUnconnected = 0;
+    result.hostNewDrcViolations = 0;
+    BOOST_CHECK( result.CanAcceptProposal() );
+    result.complete = false;
+    result.hostUnconnected = 1;
+    BOOST_CHECK( result.CanAcceptProposal() ); // Deliberate, safe partial acceptance.
+    result.hostNewDrcViolations = 1;
+    BOOST_CHECK( !result.CanAcceptProposal() );
+    result.hostNewDrcViolations = 0;
+    result.metrics.drcViolations = 1;
+    BOOST_CHECK( !result.CanAcceptProposal() );
+    result.metrics.drcViolations = 0;
+    result.cancelled = true;
+    BOOST_CHECK( !result.CanAcceptProposal() );
+}
+
+BOOST_AUTO_TEST_CASE( RoomTreeCompletionNeighboursAndSectionsMatchPinnedFreerouting )
+{
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir() + "/autorouter/room-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readBox = [&]()
+    {
+        ROUTER_BOX box;
+        input >> box.minX >> box.minY >> box.maxX >> box.maxY;
+        BOOST_REQUIRE( !input.fail() );
+        return box;
+    };
+    auto marker = [&]( const char* expected )
+    {
+        std::string word;
+        input >> word;
+        BOOST_REQUIRE_EQUAL( word, expected );
+    };
+    auto checkBox = [&]( const ROUTER_BOX& actual )
+    {
+        const auto expected = readBox();
+        BOOST_CHECK_EQUAL( actual.minX, expected.minX );
+        BOOST_CHECK_EQUAL( actual.minY, expected.minY );
+        BOOST_CHECK_EQUAL( actual.maxX, expected.maxX );
+        BOOST_CHECK_EQUAL( actual.maxY, expected.maxY );
+    };
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Tree oracle " << test )
+        {
+            marker( "TREE" );
+            int count;
+            input >> count;
+            SHAPE_SEARCH_TREE_90_DEGREE tree( { -100, -100, 100, 100 } );
+            MIN_AREA_TREE order;
+            std::map<int, std::pair<MIN_AREA_TREE::HANDLE, MIN_AREA_TREE::HANDLE>> handles;
+            for( int i = 0; i < count; ++i )
+            {
+                SHAPE_TREE_ENTRY entry;
+                int kind;
+                input >> entry.objectId;
+                entry.shape = readBox();
+                input >> entry.layer >> entry.net >> kind;
+                entry.isRoom = kind == 1;
+                entry.obstacle = kind != 2;
+                handles[entry.objectId] = { tree.Insert( entry ), order.Insert( entry ) };
+            }
+            marker( "REMOVE" );
+            int removed;
+            input >> removed;
+            BOOST_CHECK( tree.Remove( handles.at( removed ).first ) );
+            BOOST_CHECK( order.Remove( handles.at( removed ).second ) );
+            BOOST_CHECK( !tree.Remove( handles.at( removed ).first ) );
+            BOOST_CHECK( !order.Remove( handles.at( removed ).second ) );
+            marker( "INSERT" );
+            int inserted;
+            input >> inserted;
+            SHAPE_TREE_ENTRY extra{ readBox(), inserted };
+            tree.Insert( extra );
+            order.Insert( extra );
+            marker( "VISIT" );
+            int visits;
+            input >> visits;
+            BOOST_CHECK_EQUAL( order.Size(), visits );
+            ROUTER_BOX all{ -1000, -1000, 1000, 1000 };
+            order.Visit( all, [&]( const auto& entry )
+            {
+                int expected;
+                input >> expected;
+                BOOST_CHECK_EQUAL( entry.objectId, expected );
+                return true;
+            } );
+            marker( "COMPLETE" );
+            const auto room = readBox();
+            const auto contained = readBox();
+            int layer, net, ignored, hasIgnoreShape;
+            input >> layer >> net >> ignored >> hasIgnoreShape;
+            std::optional<ROUTER_BOX> ignoreShape;
+            if( hasIgnoreShape ) ignoreShape = readBox();
+            const auto completed = tree.CompleteShape( { room, layer, contained }, net,
+                    ignored == 0 ? std::nullopt : std::optional<int>( ignored ), ignoreShape );
+            marker( "RESULT" );
+            int expectedRooms;
+            input >> expectedRooms;
+            BOOST_REQUIRE_EQUAL( completed.size(), expectedRooms );
+            for( const auto& result : completed )
+            {
+                checkBox( result.GetShape() );
+                checkBox( result.GetContainedShape() );
+            }
+            marker( "NEIGHBOURS" );
+            const auto shape = readBox();
+            auto entries = tree.Overlaps( shape );
+            std::erase_if( entries, [&]( const auto& e )
+            { return e.layer != layer || !e.IsTraceObstacle( net ); } );
+            SORTED_ORTHOGONAL_ROOM_NEIGHBOURS sorted( shape, entries );
+            int neighbours;
+            input >> neighbours;
+            BOOST_REQUIRE_EQUAL( sorted.Neighbours().size(), neighbours );
+            for( const auto& neighbour : sorted.Neighbours() )
+            {
+                int id, first, last;
+                input >> id;
+                BOOST_CHECK_EQUAL( neighbour.entry.objectId, id );
+                checkBox( neighbour.intersection );
+                input >> first >> last;
+                BOOST_CHECK_EQUAL( neighbour.firstSide, first );
+                BOOST_CHECK_EQUAL( neighbour.lastSide, last );
+            }
+            int missingSide;
+            input >> missingSide;
+            BOOST_CHECK_EQUAL( sorted.FirstUnrestrainedSide(), missingSide );
+            marker( "GAPS" );
+            int gapCount;
+            input >> gapCount;
+            const auto gaps = sorted.IncompleteRooms( { -100, -100, 100, 100 }, layer );
+            BOOST_REQUIRE_EQUAL( gaps.size(), gapCount );
+            for( const auto& gap : gaps )
+            {
+                checkBox( gap.GetShape() );
+                checkBox( gap.GetContainedShape() );
+            }
+        }
+    }
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Door oracle " << test )
+        {
+            marker( "DOOR" );
+            COMPLETE_FREE_SPACE_EXPANSION_ROOM first( 1, 0, readBox() );
+            COMPLETE_FREE_SPACE_EXPANSION_ROOM second( 2, 0, readBox() );
+            EXPANSION_DOOR door( &first, &second );
+            double offset;
+            std::size_t count;
+            input >> offset >> count;
+            const auto sections = door.GetSectionSegments( offset );
+            BOOST_REQUIRE_EQUAL( sections.size(), count );
+            for( const auto& section : sections )
+            {
+                for( double coordinate : { section.a.x, section.a.y, section.b.x, section.b.y } )
+                {
+                    double expected;
+                    input >> expected;
+                    BOOST_CHECK_SMALL( coordinate - expected, 1e-9 );
+                }
+            }
+        }
+    }
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Locator and distance oracle " << test )
+        {
+            marker( "CORNER" );
+            FLOAT_POINT from, to, expected;
+            bool horizontal, orthogonal;
+            input >> from.x >> from.y >> to.x >> to.y >> horizontal >> orthogonal >> expected.x >> expected.y;
+            const auto corner = FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
+                    from, to, horizontal, orthogonal );
+            BOOST_CHECK_SMALL( corner.x - expected.x, 1e-9 );
+            BOOST_CHECK_SMALL( corner.y - expected.y, 1e-9 );
+            marker( "DISTANCE" );
+            double h, v, distance;
+            input >> from.x >> from.y >> to.x >> to.y >> h >> v >> distance;
+            BOOST_CHECK_SMALL( from.WeightedDistance( to, h, v ) - distance, 1e-9 );
+        }
+    }
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Frontier ordering oracle " << test )
+        {
+            marker( "QUEUE" );
+            auto read = [&]()
+            {
+                MAZE_LIST_ELEMENT element;
+                int first, second;
+                input >> element.sortingValue >> element.expansionValue >> first >> second >> element.sectionNoOfDoor;
+                COMPLETE_FREE_SPACE_EXPANSION_ROOM a( first, 0, { 0, 0, 100, 100 } );
+                COMPLETE_FREE_SPACE_EXPANSION_ROOM b( second, 0, { 100, 0, 200, 100 } );
+                EXPANSION_DOOR door( &a, &b );
+                element.doorId = door.GetId();
+                return element;
+            };
+            const auto left = read(), right = read();
+            int expected;
+            input >> expected;
+            const int comparison = left.SortKey() < right.SortKey() ? -1
+                                   : left.SortKey() > right.SortKey() ? 1 : 0;
+            BOOST_CHECK_EQUAL( comparison, expected );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.allowVias = false;
+    settings.layers.resize( 1 );
+    board.obstacles.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE, 0, { 0 }, {}, {},
+                                { 2500000, 0, 3500000, 2200000 } } );
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    const auto route = engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {} );
+    BOOST_REQUIRE( route );
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
+    BOOST_CHECK_GT( engine.LastRoomSearchMetrics().rooms, 1 );
+    BOOST_CHECK_LT( expanded, 1000 );
+    for( std::size_t i = 1; i < route->nodes.size(); ++i )
+        BOOST_CHECK( engine.CanUseSegment( 1, route->nodes[i - 1], route->nodes[i] ) );
+    ROUTING_CONNECTION wall;
+    wall.netCode = 2;
+    wall.complete = true;
+    wall.nodes = { { { 3000000, 2000000 }, 0 }, { { 3000000, 3000000 }, 0 } };
+    occupancy.Add( wall );
+    BOOST_CHECK( !engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {} ) );
+    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+    occupancy.Remove( wall );
+    BOOST_REQUIRE( engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {} ) );
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
+}
+
+BOOST_AUTO_TEST_CASE( RoomSearchCrossesSubGridCorridorsWithoutGridExpansion )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    const std::vector<SHAPE_TREE_ENTRY> obstacles{
+        { { 3000, 0, 4000, 8300 }, 1 },
+        { { 6000, 8700, 7000, 10000 }, 2 },
+        { { 6000, 0, 7000, 8100 }, 3 }
+    };
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+            bounds, obstacles, 0, 10, { { { 1000, 2000 }, { 1000, 2000 }, 7 } },
+            { { { 9000, 2000 }, { 9000, 2000 }, 9 } }, 100, 1, 1,
+            10000, expanded, metrics );
+    BOOST_REQUIRE( path );
+    BOOST_CHECK( metrics.routed );
+    BOOST_CHECK_GT( metrics.rooms, 2 );
+    BOOST_CHECK_GT( metrics.doors, 2 );
+    BOOST_CHECK_GT( metrics.sections, 2 );
+    BOOST_CHECK_EQUAL( path->startOwner, 7 );
+    BOOST_CHECK_EQUAL( path->targetOwner, 9 );
+    BOOST_CHECK( path->points.front() == ROUTER_POINT( { 1000, 2000 } ) );
+    BOOST_CHECK( path->points.back() == ROUTER_POINT( { 9000, 2000 } ) );
+    for( std::size_t i = 1; i < path->points.size(); ++i )
+    {
+        const auto a = path->points[i - 1];
+        const auto b = path->points[i];
+        BOOST_CHECK( a.x == b.x || a.y == b.y );
+        BOOST_CHECK( bounds.Contains( a ) && bounds.Contains( b ) );
+        for( const auto& obstacle : obstacles )
+        {
+            // Test the OPEN rectangle: input rectangles already include the
+            // required physical clearance, so their boundary is centre-space.
+            const auto overlap = INT_BOX::Intersection( obstacle.shape,
+                    { std::min( a.x, b.x ), std::min( a.y, b.y ),
+                      std::max( a.x, b.x ), std::max( a.y, b.y ) } );
+            const bool insideX = overlap.minX < obstacle.shape.maxX
+                                 && overlap.maxX > obstacle.shape.minX;
+            const bool insideY = overlap.minY < obstacle.shape.maxY
+                                 && overlap.maxY > obstacle.shape.minY;
+            BOOST_CHECK( INT_BOX::Dimension( overlap ) < 0 || !insideX || !insideY );
+        }
+    }
+    BOOST_CHECK_LT( expanded, 1000 );
+}
+
+BOOST_AUTO_TEST_CASE( RoomSearchStopsAtBudgetsCancellationAndSolidWalls )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    const std::vector<ROOM_TERMINAL> starts{ { { 1000, 5000 }, { 1000, 5000 }, 1 } };
+    const std::vector<ROOM_TERMINAL> targets{ { { 9000, 5000 }, { 9000, 5000 }, 2 } };
+    for( int budget : { 0, 1, 10, 1000 } )
+    {
+        int expanded = 0;
+        ROOM_SEARCH_METRICS metrics;
+        const auto result = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+                bounds, { { { 4000, 0, 5000, 10000 }, 1 } }, 0, 10, starts, targets,
+                100, 1, 1, budget, expanded, metrics );
+        BOOST_CHECK( !result );
+        BOOST_CHECK_LE( expanded, budget );
+    }
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto result = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+            bounds, {}, 0, 10, starts, targets, 100, 1, 1, 1000, expanded, metrics,
+            [] { return true; } );
+    BOOST_CHECK( !result );
+    BOOST_CHECK_EQUAL( expanded, 0 );
+}
+
+BOOST_AUTO_TEST_CASE( DoorSectionsRejectDisjointShapesAndPreserveNarrowDoors )
+{
+    EXPANSION_ROOM first( 1, 0, { 0, 0, 100, 100 } );
+    EXPANSION_ROOM separate( 2, 0, { 200, 0, 300, 100 } );
+    EXPANSION_DOOR invalid( &first, &separate );
+    BOOST_CHECK_EQUAL( invalid.GetDimension(), -1 );
+    BOOST_CHECK( invalid.GetSectionSegments( 10 ).empty() );
+    EXPANSION_ROOM second( 3, 0, { 100, 40, 200, 50 } );
+    EXPANSION_DOOR narrow( &first, &second );
+    const auto sections = narrow.GetSectionSegments( 10 );
+    BOOST_REQUIRE_EQUAL( sections.size(), 1 );
+    BOOST_CHECK_EQUAL( sections[0].a.x, 100 );
+    BOOST_CHECK_EQUAL( sections[0].a.y, 45 );
+    BOOST_CHECK_EQUAL( sections[0].b.y, 45 );
+    BOOST_CHECK( narrow.GetSectionSegments( 1e-12, 0, 0, 100 ).empty() );
+    BOOST_CHECK( narrow.GetSectionSegments( std::numeric_limits<double>::infinity() ).empty() );
+    BOOST_CHECK_EQUAL( FLOAT_POINT( { -1.5, -0.5 } ).Round().x, -1 );
+    BOOST_CHECK_EQUAL( FLOAT_POINT( { -1.5, -0.5 } ).Round().y, 0 );
+}
+
+BOOST_AUTO_TEST_CASE( RoomSearchPreservesMultipleSourceAndTraceInteriorTargets )
+{
+    const ROUTER_BOX bounds{ 0, 0, 1000, 1000 };
+    const std::vector<ROOM_TERMINAL> starts{ { { 50, 50 }, { 50, 50 }, 11 },
+                                           { { 150, 600 }, { 150, 600 }, 12 } };
+    const std::vector<ROOM_TERMINAL> targets{ { { 850, 200 }, { 850, 800 }, 20 } };
+    std::optional<ROOM_PATH> previous;
+    for( int repeat = 0; repeat < 3; ++repeat )
+    {
+        int expanded = 0;
+        ROOM_SEARCH_METRICS metrics;
+        const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+                bounds, {}, 0, 1, starts, targets, 10, 1, 1, 1000, expanded, metrics );
+        BOOST_REQUIRE( path );
+        BOOST_CHECK_EQUAL( path->startOwner, 12 );
+        BOOST_CHECK_EQUAL( path->targetOwner, 20 );
+        BOOST_CHECK( path->points.front() == ROUTER_POINT( { 150, 600 } ) );
+        BOOST_CHECK( path->points.back() == ROUTER_POINT( { 850, 600 } ) );
+        if( previous )
+            BOOST_CHECK( path->points == previous->points );
+        previous = path;
+    }
+}
+
+BOOST_AUTO_TEST_CASE( RoomLocatorRespectsAnglesAndBendThreshold )
+{
+    const std::vector<RECTANGULAR_CORRIDOR_STEP> corridor{
+        { { 0, 0, 100, 100 }, ROUTER_BOX{ 100, 50, 100, 100 }, { { 100, 50 }, { 100, 100 } } },
+        { { 100, 50, 200, 150 }, {}, { { 180, 130 }, { 180, 130 } } }
+    };
+    for( bool orthogonal : { true, false } )
+    {
+        const auto result = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateRectangular( { 10, 10 }, corridor, orthogonal );
+        BOOST_REQUIRE( result );
+        BOOST_CHECK( result->front() == ROUTER_POINT( { 10, 10 } ) );
+        BOOST_CHECK( result->back() == ROUTER_POINT( { 180, 130 } ) );
+        double length = 0;
+        for( std::size_t i = 1; i < result->size(); ++i )
+        {
+            const auto dx = std::abs( ( *result )[i].x - ( *result )[i - 1].x );
+            const auto dy = std::abs( ( *result )[i].y - ( *result )[i - 1].y );
+            BOOST_CHECK( dx == 0 || dy == 0 || ( !orthogonal && dx == dy ) );
+            length += std::hypot( dx, dy );
+        }
+        if( !orthogonal )
+            BOOST_CHECK_LT( length, 290 );
+    }
+    BOOST_CHECK_EQUAL( MAZE_LIST_ELEMENT::BendPenalty( { 0, 0 }, { 100, 0 }, { 200, 0 }, 17 ), 0 );
+    BOOST_CHECK_EQUAL( MAZE_LIST_ELEMENT::BendPenalty( { 0, 0 }, { 100, 0 }, { 200, 5 }, 17 ), 0 );
+    BOOST_CHECK_EQUAL( MAZE_LIST_ELEMENT::BendPenalty( { 0, 0 }, { 100, 0 }, { 100, 100 }, 17 ), 17 );
+    BOOST_CHECK_EQUAL( MAZE_LIST_ELEMENT::BendPenalty( { 100, 0 }, { 100, 0 }, { 100, 100 }, 17 ), 0 );
+}
+
+BOOST_AUTO_TEST_CASE( RoomSearchFindsIndependentlyCertifiedRectangularPaths )
+{
+    std::mt19937 random( 230090 );
+    const ROUTER_BOX bounds{ 0, 0, 100, 100 };
+    int reachable = 0;
+    for( int test = 0; test < 300; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Rectangular connectivity case " << test )
+        {
+            std::vector<SHAPE_TREE_ENTRY> obstacles;
+            for( int i = 0; i < 12; ++i )
+            {
+                const std::int64_t x = 10 + random() % 75;
+                const std::int64_t y = 10 + random() % 75;
+                obstacles.push_back( { { x, y, x + 1 + static_cast<std::int64_t>( random() % 14 ),
+                                         y + 1 + static_cast<std::int64_t>( random() % 14 ) }, i + 1 } );
+            }
+            auto allowed = [&]( ROUTER_POINT a, ROUTER_POINT b )
+            {
+                if( !bounds.Contains( a ) || !bounds.Contains( b ) )
+                    return false;
+                const ROUTER_BOX segment{ std::min( a.x, b.x ), std::min( a.y, b.y ),
+                                           std::max( a.x, b.x ), std::max( a.y, b.y ) };
+                for( const auto& obstacle : obstacles )
+                {
+                    const auto& box = obstacle.shape;
+                    if( segment.minX < box.maxX && segment.maxX > box.minX
+                        && segment.minY < box.maxY && segment.maxY > box.minY )
+                        return false;
+                }
+                return true;
+            };
+            // This fine graph is only a feasibility certificate in the TEST,
+            // never a production fallback or a source of the expected polyline.
+            bool seen[21][21]{};
+            std::queue<std::pair<int, int>> queue;
+            queue.emplace( 1, 1 );
+            seen[1][1] = true;
+            while( !queue.empty() )
+            {
+                const auto [x, y] = queue.front();
+                queue.pop();
+                for( auto [dx, dy] : { std::pair{ 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } } )
+                {
+                    const int nx = x + dx, ny = y + dy;
+                    if( nx < 0 || ny < 0 || nx > 20 || ny > 20 || seen[nx][ny]
+                        || !allowed( { x * 5, y * 5 }, { nx * 5, ny * 5 } ) )
+                        continue;
+                    seen[nx][ny] = true;
+                    queue.emplace( nx, ny );
+                }
+            }
+            if( !seen[19][19] )
+                continue;
+            ++reachable;
+            int expanded = 0;
+            ROOM_SEARCH_METRICS metrics;
+            const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+                    bounds, obstacles, 0, 1, { { { 5, 5 }, { 5, 5 }, 0 } },
+                    { { { 95, 95 }, { 95, 95 }, 1 } }, 1, 1, 1, 10000, expanded, metrics );
+            BOOST_REQUIRE( path );
+            BOOST_CHECK( path->points.front() == ROUTER_POINT( { 5, 5 } ) );
+            BOOST_CHECK( path->points.back() == ROUTER_POINT( { 95, 95 } ) );
+            for( std::size_t i = 1; i < path->points.size(); ++i )
+            {
+                const auto a = path->points[i - 1], b = path->points[i];
+                BOOST_CHECK( a.x == b.x || a.y == b.y );
+                BOOST_CHECK( allowed( a, b ) );
+            }
+        }
+    }
+    BOOST_CHECK_GE( reachable, 250 );
+}
+
+
+BOOST_AUTO_TEST_CASE( DrillGeometryAndExpansionCostsMatchPinnedFreerouting )
+{
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir() + "/autorouter/drill-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto marker = [&]( const char* expected )
+    { std::string value; input >> value; BOOST_REQUIRE_EQUAL( value, expected ); };
+    auto readBox = [&]()
+    { ROUTER_BOX b; input >> b.minX >> b.minY >> b.maxX >> b.maxY; BOOST_REQUIRE( !input.fail() ); return b; };
+    auto checkBox = [&]( ROUTER_BOX actual )
+    {
+        const auto expected = readBox();
+        BOOST_CHECK_EQUAL( actual.minX, expected.minX ); BOOST_CHECK_EQUAL( actual.minY, expected.minY );
+        BOOST_CHECK_EQUAL( actual.maxX, expected.maxX ); BOOST_CHECK_EQUAL( actual.maxY, expected.maxY );
+    };
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Cutout oracle " << test )
+        {
+            marker( "CUT" ); const auto d = readBox(), hole = readBox(); std::size_t count;
+            input >> count;
+            const auto pieces = INT_BOX::Cutout( d, hole );
+            BOOST_REQUIRE_EQUAL( pieces.size(), count );
+            for( auto piece : pieces ) checkBox( piece );
+        }
+    }
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Drill free-region oracle " << test )
+        {
+            marker( "AREA" ); const auto border = readBox(); std::size_t count; input >> count;
+            std::vector<ROUTER_BOX> holes;
+            for( std::size_t i = 0; i < count; ++i ) holes.push_back( readBox() );
+            const auto pieces = POLYLINE_AREA::SplitToConvex( border, holes );
+            BOOST_REQUIRE( pieces ); input >> count; BOOST_REQUIRE_EQUAL( pieces->size(), count );
+            for( auto piece : *pieces )
+            {
+                checkBox( piece ); int expectedId; input >> expectedId;
+                const auto center = DRILL_PAGE( piece ).Center();
+                BOOST_CHECK_EQUAL( INT_BOX::PointId( center ), expectedId );
+            }
+        }
+    }
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Drill page-array oracle " << test )
+        {
+            marker( "PAGES" ); const auto bounds = readBox(); std::int64_t width; input >> width;
+            const auto query = readBox(); std::size_t count; input >> count;
+            DRILL_PAGE_ARRAY array( bounds, width );
+            BOOST_REQUIRE_EQUAL( array.Pages().size(), count );
+            for( const auto& page : array.Pages() )
+            { checkBox( page.Shape() ); int id; input >> id; BOOST_CHECK_EQUAL( page.GetId(), id ); }
+            const auto overlapping = array.OverlappingPages( query );
+            input >> count; BOOST_REQUIRE_EQUAL( overlapping.size(), count );
+            for( auto* page : overlapping ) checkBox( page->Shape() );
+        }
+    }
+    for( int test = 0; test < 256; ++test )
+    {
+        BOOST_TEST_CONTEXT( "Drill/page frontier-cost oracle " << test )
+        {
+            marker( "PAGE_COST" ); auto shape = readBox(); FLOAT_POINT from;
+            double g, via, h, v, remaining, expectedG, expectedF;
+            input >> from.x >> from.y >> g >> via >> h >> v >> remaining >> expectedG >> expectedF;
+            const auto page = MAZE_EXPANSION_ENGINE::ToPage( shape, from, g, via, h, v, remaining );
+            BOOST_CHECK_SMALL( page.expansion - expectedG, 1e-8 );
+            BOOST_CHECK_SMALL( page.sorting - expectedF, 1e-8 );
+            marker( "DRILL_COST" ); shape = readBox(); int fromPage, expectedId; FLOAT_POINT expected;
+            input >> from.x >> from.y >> g >> via >> fromPage >> h >> v >> remaining
+                  >> expectedG >> expectedF >> expected.x >> expected.y >> expectedId;
+            const auto drill = MAZE_EXPANSION_ENGINE::ToDrill( shape, from, g, via, fromPage, h, v, remaining );
+            BOOST_CHECK_SMALL( drill.expansion - expectedG, 1e-8 );
+            BOOST_CHECK_SMALL( drill.sorting - expectedF, 1e-8 );
+            BOOST_CHECK_SMALL( drill.entry.x - expected.x, 1e-8 );
+            BOOST_CHECK_SMALL( drill.entry.y - expected.y, 1e-8 );
+            EXPANSION_DRILL object; object.location = { 100, 100 }; object.firstLayer = 0; object.lastLayer = 1;
+            BOOST_CHECK_EQUAL( object.GetId(), expectedId );
+        }
+    }
+    input >> std::ws; BOOST_CHECK( input.eof() );
+}
+
+BOOST_AUTO_TEST_CASE( DrillPageCacheResetsStateButInvalidatesGeometryOnMutation )
+{
+    DRILL_PAGE page( { -100, -100, 100, 100 } );
+    std::vector<SHAPE_TREE_ENTRY> obstacles{ { { -5, -100, 5, 100 }, 1, 0, 2, 2 } };
+    auto* drills = page.GetDrills( obstacles, 1, 3 );
+    BOOST_REQUIRE( drills ); BOOST_REQUIRE_EQUAL( drills->size(), 2 );
+    BOOST_CHECK( page.IsValid() );
+    const auto first = drills->front().location;
+    drills->front().occupied[1] = true;
+    page.Reset();
+    BOOST_REQUIRE_EQUAL( page.GetDrills( obstacles, 1, 3 )->size(), 2 );
+    BOOST_CHECK( !drills->front().occupied[1] );
+    BOOST_CHECK( drills->front().location == first );
+    // A net change makes foreign copper drillable; no stale cached cutouts.
+    BOOST_REQUIRE_EQUAL( page.GetDrills( obstacles, 2, 3 )->size(), 1 );
+    page.Invalidate(); BOOST_CHECK( !page.IsValid() );
+    BOOST_REQUIRE_EQUAL( page.GetDrills( {}, 1, 3 )->size(), 1 );
+    page.Invalidate();
+    BOOST_CHECK( !page.GetDrills( obstacles, 1, 3, false, {}, [] { return true; } ) );
+    BOOST_CHECK( !page.IsValid() );
+    BOOST_CHECK( !page.GetDrills( obstacles, 1, 3, false, {}, {}, 1 ) );
+    BOOST_REQUIRE_EQUAL( page.GetDrills( obstacles, 1, 3 )->size(), 2 );
+    // Attachment selection: last eligible top pin, otherwise bottom, strict
+    // interior only. Changing attach policy invalidates the cache as well.
+    page.Invalidate();
+    const std::vector<DRILL_PIN> pins{ { { 1, 2 }, 0, true }, { { 3, 4 }, 0, true },
+                                     { { 7, 8 }, 2, true }, { { 100, 0 }, 0, true } };
+    BOOST_CHECK( page.GetDrills( {}, 1, 3, true, pins )->front().location == ( ROUTER_POINT{ 3, 4 } ) );
+    BOOST_CHECK( page.GetDrills( {}, 1, 3, false, pins )->front().location == ( ROUTER_POINT{ 0, 0 } ) );
+}
+
+BOOST_AUTO_TEST_CASE( MultilayerRoomSearchUsesDrillSectionsAndFullPhysicalStack )
+{
+    ROOM_LAYER a, b, inactive;
+    a.id = 0; inactive.id = 17; inactive.active = false; b.id = 31;
+    a.bounds = b.bounds = inactive.bounds = { 0, 0, 10000, 10000 };
+    a.starts = { { { 1000, 5000 }, { 1000, 5000 }, 7 } };
+    b.targets = { { { 9000, 5000 }, { 9000, 5000 }, 9 } };
+    ROOM_VIA_SETTINGS via;
+    via.bounds = a.bounds; via.pageWidth = 2000; via.normalCost = 1000;
+    via.canDrill = []( auto ) { return true; };
+    auto route = [&]( const auto& layers )
+    {
+        int expanded = 0; ROOM_SEARCH_METRICS metrics;
+        auto found = MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+                layers, 1, 100, via, 10000, expanded, metrics, {}, {}, true );
+        BOOST_REQUIRE( found ); BOOST_CHECK_GT( metrics.drillPages, 0 );
+        BOOST_CHECK_GT( metrics.drills, 0 ); BOOST_CHECK_GT( metrics.layerTransitions, 0 );
+        BOOST_CHECK_LT( expanded, 1000 );
+        BOOST_CHECK_EQUAL( found->startOwner, 7 ); BOOST_CHECK_EQUAL( found->targetOwner, 9 );
+        int transitions = 0;
+        for( std::size_t i = 1; i < found->nodes.size(); ++i )
+        {
+            const auto& from = found->nodes[i - 1]; const auto& to = found->nodes[i];
+            BOOST_CHECK_NE( to.layer, 17 );
+            if( from.layer != to.layer ) { ++transitions; BOOST_CHECK( from.point == to.point ); }
+        }
+        return transitions;
+    };
+    BOOST_CHECK_EQUAL( route( std::vector{ a, inactive, b } ), 1 );
+    // A foreign plane/obstacle on an inactive inner layer blocks the physical
+    // through-drill. It is not enough that its trace entry/exit layers are clear.
+    inactive.obstacles = { { inactive.bounds, 1, 0, inactive.id } };
+    int expanded = 0; ROOM_SEARCH_METRICS metrics;
+    BOOST_CHECK( !MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+            { a, inactive, b }, 1, 100, via, 10000, expanded, metrics ) );
+    inactive.obstacles.clear();
+    a.targets = b.targets; b.targets.clear();
+    a.obstacles = { { { 4500, 0, 5500, 10000 }, 1, 0, 0 } };
+    via.obstacles = a.obstacles;
+    BOOST_CHECK_EQUAL( route( std::vector{ a, b } ), 2 );
+    expanded = 0; metrics = {};
+    BOOST_CHECK( !MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+            { a, b }, 1, 100, via, 1, expanded, metrics ) );
+    expanded = 0;
+    BOOST_CHECK( !MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+            { a, b }, 1, 100, via, 10000, expanded, metrics, [] { return true; } ) );
+    via.canDrill = []( auto ) { return false; }; expanded = 0;
+    BOOST_CHECK( !MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+            { a, b }, 1, 100, via, 10000, expanded, metrics ) );
+}
+
+BOOST_AUTO_TEST_CASE( ProductionMultilayerRoutingUsesTheRoomDrillFrontier )
+{
+    auto board = makeBoard(); auto settings = makeSettings();
+    settings.enableFanout = false;
+    board.pads[0].layers = { 0 }; board.pads[1].layers = { 1 };
+    board.pads[0].isSmd = board.pads[1].isSmd = true;
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU ); occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy ); int expanded = 0;
+    const auto path = engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {} );
+    BOOST_REQUIRE( path ); BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
+    BOOST_CHECK_GT( engine.LastRoomSearchMetrics().drillPages, 0 );
+    BOOST_CHECK_GT( engine.LastRoomSearchMetrics().layerTransitions, 0 );
+    for( std::size_t i = 1; i < path->nodes.size(); ++i )
+    {
+        const auto& a = path->nodes[i - 1]; const auto& b = path->nodes[i];
+        BOOST_CHECK( engine.CanUseSegment( 1, a, b ) );
+        if( a.layer != b.layer )
+        {
+            BOOST_CHECK( a.point != board.pads[0].position );
+            BOOST_CHECK( a.point != board.pads[1].position );
+        }
+    }
+    settings.allowViaInSmdPad = true;
+    auto attachBoard = board;
+    // Pin-centre substitution requires strict interior containment. The
+    // original y=1.5mm lies exactly on a drill-page boundary in this fixture.
+    for( auto& pad : attachBoard.pads )
+        pad.position.y -= 200000;
+    // One page makes its substituted pin centre the only drill candidate;
+    // allowing via-in-pad does not otherwise require the queue to choose it.
+    attachBoard.nets[0].viaDiameter = 1200000;
+    ROUTING_OCCUPANCY attachOccupancy( settings.gridStepIU );
+    attachOccupancy.InitializeBoard( attachBoard, settings );
+    MAZE_SEARCH_ENGINE attachEngine( attachBoard, settings, attachOccupancy );
+    expanded = 0;
+    const auto attached = attachEngine.FindConnection( attachBoard.pads[0], attachBoard.pads[1], 0, expanded, {} );
+    BOOST_REQUIRE( attached );
+    BOOST_CHECK( attachEngine.LastRoomSearchMetrics().routed );
+    bool attachedToPin = false;
+    for( std::size_t i = 1; i < attached->nodes.size(); ++i )
+        if( attached->nodes[i - 1].layer != attached->nodes[i].layer )
+        {
+            attachedToPin |= attached->nodes[i].point == attachBoard.pads[0].position
+                             || attached->nodes[i].point == attachBoard.pads[1].position;
+        }
+    BOOST_CHECK( attachedToPin );
+}
+
+BOOST_AUTO_TEST_CASE( TraceTailCleanupSplitsAtInteriorViaAndKeepsTheUsefulTrunk )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads[0].layers = { 0 };
+    board.pads[1].layers = { 1 };
+    ROUTING_CONNECTION trunk;
+    trunk.complete = true; trunk.netCode = 1;
+    trunk.nodes = { { board.pads[0].position, 0 }, { { 4000000, 1500000 }, 0 } };
+    auto via = trunk, branch = trunk;
+    via.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+    branch.nodes = { via.nodes.back(), { board.pads[1].position, 1 } };
+    std::vector<ROUTING_CONNECTION> routes{ trunk, via, branch };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    for( const auto& route : routes )
+        occupancy.Add( route );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+    BATCH_OPTIMIZER optimizer( board, settings, occupancy );
+    optimizer.RemoveRedundantViaTails( routes, [] { return true; } );
+    BOOST_REQUIRE_EQUAL( routes.size(), 3 );
+    BOOST_CHECK( routes.front().nodes == trunk.nodes );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    optimizer.RemoveRedundantViaTails( routes, {} );
+    BOOST_REQUIRE_EQUAL( routes.size(), 3 );
+    BOOST_REQUIRE_EQUAL( routes.front().nodes.size(), 2 );
+    BOOST_CHECK( routes.front().nodes.back() == via.nodes.front() );
+    BOOST_CHECK( routes[1].nodes == via.nodes );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    for( const auto& route : routes )
+    {
+        occupancy.Remove( route );
+        BOOST_CHECK( occupancy.Board()->HasCopperAt( 1, route.nodes.front() ) );
+        BOOST_CHECK( occupancy.Board()->HasCopperAt( 1, route.nodes.back() ) );
+        occupancy.Add( route );
+    }
+    optimizer.RemoveRedundantViaTails( routes, {} );
+    BOOST_CHECK( routes.front().nodes.back() == via.nodes.front() );
+    BOOST_CHECK_EQUAL( occupancy.Connections().size(), routes.size() );
+}
+
+BOOST_AUTO_TEST_CASE( TraceJunctionsUseRealCopperLayerAndExactIntersection )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION diagonal;
+    diagonal.complete = true; diagonal.netCode = 1;
+    diagonal.nodes = { { { 2000000, 500000 }, 0 }, { { 4000000, 2500000 }, 0 } };
+    copper.AddRoute( diagonal );
+    ROUTER_NODE a{ { 1500000, 1500000 }, 0 }, b{ { 4500000, 1500000 }, 0 };
+    const ROUTER_POINT junction{ 3000000, 1500000 };
+    auto points = copper.TraceJunctions( 1, a, b );
+    BOOST_REQUIRE_EQUAL( points.size(), 1 );
+    BOOST_CHECK( points.front() == junction );
+    BOOST_CHECK( copper.TraceJunctions( 2, a, b ).empty() );
+    a.layer = b.layer = 1;
+    BOOST_CHECK( copper.TraceJunctions( 1, a, b ).empty() );
+    BOOST_CHECK( !copper.HasCopperAt( 1, { junction, 1 } ) );
+    BOOST_CHECK( copper.HasCopperAt( 1, { junction, 0 } ) );
+    auto through = diagonal;
+    through.nodes = { { junction, 0 }, { junction, 1 } };
+    copper.AddRoute( through );
+    BOOST_CHECK( copper.HasCopperAt( 1, { junction, 1 } ) );
+    points = copper.TraceJunctions( 1, a, b );
+    BOOST_REQUIRE_EQUAL( points.size(), 1 );
+    BOOST_CHECK( points.front() == junction );
+}
+
+BOOST_AUTO_TEST_CASE( OverlappingTraceEndIsTrimmedToTheJunctionNotKeptAsADoubledStub )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_CONNECTION left;
+    left.complete = true; left.netCode = 1;
+    left.nodes = { { board.pads[0].position, 0 }, { { 3500000, 1500000 }, 0 } };
+    auto right = left;
+    right.nodes = { { { 3000000, 1500000 }, 0 }, { board.pads[1].position, 0 } };
+    std::vector<ROUTING_CONNECTION> routes{ left, right };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( left ); occupancy.Add( right );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+    BATCH_OPTIMIZER( board, settings, occupancy ).RemoveRedundantViaTails( routes, {} );
+    BOOST_REQUIRE_EQUAL( routes.size(), 2 );
+    BOOST_CHECK( routes.front().nodes.back() == routes.back().nodes.front() );
+    BOOST_CHECK( routes.front().nodes.front() == left.nodes.front() );
+    BOOST_CHECK( routes.back().nodes.back() == right.nodes.back() );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
+BOOST_AUTO_TEST_CASE( DrillAllocationIsValidatedAndUnusedGridsAreNotConstructed )
+{
+    const ROUTER_BOX empty{ 0, 0, 0, 1 }, bounds{ 0, 0, 100, 100 };
+    const ROUTER_BOX huge{ 0, 0, std::numeric_limits<std::int64_t>::max(), 100 };
+    const ROUTER_BOX overflow{ std::numeric_limits<std::int64_t>::min(), 0,
+                               std::numeric_limits<std::int64_t>::max(), 100 };
+    BOOST_CHECK_THROW( DRILL_PAGE_ARRAY( empty, 10 ), std::invalid_argument );
+    BOOST_CHECK_THROW( DRILL_PAGE_ARRAY( bounds, 0 ), std::invalid_argument );
+    BOOST_CHECK_THROW( DRILL_PAGE_ARRAY( huge, 1 ), std::length_error );
+    BOOST_CHECK_THROW( DRILL_PAGE_ARRAY( overflow, 1 ), std::length_error );
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 2000000000, 2000000000 };
+    board.nets[0].viaDiameter = 0;
+    settings.maxExpandedNodes = 1;
+    settings.allowVias = false;
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    AUTOROUTE_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    BOOST_CHECK( !engine.AutorouteConnection( board.pads[0], board.pads[1], 0, expanded, {} ) );
+    BOOST_CHECK_LE( expanded, 1 );
+}
 
 BOOST_AUTO_TEST_SUITE_END()

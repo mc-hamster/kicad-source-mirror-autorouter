@@ -10,11 +10,11 @@
 /*
  * Small, headless corpus harness for the native Freerouting-derived router.
  *
- * The harness deliberately uses the same KICAD_BOARD_ADAPTER and
- * ROUTING_PIPELINE as pcbnew.  It is therefore useful for the parity corpus
- * without requiring a GUI, a DSN/SES conversion, or a second implementation
- * of the board-to-snapshot boundary.  The optional live DRC pass attaches the
- * proposal to the freshly loaded board only; the input file is never written.
+ * Native full-board runs use the editor's KICAD_ROUTING_SESSION, including
+ * private refill, validation and repair. An additional, independent live DRC
+ * pass applies the proposal to the original freshly loaded board. Bounded
+ * raw-worker diagnosis and reference DSN/SES I/O are QA-only options.
+ * The input file is never written.
  */
 
 #include <algorithm>
@@ -50,6 +50,7 @@
 
 #include <autorouter/AutorouterTypes.h>
 #include <autorouter/board/KicadBoardAdapter.h>
+#include <autorouter/board/KicadRoutingSession.h>
 #include <autorouter/pipeline/RoutingPipeline.h>
 
 
@@ -127,6 +128,7 @@ struct OPTIONS
     int         maxNets = 0;
     int         maxConnections = 0;
     bool        fanout = true;
+    bool        vias = true;
     bool        routeOnlyUnconnected = true;
     bool        liveDrc = true;
 };
@@ -148,7 +150,7 @@ struct LIVE_DRC_RESULT
                                    " [--out FILE] [--max-passes N]"
                                    " [--max-iterations N] [--max-expanded-nodes N]"
                                    " [--optimization-passes N]"
-                                   " [--no-fanout] [--all-connections] [--no-live-drc]"
+                                   " [--no-fanout] [--no-vias] [--all-connections] [--no-live-drc]"
                                    " [--max-nets N] [--max-connections N]"
                                    " [--export-dsn FILE] [--include-net NET]"
                                    " [--strip-tracks] [--import-ses FILE]"
@@ -231,6 +233,11 @@ OPTIONS parseOptions( int argc, char** argv )
                     parsePositive( "--max-connections", nextValue( "--max-connections" ) );
         else if( argument == "--no-fanout" )
             options.fanout = false;
+        else if( argument == "--no-vias" )
+        {
+            options.vias = false;
+            options.fanout = false;
+        }
         else if( argument == "--all-connections" )
             options.routeOnlyUnconnected = false;
         else if( argument == "--no-live-drc" )
@@ -315,11 +322,21 @@ LIVE_DRC_RESULT runLiveDrc( BOARD* aBoard )
                             wxString::Format( "%d@(%d,%d)/L%d: %s", aItem->GetErrorCode(),
                                               aPosition.x, aPosition.y, aLayer,
                                               aItem->GetErrorMessage( false ) )
-                                    .ToStdString() );
+                                    .ToStdString() + " ["
+                            + aItem->GetMainItemID().AsString().ToStdString() + ","
+                            + aItem->GetAuxItemID().AsString().ToStdString() + "]" );
                 }
             } );
-    engine->RunTests( EDA_UNITS::MM, true, false );
-    engine->SetViolationHandler( {} );
+    try { engine->RunTests( EDA_UNITS::MM, true, false ); }
+    catch( ... ) { engine->ClearViolationHandler(); throw; }
+    engine->ClearViolationHandler();
+    if( !engine->TestsCompleted() )
+        throw std::runtime_error( "independent KiCad DRC did not complete" );
+    for( int code = DRCE_FIRST; code <= DRCE_LAST; ++code )
+        if( code != DRCE_UNCONNECTED_ITEMS // Full connectivity is counted separately.
+            && aBoard->GetDesignSettings().GetSeverity( code ) != SEVERITY::RPT_SEVERITY_IGNORE
+            && engine->IsErrorLimitExceeded( code ) )
+            throw std::runtime_error( "independent KiCad DRC reached its error limit" );
     return result;
 }
 
@@ -368,7 +385,8 @@ void applyProposal( BOARD* aBoard,
 void writeJson( const std::string& aPath, const std::string& aBoardPath,
                 const KICAD_AUTOROUTER::ROUTING_RESULT& aResult,
                 const LIVE_DRC_RESULT& aBaselineDrc, const LIVE_DRC_RESULT& aLiveDrc,
-                std::int64_t aRuntimeMs, int aBaselineUnconnected, int aUnconnected )
+                std::int64_t aRuntimeMs, std::int64_t aHostSessionMs,
+                int aBaselineUnconnected, int aUnconnected )
 {
     const KICAD_AUTOROUTER::ROUTER_METRICS& metrics = aResult.metrics;
     int introducedDrcErrors = -1;
@@ -387,6 +405,12 @@ void writeJson( const std::string& aPath, const std::string& aBoardPath,
     std::ostringstream json;
     json << "{\n"
          << "  \"board\": \"" << jsonEscape( aBoardPath ) << "\",\n"
+         << "  \"host_validated\": " << ( aResult.hostValidated ? "true" : "false" ) << ",\n"
+         << "  \"host_unconnected\": " << aResult.hostUnconnected << ",\n"
+         << "  \"host_new_drc_violations\": " << aResult.hostNewDrcViolations << ",\n"
+         << "  \"host_repair_passes\": " << aResult.hostRepairPasses << ",\n"
+         << "  \"host_validation_ms\": " << aResult.hostValidationMilliseconds << ",\n"
+         << "  \"host_session_ms\": " << aHostSessionMs << ",\n"
          << "  \"baseline_kicad_unconnected\": " << aBaselineUnconnected << ",\n"
          << "  \"kicad_unconnected\": " << aUnconnected << ",\n"
          << "  \"electrically_complete\": " << ( aUnconnected == 0 ? "true" : "false" ) << ",\n"
@@ -564,6 +588,7 @@ int main( int argc, char** argv )
         settings.optimizationPasses = options.optimizationPasses;
         settings.maxExpandedNodes = options.maxExpandedNodes;
         settings.enableFanout = options.fanout;
+        settings.allowVias = options.vias;
         settings.routeOnlyUnconnected = options.routeOnlyUnconnected;
         settings.includeNets = options.includeNets;
 
@@ -674,7 +699,12 @@ int main( int argc, char** argv )
         const auto start = std::chrono::steady_clock::now();
         KICAD_AUTOROUTER::ROUTING_RESULT result;
         if( options.importSes.empty() )
-            result = KICAD_AUTOROUTER::ROUTING_PIPELINE().Run( *snapshot, settings, {}, {} );
+        {
+            if( options.maxConnections > 0 ) // explicitly bounded raw-worker diagnosis
+                result = KICAD_AUTOROUTER::ROUTING_PIPELINE().Run( *snapshot, settings, {}, {} );
+            else
+                result = KICAD_AUTOROUTER::KICAD_ROUTING_SESSION( *board ).Run( settings );
+        }
         else
         {
             REFERENCE_IMPORT_COMMIT commit( *board );
@@ -685,8 +715,11 @@ int main( int argc, char** argv )
             result.message = "Reference session evaluated by KiCad";
         }
         const auto end = std::chrono::steady_clock::now();
-        const auto runtimeMs = std::chrono::duration_cast<std::chrono::milliseconds>( end - start )
-                                       .count();
+        const auto runtimeMs = result.hostValidated
+                ? result.metrics.elapsedMilliseconds - result.hostValidationMilliseconds
+                : std::chrono::duration_cast<std::chrono::milliseconds>( end - start ).count();
+        const auto hostSessionMs = result.hostValidated
+                ? std::chrono::duration_cast<std::chrono::milliseconds>( end - start ).count() : -1;
 
         LIVE_DRC_RESULT liveDrc;
         applyProposal( board.get(), result, adapter );
@@ -705,7 +738,7 @@ int main( int argc, char** argv )
         if( options.liveDrc && !result.cancelled )
             liveDrc = runLiveDrc( board.get() );
 
-        writeJson( options.output, options.board, result, baselineDrc, liveDrc, runtimeMs,
+        writeJson( options.output, options.board, result, baselineDrc, liveDrc, runtimeMs, hostSessionMs,
                    baselineUnconnected, unconnected );
         if( !options.saveBoard.empty() )
             KI_TEST::DumpBoardToFile( *board, options.saveBoard );

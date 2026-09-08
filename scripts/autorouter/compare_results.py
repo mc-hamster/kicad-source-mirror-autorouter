@@ -82,6 +82,10 @@ def main() -> int:
         print("input identity/normalization mismatch", file=sys.stderr)
         failed = True
 
+    if reference.get("routing_constraints") != native.get("routing_constraints"):
+        print("routing constraint mismatch", file=sys.stderr)
+        failed = True
+
     # Synthetic fanout edges are implementation-specific work, not electrical
     # completion. Both results must be measured with KiCad on materialized boards.
     reference_remaining = number(reference, "kicad_unconnected")
@@ -101,6 +105,20 @@ def main() -> int:
 
     if reference.get("validation_complete") is not True or native.get("validation_complete") is not True:
         print("KiCad validation was not completed for both results", file=sys.stderr)
+        failed = True
+
+    # Historical measurements predate the production host session. When the
+    # current harness advertises it, require that path and cross-check its
+    # connectivity against independent materialization. A bounded/raw worker
+    # run is diagnostic evidence, not production parity.
+    if "host_validated" in native and (
+            native.get("host_validated") is not True
+            or number(native, "host_unconnected") != native_remaining
+            or ("host_new_drc_violations" in native and (
+                number(native, "host_new_drc_violations") is None
+                or number(native, "host_new_drc_violations")
+                != number(native, "new_kicad_drc_errors")))):
+        print("production proposal validation missing or disagrees with KiCad", file=sys.stderr)
         failed = True
 
     print(f"{'metric':<24} {'reference':>14} {'native':>14} {'delta':>14}")

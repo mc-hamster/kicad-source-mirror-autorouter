@@ -1,9 +1,27 @@
 # Native autorouter rework
 
+Latest implementation: [Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md).
+It supersedes the connectivity, dangling-via and 555 failure status below;
+host validation and bounded plane repair now complete that fixture. Room/door
+search and forced insertion remain incomplete. The following sections describe
+earlier milestones, not the latest A/B results.
+
 The native autorouter has **not reached Freerouting parity**. The existing
 grid/visibility search, sampled plane targets, and path-shortening optimizer
 are experimental replacements, not faithful translations. Matching filenames
 in `UPSTREAM.md` describe intended correspondence, not completed ports.
+
+## Latest review / retained fixes (2026-09-07)
+
+See [Core routing parity review](CORE-ROUTING-PARITY-REVIEW.md) for the traced
+call paths, missing core operations, source links and repeated A/B evidence.
+This pass fixes full-stack through-via modeling (including inactive routing
+layers), centralizes via legality across general/direct fanout search, and
+preserves real pad copper contours using exact circle/capsule/rounded-core
+primitives where possible. Six new regression cases exercise those changes.
+A bend/frontier experiment was rejected after a tenfold timing regression.
+The 555 false-completion case remains unresolved; none of these changes make
+the experimental grid router an upstream-equivalent implementation.
 
 ## Required replacement boundary
 

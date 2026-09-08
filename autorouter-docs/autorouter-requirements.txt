@@ -1,0 +1,1254 @@
+PROJECT REQUIREMENTS: Native Full-Board Autorouter for KiCad
+
+1. USER STORY
+
+As a KiCad PCB designer,
+I want a native “Autoroute Board” command inside KiCad PCB Editor,
+so that I can automatically route an entire PCB using the board’s existing design rules and net classes, review the resulting routing as a proposal, and either accept or reject the entire result.
+
+The intended experience is similar to the traditional EAGLE autorouter:
+
+1. Open a PCB in KiCad.
+2. Click an “Autoroute Board” command/button.
+3. Configure autorouter settings in a dialog.
+4. Run the autorouter.
+5. Allow the autorouter to route the whole board, including iterative rip-up/reroute and optimization.
+6. Review the completed proposed routing in KiCad.
+7. Accept the proposal, making it part of the board, or reject it and return exactly to the pre-autoroute state.
+8. After acceptance, manually edit/clean up the result using normal KiCad tools.
+
+
+2. PRIMARY ACCEPTANCE CRITERIA
+
+A. KiCad Integration
+
+- The feature is integrated into KiCad PCB Editor rather than being a standalone application.
+- There is a native KiCad action such as:
+    Route -> Autoroute Board...
+- Invoking it opens an autorouter settings dialog.
+- The routing process operates on the currently open KiCad PCB.
+- The user does not need to manually export/import DSN/SES files.
+- The user does not need to launch a separate Java GUI.
+- The result is represented entirely as normal KiCad board objects.
+
+B. Configuration
+
+The initial dialog should expose the routing controls required to reproduce Freerouting behavior as closely as practical, including where applicable:
+
+- Layers allowed for autorouting.
+- Preferred routing direction by layer.
+- Via cost / via preference.
+- Trace length cost.
+- Congestion cost.
+- Rip-up/retry behavior.
+- Optimization passes.
+- Maximum routing iterations.
+- Whether already-routed traces may be ripped up.
+- Nets/net classes to include or exclude.
+- Routing priority.
+- Stop after first complete route versus continue optimizing.
+- Any other cost parameters used by Freerouting that materially affect route quality.
+
+KiCad’s existing board settings, net classes, trace widths, clearances, via sizes, keepouts, etc. should remain the authoritative source wherever practical rather than duplicating this configuration.
+
+C. Routing
+
+The MVP must provide practical routing parity with the current Freerouting routing engine.
+
+It must:
+
+- Route an entire PCB automatically.
+- Handle multiple routing layers to the extent Freerouting does.
+- Insert vias where required.
+- Respect KiCad design rules.
+- Respect board keepouts and obstacles.
+- Use iterative routing rather than attempting each connection only once.
+- Support rip-up and reroute.
+- Detect and respond to congestion.
+- Retry routes using changing costs/penalties.
+- Preserve Freerouting’s routing cost behavior as closely as practical.
+- Preserve Freerouting’s net ordering and search behavior as closely as practical.
+- Perform equivalent optimization/cleanup passes.
+- Produce routing of comparable completeness and quality to Freerouting.
+- Produce a board that passes KiCad DRC for the constraints supported by Freerouting.
+
+The MVP is not a reduced two-layer proof of concept.
+
+Internal development milestones may temporarily support a subset of Freerouting functionality, but the product MVP is not complete until practical Freerouting parity has been demonstrated.
+
+D. Proposal / Transaction Model
+
+This is an important UX requirement.
+
+The autorouter result should initially be treated as a proposal.
+
+After completion:
+
+- The board displays the proposed routing.
+- The user can inspect it.
+- The user can ACCEPT the proposal.
+- The user can REJECT the proposal.
+
+Reject must restore the board exactly to its state immediately before autorouting.
+
+Ideally, the entire accepted autoroute should also behave as one KiCad undoable transaction.
+
+The user should therefore never need to manually undo hundreds or thousands of generated tracks and vias.
+
+E. Manual Editing
+
+Once accepted:
+
+- Generated traces are normal KiCad tracks.
+- Generated vias are normal KiCad vias.
+- No proprietary/special representation should be required.
+- Existing KiCad editing, shove routing, DRC, track dragging, cleanup, etc. continue to work normally.
+
+
+3. TECHNICAL DISCOVERY ALREADY COMPLETED
+
+We have already investigated whether this functionality exists and the likely implementation strategy.
+
+KiCad
+
+- KiCad does not currently contain a traditional full-board, push-button autorouter comparable to the old EAGLE autorouter.
+- KiCad has a sophisticated interactive router, particularly its PNS (“push-and-shove”) routing infrastructure.
+- KiCad supports interactive/semi-automatic routing functionality, but this is not equivalent to globally routing an entire board.
+- KiCad already has substantial infrastructure that should NOT be reimplemented unnecessarily:
+    - PCB board representation.
+    - Geometry.
+    - Track/via representation.
+    - Design rules.
+    - Net classes.
+    - Keepouts.
+    - DRC.
+    - Undo/transaction handling.
+    - Interactive PNS routing.
+- KiCad development is primarily hosted in GitLab.
+- The GitHub KiCad repository is effectively a mirror and follows upstream closely.
+- Development work intended for eventual contribution to KiCad should therefore be based on the current official KiCad source tree, preferably the canonical GitLab repository.
+- We investigated KiCad forks and did not identify an existing fork that has already integrated a true native full-board Freerouting-derived autorouter into KiCad.
+
+Freerouting
+
+- Freerouting is an open-source full PCB autorouter.
+- It is actively maintained rather than being an abandoned historical project.
+- Its actual autorouting engine is substantially separated from its GUI.
+- Relevant code is concentrated around the autorouting subsystem and associated routing/board/geometry/rule support.
+- Freerouting supports concepts we need, including:
+    - Batch autorouting.
+    - Search/path expansion.
+    - Routing costs.
+    - Congestion handling.
+    - Rip-up and reroute.
+    - Multiple routing passes.
+    - Route optimization.
+- Modern Freerouting supports non-GUI/headless operation, demonstrating that the routing engine is not inseparably tied to its user interface.
+- The routing components appear sufficiently modular that a structured port is more realistic than extracting algorithms from a monolithic GUI application.
+- The routing engine is still evolving, which creates an important long-term maintenance requirement: the KiCad port should remain structurally close enough to upstream Freerouting that future improvements can be brought across without re-analyzing the entire system.
+
+Existing KiCad + Freerouting integration
+
+- A Freerouting workflow/plugin for KiCad already exists.
+- It effectively automates or assists the traditional:
+    KiCad -> Specctra DSN -> Freerouting -> SES -> KiCad
+  workflow.
+- This proves that Freerouting can successfully route KiCad PCB designs.
+- However, this remains an external-engine/import-export workflow.
+- It does not provide the desired native KiCad architecture or UX.
+- We did not identify an existing project that has genuinely merged or ported the Freerouting routing engine into KiCad’s native PCB editor.
+- Therefore, the desired native integration appears to represent a real gap rather than duplicated existing work.
+
+
+4. LICENSING DISCOVERY
+
+Licensing does not appear to be a fundamental obstacle.
+
+- KiCad is GPL licensed.
+- Freerouting is GPLv3.
+- These licenses appear compatible for a GPL KiCad derivative/contribution.
+
+Therefore, it should be legally possible to:
+
+- Study Freerouting algorithms.
+- Port GPL Freerouting implementation code where appropriate.
+- Adapt that code into KiCad.
+- Distribute the resulting GPL source.
+
+Normal GPL obligations still apply, including retaining appropriate copyright/license notices and making derivative source available.
+
+The engineer should confirm exact file-level licensing headers before directly copying implementation code, but there is no apparent license incompatibility forcing a clean-room reimplementation.
+
+
+5. IMPORTANT ARCHITECTURAL CONCLUSION
+
+Do NOT port the entire Freerouting application into KiCad.
+
+In particular, we do not want to bring over:
+
+- Freerouting GUI.
+- Freerouting windowing/UI code.
+- Specctra import/export as the internal architecture.
+- A second complete PCB editor.
+- A second long-term persistent board representation unless required by the routing algorithm.
+- Java as a runtime dependency merely to execute the autorouter inside KiCad.
+
+KiCad should continue to own the PCB.
+
+What we want from Freerouting is primarily its routing engine, algorithmic behavior, and optimization strategy.
+
+
+6. CORE ARCHITECTURE
+
+Recommended architecture:
+
+    KiCad PCB Editor
+          |
+          +-- Autoroute UI / settings
+          |
+          +-- Autoroute orchestration layer
+          |
+          +-- Faithful C++ port/adaptation of Freerouting routing engine
+          |
+          +-- KiCad compatibility/adaptor layer
+          |
+          +-- KiCad board / DRC / geometry / tracks / vias
+
+The key idea is to separate:
+
+A. ROUTING ALGORITHM
+from
+B. HOST PCB IMPLEMENTATION
+
+The routing algorithm should make decisions such as:
+
+- Which connection to route next.
+- Search expansion.
+- Path costs.
+- Congestion penalties.
+- Via penalties.
+- Rip-up decisions.
+- Retry strategy.
+- Iterative passes.
+- Route optimization.
+
+KiCad should provide, where practical:
+
+- Net topology.
+- Board geometry.
+- Existing tracks and vias.
+- Obstacles.
+- Clearance queries.
+- Track widths.
+- Via rules.
+- Layer availability.
+- Keepouts.
+- Collision/DRC tests.
+- Track creation.
+- Via creation.
+- Undo/transaction management.
+
+
+7. MAINTAINABILITY REQUIREMENT: STAY CLOSE TO FREEROUTING
+
+A major concern is avoiding creation of a one-time port that immediately becomes obsolete as Freerouting improves.
+
+Therefore, the preferred approach is NOT to radically rewrite Freerouting’s algorithm into unrelated KiCad-specific code.
+
+Instead:
+
+Maintain as close a structural correspondence to Freerouting upstream as reasonably possible.
+
+Goals:
+
+- Similar class/module boundaries.
+- Similar algorithm decomposition.
+- Similar function responsibility.
+- Similar algorithm flow.
+- Similar naming where appropriate.
+- Similar constants and cost relationships.
+- Similar state transitions.
+- Similar iteration and optimization behavior.
+- Clear comments identifying corresponding Freerouting classes/files.
+- Minimize gratuitous changes to the routing algorithm itself.
+
+This does NOT mean mechanically translating every line of Java into C++ regardless of quality.
+
+It means creating a structurally recognizable C++ port.
+
+For example, maintain documentation such as:
+
+    Freerouting                         KiCad port
+    ---------------------------------------------------------
+    autoroute/Foo.java          ->      autorouter/foo.cpp
+    autoroute/Bar.java          ->      autorouter/bar.cpp
+    RoutingBoard               ->      KicadBoardAdapter
+    Rules API                  ->      KicadRulesAdapter
+    Geometry API               ->      KicadGeometryAdapter
+    ...
+
+Ideally an engineer should be able to inspect a future Freerouting commit and quickly determine:
+
+- Does this change affect our port?
+- Which C++ file corresponds to it?
+- Which algorithm or class is impacted?
+- Can this change be manually ported with a relatively small diff?
+- Is the change irrelevant because it affects only the Freerouting GUI or file I/O?
+
+This mapping is an explicit project requirement.
+
+
+8. COMPATIBILITY / ADAPTER LAYER
+
+Where practical, create a compatibility layer that presents KiCad data through abstractions similar to those expected by Freerouting.
+
+Rather than deeply modifying the ported routing code every time Freerouting expects:
+
+    board.someFreeroutingOperation()
+
+the port should ideally use an adapter translating that operation into KiCad APIs.
+
+Conceptually:
+
+    Ported Freerouting Algorithm
+              |
+              V
+    ROUTING_BOARD_INTERFACE
+              |
+              V
+    KICAD_BOARD_ADAPTER
+              |
+              V
+    BOARD / PCB_TRACK / PCB_VIA / DRC_ENGINE / etc.
+
+This architecture should:
+
+- Reduce coupling between the routing algorithm and KiCad internals.
+- Reduce divergence from upstream Freerouting.
+- Make future Freerouting changes easier to port.
+- Allow algorithmic regression testing independently from much of the KiCad UI.
+- Make it clearer which differences are intrinsic KiCad adaptations versus algorithm changes.
+
+
+9. RELATIONSHIP TO KiCad PNS
+
+We should investigate carefully how much of KiCad’s PNS router can be reused.
+
+An early assumption was that the implementation could simply place a batch controller above PNS.
+
+Further investigation suggests that the answer may be more nuanced because a global autorouter requires functionality beyond interactive point-to-point shove routing.
+
+The engineer should determine:
+
+- Whether PNS exposes a clean programmable point-A-to-point-B route API.
+- Whether it can operate without mouse/UI interaction.
+- Whether PNS can efficiently support thousands of automated route attempts.
+- Whether PNS collision and geometry infrastructure can be reused independently of its interactive state machine.
+- Whether Freerouting search should produce complete paths which are then instantiated as KiCad tracks.
+- Whether portions of PNS can serve as a local routing or geometry subsystem while Freerouting-derived logic performs global congestion/rip-up management.
+- Whether use of PNS changes routing behavior enough to prevent Freerouting parity.
+
+Do not force the solution through PNS merely because it already exists.
+
+If replacing Freerouting routing logic with repeated PNS routing materially reduces quality, completion rate, optimization quality, or Freerouting behavioral parity, preserve the Freerouting-derived algorithm instead.
+
+Reuse KiCad infrastructure where it genuinely helps without sacrificing the primary requirement of Freerouting-quality output.
+
+
+10. MVP SCOPE — FREEROUTING PARITY
+
+The MVP must achieve practical routing parity with the current Freerouting routing engine.
+
+The MVP is NOT:
+
+- A simplified two-layer autorouter.
+- A proof-of-concept maze router.
+- An 80%-feature subset of Freerouting.
+- A new routing algorithm inspired by Freerouting.
+- Repeated automatic calls to KiCad’s interactive router unless that approach demonstrably preserves Freerouting quality.
+
+The initial implementation should preserve, as closely as practical:
+
+- Freerouting’s routing algorithms.
+- Freerouting’s net ordering behavior.
+- Freerouting’s path search behavior.
+- Freerouting’s congestion handling.
+- Freerouting’s rip-up and reroute behavior.
+- Freerouting’s routing cost model.
+- Freerouting’s via handling.
+- Freerouting’s layer handling.
+- Freerouting’s optimization passes.
+- Freerouting’s route cleanup behavior.
+- Freerouting’s handling of board rules and constraints.
+- Freerouting’s ability to route the same classes of boards it can route today.
+
+The goal is that, for the same board and equivalent routing settings, the native KiCad implementation should produce routing of approximately the same quality and completeness as Freerouting.
+
+The MVP does NOT need to introduce routing features that Freerouting does not currently have.
+
+Examples of features outside MVP scope unless already supported by the pinned Freerouting implementation include:
+
+- New high-speed routing intelligence.
+- New RF-aware routing.
+- New return-path analysis.
+- New automatic placement capabilities.
+- New differential-pair algorithms beyond Freerouting's existing capabilities.
+- New impedance optimization.
+- New machine-learning-based routing.
+- New constraint types not already handled by Freerouting.
+- Any attempt to outperform Freerouting through newly invented routing algorithms.
+
+The engineering objective is:
+
+    First reproduce Freerouting faithfully inside KiCad.
+    Improve it later.
+
+Do not intentionally remove routing capabilities merely to simplify the first product release.
+
+
+11. MVP DEFINITION OF PARITY
+
+Parity should be judged empirically rather than by whether every internal Freerouting class has been ported.
+
+A representative regression suite should be routed with:
+
+A. Current pinned upstream Freerouting.
+B. The new KiCad-native implementation.
+
+Equivalent settings and design constraints should be used wherever possible.
+
+The native implementation should be evaluated against Freerouting on:
+
+- Percentage of connections successfully routed.
+- Ability to complete the board.
+- Number of remaining unrouted connections.
+- Number of DRC violations.
+- Total routed track length.
+- Via count.
+- Routing topology and general route quality.
+- Handling of congested areas.
+- Effectiveness of rip-up and reroute.
+- Optimization quality after the initial route.
+- Runtime, with reasonable allowance for implementation-language and host-API differences.
+
+The native router does not need to produce bit-for-bit identical geometry.
+
+Small differences in:
+
+- Search ordering.
+- Floating-point calculations.
+- Geometry representation.
+- Object iteration ordering.
+- KiCad internal board representation.
+
+may cause two equally valid routes to differ geometrically.
+
+However, substantial degradation in routing quality compared with Freerouting should be treated as an implementation defect rather than an acceptable MVP limitation.
+
+For example:
+
+If Freerouting can route a test board completely and cleanly, while the KiCad implementation routinely leaves 15% of the board unrouted, the MVP has not reached parity.
+
+If both completely route the board with similar via count, track length, congestion handling, and overall quality, that is acceptable even if individual tracks differ.
+
+
+12. TECHNICAL PRIORITY
+
+When there is tension between:
+
+- making the implementation more idiomatic to KiCad,
+and
+- preserving Freerouting behavior,
+
+preserving Freerouting behavior should take priority during the initial port.
+
+Architectural cleanup can occur later once parity has been demonstrated.
+
+This is another reason to maintain a near one-to-one structural mapping between Freerouting and the C++ port.
+
+Where possible:
+
+    Freerouting algorithm code
+             |
+             | close structural translation
+             V
+    C++ Freerouting-compatible algorithm layer
+             |
+             | adapters
+             V
+    KiCad board / rule / geometry infrastructure
+
+Avoid replacing proven Freerouting algorithms with superficially similar KiCad algorithms unless regression testing demonstrates equivalent behavior.
+
+
+13. PORTING PHILOSOPHY
+
+The initial task should be approached as a port, not as the design of a new autorouter.
+
+The engineer should assume that Freerouting's behavior is the reference behavior.
+
+For each Freerouting routing component:
+
+1. Determine what the component does.
+2. Determine its dependencies on Freerouting's internal board model.
+3. Port the routing logic as directly as reasonably possible.
+4. Adapt external dependencies to KiCad through clearly defined interfaces.
+5. Preserve algorithm constants, cost relationships, iteration logic, heuristics, and ordering behavior unless there is a specific technical reason not to.
+6. Document every intentional behavioral divergence.
+7. Validate the result against upstream Freerouting.
+
+Do not "simplify" an algorithm merely because the simpler implementation appears adequate on one test board.
+
+Do not rewrite working Freerouting logic merely to make the code more aesthetically idiomatic to KiCad before parity has been reached.
+
+
+14. FREEROUTING AS THE REFERENCE IMPLEMENTATION
+
+The current Freerouting source tree should serve as the formal reference implementation for MVP development.
+
+Pin the project initially to a specific upstream Freerouting commit:
+
+    FREEROUTING_REFERENCE_COMMIT = <commit hash>
+
+That commit defines the routing behavior the MVP is attempting to reproduce.
+
+All relevant Freerouting source files should be classified as:
+
+- PORT DIRECTLY
+- PORT WITH KICAD ADAPTER
+- PROVIDED BY KICAD
+- NOT REQUIRED FOR ROUTING
+- GUI ONLY
+- IMPORT/EXPORT ONLY
+- TEST/REFERENCE ONLY
+
+The resulting mapping should be maintained in project documentation.
+
+This provides a precise answer to:
+
+    "What exactly constitutes Freerouting parity?"
+
+It also establishes a known baseline for future upstream synchronization.
+
+
+15. USER INTERFACE SCOPE FOR MVP
+
+UI parity with Freerouting is NOT required.
+
+Routing-engine parity is required.
+
+The KiCad MVP only needs sufficient native UI to:
+
+- Start the autorouter.
+- Configure all routing parameters required to reproduce Freerouting behavior.
+- Show routing progress.
+- Cancel routing.
+- Review the result.
+- Accept the result.
+- Reject the result.
+
+There is no requirement to reproduce Freerouting's standalone GUI.
+
+KiCad should provide the user experience.
+
+The ideal user workflow is:
+
+    Route -> Autoroute Board...
+
+followed by a KiCad-native configuration dialog and progress/result workflow.
+
+
+16. KICAD INTEGRATION MUST NOT REDUCE ROUTING QUALITY
+
+KiCad's existing geometry, DRC, rules, board representation, and editor infrastructure should be reused where possible.
+
+However, reuse of KiCad infrastructure is not an end in itself.
+
+If replacing a Freerouting subsystem with a KiCad subsystem materially changes routing behavior or lowers route quality, the engineer should first consider:
+
+- An adapter.
+- A compatibility implementation.
+- A more faithful port of the Freerouting subsystem.
+
+For example:
+
+Do not replace Freerouting's global search algorithm with repeated calls to KiCad's interactive PNS router merely because PNS already exists if doing so produces substantially worse full-board routes.
+
+The preferred hierarchy is:
+
+1. Preserve Freerouting routing behavior and quality.
+2. Reuse KiCad infrastructure where behavior remains equivalent.
+3. Avoid duplicated infrastructure where practical.
+4. Improve architecture after parity has been established.
+
+
+17. FEATURES OUTSIDE THE MVP
+
+The following are explicitly NOT required for the MVP unless they already exist in the pinned Freerouting version:
+
+- Better routing than Freerouting.
+- New electrical-awareness features.
+- New routing heuristics.
+- New board-placement optimization.
+- New high-speed PCB intelligence.
+- AI-based routing.
+- New DRC capabilities.
+- New via technologies.
+- New routing constraint models.
+- New optimizer algorithms.
+- New Freerouting-independent route-quality improvements.
+
+Those belong to post-parity development.
+
+The MVP objective is deliberately conservative:
+
+    Freerouting capability and quality,
+    integrated natively into KiCad.
+
+
+18. ROUTING QUALITY EXPECTATION
+
+Freerouting user sentiment appears to be mixed but generally useful:
+
+- It can perform surprisingly well on ordinary boards.
+- It is particularly valuable where a designer wants the bulk of routing completed automatically.
+- It is not expected to replace engineering judgment.
+- Results can contain unnecessary detours, vias, or aesthetically imperfect routing.
+- Complex, high-speed, RF, analog, or particularly sensitive layouts may still benefit substantially from manual routing.
+
+This project does NOT attempt to solve those limitations in the MVP.
+
+Freerouting itself defines the baseline.
+
+The success criterion is not:
+
+    “Produce routing indistinguishable from an expert PCB designer.”
+
+The success criterion is:
+
+    “Produce routing approximately as complete and as good as current Freerouting,
+     but directly inside KiCad.”
+
+Users can then review, accept, and manually improve the result.
+
+
+19. ROUTING ALGORITHM RESEARCH
+
+We established that PCB autorouting is a genuine global optimization problem rather than simply repeated shortest-path searches.
+
+Important algorithmic concepts include:
+
+- Maze routing.
+- A* / shortest-path algorithms.
+- Clearance-expanded obstacles.
+- Layer transition costs.
+- Via costs.
+- Congestion.
+- Net ordering.
+- Rip-up and reroute.
+- Negotiated congestion.
+- Iterative optimization.
+- Post-route cleanup.
+
+Relevant historical literature includes work on:
+
+- Lee-style maze routing.
+- Hadlock-style routing / shortest-path techniques.
+- Pathfinder / negotiated-congestion routing.
+- PCB-specific automated-routing algorithms.
+
+However, papers alone do not constitute a production PCB autorouter.
+
+A production router additionally requires:
+
+- PCB-specific geometry.
+- DRC-aware path generation.
+- Via handling.
+- Multi-layer handling.
+- Net prioritization.
+- Rip-up behavior.
+- Iterative convergence logic.
+- Cost tuning.
+- Optimization passes.
+- Large numbers of edge cases.
+- Practical performance engineering.
+
+Freerouting is valuable specifically because it provides a mature, functioning, GPL implementation of these ideas with years of PCB-specific engineering behind it.
+
+
+20. WHY WE ARE NOT STARTING FROM SCRATCH
+
+Writing a new autorouter entirely from academic papers would require recreating:
+
+- Search behavior.
+- Congestion heuristics.
+- Net ordering.
+- Rip-up strategy.
+- Via costing.
+- Layer-cost behavior.
+- Iterative optimization.
+- Edge-case handling.
+- Performance tuning.
+- Cleanup behavior.
+- Years of practical routing behavior.
+
+There is little value in rediscovering those details when Freerouting already supplies a working GPL implementation.
+
+Therefore:
+
+    Use Freerouting as the algorithmic reference implementation.
+
+Do not merely use Freerouting as inspiration.
+
+Do not invent a replacement algorithm unless a specific Freerouting subsystem proves fundamentally incompatible with KiCad.
+
+
+21. COMMUNITY / UPSTREAM CONSIDERATIONS
+
+There appears to be recurring community interest in full-board autorouting for KiCad, although some KiCad users and maintainers are skeptical of traditional autorouters because of route quality.
+
+Therefore, position the feature as:
+
+    “Optional native full-board autorouting”
+
+or:
+
+    “Optional native batch routing assistance”
+
+rather than:
+
+    “A replacement for manual PCB routing.”
+
+Characteristics that may improve community acceptance:
+
+- Completely optional.
+- Uses existing KiCad constraints.
+- Does not compromise PNS/manual routing.
+- Produces ordinary KiCad tracks/vias.
+- Strong DRC integration.
+- Clear proposal/review behavior.
+- Easy reject/undo.
+- Does not introduce a Java runtime dependency.
+- Does not embed an entire second PCB application.
+- Modular enough to maintain.
+- Demonstrated with real boards.
+- Empirically shown to achieve approximately the same quality as current Freerouting.
+
+A functioning prototype with Freerouting-comparable results is likely to be more persuasive than an extensive design proposal by itself.
+
+
+22. DEVELOPMENT STRATEGY
+
+Recommended development sequence:
+
+Phase 1 — Source analysis
+
+Clone current:
+
+- KiCad canonical source.
+- Freerouting source.
+
+Pin a specific Freerouting commit as the initial reference implementation.
+
+Map:
+
+- Freerouting autorouting package.
+- Search/pathfinding classes.
+- Routing state.
+- Board model dependencies.
+- Geometry dependencies.
+- Design-rule dependencies.
+- Via/layer handling.
+- Cost model.
+- Rip-up logic.
+- Optimization subsystem.
+- Cleanup behavior.
+
+Identify every dependency the routing engine has on the Freerouting board model.
+
+Phase 2 — Architecture / mapping document
+
+Produce a mapping of:
+
+    Freerouting concept -> KiCad equivalent
+
+For each dependency classify it as:
+
+- Already available directly in KiCad.
+- Requires an adapter.
+- Requires a small new KiCad API.
+- Requires a faithful port.
+- Can be discarded because it is GUI-only.
+- Can be discarded because it is import/export-only.
+
+Also produce a source-file mapping between Freerouting Java modules and the corresponding C++ port.
+
+Phase 3 — Build compatibility interfaces
+
+Create the abstraction/adaptor layer needed to isolate the routing engine from direct dependence on KiCad internals.
+
+Examples:
+
+- Board interface.
+- Rule interface.
+- Geometry interface.
+- Layer interface.
+- Track/via creation interface.
+- Transaction interface.
+
+Phase 4 — Initial algorithm port
+
+Port enough of the Freerouting engine to route one connection.
+
+The purpose of this phase is architecture validation, not MVP completion.
+
+Phase 5 — Multi-net behavior
+
+Port:
+
+- Net ordering.
+- Multiple connections.
+- Via handling.
+- Layer selection.
+- Cost calculations.
+- Obstacles.
+- Rule handling.
+
+Phase 6 — Global routing behavior
+
+Port:
+
+- Congestion logic.
+- Rip-up and reroute.
+- Retry passes.
+- Iteration logic.
+- Freerouting global routing behavior.
+
+Phase 7 — Optimization parity
+
+Port/adapt:
+
+- Freerouting optimization passes.
+- Cleanup.
+- Route-shortening behavior.
+- Via reduction behavior where applicable.
+- Other post-route optimization behavior.
+
+Phase 8 — Regression parity
+
+Run the same corpus through:
+
+- Pinned Freerouting.
+- KiCad-native port.
+
+Compare quality and completeness.
+
+Do not proceed to call the result an MVP until parity is demonstrated.
+
+Phase 9 — KiCad UX
+
+Add:
+
+    Route -> Autoroute Board...
+
+and the configuration/progress UI.
+
+Phase 10 — Proposal transaction
+
+Implement:
+
+- Pre-run board state / transaction.
+- Proposed-route visualization.
+- Accept.
+- Reject.
+- Single-step undo.
+
+Phase 11 — Community prototype
+
+Demonstrate the router on representative real-world KiCad designs and present quantitative comparisons against Freerouting.
+
+
+23. TESTING REQUIREMENTS
+
+Create a regression corpus containing multiple PCB types and complexities.
+
+Examples:
+
+- Small through-hole board.
+- Small mixed THT/SMD board.
+- Moderate-density MCU board.
+- Four-layer board.
+- Board with multiple net classes.
+- Board with large power traces.
+- Board containing keepouts.
+- Board with significant routing congestion.
+- Board known to route successfully in Freerouting.
+- Board known to require multiple rip-up/retry passes.
+- More complex boards representative of the practical upper end of Freerouting’s normal use.
+
+Include as many of Freerouting's own test/reference boards as practical if licensing and repository structure permit.
+
+For each test, capture:
+
+- Number of connections.
+- Connections successfully routed.
+- Remaining unrouted connections.
+- Completion percentage.
+- DRC errors.
+- Total track length.
+- Via count.
+- Runtime.
+- Number of rip-up operations.
+- Number of routing passes.
+- Optimization result.
+
+Where possible, compare:
+
+    Freerouting reference result
+            vs.
+    KiCad-native port result
+
+Route quality should therefore be measurable rather than judged solely by screenshots.
+
+
+24. MVP ACCEPTANCE TEST
+
+The MVP is complete when a meaningful corpus of boards can be run through both:
+
+    upstream pinned Freerouting
+
+and
+
+    the KiCad-native port
+
+and the KiCad-native implementation consistently demonstrates routing results comparable to upstream Freerouting.
+
+Suggested test procedure:
+
+1. Start with the same unrouted board.
+2. Apply equivalent design rules.
+3. Apply equivalent autorouter settings.
+4. Run the pinned Freerouting reference.
+5. Record:
+   - completion percentage
+   - unrouted connections
+   - DRC status
+   - track length
+   - via count
+   - runtime
+   - optimization result
+6. Restore the original board.
+7. Run the KiCad-native router.
+8. Record the same metrics.
+9. Compare results.
+
+The acceptance target is:
+
+- No systematic loss of routing capability.
+- No systematic loss of completion rate.
+- No systematic increase in DRC violations.
+- Comparable route quality.
+- Comparable congestion handling.
+- Comparable rip-up/reroute effectiveness.
+- Comparable optimization effectiveness.
+- Comparable ability to solve difficult boards supported by Freerouting.
+
+Exact geometric equivalence is not required.
+
+A substantial or systematic quality regression is not acceptable merely because the native implementation technically routes traces.
+
+
+25. INTERNAL DEVELOPMENT MILESTONES VS. PRODUCT MVP
+
+Intermediate development milestones may temporarily support less than full Freerouting capability, but those milestones must not be confused with the MVP.
+
+Possible engineering milestones:
+
+Milestone A:
+Port builds and runs inside KiCad.
+
+Milestone B:
+Route one connection.
+
+Milestone C:
+Route multiple connections.
+
+Milestone D:
+Support layers and vias.
+
+Milestone E:
+Support Freerouting-compatible cost behavior.
+
+Milestone F:
+Support rip-up and reroute.
+
+Milestone G:
+Support congestion negotiation / equivalent Freerouting behavior.
+
+Milestone H:
+Support full optimization behavior.
+
+Milestone I:
+Reach regression parity against pinned Freerouting.
+
+Milestone J:
+Integrate KiCad-native UI and accept/reject workflow.
+
+The product MVP is reached only after the Freerouting parity milestone and native KiCad integration are complete.
+
+
+26. UPSTREAM FREEROUTING UPDATE PROCESS
+
+Design for periodic synchronization rather than continuous automatic synchronization.
+
+Record the exact Freerouting commit used for the initial port.
+
+Example:
+
+    FREEROUTING_REFERENCE_COMMIT = <hash>
+
+Maintain an UPSTREAM.md or equivalent document containing:
+
+- Source Freerouting repository.
+- Original reference commit.
+- Current synchronized upstream commit.
+- Mapping between source and ported files.
+- Intentional differences.
+- KiCad-specific adaptations.
+- Freerouting modules intentionally not ported.
+- Upstream commits reviewed since the last synchronization.
+
+When Freerouting introduces routing improvements:
+
+1. Diff relevant Freerouting modules against the previously synchronized commit.
+2. Identify algorithmic changes.
+3. Locate corresponding C++ modules using the mapping table.
+4. Apply equivalent changes.
+5. Run the full routing regression suite.
+6. Compare against the newer Freerouting result where practical.
+7. Resolve quality regressions.
+8. Update the recorded synchronized commit.
+
+The architecture should make this a manageable maintenance process rather than requiring another ground-up port.
+
+
+27. HANDLING INTENTIONAL DIVERGENCES
+
+Any intentional deviation from Freerouting routing behavior should be documented.
+
+For each divergence, record:
+
+- Freerouting source file/class.
+- Freerouting behavior.
+- KiCad-port behavior.
+- Reason for the difference.
+- Whether the difference is required by KiCad architecture.
+- Expected route-quality impact.
+- Regression tests covering the difference.
+
+Examples of legitimate divergences may include:
+
+- Different host geometry types.
+- Different board-object ownership.
+- Different transaction handling.
+- Different threading architecture.
+- Different GUI/progress reporting.
+- Different DRC invocation APIs.
+
+Algorithmic divergences should require stronger justification than implementation-level divergences.
+
+
+28. PERFORMANCE
+
+Freerouting parity in routing quality is more important initially than exact runtime parity.
+
+However, the native implementation should remain practically usable.
+
+Performance should be measured against the pinned Freerouting reference.
+
+Large regressions should be investigated, particularly if caused by excessive conversion between:
+
+- KiCad geometry.
+- Adapter objects.
+- Ported Freerouting geometry.
+- DRC calls.
+
+If an adapter boundary becomes a serious performance bottleneck, optimize it without unnecessarily altering routing behavior.
+
+
+29. CANCEL / FAILURE BEHAVIOR
+
+The autorouter should support cancellation.
+
+If the user cancels:
+
+- The board should be returned to its pre-run state unless the UX explicitly allows reviewing the partial result.
+- No corrupted or half-committed PCB state should remain.
+- Temporary routing structures should be discarded safely.
+
+If routing fails:
+
+- The user should receive meaningful status information.
+- Remaining unrouted connections should be identifiable.
+- The user should still be able to inspect a proposed partial route if that workflow is intentionally supported.
+- Accept/reject semantics must remain clear.
+
+
+30. PROGRESS REPORTING
+
+The UI should provide useful routing progress without requiring the Freerouting GUI.
+
+Potential information includes:
+
+- Current pass.
+- Connections routed.
+- Connections remaining.
+- Current optimization stage.
+- Number of rip-ups/retries.
+- Elapsed time.
+- Cancel control.
+
+Exact UI design is not a parity requirement.
+
+The purpose is to make long autorouting operations understandable and controllable within KiCad.
+
+
+31. NON-GOALS
+
+The MVP is specifically NOT intended to:
+
+- Reproduce Freerouting's GUI.
+- Embed the Java application.
+- Require manual DSN/SES handoff.
+- Build an entirely new PCB editor.
+- Build a novel autorouter from academic papers.
+- Beat Freerouting.
+- Add AI routing.
+- Solve PCB placement.
+- Solve electrical intent not represented in rules.
+- Replace manual routing.
+- Replace KiCad PNS.
+- Change normal KiCad editing behavior.
+
+The MVP is intended to:
+
+    Bring Freerouting-class full-board autorouting natively into KiCad.
+
+
+32. KEY DESIGN PRINCIPLE
+
+The project should effectively combine:
+
+    Freerouting’s global autorouting intelligence
+
+with
+
+    KiCad’s native PCB model, design rules, DRC, editor, and UX.
+
+Do not attempt to merge the two complete applications.
+
+Do not unnecessarily rewrite the Freerouting algorithm into an unrelated design.
+
+The desired end result should feel to the user as though KiCad itself gained a native Freerouting-quality autorouter.
+
+
+33. REVISED DEFINITION OF SUCCESS
+
+The concise project objective is:
+
+    “Freerouting, but native inside KiCad.”
+
+From a user's perspective:
+
+1. Open a KiCad PCB.
+2. Choose:
+       Route -> Autoroute Board...
+3. Configure routing settings.
+4. Start the autorouter.
+5. KiCad automatically routes the board using a native C++ implementation derived closely from Freerouting.
+6. The resulting route is approximately as complete and as good as the result that current Freerouting would have produced for the same board and settings.
+7. The user reviews the proposed route directly in KiCad.
+8. The user chooses:
+       ACCEPT
+   or:
+       REJECT
+9. Reject restores the exact original board.
+10. Accept converts the proposal into ordinary KiCad routing.
+11. The designer continues editing normally.
+
+The user should not have to sacrifice Freerouting route quality in exchange for native KiCad integration.
+
+Only after this baseline has been achieved should the project begin introducing new routing capabilities or algorithmic improvements beyond Freerouting.
+
+
+34. FIRST ENGINEERING DELIVERABLE
+
+Before significant implementation work begins, produce a technical discovery document covering:
+
+A. KiCad
+
+- Exact current PCB editor source modules involved.
+- PNS interfaces potentially reusable.
+- DRC APIs.
+- Board transaction/undo APIs.
+- Geometry APIs.
+- Track/via creation APIs.
+- Layer/rule APIs.
+
+B. Freerouting
+
+- Exact source packages/classes comprising the current routing engine.
+- Dependencies of those classes.
+- Geometry dependencies.
+- Board-model dependencies.
+- Rule dependencies.
+- Optimization dependencies.
+- Which modules are GUI-only.
+- Which modules are DSN/SES I/O-only.
+- Which modules must be ported to preserve routing quality.
+
+C. Mapping
+
+For every routing-relevant Freerouting class/module:
+
+    Freerouting source
+           ->
+    proposed KiCad C++ equivalent
+           ->
+    adaptation strategy
+
+D. Risk analysis
+
+Identify any Freerouting subsystem for which:
+
+- KiCad has no equivalent.
+- A 1:1 port would be difficult.
+- Geometry differences may alter results.
+- DRC differences may alter pathfinding.
+- Performance may be problematic.
+- PNS reuse may change behavior.
+
+E. Recommendation
+
+Confirm or revise the proposed architecture before beginning the large-scale port.
+
+The goal of this first deliverable is to eliminate architectural surprises before substantial translation work begins.
+
+
+35. GUIDING ENGINEERING RULE
+
+When uncertain between:
+
+    “How would we design an autorouter for KiCad?”
+
+and:
+
+    “How does Freerouting already solve this problem, and how do we preserve that behavior inside KiCad?”
+
+default to the second question.
+
+Freerouting is the reference implementation for the MVP.
+
+KiCad is the host platform.
+
+The project is primarily an integration and faithful-porting effort, not a new autorouter research project.

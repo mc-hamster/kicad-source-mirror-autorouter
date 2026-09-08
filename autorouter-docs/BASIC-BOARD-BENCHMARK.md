@@ -1,5 +1,10 @@
 # Three small online boards: routing benchmark
 
+**Historical baseline.** The latest [production host-validation/repair results](PARITY-CLOSURE-CHECKLIST.md)
+complete all three boards with zero new KiCad DRC violations. The 555 still fails
+the via-count quality gate. Keep the original measurements below as before/after
+evidence, not as the current build's performance.
+
 Date: 2026-09-07. This is a measured comparison, not a claim of parity.
 No production routing algorithm was changed for these measurements.
 
@@ -124,6 +129,13 @@ per-process logs and all saved PCBs. A network connection and Java 25 are requir
 No GUI automation or modification of an open user board is involved.
 
 ## Saved results on this computer
+
+Permanent A/B fixtures are now preserved outside the build directory in
+[autorouter-test-assets/online-simple](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/autorouter-test-assets/online-simple/README.md).
+Each board has untouched originals, `unrouted.kicad_pcb`, `reference.kicad_pcb`
+and `native.kicad_pcb`, project companions where supplied, and baseline evidence.
+The local asset folder is Git-ignored and includes verified SHA-256 checksums.
+Use copies for new runs; do not overwrite these baselines.
 
 - **5 V regulator:** [unrouted input](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/build/autorouter/online-simple-stable/runs/regulated-5v/repeat-1/unrouted.kicad_pcb), [Freerouting result](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/build/autorouter/online-simple-stable/runs/regulated-5v/repeat-1/reference.kicad_pcb), [native result](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/build/autorouter/online-simple-stable/runs/regulated-5v/repeat-1/native.kicad_pcb).
 - **555 astable oscillator:** [unrouted input](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/build/autorouter/online-simple-stable/runs/555-astable/repeat-1/unrouted.kicad_pcb), [Freerouting result](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/build/autorouter/online-simple-stable/runs/555-astable/repeat-1/reference.kicad_pcb), [native result](/Users/jmcasler/Documents/GitHub/mchamster/kicad-source-mirror-autorouter/build/autorouter/online-simple-stable/runs/555-astable/repeat-1/native.kicad_pcb).

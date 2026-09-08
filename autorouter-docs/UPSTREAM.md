@@ -1,10 +1,15 @@
 # Freerouting upstream mapping
 
 **Correction:** the table records intended responsibility/file correspondence.
-Entries labelled "port" historically include experimental substitutes. In
-particular, the active search is grid/visibility based, the shover only shortens
-paths, and the room classes do not form an active upstream-equivalent search.
-[REWORK.md](REWORK.md) is authoritative for implementation and validation status.
+The historical "port" labels were incorrect and have been removed. In
+particular, the shover still only shortens paths. Rectangular room/door/drill
+search is now active for single-layer and multilayer attempts, with a remaining
+grid/visibility fallback. Its scope is documented in the
+[drill milestone](DRILL-SEARCH-PARITY.md) and
+[preceding room milestone](ROOM-DOOR-SEARCH.md).
+[Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) and the historical
+[Core parity review](CORE-ROUTING-PARITY-REVIEW.md)
+record actual implementation and validation status.
 
 This document is the synchronization contract for the native KiCad autorouter.  The KiCad
 implementation keeps the Freerouting package layout where it is useful: `maze`, `pipeline`, and
@@ -19,6 +24,7 @@ the corresponding Freerouting class names.
 | Reference commit | `a11c0a42d1b3827e5126429c5c9820c4ab5bec7c` |
 | Reference checkout | `/Users/jmcasler/Documents/GitHub/mchamster/freerouting` (read-only) |
 | KiCad source baseline | `b22bb49234` |
+| Current native measurement base | `47392bdb76b56ce62a7a05e524d763496bea5f18` plus the archived working-tree patch |
 | Native port root | `pcbnew/autorouter/` |
 
 The reference commit is deliberately recorded as a commit rather than a release tag.  Any
@@ -29,34 +35,34 @@ same change.
 
 | Freerouting source | KiCad native source | Classification / adaptation |
 |---|---|---|
-| `autoroute/maze/AutorouteControl.java` | `pcbnew/autorouter/maze/AutorouteControl.h/.cpp` | Port with KiCad settings values; retains via, trace, direction and congestion cost responsibilities. |
-| `autoroute/maze/AutorouteEngine.java` | `pcbnew/autorouter/maze/AutorouteEngine.h/.cpp` | Per-snapshot engine owner; `AUTOROUTER_JOB` owns the native thread and the engine owns drill/search state. |
-| `autoroute/maze/DestinationDistance.java` | `pcbnew/autorouter/maze/DestinationDistance.h/.cpp` | Layer-aware lower-bound destination estimate used by the maze frontier. |
-| `autoroute/maze/MazeSearchEngine.java` | `pcbnew/autorouter/maze/MazeSearchEngine.h/.cpp` | Port with a KiCad-IU, layer-aware search frontier and adapter collision queries, including copper-to-hole and hole-to-hole drill spacing. |
-| `autoroute/maze/MazeExpansionEngine.java` | `pcbnew/autorouter/maze/MazeExpansionEngine.h/.cpp` | Owns deterministic orthogonal/diagonal/layer neighbor expansion so search-order changes have a dedicated synchronization point. |
-| `autoroute/maze/MazeListElement.java` | `pcbnew/autorouter/maze/MazeListElement.h` | Stable value frontier record retaining expansion/sorting/sequence ordering. |
+| `autoroute/maze/AutorouteControl.java` | `pcbnew/autorouter/maze/AutorouteControl.h/.cpp` | Substitute cost model; grid-normalized lengths, fixed per-edge direction/bend costs, and retry scaling differ from upstream. |
+| `autoroute/maze/AutorouteEngine.java` | `pcbnew/autorouter/maze/AutorouteEngine.h/.cpp` | Per-snapshot engine owner; `AUTOROUTER_JOB` owns the native thread and the search owns attempt-local drill/room state. The unused wrapper drill array has been removed; persistent reuse is not implemented. |
+| `autoroute/maze/DestinationDistance.java` | `pcbnew/autorouter/maze/DestinationDistance.h/.cpp` | Legacy layer-aware grid estimate. The room/drill frontier has a separate geometric substitute, not the full upstream destination-box heuristic. |
+| `autoroute/maze/MazeSearchEngine.java` | `pcbnew/autorouter/maze/MazeSearchEngine.h/.cpp` | Hybrid boundary: guarded rectangular single/multilayer room search first, experimental grid/visibility fallback, exact snapshot collision predicates. `MazeSearchEngine90Degree`, `MazeSearchEngineMultilayer`, `RoomSearchContext` and `MazeSearchEngineRooms` isolate core state and the host adapter. |
+| `autoroute/maze/MazeExpansionEngine.java` | `pcbnew/autorouter/maze/MazeExpansionEngine.h/.cpp` | Pinned-reference page/drill frontier cost operations and radius-scaled via cost. Legacy coordinate neighbours remain only for fallback. |
+| `autoroute/maze/MazeListElement.java` | `pcbnew/autorouter/maze/MazeListElement.h` | Pinned f/g/door-ID/section ordering key, including equal-key suppression. Host target/room identity remains an adaptation. |
 | `autoroute/maze/MazeSearchElement.java` | `pcbnew/autorouter/maze/MazeSearchElement.h` | Value backtracking record for immutable snapshot search. |
 | `autoroute/maze/MazeFanoutDiagnostics.java` | `pcbnew/autorouter/maze/MazeFanoutDiagnostics.h` | Optional callback diagnostics with no GUI or logger dependency. |
-| `autoroute/maze/MazeRipupResolver.java` | `pcbnew/autorouter/maze/MazeRipupResolver.h/.cpp` | Port of deterministic victim selection. |
+| `autoroute/maze/MazeRipupResolver.java` | `pcbnew/autorouter/maze/MazeRipupResolver.h/.cpp` | Substitute conflict selection; not upstream item-local rip-up semantics. |
 | `autoroute/maze/MazeTraceShover.java` | `pcbnew/autorouter/maze/MazeTraceShover.h/.cpp` | Visibility shortening and redundant-via cleanup used by the optimizer. |
-| `autoroute/pipeline/BatchAutorouter.java` | `pcbnew/autorouter/pipeline/BatchAutorouter.h/.cpp` | Port of net ordering, pass sequencing, retries, rip-up and result materialization. |
+| `autoroute/pipeline/BatchAutorouter.java` | `pcbnew/autorouter/pipeline/BatchAutorouter.h/.cpp` | Substitute pad-graph batching, retries and result materialization; not a port of the connected-item routing pipeline. |
 | `autoroute/pipeline/BatchAutorouterThread.java` | `pcbnew/autorouter/pipeline/BatchAutorouterThread.h/.cpp` | Algorithm-side worker entry; `AUTOROUTER_JOB` owns the wx-safe native thread. |
 | `autoroute/pipeline/AutoroutePassRunner.java` | `pcbnew/autorouter/pipeline/BatchAutorouter.cpp` | The C++ worker is single-threaded per job; the board snapshot makes the pass boundary explicit. |
 | `autoroute/pipeline/AutorouteAirlineCalculator.java` | `pcbnew/autorouter/pipeline/AutorouteAirlineCalculator.h/.cpp` | Computes topology lower bounds for metrics and future board scoring. |
 | `autoroute/pipeline/BatchFanout.java` | `pcbnew/autorouter/pipeline/BatchFanout.h/.cpp` | Snapshot-side SMD fanout and plane-target classification; fanout escapes are synthetic worker pads and become ordinary KiCad vias/tracks at acceptance. |
-| `autoroute/pipeline/BatchOptimizer.java` | `pcbnew/autorouter/pipeline/BatchOptimizer.h/.cpp` | Port of cleanup responsibility; KiCad route objects are emitted only after optimization. |
+| `autoroute/pipeline/BatchOptimizer.java` | `pcbnew/autorouter/pipeline/BatchOptimizer.h/.cpp` | Guarded visibility shortening plus contact-preserving terminal-via and exact-junction trace-tail/overlap cleanup; no upstream shove, pull-tight or via reposition/reroute optimizer. |
 | `autoroute/pipeline/BatchOptimizerMultiThreaded.java` | `pcbnew/autorouter/pipeline/BatchOptimizerMultiThreaded.h` | Snapshot-safe optimizer wrapper; candidate parallelism is deferred until occupancy copies are independent. |
 | `autoroute/pipeline/OptimizeRouteTask.java` | `pcbnew/autorouter/pipeline/OptimizeRouteTask.h` | Data-only optimization candidate task; never deep-copies a live KiCad `BOARD`. |
 | `autoroute/pipeline/RoutingPipeline.java` | `pcbnew/autorouter/pipeline/RoutingPipeline.h/.cpp` | Stable orchestration seam for future fanout and diagnostics. |
 | `autoroute/path/Connection.java` | `pcbnew/autorouter/path/Connection.h/.cpp` plus `ROUTING_CONNECTION` | Data-only value wrapper; path nodes retain layer transitions. |
 | `autoroute/path/FoundConnectionInserter.java` | `BatchAutorouter.cpp` and `KicadBoardAdapter.cpp` | KiCad transaction creates ordinary tracks/vias after proposal acceptance. |
-| `autoroute/path/FoundConnectionLocator.java` | `pcbnew/autorouter/path/FoundConnectionLocator.h/.cpp` | Endpoint and path reconstruction responsibility; delegates to the maze engine. |
-| `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h` | 45-degree angle-policy synchronization seam. |
-| `autoroute/path/FoundConnectionLocatorAnyAngle.java` | `pcbnew/autorouter/path/FoundConnectionLocatorAnyAngle.h` | Any-angle policy synchronization seam. |
-| `autoroute/expansion/*.java` | `pcbnew/autorouter/expansion/*.h/.cpp` plus `ExpansionGraph` | Room/door value model and visibility landmarks; the search retains a complete adaptive cell fallback until room-expansion parity is validated. |
-| `autoroute/drill/DrillPage.java` | `pcbnew/autorouter/drill/DrillPage.h/.cpp` | Snapshot-safe spatial page for via candidates. |
-| `autoroute/drill/DrillPageArray.java` | `pcbnew/autorouter/drill/DrillPageArray.h/.cpp` | Page index used by `AutorouteEngine` for deterministic via landmarks. |
-| `autoroute/drill/ExpansionDrill.java` | `pcbnew/autorouter/drill/ExpansionDrill.h` | Data-only via transition record; transitions materialize as ordinary `PCB_VIA`. |
+| `autoroute/path/FoundConnectionLocator.java` | `pcbnew/autorouter/path/FoundConnectionLocator.h/.cpp` | Unwired wrapper that invokes search again; not the upstream door-section backtrace locator. |
+| `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h/.cpp` | Active rectangular 90/45-degree corridor locator; composed with through-drill transitions. Full convex/acute/thin-room and pin-exit behavior remain unported. |
+| `autoroute/path/FoundConnectionLocatorAnyAngle.java` | `pcbnew/autorouter/path/FoundConnectionLocatorAnyAngle.h` | Alias of the generic locator, not an any-angle locator implementation. |
+| `autoroute/expansion/*.java` | `pcbnew/autorouter/expansion/*.h/.cpp` plus `ExpansionGraph` | Orthogonal neighbours, free-room lifecycle and door sections now run in the rectangular slice. Other angle/obstacle classes remain unported; rectangular drill-room linkage is now active. ExpansionGraph is still the separate legacy visibility graph. |
+| `autoroute/drill/DrillPage.java` | `pcbnew/autorouter/drill/DrillPage.h/.cpp` | Lazy rectangular free-drill cutouts with source piece order, centroid/pin-centre selection, net/policy cache and separate reset/invalidate semantics. |
+| `autoroute/drill/DrillPageArray.java` | `pcbnew/autorouter/drill/DrillPageArray.h/.cpp` | Active, attempt-owned, resource-bounded row-major page array. Area-only overlap queries use the source bounding-page range. ExpansionGraph still has legacy landmark sampling for fallback. |
+| `autoroute/drill/ExpansionDrill.java` | `pcbnew/autorouter/drill/ExpansionDrill.h` | Drill centroid/region, rooms across the full physical stack, per-layer occupation and source hash. Through transitions materialize as ordinary `PCB_VIA`; general padstacks are not implemented. |
 | `autoroute/AutorouteAttemptResult.java` | `AutorouterTypes.h` (`ROUTING_RESULT`) | Worker result, completion state, metrics, message and cancellation. |
 | `autoroute/AutorouteAttemptState.java` | `ROUTER_PROGRESS` / `AUTOROUTER_JOB` | Progress state is polled by the native dialog; fanout connections are reported separately in `ROUTER_METRICS`. |
 | `autoroute/BoardHistory*.java` | `BOARD_HISTORY` plus proposal-owned objects | Bounded worker-side connection snapshots retain the best negotiated/routed state; KiCad `BOARD_COMMIT` still owns editor undo and rejected proposals never enter the board. |
@@ -71,17 +77,18 @@ same change.
 
 | Freerouting concept | KiCad equivalent | Native file |
 |---|---|---|
-| `board.facade.RoutingBoard` | `KICAD_BOARD_ADAPTER` + `ROUTING_BOARD_INTERFACE` | `board/KicadBoardAdapter.h/.cpp`, `board/RoutingBoardInterface.h` |
+| `board.facade.RoutingBoard` | Partial mutable copper/contact graph with R-tree queries and transactions; not upstream normal-contact, forced insertion or room semantics | `board/facade/RoutingBoard.h/.cpp`; input capture remains in `KicadBoardAdapter` |
 | `RoutingBoardSearchFacade` / shape search tree | Snapshot obstacles, outline and keepouts | `board/KicadBoardAdapter.cpp`, `maze/MazeSearchEngine.cpp` |
-| `RoutingBoardOperations` | `BOARD`, `PCB_TRACK`, `PCB_VIA`, `BOARD_COMMIT` | KiCad-provided APIs; used only on the editor thread |
+| `RoutingBoardOperations` | Live edits use `BOARD_COMMIT` on the editor thread; a private `BOARD` is used by host validation on the worker. Neither implements reference forced insertion | `AutorouterTool.cpp`, `board/KicadRoutingSession.cpp` |
 | `RoutingBoardUndoFacade` / board history | `BOARD_COMMIT` | KiCad-provided API; one accepted proposal is one commit |
 | `board.trace.PolylineTrace*` | `PCB_TRACK` segments | `KicadBoardAdapter::CreatePreviewItems` |
 | `board.optimize.TraceShover` / tighteners | `MAZE_TRACE_SHOVER` called by `BatchOptimizer` | `maze/MazeTraceShover.cpp`; future direct ports must preserve the file mapping |
 | `board.optimize.ViaOptimizer` | `ROUTING_VIA` cleanup seam | `pipeline/BatchOptimizer.cpp` and adapter |
 | planar `IntPoint`, `IntBox`, `TileShape`, polygon geometry | `VECTOR2I`, `BOX2I`, `SHAPE_LINE_CHAIN`, `SHAPE_POLY_SET` | Adapter conversion; all worker coordinates are integer KiCad IU |
 | `rules.Net`, `NetClass`, clearance matrix | `NETCLASS`, `BOARD_DESIGN_SETTINGS`, pad/track own clearance, layer settings | `board/KicadBoardAdapter.cpp` |
-| `drc.DesignRulesChecker` | KiCad DRC engine and adapter collision checks | `drc/` APIs remain authoritative; the worker mirrors snapshot-safe clearance, hole, outline, keepout, and route-pair checks before commit, while the parity harness runs live KiCad DRC on a fresh board |
-| `ConductionArea` / plane behavior | Filled KiCad zones plus synthetic worker landing pads | `KicadBoardAdapter` adds a small deterministic set of targets per filled same-net zone/layer and keeps the filled polygon traversable only for that net; isolated island/connectivity semantics still require parity coverage |
+| `rules.ViaRule` / via padstacks | Supported through-hole-only subset; entry/exit layers do not define physical span | `rules/ViaRule.h`, `MazeSearchEngine::CanUseSegment`, `BatchAutorouter::buildGeometry` |
+| `drc.DesignRulesChecker` | KiCad DRC engine and adapter collision checks | `KicadRoutingSession` refills/validates private proposals before acceptance. QA independently materializes and checks them again. Raw worker checks alone cannot validate a proposal |
+| `ConductionArea` / plane behavior | Region-aware copper graph, synthetic targets and exact ratsnest-region anchors, followed by host refill/repair | `KicadBoardAdapter`, `board/facade/RoutingBoard`, `KicadRoutingSession`; dynamic full-region plane search and reference via optimization remain missing |
 
 ## KiCad editor integration mapping
 
@@ -97,13 +104,15 @@ same change.
 
 ## Intentional host differences
 
-1. The board is never serialized through DSN/SES.  The adapter copies only the immutable inputs
-   required by the worker and creates ordinary KiCad objects at acceptance.
-2. wxWidgets and KiCad views are never touched from the worker thread.
+1. Production never uses DSN/SES. The host session clones the board with native
+   in-memory KiCad serialization, preserving unsaved geometry and net settings.
+   Data-only snapshots feed the core; ordinary tracks/vias are created at acceptance.
+2. KiCad views, wxWidgets UI and the live editor board are never touched from
+   the worker thread. Refill and DRC run against a session-owned private board.
 3. The preview is a `VIEW_ITEM`, not a `BOARD_ITEM`; this is what makes Reject exact and keeps the
    pre-run board out of the undo stack.
-4. KiCad's integer geometry and rule APIs replace Freerouting's planar model.  The adapter is the
-   only place where that conversion is allowed.
+4. The adapter converts host coordinates/rules, but this is not a reason to omit the private
+   compensated convex-shape model and mutable search tree required by the core port.
 5. PNS is not used as a global routing engine.  It remains available for manual routing; reusing
    its collision primitives is acceptable only when parity tests show no behavioral change.
 6. Freerouting's per-net `attachSmdAllowed` flag is exposed as the native
@@ -124,3 +133,28 @@ same change.
 3. Update the adapter only for KiCad ownership, geometry, rule, or transaction differences.
 4. Run the pure algorithm tests and the regression corpus against both implementations.
 5. Record the new commit and every intentional divergence in this file.
+
+## Rectangular core milestone mapping (2026-09-08)
+
+| Reference source | Native file | Scope |
+|---|---|---|
+| `datastructures/MinAreaTree.java` | `datastructures/MinAreaTree.h/.cpp` | Insertion ties, removal and dynamically pruned traversal; rectangle entries with stable handles. |
+| `board/searchtree/ShapeSearchTree90Degree.java` | Same relative path, `.h/.cpp` | Complete-shape traversal/ignore semantics plus restraint; caller supplies expanded shapes. |
+| `autoroute/expansion/SortedOrthogonalRoomNeighbours.java` | `expansion/SortedOrthogonalRoomNeighbours.h/.cpp` | Free-room ordering and gaps; obstacle-room branch not ported. |
+| `autoroute/expansion/ExpansionDoor.java` | `expansion/ExpansionDoor.h/.cpp` | Rectangle overlap/line sections, narrow-door handling, explicit host section-budget guard. |
+| `autoroute/maze/AutorouteEngine.java`, `MazeSearchEngine.java` | `maze/MazeSearchEngine90Degree.h/.cpp` | Active free-room lifecycle/frontier; shared lifecycle now resides in `RoomSearchContext.h`, with the through-drill frontier in `MazeSearchEngineMultilayer.cpp`. No shove/rip-up rooms. |
+| `autoroute/maze/MazeListElement.java` | `maze/MazeListElement.h` | Exact ordering key; full backtracking state resides in the rectangular search. |
+| `autoroute/path/FoundConnectionLocator*.java` | `path/FoundConnectionLocator45Degree.h/.cpp` | Reference corner construction and rectangular corridor subset; no full 45/general geometry. |
+| `geometry/planar/IntBox.java`, `FloatPoint.java` | `geometry/planar/IntBox.h`, `FloatLine.h` | Required rectangle/rounding/weighted-distance primitives only. |
+
+Additional drill milestone mapping:
+
+| Reference source | Native file | Scope |
+|---|---|---|
+| `geometry/planar/IntBox.java` cutout; `PolylineArea.java` split-to-convex | `geometry/planar/IntBox.h`, `PolylineArea.h` | Rectangular cutout order/perimeter ties and sequential hole decomposition, with cancellation/resource failure. Not general polygon decomposition. |
+| `autoroute/drill/DrillPage*`, `ExpansionDrill` | `drill/` | Active page/region/physical-room/layer state, not sampled landmarks. |
+| `autoroute/maze/MazeExpansionEngine`, `MazeSearchEngine` | `maze/MazeExpansionEngine.h`, `MazeSearchEngineMultilayer.cpp` | One room/page/drill-layer queue with reference page/drill cost primitives. Heuristic, target IDs and geometry adapter remain partial. |
+| `board/facade/RoutingBoard.removeTraceTails` and normal-contact splitting | `board/facade/RoutingBoard.cpp`, `pipeline/BatchOptimizer.cpp` | Native exact-junction trimming of generated trace tails/overlapping ends, preserving real pad/plane groups. Not the complete source item-chain/normalization algorithm. |
+
+The Java executable is used only by `scripts/autorouter/{Room,Drill}SearchOracle.java`
+and A/B QA; it is not linked, launched, or required by the native editor.
