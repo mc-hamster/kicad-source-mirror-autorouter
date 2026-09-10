@@ -63,6 +63,7 @@
 #include <autorouter/pipeline/BatchFanout.h>
 #include <autorouter/pipeline/AutoroutePassRunner.h>
 #include <autorouter/pipeline/AutorouteBatchLoop.h>
+#include <autorouter/pipeline/BatchAutorouter.h>
 #include <autorouter/pipeline/BatchOptimizer.h>
 #include <autorouter/board/optimize/ViaOptimizer.h>
 #include <autorouter/pipeline/ReadSortedRouteItems.h>
@@ -5765,6 +5766,107 @@ BOOST_AUTO_TEST_CASE( OptimizerReroutesAWholeConnectionAndKeepsOnlyAnImprovement
         if( routes.front().nodes[index - 1].layer != routes.front().nodes[index].layer )
             ++transitions;
     BOOST_CHECK_EQUAL( transitions, 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( OptimizerBatchSubpassesRebatchAnAffectedForeignConnection )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 10000000, 10000000 };
+    const auto addPad = [&]( int aNet, ROUTER_POINT aPoint )
+    {
+        ROUTING_PAD pad;
+        pad.netCode = aNet;
+        pad.position = aPoint;
+        pad.layers = { 0 };
+        pad.trackWidth = 100000;
+        pad.clearance = 100000;
+        board.pads.push_back( std::move( pad ) );
+        return board.pads.size() - 1;
+    };
+
+    const std::size_t left = addPad( 1, { 1000000, 5000000 } );
+    const std::size_t right = addPad( 1, { 9000000, 5000000 } );
+    const std::size_t lower = addPad( 2, { 5000000, 4000000 } );
+    const std::size_t upper = addPad( 2, { 5000000, 6000000 } );
+
+    ROUTING_NET horizontalNet;
+    horizontalNet.netCode = 1;
+    horizontalNet.name = "horizontal";
+    horizontalNet.padIndices = { left, right };
+    horizontalNet.connections = { { left, right } };
+    horizontalNet.viaDiameter = 300000;
+    horizontalNet.viaDrill = 150000;
+    ROUTING_NET verticalNet = horizontalNet;
+    verticalNet.netCode = 2;
+    verticalNet.name = "vertical";
+    verticalNet.padIndices = { lower, upper };
+    verticalNet.connections = { { lower, upper } };
+    board.nets = { horizontalNet, verticalNet };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.layers = { { 0, true, 1, 1 } };
+    settings.allowVias = false;
+    settings.startRipupCost = 1;
+    settings.optimizationAdditionalRipupCostFactorAtStart = 1;
+    settings.optimizationTraceRipupCostFactor = 1.0;
+    settings.optimizationPasses = 1;
+    // ReadSortedRouteItems orders this fixture's shorter vertical item first;
+    // let the pass advance to the intentionally poor horizontal item.
+    settings.maxOptimizationItems = 2;
+    settings.maxOptimizationAutoroutePasses = 3;
+    settings.maxRipups = 10;
+
+    // The selected horizontal route is intentionally much longer than a
+    // direct crossing. The vertical route occupies that crossing. A faithful
+    // optimizer batch sub-pass may displace or rip that otherwise unrelated
+    // connection, then schedules its newly incomplete net on the following
+    // pass. The previous item-local star reroute could not do this.
+    ROUTING_CONNECTION horizontal;
+    horizontal.netCode = 1;
+    horizontal.complete = true;
+    horizontal.fromPadIndex = left;
+    horizontal.toPadIndex = right;
+    horizontal.nodes = {
+        { board.pads[left].position, 0 }, { { 1000000, 8500000 }, 0 },
+        { { 2000000, 8500000 }, 0 }, { { 2000000, 7000000 }, 0 },
+        { { 3000000, 7000000 }, 0 }, { { 3000000, 8500000 }, 0 },
+        { { 4000000, 8500000 }, 0 }, { { 4000000, 7000000 }, 0 },
+        { { 6000000, 7000000 }, 0 }, { { 6000000, 8500000 }, 0 },
+        { { 7000000, 8500000 }, 0 }, { { 7000000, 7000000 }, 0 },
+        { { 8000000, 7000000 }, 0 }, { { 8000000, 8500000 }, 0 },
+        { { 9000000, 8500000 }, 0 }, { board.pads[right].position, 0 }
+    };
+    ROUTING_CONNECTION vertical;
+    vertical.netCode = 2;
+    vertical.complete = true;
+    vertical.fromPadIndex = lower;
+    vertical.toPadIndex = upper;
+    vertical.nodes = { { board.pads[lower].position, 0 },
+                       { board.pads[upper].position, 0 } };
+
+    std::vector<ROUTING_CONNECTION> routes{ horizontal, vertical };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( horizontal );
+    occupancy.Add( vertical );
+    const double before = CONNECTION::FromRoute( horizontal ).TraceLength()
+                          + CONNECTION::FromRoute( vertical ).TraceLength();
+
+    BOOST_REQUIRE_EQUAL( BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} ),
+                         1 );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( horizontalNet ), 0 );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( verticalNet ), 0 );
+    BOOST_CHECK( occupancy.Board()->Connected( left, right ) );
+    BOOST_CHECK( occupancy.Board()->Connected( lower, upper ) );
+    BOOST_CHECK( std::none_of( routes.begin(), routes.end(), [&]( const auto& route )
+    {
+        return route.netCode == 2 && SameRouteGeometry( route, vertical );
+    } ) );
+    double after = 0.0;
+    for( const ROUTING_CONNECTION& route : routes )
+        after += CONNECTION::FromRoute( route ).TraceLength();
+    BOOST_CHECK_LT( after, before );
 }
 
 BOOST_AUTO_TEST_CASE( ARouteCannotInventCopperAtAVirtualPlaneTarget )

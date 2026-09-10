@@ -37,6 +37,7 @@
 #include "../board/optimize/ViaOptimizer.h"
 #include "../maze/MazeTraceShover.h"
 #include "../path/FoundConnectionInserter.h"
+#include "BatchAutorouter.h"
 #include "ReadSortedRouteItems.h"
 
 
@@ -698,6 +699,56 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                     haveBest = true;
                 }
             };
+
+            // BatchOptimizer.optRouteItem does not reconnect only the two
+            // ends of the selected route.  After removing the complete item
+            // chain it invokes BatchAutorouter.autoroutePassesForOptimizingItem,
+            // which takes fresh whole-board item snapshots and may negotiate
+            // another movable connection out of the way.  Run that operation
+            // in a nested transaction: an accepted sub-pass keeps every
+            // partial insertion/rip-up as one candidate, while rejection
+            // restores the exact post-removal board before the bounded
+            // pull-tight/via fallbacks below are considered.
+            bool acceptedBatchCandidate = false;
+            // Native fanout and plane routes use synthetic target pads which
+            // Freerouting does not have. Feeding either ripped item to the
+            // ordinary pass can bypass or duplicate the required SMD escape.
+            // Keep their via movement in the dedicated candidate path below
+            // until both use real drill/conduction-area items end to end.
+            if( !original.isFanoutConnection && !original.isPlaneConnection )
+            {
+                ROUTING_OCCUPANCY::TRANSACTION batchTransaction( m_occupancy );
+                std::vector<ROUTING_CONNECTION> batchConnections =
+                        m_occupancy.Connections();
+                BATCH_AUTOROUTER::AutoroutePassesForOptimizingItem(
+                        m_board, itemOptimizationSettings,
+                        std::max( 0, m_settings.maxOptimizationAutoroutePasses ),
+                        m_occupancy, batchConnections, aCancel );
+
+                // The source helper removes tails and optimizes the changed
+                // area before BatchOptimizer evaluates board statistics.
+                // Native cleanup is still a bounded subset of optChangedArea,
+                // but it must run inside the same speculative transaction.
+                RemoveRedundantViaTails( batchConnections, aCancel );
+                batchConnections = m_occupancy.Connections();
+
+                const ROUTE_QUALITY batchQuality = routeQuality(
+                        m_board, batchConnections, *m_occupancy.Board() );
+                if( !( aCancel && aCancel() )
+                    && preservesPadGroups( groups, *m_occupancy.Board() )
+                    && isImprovement( before, batchQuality ) )
+                {
+                    batchTransaction.Commit();
+                    transaction.Commit();
+                    aConnections = m_occupancy.Connections();
+                    changedThisPass = true;
+                    consecutiveFailures = 0;
+                    acceptedBatchCandidate = true;
+                }
+            }
+
+            if( acceptedBatchCandidate )
+                continue;
 
             const auto consider = [&]( ROUTING_CONNECTION aCandidate )
             {

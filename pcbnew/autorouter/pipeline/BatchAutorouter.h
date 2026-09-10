@@ -26,7 +26,6 @@
 
 #include <vector>
 
-#include "BatchOptimizer.h"
 #include "../maze/AutorouteEngine.h"
 #include "../maze/MazeRipupResolver.h"
 
@@ -40,6 +39,25 @@ public:
     ROUTING_RESULT Run( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
                         const ROUTER_CANCEL_CALLBACK& aCancel,
                         const ROUTER_PROGRESS_CALLBACK& aProgress ) const;
+
+    /**
+     * Freerouting equivalent:
+     * BatchAutorouter.autoroutePassesForOptimizingItem().
+     *
+     * Route fresh source-order item snapshots on an already mutable board.
+     * Unlike Run(), this deliberately skips fanout, history and final result
+     * materialization: BatchOptimizer owns the surrounding snapshot and
+     * accepts or rolls back the complete set of sub-pass edits.
+     *
+     * The return value follows the Java method exactly: the number of passes
+     * needed to complete the board, or aMaxPassCount + 1 if work remains.
+     */
+    static int AutoroutePassesForOptimizingItem(
+            const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
+            int aMaxPassCount, ROUTING_OCCUPANCY& aOccupancy,
+            std::vector<ROUTING_CONNECTION>& aConnections,
+            const ROUTER_CANCEL_CALLBACK& aCancel,
+            int* aExpandedNodes = nullptr, int* aRipups = nullptr );
 
 private:
     struct NET_ORDER_ENTRY

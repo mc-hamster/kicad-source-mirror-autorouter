@@ -42,6 +42,7 @@
 #include "AutoroutePassRunner.h"
 #include "AutorouteConnectionRouter.h"
 #include "AutorouteBatchLoop.h"
+#include "BatchOptimizer.h"
 #include "BatchOptimizerMultiThreaded.h"
 #include "AutorouteUnroutedReport.h"
 #include "BatchFanout.h"
@@ -1635,6 +1636,78 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
 
     return allConnectionsRouted
            || ( aMaximumNewConnections > 0 && newConnectionCount > 0 );
+}
+
+
+int BATCH_AUTOROUTER::AutoroutePassesForOptimizingItem(
+        const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
+        int aMaxPassCount, ROUTING_OCCUPANCY& aOccupancy,
+        std::vector<ROUTING_CONNECTION>& aConnections,
+        const ROUTER_CANCEL_CALLBACK& aCancel, int* aExpandedNodes, int* aRipups )
+{
+    // The source constructs a dedicated BatchAutorouter with the optimizer's
+    // calculated start rip-up cost. AutorouteConnectionRouter enables rip-up
+    // on every one of these passes, including pass one.
+    AUTOROUTER_SETTINGS optimizerSettings = aSettings;
+    optimizerSettings.allowRipupRouted = true;
+    optimizerSettings.allowRipupOnFirstIteration = true;
+
+    BATCH_AUTOROUTER router;
+    AUTOROUTE_ENGINE engine( aBoard, optimizerSettings, aOccupancy );
+    int expandedNodes = 0;
+    int ripups = 0;
+    bool stillUnroutedItems = true;
+    int currentPassNo = 1;
+
+    while( stillUnroutedItems && !( aCancel && aCancel() )
+           && currentPassNo <= aMaxPassCount )
+    {
+        const std::vector<AUTOROUTE_ITEM> items =
+                AUTOROUTE_PASS_RUNNER::GetAutorouteItems( aBoard, *aOccupancy.Board() );
+
+        if( items.empty() )
+            stillUnroutedItems = false;
+        else
+        {
+            // AutoroutePassRunner snapshots the to-do list before mutating the
+            // board. An item connected by an earlier task in this same snapshot
+            // is skipped and does not by itself keep the pass loop alive.
+            bool attemptedItem = false;
+            for( const AUTOROUTE_ITEM& item : items )
+            {
+                if( aCancel && aCancel() )
+                    break;
+
+                const auto net = std::find_if(
+                        aBoard.nets.begin(), aBoard.nets.end(),
+                        [&]( const ROUTING_NET& aNet ) { return aNet.netCode == item.netCode; } );
+                if( net == aBoard.nets.end() || aOccupancy.Board()->CountMissing( *net ) == 0 )
+                    continue;
+
+                attemptedItem = true;
+                int itemExpanded = 0;
+                // Java pass numbers are one-based. The native search takes a
+                // zero-based retry and derives ripupPassNo = retry + 1.
+                router.routeNet( aBoard, optimizerSettings, *net, currentPassNo - 1,
+                                 aOccupancy, engine, aConnections, itemExpanded,
+                                 ripups, aCancel, {}, item.pad, 1 );
+                expandedNodes += itemExpanded;
+            }
+
+            stillUnroutedItems = attemptedItem;
+        }
+
+        ++currentPassNo;
+    }
+
+    if( !stillUnroutedItems )
+        --currentPassNo;
+
+    if( aExpandedNodes )
+        *aExpandedNodes += expandedNodes;
+    if( aRipups )
+        *aRipups += ripups;
+    return currentPassNo;
 }
 
 
