@@ -40,8 +40,10 @@ without reducing the required copper clearance.
 ## Deliberate transitional boundaries
 
 - Freerouting's `DrillPage` is rectangular, and native page enumeration remains
-  an `IntBox` grid. The current free-drill decomposition is still the bounded
-  rectangular subset rather than complete general-convex `TileShape` cutouts.
+  an `IntBox` grid. Exact 45-degree obstacle cutouts now retain `IntOctagon`
+  regions through drill selection; see
+  [the drill-region checkpoint](OCTAGONAL-DRILL-REGIONS.md). Arbitrary-angle
+  `Simplex` cutouts remain open.
 - Ordinary multilayer routing selects the exact-octagonal frontier. Fanout stays
   on the qualified rectangular frontier because enabling the new queue for
   first-drill termination regressed the 555 smoke from eight to eleven vias and
@@ -88,4 +90,3 @@ not a parity pass.
    control flow against normalized source decision streams.
 4. Remove each rectangular/visibility fallback only after completion, full
    host DRC, quality, runtime and bounded-memory corpus gates pass.
-

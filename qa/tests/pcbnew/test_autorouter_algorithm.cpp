@@ -290,6 +290,45 @@ BOOST_AUTO_TEST_CASE( IntOctagonCoreGeometryMatchesPinnedFreerouting )
             int isBox;
             input >> isBox;
             BOOST_CHECK_EQUAL( actual.IsIntBox(), isBox != 0 );
+            for( bool outerIsBox : { false, true } )
+            {
+                BOOST_TEST_CONTEXT( "outerIsBox=" << outerIsBox )
+                {
+                    std::size_t count;
+                    input >> count;
+                    std::vector<INT_OCTAGON> pieces;
+                    if( actual.Dimension() == 2 && other.Dimension() == 2 )
+                    {
+                        const auto rawPieces = outerIsBox
+                                ? other.CutoutFromBox( actual.BoundingBox() )
+                                : actual.Cutout( other );
+                        pieces.assign( rawPieces.begin(), rawPieces.end() );
+                    }
+                    BOOST_REQUIRE_EQUAL( pieces.size(), count );
+                    for( std::size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex )
+                    {
+                        BOOST_TEST_CONTEXT( "piece " << pieceIndex )
+                        {
+                            const INT_OCTAGON expected = readOctagon();
+                            const INT_OCTAGON& piece = pieces[pieceIndex];
+                            BOOST_CHECK_MESSAGE(
+                                    piece == expected,
+                                    "actual=" << piece.leftX << ',' << piece.bottomY << ','
+                                              << piece.rightX << ',' << piece.topY << ','
+                                              << piece.upperLeftDiagonalX << ','
+                                              << piece.lowerRightDiagonalX << ','
+                                              << piece.lowerLeftDiagonalX << ','
+                                              << piece.upperRightDiagonalX << " expected="
+                                              << expected.leftX << ',' << expected.bottomY << ','
+                                              << expected.rightX << ',' << expected.topY << ','
+                                              << expected.upperLeftDiagonalX << ','
+                                              << expected.lowerRightDiagonalX << ','
+                                              << expected.lowerLeftDiagonalX << ','
+                                              << expected.upperRightDiagonalX );
+                        }
+                    }
+                }
+            }
             BOOST_REQUIRE( !input.fail() );
         }
     }
@@ -7458,6 +7497,41 @@ BOOST_AUTO_TEST_CASE( DrillPageCacheResetsStateButInvalidatesGeometryOnMutation 
     BOOST_CHECK( page.GetDrills( {}, 1, 3, false, pins )->front().location == ( ROUTER_POINT{ 0, 0 } ) );
 }
 
+
+BOOST_AUTO_TEST_CASE( DrillPagePreservesExactOctagonalFreeRegions )
+{
+    using PLANAR::INT_OCTAGON;
+
+    DRILL_PAGE page( { -100, -100, 100, 100 } );
+    const INT_OCTAGON diamond( -40, -40, 40, 40, -40, 40, -40, 40 );
+    SHAPE_TREE_ENTRY obstacle{ diamond.BoundingBox(), 1, 0, 0, 2,
+                               false, true, diamond };
+
+    // (35,35) is inside the diamond's AABB but outside its exact x+y <= 40
+    // support.  A rectangular drill-page cutout incorrectly discards it.
+    const ROUTER_POINT diagonalFreePoint{ 35, 35 };
+    const std::vector<DRILL_PIN> pins{ { diagonalFreePoint, 0, true } };
+    const auto* drills = page.GetDrills( { obstacle }, 1, 2, true, pins );
+    BOOST_REQUIRE( drills );
+    BOOST_CHECK( std::none_of( drills->begin(), drills->end(), []( const auto& drill )
+    {
+        return drill.freeShape.Contains( { 0, 0 } );
+    } ) );
+    BOOST_CHECK( std::any_of( drills->begin(), drills->end(), [&]( const auto& drill )
+    {
+        return drill.freeShape.Contains( diagonalFreePoint );
+    } ) );
+    BOOST_CHECK( std::any_of( drills->begin(), drills->end(), [&]( const auto& drill )
+    {
+        return drill.location == diagonalFreePoint;
+    } ) );
+
+    const FLOAT_POINT nearest = MAZE_EXPANSION_ENGINE::Nearest(
+            diamond, FLOAT_POINT{ 50.0, 50.0 } );
+    BOOST_CHECK_SMALL( nearest.x - 20.0, 1e-9 );
+    BOOST_CHECK_SMALL( nearest.y - 20.0, 1e-9 );
+}
+
 BOOST_AUTO_TEST_CASE( MultilayerRoomSearchUsesDrillSectionsAndFullPhysicalStack )
 {
     ROOM_LAYER a, b, inactive;
@@ -7596,7 +7670,10 @@ BOOST_AUTO_TEST_CASE( ExactOctagonalMultilayerSearchUsesRoomsDoorsAndDrills )
         {
             const auto path = PLANAR::POLYLINE::FromPoints(
                     { from.point, to.point } );
-            const auto obstacle = diamond.ToSimplex();
+            // Room and drill shapes meet on their exact support lines.  A
+            // centreline may legally run on that compensated boundary; it
+            // must never enter the obstacle interior.
+            const auto obstacle = diamond.Offset( -1 ).ToSimplex();
             BOOST_REQUIRE( obstacle );
             BOOST_CHECK( path.Empty() || !obstacle->IntersectsSegment( path, 1 ) );
         }

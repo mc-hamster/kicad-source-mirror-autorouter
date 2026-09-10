@@ -61,8 +61,8 @@ std::vector<EXPANSION_DRILL>* DRILL_PAGE::GetDrills(
     m_net = aNet;
     m_attachSmd = aAttachSmd;
     m_layerCount = aLayerCount;
-    std::vector<ROUTER_BOX> holes;
-    auto previous = INT_BOX::Empty();
+    std::vector<PLANAR::INT_OCTAGON> holes;
+    std::optional<PLANAR::INT_OCTAGON> previous;
     for( const auto& entry : aObstacles )
     {
         if( aCancel && aCancel() )
@@ -70,15 +70,18 @@ std::vector<EXPANSION_DRILL>* DRILL_PAGE::GetDrills(
         if( entry.isRoom || !entry.IsTraceObstacle( aNet )
             || !INT_BOX::Intersects( entry.shape, m_shape ) )
             continue;
-        if( !INT_BOX::Contains( previous, entry.shape ) )
+        const PLANAR::INT_OCTAGON obstacle = entry.BoundingOctagon();
+        if( !previous || !obstacle.IsContainedIn( *previous ) )
         {
-            auto cutout = INT_BOX::Intersection( entry.shape, m_shape );
-            if( INT_BOX::Dimension( cutout ) == 2 )
+            const PLANAR::INT_OCTAGON cutout = obstacle.Intersection(
+                    PLANAR::INT_OCTAGON::FromBox( m_shape ) );
+            if( cutout.Dimension() == 2 )
                 holes.push_back( cutout );
         }
-        previous = entry.shape;
+        previous = obstacle;
     }
-    auto shapes = POLYLINE_AREA::SplitToConvex( m_shape, holes, aCancel, aMaxPieces );
+    auto shapes = POLYLINE_AREA::SplitOctagonalToConvex(
+            m_shape, holes, aCancel, aMaxPieces );
     if( !shapes )
         return nullptr;
     std::vector<EXPANSION_DRILL> drills;
@@ -94,17 +97,16 @@ std::vector<EXPANSION_DRILL>* DRILL_PAGE::GetDrills(
                 // layer with a candidate, and strict interior containment.
                 for( const auto& pin : aPins )
                     if( pin.layer == layer && pin.drillAllowed
-                        && pin.position.x > shape.minX && pin.position.x < shape.maxX
-                        && pin.position.y > shape.minY && pin.position.y < shape.maxY )
+                        && shape.ContainsInside( pin.position ) )
                         pinCenter = pin.position;
                 if( pinCenter )
                     break;
             }
         EXPANSION_DRILL drill;
         drill.freeShape = shape;
-        drill.location = pinCenter.value_or( FLOAT_POINT{
-                ( static_cast<double>( shape.minX ) + shape.maxX ) / 2,
-                ( static_cast<double>( shape.minY ) + shape.maxY ) / 2 }.Round() );
+        const auto center = shape.CentreOfGravity();
+        drill.location = pinCenter.value_or(
+                FLOAT_POINT{ center.first, center.second }.Round() );
         drill.firstLayer = 0;
         drill.lastLayer = aLayerCount - 1;
         drill.rooms.resize( aLayerCount, nullptr );

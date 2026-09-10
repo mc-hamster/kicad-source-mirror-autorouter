@@ -71,6 +71,7 @@ public:
     INT_OCTAGON Enlarge( double aOffset ) const { return Offset( aOffset ); }
 
     bool Contains( ROUTER_POINT aPoint ) const;
+    bool ContainsInside( ROUTER_POINT aPoint ) const;
     bool IsContainedIn( const ROUTER_BOX& aBox ) const;
     bool IsContainedIn( const INT_OCTAGON& aOther ) const;
     bool Intersects( const INT_OCTAGON& aOther ) const;
@@ -79,6 +80,25 @@ public:
     INT_OCTAGON Union( const INT_OCTAGON& aOther ) const;
     INT_OCTAGON Intersection( const INT_OCTAGON& aOther ) const;
     INT_OCTAGON Normalize() const;
+
+    /** Divide this outer octagon minus aCutout into Freerouting's ordered
+     * convex pieces. A non-overlap returns only this shape; an area overlap
+     * returns eight pieces, including empty/lower-dimensional intermediates,
+     * so PolylineArea can apply TileShape's dimension filtering itself.
+     */
+    std::vector<INT_OCTAGON> Cutout( const INT_OCTAGON& aCutout ) const;
+
+    /** Divide a rectangular outer shape minus this octagonal cutout.  This is
+     * the specialised IntOctagon.cutoutFrom(IntBox) dispatch used by Java
+     * before TileShape.simplify() changes later dispatch decisions.
+     */
+    std::vector<INT_OCTAGON> CutoutFromBox( const ROUTER_BOX& aOuter ) const;
+
+    /** Arithmetic mean of the eight source octagon corners.  This deliberately
+     * is not the polygon area centroid: PolylineShape.centreOfGravity() uses
+     * the arithmetic corner mean and DrillPage rounds that point.
+     */
+    std::pair<double, double> CentreOfGravity() const;
 
     /** Source Side values encoded as -1=ON_THE_LEFT, 0=COLLINEAR,
      * +1=ON_THE_RIGHT. */

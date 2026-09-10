@@ -273,6 +273,23 @@ bool INT_OCTAGON::Contains( ROUTER_POINT aPoint ) const
 }
 
 
+bool INT_OCTAGON::ContainsInside( ROUTER_POINT aPoint ) const
+{
+    if( leftX >= aPoint.x || bottomY >= aPoint.y
+        || rightX <= aPoint.x || topY <= aPoint.y )
+    {
+        return false;
+    }
+
+    const INTEGER difference = INTEGER( aPoint.x ) - aPoint.y;
+    const INTEGER sum = INTEGER( aPoint.x ) + aPoint.y;
+    return INTEGER( upperLeftDiagonalX ) < difference
+           && INTEGER( lowerRightDiagonalX ) > difference
+           && INTEGER( lowerLeftDiagonalX ) < sum
+           && INTEGER( upperRightDiagonalX ) > sum;
+}
+
+
 INT_OCTAGON INT_OCTAGON::Union( const INT_OCTAGON& aOther ) const
 {
     return { std::min( leftX, aOther.leftX ), std::min( bottomY, aOther.bottomY ),
@@ -294,6 +311,382 @@ INT_OCTAGON INT_OCTAGON::Intersection( const INT_OCTAGON& aOther ) const
                         std::min( lowerRightDiagonalX, aOther.lowerRightDiagonalX ),
                         std::max( lowerLeftDiagonalX, aOther.lowerLeftDiagonalX ),
                         std::min( upperRightDiagonalX, aOther.upperRightDiagonalX ) ).Normalize();
+}
+
+
+std::vector<INT_OCTAGON> INT_OCTAGON::Cutout( const INT_OCTAGON& aCutout ) const
+{
+    // Direct translation of IntOctagon.cutoutFrom(IntOctagon).  `d` is the
+    // divide shape and `c` is the part of the requested cutout which actually
+    // lies in it.  The order and the circumference-reducing divider switches
+    // are routing decisions: DrillPage consumes the resulting shapes in this
+    // sequence and therefore tests candidate vias in this sequence.
+    const INT_OCTAGON& d = *this;
+    const INT_OCTAGON c = aCutout.Intersection( d );
+    if( aCutout.IsEmpty() || c.Dimension() < aCutout.Dimension() )
+    {
+        return { d };
+    }
+
+    std::int64_t temporary = subtract( c.lowerLeftDiagonalX, c.leftX );
+    std::array<INT_OCTAGON, 8> result = {
+        INT_OCTAGON( d.leftX, temporary, c.leftX,
+                     subtract( c.leftX, c.upperLeftDiagonalX ),
+                     d.upperLeftDiagonalX, d.lowerRightDiagonalX,
+                     d.lowerLeftDiagonalX, d.upperRightDiagonalX ),
+        Empty(), Empty(), Empty(), Empty(), Empty(), Empty(), Empty()
+    };
+
+    std::int64_t temporary2 = subtract( c.lowerLeftDiagonalX, c.bottomY );
+    result[1] = INT_OCTAGON( d.leftX, d.bottomY, temporary2, temporary,
+                             d.upperLeftDiagonalX, d.lowerRightDiagonalX,
+                             d.lowerLeftDiagonalX, c.lowerLeftDiagonalX );
+
+    temporary = add( c.lowerRightDiagonalX, c.bottomY );
+    result[2] = INT_OCTAGON( temporary2, d.bottomY, temporary, c.bottomY,
+                             d.upperLeftDiagonalX, d.lowerRightDiagonalX,
+                             d.lowerLeftDiagonalX, d.upperRightDiagonalX );
+
+    temporary2 = subtract( c.rightX, c.lowerRightDiagonalX );
+    result[3] = INT_OCTAGON( temporary, d.bottomY, d.rightX, temporary2,
+                             c.lowerRightDiagonalX, d.lowerRightDiagonalX,
+                             d.lowerLeftDiagonalX, d.upperRightDiagonalX );
+
+    temporary = subtract( c.upperRightDiagonalX, c.rightX );
+    result[4] = INT_OCTAGON( c.rightX, temporary2, d.rightX, temporary,
+                             d.upperLeftDiagonalX, d.lowerRightDiagonalX,
+                             d.lowerLeftDiagonalX, d.upperRightDiagonalX );
+
+    temporary2 = subtract( c.upperRightDiagonalX, c.topY );
+    result[5] = INT_OCTAGON( temporary2, temporary, d.rightX, d.topY,
+                             d.upperLeftDiagonalX, d.lowerRightDiagonalX,
+                             c.upperRightDiagonalX, d.upperRightDiagonalX );
+
+    temporary = add( c.upperLeftDiagonalX, c.topY );
+    result[6] = INT_OCTAGON( temporary, c.topY, temporary2, d.topY,
+                             d.upperLeftDiagonalX, d.lowerRightDiagonalX,
+                             d.lowerLeftDiagonalX, d.upperRightDiagonalX );
+
+    temporary2 = subtract( c.leftX, c.upperLeftDiagonalX );
+    result[7] = INT_OCTAGON( d.leftX, temporary2, temporary, d.topY,
+                             d.upperLeftDiagonalX, c.upperLeftDiagonalX,
+                             d.lowerLeftDiagonalX, d.upperRightDiagonalX );
+
+    for( INT_OCTAGON& piece : result )
+        piece = piece.Normalize();
+
+    INT_OCTAGON first = result[0];
+    INT_OCTAGON second = result[7];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && first.rightX - first.LeftXValue( first.topY )
+                   > second.UpperYValue( first.rightX ) - second.bottomY )
+    {
+        first = INT_OCTAGON(
+                std::min( first.leftX, second.leftX ), first.bottomY,
+                first.rightX, second.topY, second.upperLeftDiagonalX,
+                first.lowerRightDiagonalX, first.lowerLeftDiagonalX,
+                second.upperRightDiagonalX );
+        second = INT_OCTAGON(
+                first.rightX, second.bottomY, second.rightX, second.topY,
+                second.upperLeftDiagonalX, second.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, second.upperRightDiagonalX );
+        result[0] = first.Normalize();
+        result[7] = second.Normalize();
+    }
+
+    first = result[7];
+    second = result[6];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && second.UpperYValue( first.rightX ) - second.bottomY
+                   > first.rightX - first.LeftXValue( second.bottomY ) )
+    {
+        second = INT_OCTAGON(
+                first.leftX, second.bottomY, second.rightX,
+                std::max( second.topY, first.topY ), first.upperLeftDiagonalX,
+                second.lowerRightDiagonalX, first.lowerLeftDiagonalX,
+                second.upperRightDiagonalX );
+        first = INT_OCTAGON(
+                first.leftX, first.bottomY, first.rightX, second.bottomY,
+                first.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                first.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        result[7] = first.Normalize();
+        result[6] = second.Normalize();
+    }
+
+    first = result[6];
+    second = result[5];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && second.UpperYValue( first.rightX ) - first.bottomY
+                   > second.RightXValue( first.bottomY ) - second.leftX )
+    {
+        first = INT_OCTAGON(
+                first.leftX, first.bottomY, second.rightX,
+                std::max( second.topY, first.topY ), first.upperLeftDiagonalX,
+                second.lowerRightDiagonalX, first.lowerLeftDiagonalX,
+                second.upperRightDiagonalX );
+        second = INT_OCTAGON(
+                second.leftX, second.bottomY, second.rightX, first.bottomY,
+                second.upperLeftDiagonalX, second.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, second.upperRightDiagonalX );
+        result[6] = first.Normalize();
+        result[5] = second.Normalize();
+    }
+
+    first = result[5];
+    second = result[4];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && second.RightXValue( second.topY ) - second.leftX
+                   > first.UpperYValue( second.leftX ) - second.topY )
+    {
+        second = INT_OCTAGON(
+                second.leftX, second.bottomY, std::max( second.rightX, first.rightX ),
+                first.topY, first.upperLeftDiagonalX, second.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        first = INT_OCTAGON(
+                first.leftX, first.bottomY, second.leftX, first.topY,
+                first.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                first.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        result[5] = first.Normalize();
+        result[4] = second.Normalize();
+    }
+
+    first = result[4];
+    second = result[3];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && first.RightXValue( first.bottomY ) - first.leftX
+                   > first.bottomY - second.LowerYValue( first.leftX ) )
+    {
+        first = INT_OCTAGON(
+                first.leftX, second.bottomY, std::max( second.rightX, first.rightX ),
+                first.topY, first.upperLeftDiagonalX, second.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        second = INT_OCTAGON(
+                second.leftX, second.bottomY, first.leftX, second.topY,
+                second.upperLeftDiagonalX, second.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, second.upperRightDiagonalX );
+        result[4] = first.Normalize();
+        result[3] = second.Normalize();
+    }
+
+    first = result[3];
+    second = result[2];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && second.topY - second.LowerYValue( second.rightX )
+                   > first.RightXValue( second.topY ) - second.rightX )
+    {
+        second = INT_OCTAGON(
+                second.leftX, std::min( first.bottomY, second.bottomY ), first.rightX,
+                second.topY, second.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        first = INT_OCTAGON(
+                first.leftX, second.topY, first.rightX, first.topY,
+                first.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                first.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        result[3] = first.Normalize();
+        result[2] = second.Normalize();
+    }
+
+    first = result[2];
+    second = result[1];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && first.topY - first.LowerYValue( first.leftX )
+                   > first.leftX - second.LeftXValue( first.topY ) )
+    {
+        first = INT_OCTAGON(
+                second.leftX, std::min( first.bottomY, second.bottomY ), first.rightX,
+                first.topY, second.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        second = INT_OCTAGON(
+                second.leftX, first.topY, second.rightX, second.topY,
+                second.upperLeftDiagonalX, second.lowerRightDiagonalX,
+                second.lowerLeftDiagonalX, second.upperRightDiagonalX );
+        result[2] = first.Normalize();
+        result[1] = second.Normalize();
+    }
+
+    first = result[1];
+    second = result[0];
+    if( !( first.IsEmpty() || second.IsEmpty() )
+        && second.rightX - second.LeftXValue( second.bottomY )
+                   > second.bottomY - first.LowerYValue( second.rightX ) )
+    {
+        second = INT_OCTAGON(
+                std::min( second.leftX, first.leftX ), first.bottomY, second.rightX,
+                second.topY, second.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                first.lowerLeftDiagonalX, second.upperRightDiagonalX );
+        first = INT_OCTAGON(
+                second.rightX, first.bottomY, first.rightX, first.topY,
+                first.upperLeftDiagonalX, first.lowerRightDiagonalX,
+                first.lowerLeftDiagonalX, first.upperRightDiagonalX );
+        result[1] = first.Normalize();
+        result[0] = second.Normalize();
+    }
+
+    return { result.begin(), result.end() };
+}
+
+
+std::vector<INT_OCTAGON> INT_OCTAGON::CutoutFromBox(
+        const ROUTER_BOX& aOuter ) const
+{
+    const auto rawBoxOctagon = []( const ROUTER_BOX& aBox )
+    {
+        // IntBox.toIntOctagon() preserves a lower-dimensional/inverted
+        // intermediate instead of replacing it with IntOctagon.EMPTY.  The
+        // PolylineArea caller performs dimension filtering afterwards.
+        return INT_OCTAGON(
+                aBox.minX, aBox.minY, aBox.maxX, aBox.maxY,
+                subtract( aBox.minX, aBox.maxY ),
+                subtract( aBox.maxX, aBox.minY ),
+                add( aBox.minX, aBox.minY ),
+                add( aBox.maxX, aBox.maxY ) );
+    };
+    const INT_OCTAGON outer = FromBox( aOuter );
+    const INT_OCTAGON c = Intersection( outer );
+    if( IsEmpty() || c.Dimension() < Dimension() )
+    {
+        return { outer };
+    }
+
+    std::array<ROUTER_BOX, 4> boxes = {
+        ROUTER_BOX{ aOuter.minX, subtract( c.lowerLeftDiagonalX, c.leftX ),
+                    c.leftX, subtract( c.leftX, c.upperLeftDiagonalX ) },
+        ROUTER_BOX{ c.rightX, subtract( c.rightX, c.lowerRightDiagonalX ),
+                    aOuter.maxX, subtract( c.upperRightDiagonalX, c.rightX ) },
+        ROUTER_BOX{ subtract( c.lowerLeftDiagonalX, c.bottomY ), aOuter.minY,
+                    add( c.lowerRightDiagonalX, c.bottomY ), c.bottomY },
+        ROUTER_BOX{ add( c.upperLeftDiagonalX, c.topY ), c.topY,
+                    subtract( c.upperRightDiagonalX, c.topY ), aOuter.maxY }
+    };
+
+    // The source uses +/-Limits.CRIT_INT as unbounded support sentinels.
+    // KiCad IU routinely exceed Java's 25-bit safe-coordinate range, so use
+    // the same construction with a proportionally wide int64 sentinel.  It
+    // must stay clear of the ends because Normalize adds/subtracts supports.
+    constexpr std::int64_t critical =
+            std::numeric_limits<std::int64_t>::max() / 16;
+    std::array<INT_OCTAGON, 4> octagons = {
+        INT_OCTAGON( aOuter.minX, boxes[0].maxY, boxes[3].minX, aOuter.maxY,
+                     -critical, c.upperLeftDiagonalX,
+                     -critical, critical ).Normalize(),
+        INT_OCTAGON( aOuter.minX, aOuter.minY, boxes[2].minX, boxes[0].minY,
+                     -critical, critical,
+                     -critical, c.lowerLeftDiagonalX ).Normalize(),
+        INT_OCTAGON( boxes[2].maxX, aOuter.minY, aOuter.maxX, boxes[1].minY,
+                     c.lowerRightDiagonalX, critical,
+                     -critical, critical ).Normalize(),
+        INT_OCTAGON( boxes[3].maxX, boxes[1].maxY, aOuter.maxX, aOuter.maxY,
+                     -critical, critical,
+                     c.upperRightDiagonalX, critical ).Normalize()
+    };
+
+    ROUTER_BOX box = boxes[0];
+    INT_OCTAGON octagon = octagons[0];
+    if( box.maxX - box.minX > octagon.topY - octagon.bottomY )
+    {
+        boxes[0] = { box.minX, box.minY, box.maxX, octagon.topY };
+        octagons[0] = INT_OCTAGON(
+                box.maxX, octagon.bottomY, octagon.rightX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[3];
+    octagon = octagons[0];
+    if( box.maxY - box.minY > octagon.rightX - octagon.leftX )
+    {
+        boxes[3] = { octagon.leftX, box.minY, box.maxX, box.maxY };
+        octagons[0] = INT_OCTAGON(
+                octagon.leftX, octagon.bottomY, octagon.rightX, box.minY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[3];
+    octagon = octagons[3];
+    if( box.maxY - box.minY > octagon.rightX - octagon.leftX )
+    {
+        boxes[3] = { box.minX, box.minY, octagon.rightX, box.maxY };
+        octagons[3] = INT_OCTAGON(
+                octagon.leftX, octagon.bottomY, octagon.rightX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[1];
+    octagon = octagons[3];
+    if( box.maxX - box.minX > octagon.topY - octagon.bottomY )
+    {
+        boxes[1] = { box.minX, box.minY, box.maxX, octagon.topY };
+        octagons[3] = INT_OCTAGON(
+                octagon.leftX, octagon.bottomY, box.minX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[1];
+    octagon = octagons[2];
+    if( box.maxX - box.minX > octagon.topY - octagon.bottomY )
+    {
+        boxes[1] = { box.minX, octagon.bottomY, box.maxX, box.maxY };
+        octagons[2] = INT_OCTAGON(
+                octagon.leftX, octagon.bottomY, box.minX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[2];
+    octagon = octagons[2];
+    if( box.maxY - box.minY > octagon.rightX - octagon.leftX )
+    {
+        boxes[2] = { box.minX, box.minY, octagon.rightX, box.maxY };
+        octagons[2] = INT_OCTAGON(
+                octagon.leftX, box.maxY, octagon.rightX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[2];
+    octagon = octagons[1];
+    if( box.maxY - box.minY > octagon.rightX - octagon.leftX )
+    {
+        boxes[2] = { octagon.leftX, box.minY, box.maxX, box.maxY };
+        octagons[1] = INT_OCTAGON(
+                octagon.leftX, box.maxY, octagon.rightX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    box = boxes[0];
+    octagon = octagons[1];
+    if( box.maxX - box.minX > octagon.topY - octagon.bottomY )
+    {
+        boxes[0] = { box.minX, octagon.bottomY, box.maxX, box.maxY };
+        octagons[1] = INT_OCTAGON(
+                box.maxX, octagon.bottomY, octagon.rightX, octagon.topY,
+                octagon.upperLeftDiagonalX, octagon.lowerRightDiagonalX,
+                octagon.lowerLeftDiagonalX, octagon.upperRightDiagonalX ).Normalize();
+    }
+
+    return { rawBoxOctagon( boxes[0] ), rawBoxOctagon( boxes[1] ),
+             rawBoxOctagon( boxes[2] ), rawBoxOctagon( boxes[3] ),
+             octagons[0], octagons[1], octagons[2], octagons[3] };
+}
+
+
+std::pair<double, double> INT_OCTAGON::CentreOfGravity() const
+{
+    if( Dimension() < 0 )
+        return { 0.0, 0.0 };
+
+    long double x = 0;
+    long double y = 0;
+    for( int index = 0; index < 8; ++index )
+    {
+        x += CornerX( index );
+        y += CornerY( index );
+    }
+    return { static_cast<double>( x / 8.0L ), static_cast<double>( y / 8.0L ) };
 }
 
 

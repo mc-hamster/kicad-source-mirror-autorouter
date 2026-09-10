@@ -23,6 +23,7 @@
  */
 #pragma once
 #include "../geometry/planar/FloatLine.h"
+#include "../geometry/planar/IntOctagon.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -43,6 +44,9 @@ public:
                  std::clamp( aFrom.y, static_cast<double>( aShape.minY ), static_cast<double>( aShape.maxY ) ) };
     }
 
+    static FLOAT_POINT Nearest( const PLANAR::INT_OCTAGON& aShape,
+                                FLOAT_POINT aFrom );
+
     static COST ToPage( ROUTER_BOX aPage, FLOAT_POINT aFrom, double aExpansion,
                         double aViaCost, double aHorizontal, double aVertical, double aRemaining )
     {
@@ -60,6 +64,18 @@ public:
     {
         const auto point = Nearest( aCentreShape, aFrom );
         const double expansion = aExpansion + point.WeightedDistance( aFrom, aHorizontal, aVertical )
+                                 + ( aFromPage ? 0 : aViaCost );
+        return { expansion, expansion + aRemaining, point };
+    }
+
+    static COST ToDrill( const PLANAR::INT_OCTAGON& aCentreShape,
+                         FLOAT_POINT aFrom, double aExpansion,
+                         double aViaCost, bool aFromPage, double aHorizontal,
+                         double aVertical, double aRemaining )
+    {
+        const auto point = Nearest( aCentreShape, aFrom );
+        const double expansion = aExpansion
+                                 + point.WeightedDistance( aFrom, aHorizontal, aVertical )
                                  + ( aFromPage ? 0 : aViaCost );
         return { expansion, expansion + aRemaining, point };
     }

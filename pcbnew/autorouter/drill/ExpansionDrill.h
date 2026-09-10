@@ -21,6 +21,7 @@
 
 #include "../AutorouterTypes.h"
 #include "../geometry/planar/IntBox.h"
+#include "../geometry/planar/IntOctagon.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -31,7 +32,7 @@ class EXPANSION_ROOM;
 struct EXPANSION_DRILL
 {
     ROUTER_POINT location;
-    ROUTER_BOX   freeShape;
+    PLANAR::INT_OCTAGON freeShape = PLANAR::INT_OCTAGON::Empty();
     int          firstLayer = -1;
     int          lastLayer = -1;
     bool         valid = true;

@@ -29,6 +29,51 @@
 namespace KICAD_AUTOROUTER
 {
 
+FLOAT_POINT MAZE_EXPANSION_ENGINE::Nearest(
+        const PLANAR::INT_OCTAGON& aShape, FLOAT_POINT aFrom )
+{
+    const long double difference = static_cast<long double>( aFrom.x ) - aFrom.y;
+    const long double sum = static_cast<long double>( aFrom.x ) + aFrom.y;
+    if( aFrom.x >= aShape.leftX && aFrom.x <= aShape.rightX
+        && aFrom.y >= aShape.bottomY && aFrom.y <= aShape.topY
+        && difference >= aShape.upperLeftDiagonalX
+        && difference <= aShape.lowerRightDiagonalX
+        && sum >= aShape.lowerLeftDiagonalX
+        && sum <= aShape.upperRightDiagonalX )
+    {
+        return aFrom;
+    }
+
+    FLOAT_POINT result;
+    long double best = std::numeric_limits<long double>::infinity();
+    for( int index = 0; index < 8; ++index )
+    {
+        const ROUTER_POINT first = aShape.Corner( index );
+        const ROUTER_POINT second = aShape.Corner( ( index + 1 ) % 8 );
+        const long double dx = static_cast<long double>( second.x ) - first.x;
+        const long double dy = static_cast<long double>( second.y ) - first.y;
+        const long double lengthSquared = dx * dx + dy * dy;
+        if( lengthSquared <= 0 )
+            continue;
+        const long double ratio = std::clamp(
+                ( ( static_cast<long double>( aFrom.x ) - first.x ) * dx
+                  + ( static_cast<long double>( aFrom.y ) - first.y ) * dy )
+                        / lengthSquared,
+                0.0L, 1.0L );
+        const long double x = first.x + ratio * dx;
+        const long double y = first.y + ratio * dy;
+        const long double distanceX = static_cast<long double>( aFrom.x ) - x;
+        const long double distanceY = static_cast<long double>( aFrom.y ) - y;
+        const long double distanceSquared = distanceX * distanceX + distanceY * distanceY;
+        if( distanceSquared < best )
+        {
+            best = distanceSquared;
+            result = { static_cast<double>( x ), static_cast<double>( y ) };
+        }
+    }
+    return result;
+}
+
 std::vector<ROUTER_NODE> MAZE_EXPANSION_ENGINE::Neighbours(
         const ROUTER_NODE& aNode, std::int64_t aGridStep,
         const std::vector<ROUTER_LAYER_SETTINGS>& aLayers, bool aAllowVias )

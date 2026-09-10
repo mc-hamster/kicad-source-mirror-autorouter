@@ -14,6 +14,11 @@ public class IntOctagonOracle {
         .append(' ').append(octagon.upperRightDiagonalX);
   }
 
+  private static void appendCutout(StringBuilder out, TileShape[] pieces) {
+    out.append(' ').append(pieces.length);
+    for (TileShape piece : pieces) appendOctagon(out, piece.boundingOctagon());
+  }
+
   private static IntOctagon randomOctagon(Random random) {
     int left = random.nextInt(241) - 120;
     int bottom = random.nextInt(241) - 120;
@@ -83,6 +88,12 @@ public class IntOctagonOracle {
             .append(' ').append(sideCode(octagon.compare(other, border)));
       }
       out.append(' ').append(octagon.isIntBox() ? 1 : 0);
+      if (octagon.dimension() == 2 && other.dimension() == 2) {
+        appendCutout(out, octagon.cutout(other));
+        appendCutout(out, octagon.boundingBox().cutout(other));
+      } else {
+        out.append(" 0 0");
+      }
       System.out.println(out);
     }
   }

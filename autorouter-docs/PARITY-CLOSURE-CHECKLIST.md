@@ -39,8 +39,11 @@ only as a bounded transition fallback on layers without general-convex
 geometry. Ordinary multilayer routing now keeps exact octagons through
 per-layer room completion, door expansion, terminal attachment and
 backtracking. Drill pages themselves remain source-shaped `IntBox` pages, as
-they are in Freerouting, and their free-drill cutouts still use the bounded
-rectangular subset before the final exact full-stack via preflight. Fanout
+they are in Freerouting. Their free-drill decomposition now preserves exact
+`IntOctagon` obstacle intersections, ordered box/octagon cutout pieces, strict
+pin attachment, arithmetic-corner centres and diagonal nearest-point approach
+costs before the final exact full-stack via preflight. General arbitrary-angle
+`Simplex` cutouts remain open. Fanout
 deliberately remains on the already-qualified rectangular drill frontier until
 first-drill/source ordering is matched.
 
@@ -53,12 +56,15 @@ without enumerating millions of lattice points. Randomized brute-force tests
 cover 4,096 segment/room combinations, and the active 45-degree frontier uses
 that exact attachment path for point, axial and oblique trace terminals.
 
-The ordinary-multilayer activation checkpoint passes 178 native autorouter
-cases / 661,115 assertions and a production 555-board smoke: 21/21 routed
-connections, zero host-unconnected items, zero new KiCad DRC violations, eight
-vias, 117.876 mm of track, 10,788 expanded nodes and no host repair. This is a
-safety checkpoint, not a quality-parity claim: the v2.3.0 reference still uses
-seven vias on this fixture. Exact free-drill convex regions, source
+The octagonal drill-region checkpoint passes 179 native autorouter cases /
+672,692 assertions. Its production 555-board smoke routes 21/21 connections
+with zero new KiCad DRC violations but uses nine vias, 124.171 mm of track and
+one host repair pass. This is a quality regression from the prior eight-via
+octagonal-room checkpoint and remains explicitly open; Freerouting v2.3.0 uses
+seven vias. The preceding room activation checkpoint routed 21/21 connections,
+zero host-unconnected items, zero new KiCad DRC violations, eight vias, 117.876
+mm of track, 10,788 expanded nodes and no host repair. It was also a safety
+checkpoint, not a quality-parity claim. General-convex free-drill regions, source
 first-drill/fanout ordering, the full reference backtracker/locator corner
 policy, any-angle rooms, and broad-board qualification remain open.
 
