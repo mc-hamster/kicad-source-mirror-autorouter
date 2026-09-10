@@ -33,23 +33,46 @@ namespace KICAD_AUTOROUTER
 
 double AUTOROUTE_CONTROL::ViaCost() const
 {
-    // Experimental retry penalty; this is not upstream padstack-radius-scaled
-    // minNormalViaCost. See the core parity review before changing units.
     const int configuredCost = m_targetIsPlane && m_settings.planeViaCost > 0
                                        ? m_settings.planeViaCost
                                        : m_settings.viaCost;
-    return static_cast<double>( std::max( 0, configuredCost ) )
-           * ( 1.0 + 0.15 * static_cast<double>( m_retry ) );
+    double radiusFactor = std::max( m_maxViaRadius, 1.0 );
+    if( m_pureSmdNet )
+        radiusFactor *= 0.1;
+    return static_cast<double>( std::max( 0, configuredCost ) ) * radiusFactor;
 }
 
 
 double AUTOROUTE_CONTROL::TraceCost( double aLength ) const
 {
-    // Experimental grid-normalized units. Upstream instead uses geometric
-    // distances weighted per axis and scales via costs by padstack radius.
-    // These models must be replaced together, not described as equivalent.
+    // Compatibility units for the remaining visibility/grid fallback.  The
+    // active room frontier uses WeightedTraceCost/ROOM_COST_SPACE instead.
     const double resolution = std::max( 1, m_settings.gridStepIU );
     return std::max( 0, m_settings.traceLengthCost ) * ( aLength / resolution );
+}
+
+
+double AUTOROUTE_CONTROL::WeightedTraceCost( int aLayer, const ROUTER_POINT& aStart,
+                                              const ROUTER_POINT& aEnd ) const
+{
+    const auto layerIt = std::find_if(
+            m_settings.layers.begin(), m_settings.layers.end(),
+            [aLayer]( const ROUTER_LAYER_SETTINGS& aLayerSetting )
+            { return aLayerSetting.layerId == aLayer; } );
+    const double preferred = std::max( 0, m_settings.traceLengthCost );
+    double horizontal = preferred;
+    double vertical = preferred;
+    if( layerIt != m_settings.layers.end() && layerIt->preferredDirection != 0 )
+    {
+        const double against = preferred + std::max( 0, layerIt->directionCost ) / 10.0;
+        if( layerIt->preferredDirection == 1 )
+            vertical = against;
+        else if( layerIt->preferredDirection == 2 )
+            horizontal = against;
+    }
+    const double dx = static_cast<double>( aEnd.x ) - aStart.x;
+    const double dy = static_cast<double>( aEnd.y ) - aStart.y;
+    return std::hypot( dx * horizontal, dy * vertical );
 }
 
 

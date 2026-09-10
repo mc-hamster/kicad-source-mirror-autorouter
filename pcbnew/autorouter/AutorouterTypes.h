@@ -108,11 +108,11 @@ struct AUTOROUTER_SETTINGS
     std::vector<ROUTER_LAYER_SETTINGS> layers;
 
     int  gridStepIU = 500000;          // 0.5 mm default search pitch
-    int  viaCost = 500;
+    int  viaCost = 50;
     // Freerouting uses a separate, cheaper via cost when the destination is
     // a copper plane.  Keep this independent so plane nets prefer a short
     // escape to their plane over a long surface route.
-    int  planeViaCost = 50;
+    int  planeViaCost = 5;
     int  traceLengthCost = 1;
     int  congestionCost = 100;
     int  bendCost = 10;
@@ -123,22 +123,30 @@ struct AUTOROUTER_SETTINGS
     // Base cost for the first rip-up/reroute pass.  The batch loop scales it
     // by the pass number, matching BatchAutorouter.startRipupCosts.
     int  startRipupCost = 100;
+    // Legacy native setting retained for project/UI compatibility.  A
+    // Freerouting routing item is searched exactly once in each batch pass;
+    // difficulty is increased by the next pass, not by an inner retry loop.
+    // Do not use this value to multiply maze searches.
     int  maxIterations = 8;
-    int  maxPasses = 4;
-    int  optimizationPasses = 2;
+    // Pinned Freerouting v2.3.0 caps. Both stages have independent
+    // convergence guards and normally finish far below these safety limits.
+    int  maxPasses = 9999;
+    int  optimizationPasses = 100;
     int  maxOptimizationItems = 0;     // 0 = no item limit
+    // Freerouting's optimizer removes a complete connection and gives the
+    // batch router a small, independent retry budget before comparing the
+    // candidate lexicographically (incompletes, vias, then trace length).
+    int  maxOptimizationAutoroutePasses = 6;
+    int  maxOptimizationConsecutiveFailures = 50;
     int  maxRipups = 128;
     int  maxExpandedNodes = 250000;
-    // Fanout is a pre-pass, not the whole job.  The original unbounded
-    // Java-style defaults multiply a 10-second search by every SMD pin and
-    // every pass, so a modest board can spend tens of minutes before ordinary
-    // routing gets a chance to run.  Keep the complete fanout algorithm
-    // available through these settings, but use an interactive default that
-    // makes a short, bounded attempt and then falls back to the batch router.
-    int  maxFanoutPasses = 1;
+    // Pinned Freerouting v2.3.0 defaults. Normal convergence guards stop the
+    // fanout stage before this cap when no additional pins are escaped.
+    int  maxFanoutPasses = 20;
     int  maxFanoutItems = 0;
-    std::int64_t maxFanoutMillisecondsPerPin = 250;
-    std::int64_t fanoutTimeoutMilliseconds = 10000;
+    std::int64_t maxFanoutMillisecondsPerPin = 10000;
+    // Zero is the source default: no independent whole-fanout deadline.
+    std::int64_t fanoutTimeoutMilliseconds = 0;
     bool fanoutRipupAllowed = true;
     // These are KiCad IU equivalents of Freerouting's default 2.5 mm and
     // 4.5 mm fanout escape envelope.  The geometric pad exit requirement is
@@ -174,6 +182,10 @@ struct AUTOROUTER_SETTINGS
     std::vector<std::string> excludeNetClasses;
     std::vector<std::string> includeNets;
     std::vector<std::string> excludeNets;
+    // Freerouting enables negotiated rip-up on every ordinary routing pass,
+    // including pass one.  Kept as an explicit switch for focused strict
+    // search tests and host-repair policy overrides.
+    bool allowRipupOnFirstIteration = true;
 };
 
 
@@ -306,6 +318,13 @@ struct ROUTING_OBSTACLE
     // internal proposal DRC from counting the same physical BOARD_ITEM twice;
     // the record remains available for exact UUID removal on acceptance.
     bool                    isMirroredToObstacleModel = false;
+    // The item already exists on the private KiCad proposal board, but was
+    // created by an earlier autorouter stage rather than by the user.  This
+    // distinction is essential during post-refill repair: user copper remains
+    // protected, while job-owned copper stays electrically represented and
+    // may be ripped up/rerouted like any other generated route.  Kept at the
+    // end to preserve the aggregate-initializer layout used by tests.
+    bool                    isAutorouterOwned = false;
 };
 
 
@@ -468,6 +487,11 @@ struct ROUTING_CONNECTION
     // Empty means every edge inherits the resolved net defaults.  Otherwise
     // there is precisely one style for each pair of consecutive nodes.
     std::vector<ROUTING_EDGE_STYLE> edgeStyles;
+    // See ROUTING_OBSTACLE::isAutorouterOwned.  This connection has a host
+    // UUID because an earlier stage materialized it on the private proposal
+    // board, but it is not protected source copper.  Kept last so existing
+    // aggregate initializers retain their field mapping.
+    bool                    isAutorouterOwned = false;
 };
 
 

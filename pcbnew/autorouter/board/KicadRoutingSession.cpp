@@ -174,6 +174,24 @@ void apply( BOARD& board, const ROUTING_RESULT& result )
         board.Add( item.release() );
     }
 }
+
+std::set<std::string> autorouterOwnedTracks(
+        const BOARD& board, const std::set<std::string>& sourceTracks )
+{
+    std::set<std::string> result;
+
+    for( const PCB_TRACK* track : board.Tracks() )
+    {
+        if( !track )
+            continue;
+
+        const std::string id = track->m_Uuid.AsString().ToStdString();
+        if( !sourceTracks.contains( id ) )
+            result.insert( id );
+    }
+
+    return result;
+}
 }
 
 struct KICAD_ROUTING_SESSION::IMPL
@@ -249,6 +267,14 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
                         + " nets=" + std::to_string( snapshot->nets.size() )
                         + " connections=" + std::to_string( snapshotConnections )
                         + " obstacles=" + std::to_string( snapshot->obstacles.size() ) );
+    if( autorouterDebugEnabled() )
+    {
+        for( const ROUTING_NET& net : snapshot->nets )
+        {
+            autorouterDebugLog( "Host snapshot net code=" + std::to_string( net.netCode )
+                                + " name=" + net.name );
+        }
+    }
     const auto routingStarted = CLOCK::now();
     auto result = ROUTING_PIPELINE().Run( *snapshot, settings, cancel, recordProgress );
     std::int64_t routingMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -262,6 +288,8 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
                         + " complete=" + std::to_string( result.complete )
                         + " message=" + result.message );
     apply( *work, result );
+    std::set<std::string> jobOwnedTracks =
+            autorouterOwnedTracks( *work, m_impl->sourceTracks );
     stage( "Refilling and validating the proposal" );
     refill( *work, reporter );
     int missing = work->GetConnectivity()->GetUnconnectedCount( false );
@@ -276,13 +304,38 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
         initDrc( *candidate, reporter );
         AUTOROUTER_SETTINGS repairSettings = settings;
         repairSettings.allowRipupExisting = false;
+        // With no legal via escape, a strict raster can spend the entire
+        // node budget proving that a crossing-free repair is impossible.
+        // Multilayer repair retains the strict first attempt for now: the
+        // native batch scheduler can otherwise oscillate two short routes in
+        // a narrow channel instead of selecting the reference shove result.
+        repairSettings.allowRipupOnFirstIteration = !repairSettings.allowVias;
         repairSettings.routeOnlyUnconnected = true;
         repairSettings.enableFanout = false;
-        auto repairSnapshot = KICAD_BOARD_ADAPTER( candidate.get() ).CreateSnapshot( repairSettings );
+        auto repairSnapshot = KICAD_BOARD_ADAPTER(
+                candidate.get(), jobOwnedTracks ).CreateSnapshot( repairSettings );
         const auto repairStarted = CLOCK::now();
         auto repair = ROUTING_PIPELINE().Run( *repairSnapshot, repairSettings, cancel, recordProgress );
         routingMs += std::chrono::duration_cast<std::chrono::milliseconds>(
                 CLOCK::now() - repairStarted ).count();
+        autorouterDebugLog( "Repair pipeline result: routed="
+                + std::to_string( repair.metrics.routedConnections ) + "/"
+                + std::to_string( repair.metrics.totalConnections ) + " segments="
+                + std::to_string( repair.segments.size() ) + " vias="
+                + std::to_string( repair.vias.size() ) + " removed="
+                + std::to_string( repair.removedBoardItemIds.size() ) + " ripups="
+                + std::to_string( repair.metrics.ripups ) );
+        if( autorouterDebugEnabled() )
+        {
+            KICAD_BOARD_ADAPTER candidateAdapter( candidate.get() );
+            for( const std::string& id : repair.removedBoardItemIds )
+            {
+                const BOARD_ITEM* item = candidateAdapter.FindBoardItem( id );
+                const PCB_TRACK* track = dynamic_cast<const PCB_TRACK*>( item );
+                autorouterDebugLog( "Repair removes id=" + id
+                        + " net=" + std::to_string( track ? track->GetNetCode() : -1 ) );
+            }
+        }
         if( repair.cancelled || reporter.IsCancelled() )
         { result.cancelled = true; result.complete = false; return result; }
         if( repair.segments.empty() && repair.vias.empty() )
@@ -297,6 +350,7 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
         if( candidateMissing >= missing || candidateDrc > newDrc )
             break;
         work = std::move( candidate );
+        jobOwnedTracks = autorouterOwnedTracks( *work, m_impl->sourceTracks );
         missing = candidateMissing;
         newDrc = candidateDrc;
         ++result.hostRepairPasses;

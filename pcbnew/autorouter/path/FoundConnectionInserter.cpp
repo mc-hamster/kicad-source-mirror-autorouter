@@ -394,6 +394,7 @@ tryShoveGeneratedConnections( const ROUTING_CONNECTION& aCandidate,
         if( aVictim.isExistingBoardRoute )
         {
             plan.replacement.isExistingBoardRoute = false;
+            plan.replacement.isAutorouterOwned = false;
             plan.replacement.isShoveMovable = true;
         }
 
@@ -404,6 +405,7 @@ tryShoveGeneratedConnections( const ROUTING_CONNECTION& aCandidate,
             // batch output can remove the original only after this complete
             // replacement transaction succeeds.
             contact.replacement.isExistingBoardRoute = false;
+            contact.replacement.isAutorouterOwned = false;
             contact.replacement.isShoveMovable = true;
             if( !contact.replacement.complete || !HasValidEdgeStyles( contact.replacement ) )
                 return false;
@@ -411,6 +413,7 @@ tryShoveGeneratedConnections( const ROUTING_CONNECTION& aCandidate,
         for( ROUTING_CONNECTION& bridge : plan.bridges )
         {
             bridge.isExistingBoardRoute = false;
+            bridge.isAutorouterOwned = false;
             bridge.isShoveMovable = true;
             if( !bridge.complete || !HasValidEdgeStyles( bridge ) )
                 return false;
@@ -596,7 +599,11 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
         // restores all original route identities on this path.
         const bool wouldDiscardProtectedCopper = std::any_of(
                 ripups.begin(), ripups.end(), []( const ROUTING_CONNECTION& aVictim )
-                { return aVictim.isFanoutConnection || aVictim.isExistingBoardRoute; } );
+                {
+                    return aVictim.isFanoutConnection
+                           || ( aVictim.isExistingBoardRoute
+                                && !aVictim.isAutorouterOwned );
+                } );
         if( !allowRipupFallback || wouldDiscardProtectedCopper )
             return { STATE::BLOCKED, blockedEdge };
     }

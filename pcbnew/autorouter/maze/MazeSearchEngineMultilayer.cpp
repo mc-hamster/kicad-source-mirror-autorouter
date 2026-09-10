@@ -137,7 +137,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         auto rooms = space.complete( space.incomplete( { layers[layer].bounds, layers[layer].id, seed } ) );
         return rooms.size() == 1 ? rooms.front() : nullptr;
     };
-    enum class KIND { ROOM_ENTRY, PAGE, DRILL_ENTER, DRILL_EXIT, TARGET };
+    enum class KIND { ROOM_ENTRY, PAGE, DRILL_ENTER, DRILL_EXIT, TARGET, FANOUT_TARGET };
     struct STATE
     {
         KIND kind = KIND::ROOM_ENTRY;
@@ -162,6 +162,21 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     bool allocationLimit = false;
     auto push = [&]( STATE state )
     {
+        if( via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
+            && via.fanoutMaxDistance > 0 )
+        {
+            const FLOAT_POINT point = state.entry.Middle();
+            const long double dx = static_cast<long double>( point.x )
+                                           - via.fanoutCenter.x;
+            const long double dy = static_cast<long double>( point.y )
+                                           - via.fanoutCenter.y;
+            if( std::hypotl( dx, dy )
+                > static_cast<long double>( via.fanoutMaxDistance ) )
+            {
+                return;
+            }
+        }
+
         const int id = state.door ? state.door->GetId() : state.page ? state.page->GetId()
                       : state.drill ? state.drill->GetId()
                       : static_cast<std::int32_t>( 31u * static_cast<std::uint32_t>( state.itemId )
@@ -227,6 +242,22 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     return std::nullopt;
                 if( !drill.valid || drill.occupied[current.layer] )
                     continue;
+                if( via.stopAtFirstDrill
+                    && layers[current.layer].id == via.fanoutSourceLayer )
+                {
+                    const long double dx = static_cast<long double>( drill.location.x )
+                                                   - via.fanoutCenter.x;
+                    const long double dy = static_cast<long double>( drill.location.y )
+                                                   - via.fanoutCenter.y;
+                    const long double distance = std::hypotl( dx, dy );
+                    if( distance < static_cast<long double>( via.fanoutMinDistance )
+                        || ( via.fanoutMaxDistance > 0
+                             && distance
+                                        > static_cast<long double>( via.fanoutMaxDistance ) ) )
+                    {
+                        continue;
+                    }
+                }
                 bool roomsReady = true;
                 for( std::size_t i = 0; i < layers.size(); ++i )
                     if( layers[i].active && !drill.rooms[i] )
@@ -270,23 +301,32 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             current.drill->occupied[current.layer] = true;
             if( current.kind == KIND::DRILL_ENTER )
             {
+                const bool fanoutDrill = via.stopAtFirstDrill
+                                         && layers[current.layer].id
+                                                    == via.fanoutSourceLayer;
                 for( std::size_t to = 0; to < layers.size(); ++to )
                 {
                     if( to == current.layer || !layers[to].active || current.drill->occupied[to] )
                         continue;
                     STATE state = current;
-                    state.kind = KIND::DRILL_EXIT; state.layer = to; state.section = to;
+                    state.kind = fanoutDrill ? KIND::FANOUT_TARGET : KIND::DRILL_EXIT;
+                    state.layer = to; state.section = to;
                     state.room = spaces[to]->byShape.at( current.drill->rooms[to] );
-                    state.parent = index; state.f = state.g + remaining( from, to );
+                    state.parent = index;
+                    state.f = fanoutDrill ? state.g : state.g + remaining( from, to );
                     push( state );
                     ++metrics.layerTransitions;
                 }
                 continue;
             }
         }
-        if( current.kind == KIND::TARGET )
+        if( current.kind == KIND::TARGET || current.kind == KIND::FANOUT_TARGET )
         {
-            ROOM_MULTILAYER_PATH result{ {}, current.owner, current.targetOwner };
+            ROOM_MULTILAYER_PATH result{
+                    {}, current.owner,
+                    current.kind == KIND::FANOUT_TARGET
+                            ? std::numeric_limits<std::size_t>::max()
+                            : current.targetOwner };
             std::vector<std::size_t> chain;
             for( auto i = index; i != NONE; i = states[i].parent )
                 chain.push_back( i );
@@ -298,7 +338,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             {
                 const auto& before = states[chain[i - 1]];
                 const auto& after = states[chain[i]];
-                if( after.kind == KIND::DRILL_EXIT )
+                if( after.kind == KIND::DRILL_EXIT || after.kind == KIND::FANOUT_TARGET )
                 {
                     if( result.nodes.back().point != after.drill->location )
                     { valid = false; break; }

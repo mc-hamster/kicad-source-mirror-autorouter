@@ -59,6 +59,14 @@ struct ROOM_VIA_SETTINGS
     std::vector<DRILL_PIN> pins; // Physical layer ordinals, not host layer IDs.
     // Must validate the entire manufactured via, not only entry/exit layers.
     std::function<bool( ROUTER_POINT )> canDrill;
+    // RoutingBoard.fanout terminates at the first drill reached from the
+    // pin's one-layer connected set. These fields keep that state inside the
+    // same room/drill frontier instead of falling back to a second grid maze.
+    bool stopAtFirstDrill = false;
+    int fanoutSourceLayer = -1;
+    ROUTER_POINT fanoutCenter;
+    std::int64_t fanoutMinDistance = 0;
+    std::int64_t fanoutMaxDistance = 0; // 0 = unbounded
 };
 
 struct ROOM_MULTILAYER_PATH

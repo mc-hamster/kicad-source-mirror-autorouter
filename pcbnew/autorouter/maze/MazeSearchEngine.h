@@ -158,7 +158,8 @@ public:
                                                        const ROUTER_CANCEL_CALLBACK& aCancel,
                                                        const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
                                                        const std::vector<ROUTING_TERMINAL>& aStarts = {},
-                                                       const std::vector<ROUTING_TERMINAL>& aTargets = {} ) const;
+                                                       const std::vector<ROUTING_TERMINAL>& aTargets = {},
+                                                       bool aAllowLegacyFallback = true ) const;
 
     // Retry searches may temporarily cross committed routes.  Resolve those
     // crossings with the same netclass, layer-span, copper, and drill rules
@@ -238,13 +239,21 @@ private:
             const std::vector<ROUTING_TERMINAL>& aStarts,
             const std::vector<ROUTING_TERMINAL>& aTargets, int aRetry, int& aExpanded,
             const ROUTER_CANCEL_CALLBACK& aCancel,
-            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const;
+            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress,
+            const ROUTING_PAD* aFanoutTarget = nullptr ) const;
     std::optional<ROUTING_CONNECTION> findRoomConnection(
             const std::vector<ROUTING_TERMINAL>& aStarts,
             const std::vector<ROUTING_TERMINAL>& aTargets, int aRetry, int& aExpanded,
             const ROUTER_CANCEL_CALLBACK& aCancel,
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const;
     mutable ROOM_SEARCH_METRICS m_roomMetrics;
+    // The reference frontier can enter a routable obstacle room after paying
+    // its rip-up cost.  The rectangular native slice first searches strict
+    // free rooms, then (only when negotiated rip-up is enabled) repeats the
+    // room search without movable route obstacles.  Final conflict discovery
+    // and transactional forced insertion remain authoritative.  This flag is
+    // attempt-local and never removes fixed/user copper.
+    mutable bool m_ignoreRoutableRoomObstacles = false;
 
     struct OPEN_NODE
     {
@@ -271,6 +280,7 @@ private:
     };
 
     bool isLayerEnabled( int aLayer ) const;
+    bool isPureSmdNet( int aNetCode ) const;
     int  layerOrdinal( int aLayer ) const;
     bool isOnPadLayer( const ROUTING_PAD& aPad, int aLayer ) const;
     bool isPointAllowed( const ROUTER_POINT& aPoint, int aLayer, int aNetCode,

@@ -126,6 +126,16 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
     {
         if( aCancel && aCancel() )
             return {};
+
+        const bool movableRoute = !connection.isExistingBoardRoute
+                                  || connection.isAutorouterOwned
+                                  || m_settings.allowRipupExisting;
+        if( m_ignoreRoutableRoomObstacles && movableRoute
+            && connection.netCode != net )
+        {
+            continue;
+        }
+
         if( connection.netCode == net )
         {
             if( aForVia )
@@ -271,16 +281,15 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
     {
         // The batch/rip-up layer still consumes legacy route-cost units. Do
         // not leak geometric IU costs from the new frontier into that score.
-        AUTOROUTE_CONTROL control( m_settings, net, aRetry );
+        AUTOROUTE_CONTROL control( m_settings, net, aRetry, false,
+                                   std::max( netTrackRadius( net ), netViaRadius( net ) ),
+                                   isPureSmdNet( net ) );
         best->cost = 0;
         for( std::size_t i = 1; i < best->nodes.size(); ++i )
         {
             const auto& from = best->nodes[i - 1];
             const auto& to = best->nodes[i];
-            best->cost += control.TraceCost( std::hypot(
-                    static_cast<double>( to.point.x ) - from.point.x,
-                    static_cast<double>( to.point.y ) - from.point.y ) )
-                    + control.DirectionCost( to.layer, from.point, to.point )
+            best->cost += control.WeightedTraceCost( to.layer, from.point, to.point )
                     + control.CongestionCost( m_occupancy.SegmentUsage( from, to, net ) )
                     + ( from.point != to.point ? m_settings.bendCost : 0 );
         }
@@ -290,7 +299,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
 std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnection(
         const std::vector<ROUTING_TERMINAL>& starts, const std::vector<ROUTING_TERMINAL>& targets,
         int retry, int& expanded, const ROUTER_CANCEL_CALLBACK& cancel,
-        const ROUTER_SEARCH_PROGRESS_CALLBACK& progress ) const
+        const ROUTER_SEARCH_PROGRESS_CALLBACK& progress,
+        const ROUTING_PAD* fanoutTarget ) const
 {
     const int net = starts.front().pad.netCode;
 
@@ -327,6 +337,18 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                 return false;
         return true;
     };
+    if( fanoutTarget )
+    {
+        via.stopAtFirstDrill = true;
+        via.fanoutSourceLayer = fanoutTarget->fanoutSourceLayer;
+        via.fanoutMinDistance = std::max<std::int64_t>(
+                0, fanoutTarget->fanoutMinEscapeLength );
+        via.fanoutMaxDistance = std::max<std::int64_t>(
+                0, fanoutTarget->fanoutMaxEscapeLength );
+        via.fanoutCenter = starts.front().pad.position;
+        if( fanoutTarget->fanoutSourcePadIndex < m_board.pads.size() )
+            via.fanoutCenter = m_board.pads[fanoutTarget->fanoutSourcePadIndex].position;
+    }
     const auto started = std::chrono::steady_clock::now();
     int nextObstacleId = 1;
     for( int id : physical )
@@ -385,14 +407,15 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             ROUTING_CONNECTION found;
             found.netCode = net; found.fromPadIndex = path->startOwner; found.toPadIndex = path->targetOwner;
             found.complete = true; found.nodes = path->nodes;
-            AUTOROUTE_CONTROL control( m_settings, net, retry, plane );
+            found.isFanoutConnection = fanoutTarget != nullptr;
+            AUTOROUTE_CONTROL control( m_settings, net, retry, plane,
+                                       std::max( radius, netViaRadius( net ) ),
+                                       hasPads && pureSmd );
             for( std::size_t i = 1; i < found.nodes.size(); ++i )
             {
                 const auto& a = found.nodes[i - 1]; const auto& b = found.nodes[i];
                 found.cost += a.layer != b.layer ? control.ViaCost()
-                        : control.TraceCost( std::hypot( static_cast<double>( b.point.x ) - a.point.x,
-                                                        static_cast<double>( b.point.y ) - a.point.y ) )
-                          + control.DirectionCost( b.layer, a.point, b.point )
+                        : control.WeightedTraceCost( b.layer, a.point, b.point )
                           + control.CongestionCost( m_occupancy.SegmentUsage( a, b, net ) )
                           + ( a.point != b.point ? m_settings.bendCost : 0 );
             }

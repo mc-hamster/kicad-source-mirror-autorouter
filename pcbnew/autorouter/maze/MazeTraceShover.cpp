@@ -66,7 +66,7 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
 
                 if( start.layer != end.layer
                     || !CanCollapseRouteEdges( aConnection, first, last - 1 )
-                    || !aSearch.CanUseSegment( aConnection.netCode, start, end, false, style ) )
+                    || !aSearch.CanInsertSegment( aConnection.netCode, start, end, style ) )
                 {
                     continue;
                 }
@@ -99,7 +99,7 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
         if( previous.point == current.point && current.point == next.point
             && previous.layer != next.layer
             && CanCollapseRouteEdges( aConnection, index - 1, index )
-            && aSearch.CanUseSegment( aConnection.netCode, previous, next, true, style ) )
+            && aSearch.CanInsertSegment( aConnection.netCode, previous, next, style ) )
         {
             if( !CollapseRouteNodes( aConnection, index - 1, index + 1 ) )
             {

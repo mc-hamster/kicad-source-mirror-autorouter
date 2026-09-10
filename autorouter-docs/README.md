@@ -25,6 +25,8 @@ not be interpreted as proof that the named upstream algorithms are implemented.
 * [UPSTREAM.md](UPSTREAM.md) — pinned source commit and filename-level mapping.
 * [Freerouting Codex sync runbook](FREEROUTING-CODEX-SYNC.md) — direct-from-GitHub PR inventory,
   autorouter-only porting rules, ledger format, validation gates, and target-PR traceability.
+* [DAC2020 Freerouting A/B test runbook](FREEROUTING-DAC2020-AB-RUNBOOK.md) — agent procedure
+  for testing native routing against a pinned Freerouting reference on the ten KiCad corpus boards.
 * [Regression corpus](regression-corpus.yml) — parity cases and required measurements.
 * [Three small online-board benchmarks](BASIC-BOARD-BENCHMARK.md) — official
   Freerouting 2.3.0 versus native, repeatable downloads, timings, DRC, and saved PCBs.

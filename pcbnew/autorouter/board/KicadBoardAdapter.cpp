@@ -22,6 +22,7 @@
  */
 
 #include "KicadBoardAdapter.h"
+#include "../AutorouterDebug.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +43,7 @@
 #include <geometry/shape_arc.h>
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_poly_set.h>
+#include <geometry/shape_segment.h>
 #include <layer_ids.h>
 #include <netclass.h>
 #include <pad.h>
@@ -471,6 +473,220 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             packagePins.emplace( pad, std::pair{ component, pin++ } );
     }
     std::map<const BOARD_CONNECTED_ITEM*, std::size_t> padIndices;
+    std::set<int> autorouterOwnedNetCodes;
+
+    // Freerouting sees the copper which forms a thermal relief after the DSN
+    // plane has been generated.  The native worker instead receives KiCad's
+    // pads and zones separately and KiCad refills the zones only after a
+    // proposal has been made.  Preserve the thermal spokes present in the
+    // baseline fill as same-net capsule obstacles, so foreign traces cannot
+    // consume all exits before the proposal refill.  Do not reserve a full
+    // circle: dense IC pads legitimately occupy the directions in which
+    // KiCad omitted a spoke.
+    auto thermalReservations = [&]( PAD* aPad, PCB_LAYER_ID aLayer,
+                                    std::int64_t aPadClearance )
+    {
+        std::vector<ROUTING_OBSTACLE> result;
+
+        if( aPad->GetNetCode() <= 0 || !aPad->FlashLayer( aLayer ) )
+            return result;
+
+        const BOARD_DESIGN_SETTINGS& designSettings = m_board->GetDesignSettings();
+
+        for( ZONE* zone : m_board->Zones() )
+        {
+            if( !zone || zone->GetIsRuleArea() || zone->GetNetCode() != aPad->GetNetCode()
+                || !zone->GetLayerSet().Contains( aLayer )
+                || !zone->GetBoundingBox().Intersects( aPad->GetBoundingBox( aLayer ) ) )
+            {
+                continue;
+            }
+
+            const SHAPE_POLY_SET outline = zone->GetBoardOutline();
+            if( !outline.Contains( aPad->GetPosition() ) )
+                continue;
+
+            ZONE_CONNECTION connection = zone->GetPadConnection();
+            int gap = zone->GetThermalReliefGap();
+            int spokeWidth = zone->GetThermalReliefSpokeWidth();
+
+            if( const std::optional<int> padGap = aPad->GetLocalThermalGapOverride();
+                padGap && *padGap > 0 )
+            {
+                gap = *padGap;
+            }
+
+            if( const int padSpokeWidth = aPad->GetLocalSpokeWidthOverride();
+                padSpokeWidth > 0 )
+            {
+                spokeWidth = padSpokeWidth;
+            }
+
+            if( designSettings.m_DRCEngine )
+            {
+                connection = designSettings.m_DRCEngine
+                                     ->EvalZoneConnection( aPad, zone, aLayer )
+                                     .m_ZoneConnection;
+                gap = designSettings.m_DRCEngine
+                              ->EvalRules( THERMAL_RELIEF_GAP_CONSTRAINT, aPad, zone,
+                                           aLayer )
+                              .GetValue()
+                              .Min();
+                spokeWidth = designSettings.m_DRCEngine
+                                     ->EvalRules( THERMAL_SPOKE_WIDTH_CONSTRAINT, aPad,
+                                                  zone, aLayer )
+                                     .GetValue()
+                                     .Opt();
+            }
+            else if( connection == ZONE_CONNECTION::THT_THERMAL )
+            {
+                connection = aPad->GetAttribute() == PAD_ATTRIB::PTH
+                                     ? ZONE_CONNECTION::THERMAL
+                                     : ZONE_CONNECTION::FULL;
+            }
+
+            if( connection != ZONE_CONNECTION::THERMAL || spokeWidth <= 0 )
+                continue;
+
+            spokeWidth = std::min( spokeWidth,
+                                   std::min( std::abs( aPad->GetSize( aLayer ).x ),
+                                             std::abs( aPad->GetSize( aLayer ).y ) ) );
+            if( spokeWidth < zone->GetMinThickness() )
+                continue;
+
+            const VECTOR2I center = aPad->ShapePos( aLayer );
+            const std::shared_ptr<SHAPE> padShape = aPad->GetEffectiveShape(
+                    aLayer, FLASHING::ALWAYS_FLASHED );
+            if( !padShape )
+                continue;
+
+            const std::shared_ptr<SHAPE_POLY_SET> filled =
+                    zone->HasFilledPolysForLayer( aLayer )
+                            ? zone->GetFilledPolysList( aLayer ) : nullptr;
+            const EDA_ANGLE baseAngle = aPad->GetThermalSpokeAngle()
+                                        + aPad->GetOrientation();
+
+            for( int direction = 0; direction < 4; ++direction )
+            {
+                const EDA_ANGLE angle = baseAngle
+                                        + EDA_ANGLE( 90.0 * direction, DEGREES_T );
+                const double dx = angle.Cos();
+                const double dy = angle.Sin();
+                const auto pointAt = [&]( std::int64_t aDistance )
+                {
+                    return VECTOR2I(
+                            static_cast<int>( std::llround( center.x + dx * aDistance ) ),
+                            static_cast<int>( std::llround( center.y + dy * aDistance ) ) );
+                };
+
+                // Locate the flashed-pad boundary on this exact spoke ray.
+                // A binary search works for every convex standard pad shape
+                // and avoids reducing a long rectangular pad to its radius.
+                std::int64_t inside = 0;
+                std::int64_t outside = std::max<std::int64_t>(
+                        1, 2LL * std::max( std::abs( aPad->GetSize( aLayer ).x ),
+                                          std::abs( aPad->GetSize( aLayer ).y ) ) );
+                while( padShape->Collide( pointAt( outside ) )
+                       && outside < 1000000000LL )
+                {
+                    outside *= 2;
+                }
+                while( outside - inside > 1 )
+                {
+                    const std::int64_t middle = inside + ( outside - inside ) / 2;
+                    if( padShape->Collide( pointAt( middle ) ) )
+                        inside = middle;
+                    else
+                        outside = middle;
+                }
+
+                const std::int64_t sampleDistance = inside
+                                                    + std::max<std::int64_t>( 1, gap / 2 );
+                const VECTOR2I sample = pointAt( sampleDistance );
+                const std::int64_t endDistance = inside + std::max( 0, gap )
+                                                 + std::max( zone->GetMinThickness(),
+                                                             spokeWidth / 2 );
+                const VECTOR2I end = pointAt( endDistance );
+
+                const bool hasBaselineFill = filled && !filled->IsEmpty();
+                bool spokeExists = hasBaselineFill && filled->Contains( sample );
+                if( !hasBaselineFill )
+                {
+                    // Unit-created or stale unfilled boards have no baseline
+                    // copper to sample.  Fall back to exact host pad shapes
+                    // and keep only directions which are not already blocked
+                    // by a foreign fixed pad.
+                    spokeExists = outline.Contains( end );
+                    const SHAPE_SEGMENT spoke( center, end, spokeWidth );
+                    for( PAD* other : m_board->GetPads() )
+                    {
+                        if( !spokeExists || !other || other == aPad
+                            || other->GetNetCode() == aPad->GetNetCode()
+                            || !other->FlashLayer( aLayer ) )
+                        {
+                            continue;
+                        }
+
+                        const std::shared_ptr<SHAPE> otherShape = other->GetEffectiveShape(
+                                aLayer, FLASHING::ALWAYS_FLASHED );
+                        const int clearance = std::max(
+                                { 0, m_board->GetDesignSettings().m_MinClearance,
+                                  other->GetOwnClearance( aLayer ) } );
+                        if( otherShape && spoke.Collide( otherShape.get(), clearance ) )
+                            spokeExists = false;
+                    }
+                }
+
+                if( !spokeExists )
+                    continue;
+
+                ROUTING_OBSTACLE thermal;
+                thermal.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                thermal.netCode = aPad->GetNetCode();
+                thermal.boardItemId = aPad->m_Uuid.AsString().ToStdString();
+                thermal.layers = { static_cast<int>( aLayer ) };
+                thermal.start = point( center );
+                thermal.end = point( end );
+                thermal.radius = spokeWidth / 2;
+                thermal.blocksTracks = true;
+                thermal.blocksVias = true;
+                // A foreign trace clears the spoke as zone copper, not merely
+                // as pad copper.  KiCad's local zone clearance is commonly
+                // larger than the pad/netclass value; using the latter let a
+                // legal pad-adjacent trace erase the spoke during refill.
+                thermal.clearance = std::max<std::int64_t>(
+                        { 0, aPadClearance,
+                          zone->GetLocalClearance().value_or( 0 ) } );
+                if( autorouterDebugEnabled() )
+                {
+                    autorouterDebugLog(
+                            "thermal reservation pad="
+                            + aPad->m_Uuid.AsString().ToStdString() + " net="
+                            + std::to_string( aPad->GetNetCode() ) + " layer="
+                            + std::to_string( static_cast<int>( aLayer ) ) + " from=("
+                            + std::to_string( thermal.start.x ) + ","
+                            + std::to_string( thermal.start.y ) + ") to=("
+                            + std::to_string( thermal.end.x ) + ","
+                            + std::to_string( thermal.end.y ) + ") radius="
+                            + std::to_string( thermal.radius ) );
+                }
+                result.push_back( std::move( thermal ) );
+            }
+        }
+
+        return result;
+    };
+
+    for( const PCB_TRACK* track : m_board->Tracks() )
+    {
+        if( track
+            && m_autorouterOwnedBoardItemIds.contains(
+                    toStdString( track->m_Uuid.AsString() ) ) )
+        {
+            autorouterOwnedNetCodes.insert( track->GetNetCode() );
+        }
+    }
+
     for( PAD* pad : m_board->GetPads() )
     {
         if( !pad )
@@ -646,6 +862,11 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     aSnapshot.obstacles.push_back( std::move( part ) );
                 }
             }
+
+            auto thermal = thermalReservations( pad, layerId, clearance );
+            aSnapshot.obstacles.insert( aSnapshot.obstacles.end(),
+                                        std::make_move_iterator( thermal.begin() ),
+                                        std::make_move_iterator( thermal.end() ) );
         }
 
         if( pad->HasHole() )
@@ -844,14 +1065,33 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         for( const auto& cluster : clusters )
         {
             std::vector<std::size_t> group;
+            bool dependsOnAutorouterCopper = false;
             for( const CN_ITEM* item : *cluster )
             {
                 if( !item->Valid() )
                     continue;
+
+                if( const auto* track = dynamic_cast<const PCB_TRACK*>( item->Parent() ) )
+                {
+                    const std::string id = toStdString( track->m_Uuid.AsString() );
+                    dependsOnAutorouterCopper = dependsOnAutorouterCopper
+                                                || m_autorouterOwnedBoardItemIds.contains( id );
+                }
+
                 const auto it = padIndices.find( item->Parent() );
                 if( it != padIndices.end() )
                     group.push_back( it->second );
             }
+
+            // Mutable job copper is represented by actual worker routes below.
+            // Baking this cluster into connectedPadGroups would make its
+            // connectivity survive a later rip-up and could let CountMissing()
+            // accept a physically disconnected repair proposal.  Skipping a
+            // mixed cluster is conservative: fixed-source connectivity can be
+            // rediscovered, whereas a false immutable union cannot be undone.
+            if( dependsOnAutorouterCopper )
+                continue;
+
             std::sort( group.begin(), group.end() );
             group.erase( std::unique( group.begin(), group.end() ), group.end() );
             if( group.size() < 2 )
@@ -1008,6 +1248,25 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             if( uniqueConnections.insert( connection ).second )
                 net.connections.push_back( connection );
         }
+
+        // Repair begins with only the host's currently missing ratsnest
+        // edges, including exact zone-island terminals above.  It may then
+        // rip up mutable copper created by an earlier stage.  Preserve a
+        // complete real-pad spanning requirement for every affected net so a
+        // cross-net rip-up creates work that later entries/passes can restore;
+        // otherwise the repair can fix one gap while silently breaking an
+        // equal number of connections that were complete at snapshot time.
+        if( autorouterOwnedNetCodes.contains( net.netCode )
+            && net.padIndices.size() > 1 )
+        {
+            for( std::size_t index = 1; index < net.padIndices.size(); ++index )
+            {
+                const auto connection = std::minmax( net.padIndices.front(),
+                                                     net.padIndices[index] );
+                if( uniqueConnections.insert( connection ).second )
+                    net.connections.push_back( connection );
+            }
+        }
     }
 }
 
@@ -1033,6 +1292,8 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
         const bool isIncludedNet = includedNets.contains( track->GetNetCode() );
 
         const std::string boardItemId = toStdString( track->m_Uuid.AsString() );
+        const bool isAutorouterOwned =
+                m_autorouterOwnedBoardItemIds.contains( boardItemId );
         const std::int64_t clearance =
                 std::max( 0, track->GetOwnClearance( track->GetLayer() ) );
         std::vector<ROUTING_OBSTACLE> obstacles;
@@ -1075,6 +1336,7 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
             ROUTING_OBSTACLE obstacle;
             obstacle.netCode = track->GetNetCode();
             obstacle.isExistingRoute = true;
+            obstacle.isAutorouterOwned = isAutorouterOwned;
             obstacle.boardItemId = boardItemId;
             appendLayers( obstacle.layers, track->GetLayerSet() );
             obstacle.blocksTracks = true;
@@ -1167,7 +1429,8 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
         // user-locked trace/via would violate KiCad's ownership contract.
         for( ROUTING_OBSTACLE& obstacle : obstacles )
         {
-            if( aSettings.allowRipupExisting && isIncludedNet && !track->IsLocked() )
+            if( ( aSettings.allowRipupExisting || isAutorouterOwned )
+                && isIncludedNet && !track->IsLocked() )
             {
                 aSnapshot.removableExistingRoutes.push_back( std::move( obstacle ) );
             }

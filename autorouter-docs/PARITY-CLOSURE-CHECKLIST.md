@@ -12,15 +12,47 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — exact geometry and recursive fixed-obstacle spring-over
+## Latest core milestone — transactional forced insertion, movable-copper shove,
+## neckdown, fanout, and optimizer rerouting
+
+The active pipeline now performs one normal routing search per item/pass (plus
+the source-style optional neck-width retry), enables negotiated rip-up on pass
+one, and tries the room/drill frontier without movable foreign route copper only
+after strict free-room search fails. Every resulting crossing is resolved by a
+single insertion transaction: generated and supported straight source traces
+can spring around the incoming route recursively, supported vias can move while
+retaining their normal trace contacts through bridges, and only unresolved
+victims consume the bounded rip-up budget. Pin-entry neckdown is represented by
+per-edge width/clearance metadata and complete failed searches can retry at the
+configured neck width.
+
+Fanout now uses dynamic connected/unconnected terminal sets, terminates on the
+first inserted drill (or a real same-layer target), relocates its synthetic
+landing to actual inserted copper, and preserves successful partial fanout work.
+The optimizer transactionally removes and reroutes whole native connection
+records, compares incompletes/vias/length lexicographically, preserves pad groups
+and branch contacts, and removes redundant via/trace tails safely. Active room
+cost accounting uses weighted geometric trace costs and the source's
+radius-scaled normal/plane via cost, including the pure-SMD discount.
+
+These are substantial active implementations, but **not full parity**. The
+negotiated room pass does not yet carry exact obstacle-room rip-up cost/state;
+source item chains/forks are not fully normalized; arbitrary convex/curved item
+shove, general padstacks, via movement optimization, and true parallel optimizer
+scheduling remain open. The remaining legacy visibility/raster fallback still
+uses compatibility cost units.
+
+## Previous core milestone — exact geometry and recursive fixed-obstacle spring-over
 
 [Geometry/spring-over report](CONVEX-SPRING-OVER-PARITY.md) adds arbitrary-precision
 rational line intersections, support-line polylines, bounded convex entrance and
 cutout semantics, and recursive two-direction fixed-obstacle contour replacement.
 The production orthogonal/rectangle adapter runs inside atomic insertion and
 publishes its checked replacement path. All 2,432 pinned Java records agree.
-This is **not** movable-copper shove, full convex room geometry, partial-progress
-forced insertion, neckdown, or complete batch/fanout parity. Those stay open.
+This milestone alone did not include movable-copper shove, full convex room
+geometry, partial-progress forced insertion, neckdown, or complete batch/fanout
+parity. Some bounded forms are now implemented as described above; the general
+cases remain open.
 
 ## Previous core milestone — normal contacts, atomic insertion, fanout ordering
 
@@ -29,9 +61,10 @@ adds source-tested normal-contact predicates, exact integer junction splitting,
 transactional candidate insertion/rip-up, allocation-free rollback restoration,
 and reference component/pin fanout ordering with actual bounded passes.
 It also identifies the variable-width output-model prerequisite for neckdown.
-**Full convex/rational geometry, forced displacement, shove/neckdown and complete
-batch/fanout behaviour are still missing.** See the report for exact limits and
-new proof; no full-port acceptance box is checked by this work.
+**Full convex/rational geometry and complete forced displacement, shove/neckdown,
+batch, and fanout behaviour remain incomplete.** See the latest milestone above
+for the bounded active subsets added since this earlier report; no full-port
+acceptance box is checked by this work.
 
 ## Previous core milestone — direct destination translation, 2026-09-08
 
@@ -165,11 +198,11 @@ Every row below is required or needs an explicit, justified host adaptation.
 | **7. Drill/via expansion** | **Partial.** Lazy rectangular drill pages, cutout ordering, full-stack room lookup, drill-layer expansion, SMD pin-centre substitution, and separate geometry invalidation/maze reset now run. Need nonrectangular/acute drill geometry, thin-room and forced-pad checks, masks, multiple via rules, blind/buried/microvia padstacks where upstream supports them, and incremental cross-attempt cache invalidation/reuse. | Multilayer fixtures with inactive layers, asymmetric pads, alternative via rules, blocked intermediate layers and drill spacing. |
 | **8. Routing costs and heuristic** | **Not equivalent overall.** The room frontier now uses reference weighted Euclidean distance and normalized bend detection; queue/distance primitives have Java oracles. Legacy batch score compatibility and UI direction/bend-unit mapping remain adaptations. The fallback retains grid-normalized lengths, fixed direction penalties and retry-scaled via costs, while the new drill frontier uses radius-scaled via cost (including the source-pin pure-SMD discount). The component/solder/inner-box destination estimate is now a direct, bit-tested translation, wired into both room frontiers through an explicit IU adapter. LegacyDestinationDistance remains isolated to the raster fallback; native UI cost mapping and target-region modeling still differ. Need exact preferred/nonpreferred costs, normal/plane via costs, rip-up costs, admissible destination estimates and ordering. Change them together with frontier state, not one coefficient at a time. | Numeric oracle plus path/order comparisons; no clearance/completion regression and measured time/memory. The prior isolated cost change was rejected for a large runtime regression. |
 | **9. Path location** | **Active rectangular 90/45 subset.** `FoundConnectionLocator45Degree` is no longer an alias: it locates a backtracked rectangular corridor using nearest door/overlap entries and reference corner construction, without searching again. Still need full convex/acute/thin-room, pad/trace/area attachment, neckdown and nonrectangular/multiple-padstack reconstruction. Rectangular through-drill reconstruction is active. The legacy locator and any-angle alias remain unported. | Every reconstructed edge and contact agrees with reference constraints before insertion; adversarial short/acute/narrow corridors. |
-| **10. Forced insertion and speculative undo** | **Partial transaction foundation, forced algorithm missing.** Active candidate insertion validates edges after speculative generated-route rip-up and commits copper/contact/usage state atomically; rollback restores saved indexes without allocation. Need `insertForcedTracePolyline`/via-equivalent operations, trace contact splitting, partial insertion failure, atomic rollback of geometry, contacts, occupancy and all search caches. The active checked-candidate transaction does not implement Java partial-progress forced insertion. | Failed insertions restore all internal state; successful insertions update actual copper. Editor acceptance undo is tested separately. |
-| **11. Shove, spring-over, neckdown** | **Fixed-obstacle spring-over slice active; shove and neckdown missing.** `TraceShover::SpringOverObstacles` now recursively wraps fixed rectangular obstacles in both directions during checked insertion, with a 20-level bound, strict replacement checks and cancellation rollback. `MazeTraceShover::Shorten` is still not shove. Need recursive local trace/via displacement, general compensated convex offsets and item eligibility, forced pin escapes and neckdown where legal. KiCad rule compliance must not be relaxed to imitate reference violations. | Congested fixtures that require displacement rather than reroute alone, exact affected-item logs, and full DRC after each committed operation. |
-| **12. Batch scheduling and rip-up** | **Partial/alternate.** Shortest-edge connected-component growth and negotiated crossing are not reference item selection. Need equivalent item/net ordering, routing direction (including planes), pass escalation, connection-chain rip-up, stopping/cycle detection and best-board restoration based on physical quality. | Per-pass connected sets, attempted item order, removed items, stop decisions and retained checkpoints compared to reference. |
-| **13. Fanout** | **Partial.** Source-tested component/pin sorting now drives planning and actual bounded fanout passes. Synthetic escape planning and safe cleanup remain. Need full source pass costs/time policies, dense/BGA breakout, actual feasible via landing search, fanout pass policy and reference handling of successful versus failed fanouts. | Fine-pitch/BGA/through-hole/mixed fixtures, constrained layers and via-in-pad enabled/disabled; no dangling vias/stubs. |
-| **14. Optimization** | **Missing beyond guarded shortening/cleanup.** Need 90/45/any-angle pull-tight, contact-preserving corner movement, via reposition/removal, plane/fanout via optimization, rerouting candidate selection/scoring, pass termination and actual parallel optimizer semantics (current multi-threaded class delegates serially). | Completion and full DRC must never degrade; compare via count, length, candidate scores, time and peak memory. |
+| **10. Forced insertion and speculative undo** | **Partial, active.** Candidate insertion validates edges and resolves its full victim set inside one occupancy/board transaction. It recursively springs supported generated/source traces, moves supported vias with normal-contact bridges, publishes every replacement, and rolls back geometry, contacts, route maps and usage on failure/cancellation. Need exact Java partial-progress `insertForcedTracePolyline` semantics, general item/contact splitting, all cache invalidation, conduction-area mutation, and unsupported item types. | Failed insertions restore all internal state; successful insertions update actual copper. Editor acceptance undo is tested separately. |
+| **11. Shove, spring-over, neckdown** | **Partial, active bounded subset.** Recursive two-direction fixed and movable straight-trace spring-over runs during checked insertion. Uniform vias with supported trace/area contacts can move atomically; bridges preserve old-centre contacts. Pin-entry and whole-connection neck-width retries carry variable edge styles. Need general compensated convex/curved shove, source-equivalent recursion/stack limits and alternatives, forced pad displacement, arbitrary drill contact graphs, and exact partial neckdown lengths. KiCad rule compliance must not be relaxed to imitate reference violations. | Congested fixtures that require displacement rather than reroute alone, exact affected-item logs, and full DRC after each committed operation. |
+| **12. Batch scheduling and rip-up** | **Partial, active source-order adapter.** The batch now schedules real pads in stable snapshot item order, recomputes dynamic connected/unconnected terminal sets, performs one normal search plus optional neck retry per item/pass, enables pass-one rip-up, retains successful net components, and checkpoints the strongest safe result. The negotiated room retry can traverse movable copper and insertion resolves the concrete victims. Need exact source item IDs/iteration across generated traces and vias, obstacle-room rip-up cost/state (`startRipupCosts * passNo`, detour/fanout protection/randomization), full stopping/score/history restoration, connection-chain removal and reference time-limit semantics. | Per-pass connected sets, attempted item order, removed items and costs, stop decisions and retained checkpoints compared to reference. |
+| **13. Fanout** | **Partial, active.** Source-tested component/pin sorting drives actual bounded passes. Searches use dynamic connected/unconnected item terminals, small-net nearest-target fallback, source pass-scaled per-pin budgets, first-drill/same-layer termination, actual landing relocation, selected via dimensions, and successful partial-work retention. Failed synthetic landings are removed before ordinary routing. Need exact source padstack/rule candidates and drill rooms, obstacle rip-up costs/fanout protection, dense BGA policy, all pass convergence counters and broad corpus proof. | Fine-pitch/BGA/through-hole/mixed fixtures, constrained layers and via-in-pad enabled/disabled; no dangling vias/stubs. |
+| **14. Optimization** | **Partial, active serial implementation.** The optimizer removes and reroutes complete native connection records transactionally, alternates bounded maze retries with strict pull-tight candidates, compares incompletes/vias/length lexicographically, preserves real pad groups and external branch contacts, and trims redundant via/trace tails. Need exact `Connection.get()` chain/fork collection and normalization, source sorted via/trace item iteration, increased/trace-scaled rip-up phases, score thresholds, 90/45/any-angle pull-tight, via reposition/removal and plane/fanout-via optimization. `BatchOptimizerMultiThreaded` still delegates serially and lacks global-optimal/greedy/hybrid scheduling. | Completion and full DRC must never degrade; compare via count, length, candidate scores, time and peak memory. |
 | **15. Plane semantics** | **Improved but partial.** Host refill/repair fixes the default 555 island failure, but its no-via case still times out. Repair snapshots freeze earlier job-owned copper together with user copper; preserve ownership and mutable contacts across refill before implementing safe removal/rerouting. Core still uses sampled plane targets rather than full conduction-region search, has no dynamic void/split model during routing and no reference-equivalent plane stopping/via optimization. Exact island anchors are a host compatibility measure, not that port. | Outer/inner planes, multiple islands, holes, thermals, split/merged pours, zero-initial-task nets, mixed-net tracks cutting pours, repeated refill, and original/job-owned-copper preservation during rejected/accepted repairs. |
 | **16. Integration, safety and lifecycle** | **Partial.** Native action, settings, worker cancellation, preview, private validation and one track/via acceptance commit exist. Need complete rejection/undo/redo tests with zones and existing copper, preview/refilled-zone consistency, unsaved/custom rules and classes, invalid/unsupported-input handling, concurrent jobs/cancellation latency and no accidental live model access. Acceptance currently commits routing items; zone refill display/undo is not fully covered. | GUI tests on the built application, board serialization equality after reject/cancel, one-step undo/redo, exact post-accept refill equivalence and distinct validation-failure states. |
 
@@ -220,9 +253,12 @@ host-specific and does not need a Java counterpart.
 3. Port an **active end-to-end** room/door search + locator + transactional
    inserter, extending the active rectangular single/multilayer slice to exact 45/general convex cases and general via rules.
    Do not substitute another graph/grid router and rename it.
-4. Add forced shove/spring-over/neckdown, then match batch and fanout decisions.
-5. Port optimization and deterministic scheduling; validate quality and resource
-   budgets across the broader corpus before calling practical parity achieved.
+4. Extend the active forced shove/spring-over/neckdown subset to general item
+   geometry and exact partial insertion; then match obstacle-room rip-up, batch,
+   and fanout decisions.
+5. Complete optimizer chain/via behavior and parallel scheduling; validate
+   quality and resource budgets across the broader corpus before calling
+   practical parity achieved.
 
 Do not mark the unchecked rows done because the current three boards route.
 

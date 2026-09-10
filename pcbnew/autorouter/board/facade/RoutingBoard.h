@@ -28,8 +28,12 @@ public:
     void AddRoute( const ROUTING_CONNECTION& aRoute );
     void RemoveRoute( const ROUTING_CONNECTION& aRoute );
     void ClearRoutes();
+    /** Move a planning-only terminal to the drill selected by dynamic fanout. */
+    void RelocateSyntheticPad( std::size_t aPad, ROUTER_POINT aPosition );
 
     bool Connected( std::size_t aFirstPad, std::size_t aSecondPad ) const;
+    /** True when the pad's physical same-net component reaches another copper layer. */
+    bool ConnectedSetTouchesOtherLayer( std::size_t aPad, int aLayer ) const;
     std::vector<std::vector<std::size_t>> ConnectedPadGroups( int aNetCode ) const;
     int CountMissing( const ROUTING_NET& aNet ) const;
     std::vector<ROUTING_TERMINAL> Terminals( std::size_t aPad ) const;

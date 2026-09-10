@@ -34,6 +34,7 @@ class AUTOROUTE_BATCH_LOOP
 public:
     bool Observe( int aRoutedConnections, int aRipups )
     {
+        ++m_passes;
         if( m_seen && aRoutedConnections <= m_lastRouted && aRipups == m_lastRipups )
             ++m_stagnantPasses;
         else
@@ -42,7 +43,12 @@ public:
         m_lastRouted = aRoutedConnections;
         m_lastRipups = aRipups;
         m_seen = true;
-        return m_stagnantPasses >= 2;
+        // BatchAutorouter does not apply stagnation termination before pass
+        // eight and requires ten consecutive no-improvement passes. The
+        // native score is lexicographic (DRC, incompletes, vias, length), but
+        // routed/rip-up continuity is the pass-loop signal available before
+        // a checkpoint is materialized.
+        return m_passes >= 8 && m_stagnantPasses >= 10;
     }
 
     int StagnantPasses() const { return m_stagnantPasses; }
@@ -51,6 +57,7 @@ private:
     int  m_lastRouted = 0;
     int  m_lastRipups = 0;
     int  m_stagnantPasses = 0;
+    int  m_passes = 0;
     bool m_seen = false;
 };
 

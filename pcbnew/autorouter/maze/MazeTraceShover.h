@@ -19,9 +19,9 @@ namespace KICAD_AUTOROUTER
 
 class MAZE_SEARCH_ENGINE;
 
-/** Legacy line-of-sight shortening, NOT Freerouting's trace shove algorithm.
- * The historical filename is retained for navigation; this cannot displace
- * neighbouring traces/vias and must not be treated as a completed translation.
+/** Contact-preserving line-of-sight pull-tight used by the batch optimizer.
+ * Movable-neighbour displacement is handled by the checked forced inserter;
+ * this local operation only accepts strict, immediately insertable copper.
  */
 class MAZE_TRACE_SHOVER
 {

@@ -83,7 +83,8 @@ std::int64_t routeWidth( const BOARD_SNAPSHOT& aBoard, const ROUTING_NET& aNet )
 
 bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
                                const ROUTING_PAD& aSource,
-                               const ROUTING_PAD& aLanding )
+                               const ROUTING_PAD& aLanding,
+                               bool aAllowSameLayerFinish = false )
 {
     if( !aLanding.isFanoutTarget || aLanding.fanoutSourceLayer < 0
         || aLanding.fanoutTargetLayer < 0 || aConnection.nodes.size() < 2 )
@@ -107,7 +108,10 @@ bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
     for( std::size_t index = 0; index < aConnection.nodes.size(); ++index )
     {
         const ROUTER_NODE& node = aConnection.nodes[index];
-        if( !sawTransition && node.layer == aLanding.fanoutSourceLayer
+        const bool sameLayerDestination = aAllowSameLayerFinish
+                                          && index + 1 == aConnection.nodes.size();
+        if( !sameLayerDestination && !sawTransition
+            && node.layer == aLanding.fanoutSourceLayer
             && distance( node.point, aSource.position ) > static_cast<double>( maximum ) )
         {
             return false;
@@ -135,10 +139,12 @@ bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
         }
     }
 
-    // A synthetic landing on a different layer must be reached through its
-    // fanout via.  Returning a same-layer path would make the later graph
-    // rewrite look connected while it has no physical layer transition.
-    return sawTransition || aLanding.fanoutSourceLayer == aLanding.fanoutTargetLayer;
+    // A synthetic landing on a different layer must normally be reached
+    // through its fanout via.  Dynamic fanout is the exception: reaching a
+    // real same-layer destination before a drill is a completed fanout
+    // attempt in the reference implementation.
+    return sawTransition || aAllowSameLayerFinish
+           || aLanding.fanoutSourceLayer == aLanding.fanoutTargetLayer;
 }
 
 
@@ -252,6 +258,9 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
         ROUTING_CONNECTION connection;
         connection.complete = true;
         connection.isExistingBoardRoute = true;
+        connection.isAutorouterOwned = std::all_of(
+                pieces.begin(), pieces.end(), []( const ROUTING_OBSTACLE* aPiece )
+                { return aPiece->isAutorouterOwned; } );
         connection.isShoveMovable = false;
         connection.sourceBoardItemIds = { id };
         connection.netCode = copper.front()->netCode;
@@ -933,25 +942,10 @@ BATCH_AUTOROUTER::orderNets( const BOARD_SNAPSHOT& aBoard ) const
             result.push_back( { &net, netHalfPerimeter( aBoard, net ) } );
     }
 
-    // Stable ordering is important for parity investigations and makes routing
-    // results repeatable even when two nets have identical geometry.
-    std::stable_sort( result.begin(), result.end(),
-                      []( const NET_ORDER_ENTRY& aLeft, const NET_ORDER_ENTRY& aRight )
-                      {
-                          if( aLeft.net->netClassPriority != aRight.net->netClassPriority )
-                          {
-                              return aLeft.net->netClassPriority
-                                     > aRight.net->netClassPriority;
-                          }
-
-                          if( aLeft.net->padIndices.size() != aRight.net->padIndices.size() )
-                              return aLeft.net->padIndices.size() > aRight.net->padIndices.size();
-
-                          if( aLeft.halfPerimeter != aRight.halfPerimeter )
-                              return aLeft.halfPerimeter > aRight.halfPerimeter;
-
-                          return aLeft.net->netCode < aRight.net->netCode;
-                      } );
+    // Freerouting v2.3 deliberately disabled the experimental airline-length
+    // sort because it regressed convergence. Preserve the adapter's stable
+    // source order; do not silently replace item iteration with a
+    // largest-net/longest-airline heuristic.
 
     return result;
 }
@@ -999,7 +993,9 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                                  const AUTOROUTE_ENGINE& aEngine,
                                  std::vector<ROUTING_CONNECTION>& aConnections,
                                  int& aExpandedNodes, int& aRipups, const ROUTER_CANCEL_CALLBACK& aCancel,
-                                 const ROUTER_SEARCH_PROGRESS_CALLBACK& aSearchProgress ) const
+                                 const ROUTER_SEARCH_PROGRESS_CALLBACK& aSearchProgress,
+                                 std::size_t aPreferredPad,
+                                 int aMaximumNewConnections ) const
 {
     const auto netStarted = std::chrono::steady_clock::now();
 
@@ -1007,7 +1003,9 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
     {
         std::ostringstream message;
         message << "BEGIN net code=" << aNet.netCode << " pads=" << aNet.padIndices.size()
-                << " connections=" << aNet.connections.size() << " retry=" << aRetry;
+                << " connections=" << aNet.connections.size() << " retry=" << aRetry
+                << " preferredPad=" << aPreferredPad
+                << " maxNew=" << aMaximumNewConnections;
         autorouterDebugLog( message.str() );
     }
 
@@ -1092,26 +1090,59 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
     };
     refreshContacts();
 
-    // A ratsnest is an electrical graph, not a routing order.  On a large
-    // multi-pad net (the Arduino board's ground net is a good example), the
-    // first edge in that graph can be a long, highly-congested diagonal.  A
-    // batch router should grow a connected tree from short legal edges first;
-    // otherwise every retry can spend the full A* expansion budget on the
-    // same pathological edge before any useful copper is committed.  Keep
-    // the net ordering unchanged, but choose the next edge from this net
-    // using the same connected-component information maintained below.
+    // The source router consumes its natural board-item order. The KiCad
+    // adapter's ratsnest edge order is the stable native representation of
+    // that order; an earlier shortest-edge/component-class sort was a
+    // separate heuristic and produced systematically different congestion
+    // decisions from the reference.
     std::vector<std::pair<std::size_t, std::size_t>> pendingConnections = aNet.connections;
 
-    auto connectionDistance = [&]( const std::pair<std::size_t, std::size_t>& aConnection )
+    // BatchAutorouter.getAutorouteItems() schedules one natural-order board
+    // item at a time. Model that item by its real pad representative and let
+    // the worker contact graph supply its complete connected/unconnected
+    // sets. A ratsnest edge is only a fallback when no item was requested
+    // (the isolated fanout stage and data-only callers).
+    if( aPreferredPad != std::numeric_limits<std::size_t>::max() )
     {
-        if( aConnection.first >= aBoard.pads.size() || aConnection.second >= aBoard.pads.size() )
-            return std::numeric_limits<long double>::max();
+        if( aPreferredPad >= aBoard.pads.size()
+            || aBoard.pads[aPreferredPad].netCode != aNet.netCode )
+        {
+            flushNewConnections();
+            return false;
+        }
 
-        const ROUTER_POINT& first = aBoard.pads[aConnection.first].position;
-        const ROUTER_POINT& second = aBoard.pads[aConnection.second].position;
-        return std::abs( static_cast<long double>( first.x ) - second.x )
-               + std::abs( static_cast<long double>( first.y ) - second.y );
-    };
+        std::optional<std::size_t> unconnectedTarget;
+        for( std::size_t target : aNet.planeTargetIndices )
+        {
+            if( target < aBoard.pads.size()
+                && !aOccupancy.Board()->Connected( aPreferredPad, target ) )
+            {
+                unconnectedTarget = target;
+                break;
+            }
+        }
+
+        if( !unconnectedTarget )
+        {
+            for( std::size_t target : aNet.padIndices )
+            {
+                if( target < aBoard.pads.size() && target != aPreferredPad
+                    && !aOccupancy.Board()->Connected( aPreferredPad, target ) )
+                {
+                    unconnectedTarget = target;
+                    break;
+                }
+            }
+        }
+
+        if( !unconnectedTarget )
+        {
+            flushNewConnections();
+            return true;
+        }
+
+        pendingConnections = { { aPreferredPad, *unconnectedTarget } };
+    }
 
     while( !pendingConnections.empty() )
     {
@@ -1125,46 +1156,8 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             return false;
         }
 
-        std::size_t selected = 0;
-        int          selectedClass = std::numeric_limits<int>::max();
-        long double  selectedDistance = std::numeric_limits<long double>::max();
-
-        for( std::size_t index = 0; index < pendingConnections.size(); ++index )
-        {
-            const auto& [candidateSource, candidateTarget] = pendingConnections[index];
-            if( candidateSource >= aBoard.pads.size() || candidateTarget >= aBoard.pads.size() )
-                continue;
-
-            const bool candidatePlane = aBoard.pads[candidateTarget].isPlaneTarget;
-            const bool sourceConnected = activePads.contains( candidateSource );
-            const bool targetConnected = activePads.contains( candidateTarget );
-
-            // Class 0 grows the existing component (including a fanout stub
-            // into a plane), class 1 starts the next shortest component, and
-            // class 2 is a fallback for redundant/already-connected edges.
-            const int candidateClass = candidatePlane
-                                               ? sourceConnected ? 0 : 1
-                                               : sourceConnected != targetConnected ? 0
-                                                                                     : ( !sourceConnected
-                                                                                                 && !targetConnected
-                                                                                         ? 1
-                                                                                         : 2 );
-            const long double candidateDistance = connectionDistance(
-                    pendingConnections[index] );
-
-            if( candidateClass < selectedClass
-                || ( candidateClass == selectedClass
-                     && candidateDistance < selectedDistance ) )
-            {
-                selected = index;
-                selectedClass = candidateClass;
-                selectedDistance = candidateDistance;
-            }
-        }
-
-        const auto [sourceIndex, targetIndex] = pendingConnections[selected];
-        pendingConnections.erase( pendingConnections.begin()
-                                  + static_cast<std::ptrdiff_t>( selected ) );
+        const auto [sourceIndex, targetIndex] = pendingConnections.front();
+        pendingConnections.erase( pendingConnections.begin() );
 
         if( sourceIndex >= aBoard.pads.size() || targetIndex >= aBoard.pads.size() )
         {
@@ -1179,6 +1172,9 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         std::size_t routeTargetIndex = targetIndex;
 
         const bool targetIsPlane = aBoard.pads[targetIndex].isPlaneTarget;
+        const bool requestedFanoutTask =
+                aBoard.pads[targetIndex].isFanoutTarget
+                && aBoard.pads[targetIndex].fanoutSourcePadIndex == sourceIndex;
 
         // Select the connected component independently of ratsnest ordering.
         // For ordinary nets it becomes the destination set below, matching
@@ -1234,22 +1230,88 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
 
             std::vector<ROUTING_TERMINAL> starts;
             std::vector<ROUTING_TERMINAL> destinations;
+            std::vector<std::vector<ROUTING_TERMINAL>> destinationAttempts;
             // Upstream AutorouteConnectionRouter routes from the unconnected
             // set to the selected item's connected set for ordinary nets.
             // Preserve all legal pad terminals, not just the ratsnest pair.
             // Fanout retains its explicit escape transition. Plane routing
             // starts at the entire connected set (AutorouteConnectionRouter),
             // not just the chosen synthetic landing on one layer.
-            const bool fanoutTask = target.isFanoutTarget
-                                    && target.fanoutSourcePadIndex == routeSourceIndex;
-            if( !fanoutTask && targetIsPlane && !source.isExactTarget )
+            if( requestedFanoutTask )
+            {
+                starts = aOccupancy.Board()->Terminals( sourceIndex );
+
+                // RoutingBoard.fanout() searches the pin's complete
+                // unconnected item set.  Real pad representatives expose
+                // their attached trace/via terminals through the worker
+                // board, so this remains dynamic after every insertion and
+                // rip-up instead of freezing one ratsnest edge.
+                std::vector<std::size_t> unconnected;
+                for( std::size_t index : aNet.padIndices )
+                {
+                    if( index < aBoard.pads.size() && index != sourceIndex
+                        && !aBoard.pads[index].isFanoutTarget
+                        && !aBoard.pads[index].isPlaneTarget
+                        && !aOccupancy.Board()->Connected( sourceIndex, index ) )
+                    {
+                        unconnected.push_back( index );
+                    }
+                }
+                std::stable_sort(
+                        unconnected.begin(), unconnected.end(),
+                        [&]( std::size_t aLeft, std::size_t aRight )
+                        {
+                            const double left = distance( source.position,
+                                                          aBoard.pads[aLeft].position );
+                            const double right = distance( source.position,
+                                                           aBoard.pads[aRight].position );
+                            return left != right ? left < right : aLeft < aRight;
+                        } );
+                for( std::size_t index : unconnected )
+                {
+                    auto terminals = aOccupancy.Board()->Terminals( index );
+                    destinations.insert( destinations.end(), terminals.begin(),
+                                         terminals.end() );
+                }
+
+                // RoutingBoard.fanout() deliberately avoids searching a
+                // small multi-item net as one broad target set on its first
+                // attempt. For one to four unconnected items it first tries
+                // only the item whose bounding-box centre is closest to the
+                // pin; only a failed search falls back to the complete set.
+                // Larger nets use the complete set immediately. The native
+                // terminals are exact item representatives, so preserving
+                // them as separate attempts reproduces that source decision
+                // without inventing another ratsnest edge.
+                if( !destinations.empty() && unconnected.size() <= 4 )
+                {
+                    destinationAttempts.push_back(
+                            aOccupancy.Board()->Terminals( unconnected.front() ) );
+
+                    if( unconnected.size() > 1 )
+                        destinationAttempts.push_back( destinations );
+                }
+                else if( !destinations.empty() )
+                {
+                    destinationAttempts.push_back( destinations );
+                }
+
+                // Plane-only nets have no ordinary pad destination to place
+                // in the item-set search.  Retain the preflighted synthetic
+                // landing fallback for that case; passing only an explicit
+                // start would disable the local fanout construction without
+                // providing a real destination in return.
+                if( destinations.empty() )
+                    starts.clear();
+            }
+            else if( targetIsPlane && !source.isExactTarget )
             {
                 // Post-refill repair can request an exact island anchor. That
                 // host-only subproblem must retain its specified start point;
                 // it is not a general connected-set search request.
                 starts = aOccupancy.Board()->Terminals( routeSourceIndex );
             }
-            else if( !fanoutTask && aNet.planeTargetIndices.empty() )
+            else if( aNet.planeTargetIndices.empty() )
             {
                 const std::size_t connectedRoot = findRoot( routeSourceIndex );
                 destinations = aOccupancy.Board()->Terminals( routeSourceIndex );
@@ -1263,87 +1325,110 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                 }
             }
 
-            // Honour the explicit per-connection attempt budget. The room
-            // engine will replace this experimental raster retry mechanism.
-            const int attemptsThisPass = std::max( 1, aSettings.maxIterations );
+            // An empty explicit set selects the ordinary pair/synthetic
+            // landing behavior in MAZE_SEARCH_ENGINE. All non-fanout routes
+            // have exactly one destination attempt.
+            if( destinationAttempts.empty() )
+                destinationAttempts.push_back( destinations );
 
-            for( int iteration = 0; iteration < attemptsThisPass; ++iteration )
+            for( std::size_t destinationAttempt = 0;
+                 destinationAttempt < destinationAttempts.size() && !connection;
+                 ++destinationAttempt )
             {
-                if( aCancel && aCancel() )
-                {
-                    flushNewConnections();
-                    return false;
-                }
+                const std::vector<ROUTING_TERMINAL>& searchDestinations =
+                        destinationAttempts[destinationAttempt];
 
-                int expanded = 0;
-                const int expandedBeforeSearch = aExpandedNodes;
-                const auto searchStarted = std::chrono::steady_clock::now();
-                const ROUTER_SEARCH_PROGRESS_CALLBACK searchProgress =
-                        [&]( int aSearchExpanded )
+                // AutorouteConnectionRouter performs one normal-width search
+                // for an item in each batch pass, followed only by its
+                // optional neck-width search.  The old native implementation
+                // multiplied this work by maxIterations while also refining
+                // the grid and retry costs; a single difficult item could
+                // therefore consume millions of nodes before the next item
+                // was seen.  Pass-level retry/rip-up state is aRetry.
+                for( int iteration = 0; iteration < 1; ++iteration )
                 {
-                    if( aSearchProgress )
-                        aSearchProgress( expandedBeforeSearch + expanded + aSearchExpanded );
-                };
-                connection = aEngine.AutorouteConnection( source, target, aRetry + iteration,
-                                                           expanded, aCancel, searchProgress,
-                                                           starts, destinations );
-                aExpandedNodes += expanded;
+                    if( aCancel && aCancel() )
+                    {
+                        flushNewConnections();
+                        return false;
+                    }
 
-                // This is distinct from a pin-entry neckdown.  Freerouting's
-                // AutorouteConnectionRouter retries a complete failed search
-                // at the configured neck width, so a narrow corridor can be
-                // discovered by the maze itself rather than only after a
-                // normal-width path reaches a terminal pad.  The retry owns a
-                // separate immutable engine: its spatial padding, room
-                // clearance predicates, output edge styles, and strict
-                // insertion all agree on the selected width.
-                int neckExpanded = 0;
-                const std::int64_t normalWidth = routeWidth( aBoard, aNet );
-                const std::int64_t neckWidth = std::max<std::int64_t>(
-                        0, aSettings.neckWidthIU );
-                if( !connection && neckWidth > 0 && neckWidth < normalWidth
-                    && !( aCancel && aCancel() ) )
-                {
-                    const int expandedBeforeNeckSearch = aExpandedNodes;
-                    const ROUTER_SEARCH_PROGRESS_CALLBACK neckSearchProgress =
+                    int expanded = 0;
+                    const int expandedBeforeSearch = aExpandedNodes;
+                    const auto searchStarted = std::chrono::steady_clock::now();
+                    const ROUTER_SEARCH_PROGRESS_CALLBACK searchProgress =
                             [&]( int aSearchExpanded )
                     {
                         if( aSearchProgress )
-                            aSearchProgress( expandedBeforeNeckSearch + neckExpanded
-                                             + aSearchExpanded );
+                            aSearchProgress( expandedBeforeSearch + expanded + aSearchExpanded );
                     };
-                    AUTOROUTE_ENGINE neckEngine( aBoard, aSettings, aOccupancy, 0,
-                                                  std::nullopt, aNet.netCode, neckWidth );
-                    connection = neckEngine.AutorouteConnection(
-                            source, target, aRetry + iteration, neckExpanded, aCancel,
-                            neckSearchProgress, starts, destinations );
-                    aExpandedNodes += neckExpanded;
-                }
+                    ROUTING_PAD searchTarget = target;
+                    if( !requestedFanoutTask )
+                        searchTarget.isFanoutTarget = false;
+                    connection = aEngine.AutorouteConnection(
+                            source, searchTarget, aRetry, expanded, aCancel,
+                            searchProgress, starts, searchDestinations );
+                    aExpandedNodes += expanded;
 
-                if( autorouterDebugEnabled() )
-                {
-                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  std::chrono::steady_clock::now()
-                                                          - searchStarted )
-                                                  .count();
-                    std::ostringstream message;
-                    message << "search result net=" << aNet.netCode << " sourcePad="
-                            << routeSourceIndex << " targetPad=" << candidate
-                            << " iteration=" << iteration << " found=" << connection.has_value()
-                            << " expanded=" << expanded << " neckExpanded=" << neckExpanded
-                            << " neckWidth=" << neckWidth << " elapsed=" << elapsed << " ms";
-                    autorouterDebugLog( message.str() );
-                }
+                    // This is distinct from a pin-entry neckdown.  Freerouting's
+                    // AutorouteConnectionRouter retries a complete failed search
+                    // at the configured neck width, so a narrow corridor can be
+                    // discovered by the maze itself rather than only after a
+                    // normal-width path reaches a terminal pad.  The retry owns a
+                    // separate immutable engine: its spatial padding, room
+                    // clearance predicates, output edge styles, and strict
+                    // insertion all agree on the selected width.
+                    int neckExpanded = 0;
+                    const std::int64_t normalWidth = routeWidth( aBoard, aNet );
+                    const std::int64_t neckWidth = std::max<std::int64_t>(
+                            0, aSettings.neckWidthIU );
+                    if( !connection && neckWidth > 0 && neckWidth < normalWidth
+                        && !( aCancel && aCancel() ) )
+                    {
+                        const int expandedBeforeNeckSearch = aExpandedNodes;
+                        const ROUTER_SEARCH_PROGRESS_CALLBACK neckSearchProgress =
+                                [&]( int aSearchExpanded )
+                        {
+                            if( aSearchProgress )
+                                aSearchProgress( expandedBeforeNeckSearch + neckExpanded
+                                                 + aSearchExpanded );
+                        };
+                        AUTOROUTE_ENGINE neckEngine( aBoard, aSettings, aOccupancy, 0,
+                                                      std::nullopt, aNet.netCode, neckWidth );
+                        connection = neckEngine.AutorouteConnection(
+                                source, searchTarget, aRetry, neckExpanded, aCancel,
+                                neckSearchProgress, starts, searchDestinations );
+                        aExpandedNodes += neckExpanded;
+                    }
 
-                if( connection )
-                {
-                    routeSourceIndex = connection->fromPadIndex < aBoard.pads.size()
-                                               ? connection->fromPadIndex : routeSourceIndex;
-                    routeTargetIndex = connection->toPadIndex < aBoard.pads.size()
-                                               ? connection->toPadIndex : candidate;
-                    source = aBoard.pads[routeSourceIndex];
-                    target = aBoard.pads[routeTargetIndex];
-                    break;
+                    if( autorouterDebugEnabled() )
+                    {
+                        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      std::chrono::steady_clock::now()
+                                                              - searchStarted )
+                                                      .count();
+                        std::ostringstream message;
+                        message << "search result net=" << aNet.netCode << " sourcePad="
+                                << routeSourceIndex << " targetPad=" << candidate
+                                << " destinationAttempt=" << destinationAttempt
+                                << " destinations=" << searchDestinations.size()
+                                << " iteration=" << iteration
+                                << " found=" << connection.has_value()
+                                << " expanded=" << expanded << " neckExpanded=" << neckExpanded
+                                << " neckWidth=" << neckWidth << " elapsed=" << elapsed << " ms";
+                        autorouterDebugLog( message.str() );
+                    }
+
+                    if( connection )
+                    {
+                        routeSourceIndex = connection->fromPadIndex < aBoard.pads.size()
+                                                   ? connection->fromPadIndex : routeSourceIndex;
+                        routeTargetIndex = connection->toPadIndex < aBoard.pads.size()
+                                                   ? connection->toPadIndex : candidate;
+                        source = aBoard.pads[routeSourceIndex];
+                        target = aBoard.pads[routeTargetIndex];
+                        break;
+                    }
                 }
             }
 
@@ -1362,6 +1447,7 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             continue;
         }
 
+        const bool searchMarkedFanout = connection->isFanoutConnection;
         connection->fromPadIndex = routeSourceIndex;
         connection->toPadIndex = routeTargetIndex;
         connection->isPlaneConnection = target.isPlaneTarget;
@@ -1381,11 +1467,19 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             fanoutSource = &target;
             fanoutLanding = &source;
         }
-        connection->isFanoutConnection = fanoutSource != nullptr;
+        if( searchMarkedFanout && fanoutSource == nullptr )
+        {
+            fanoutSource = &aBoard.pads[sourceIndex];
+            fanoutLanding = &aBoard.pads[targetIndex];
+        }
+        connection->isFanoutConnection = searchMarkedFanout || fanoutSource != nullptr;
 
         if( connection->isFanoutConnection )
         {
-            if( !fanoutEscapeFitsEnvelope( *connection, *fanoutSource, *fanoutLanding ) )
+            const bool sameLayerFinish = searchMarkedFanout
+                                         && routeTargetIndex != targetIndex;
+            if( !fanoutEscapeFitsEnvelope( *connection, *fanoutSource,
+                                           *fanoutLanding, sameLayerFinish ) )
             {
                 if( autorouterDebugEnabled() )
                     autorouterDebugLog( "fanout escape rejected outside configured envelope" );
@@ -1497,6 +1591,12 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         newConnections.push_back( std::move( *connection ) );
 
         refreshContacts();
+
+        if( aMaximumNewConnections > 0
+            && static_cast<int>( newConnections.size() ) >= aMaximumNewConnections )
+        {
+            break;
+        }
     }
 
     flushNewConnections();
@@ -1516,7 +1616,8 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         autorouterDebugLog( message.str() );
     }
 
-    return allConnectionsRouted;
+    return allConnectionsRouted
+           || ( aMaximumNewConnections > 0 && newConnectionCount > 0 );
 }
 
 
@@ -1554,6 +1655,30 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
         // replacement; unchanged static copper is deliberately not output.
         if( connection.isExistingBoardRoute )
             continue;
+        if( autorouterDebugEnabled() )
+        {
+            int transitions = 0;
+            for( std::size_t index = 1; index < connection.nodes.size(); ++index )
+                if( connection.nodes[index - 1].layer != connection.nodes[index].layer )
+                    ++transitions;
+            std::ostringstream message;
+            message << "ROUTE_GEOMETRY fanout=" << connection.isFanoutConnection
+                    << " net=" << connection.netCode
+                    << " fromPad=" << connection.fromPadIndex
+                    << " toPad=" << connection.toPadIndex
+                    << " nodes=" << connection.nodes.size()
+                    << " transitions=" << transitions;
+            if( !connection.nodes.empty() )
+            {
+                message << " first=(" << connection.nodes.front().point.x << ','
+                        << connection.nodes.front().point.y << ",L"
+                        << connection.nodes.front().layer << ") last=("
+                        << connection.nodes.back().point.x << ','
+                        << connection.nodes.back().point.y << ",L"
+                        << connection.nodes.back().layer << ')';
+            }
+            autorouterDebugLog( message.str() );
+        }
         if( connection.isFanoutConnection )
             ++aResult.metrics.fanoutConnections;
 
@@ -1598,7 +1723,7 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
     std::set<int> completeNets;
     ROUTING_BOARD copper( aBoard, aSettings );
     for( const auto& connection : aConnections )
-        if( !connection.isExistingBoardRoute )
+        if( !connection.isExistingBoardRoute || connection.isAutorouterOwned )
             copper.AddRoute( connection );
     for( const ROUTING_NET& net : aBoard.nets )
     {
@@ -1627,6 +1752,35 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
         for( const std::string& id : connection.sourceBoardItemIds )
             if( removableSourceIds.contains( id ) )
                 removed.insert( id );
+    }
+
+    // A job-owned BOARD_ITEM that disappeared from the final worker route set
+    // was conventionally ripped up rather than shoved.  Delete it from the
+    // private KiCad board before applying replacement geometry.  Unchanged
+    // job-owned routes remain represented by static records and are retained.
+    std::set<std::string> autorouterOwnedIds;
+    for( const ROUTING_OBSTACLE& obstacle : aBoard.removableExistingRoutes )
+    {
+        if( obstacle.isExistingRoute && obstacle.isAutorouterOwned
+            && !obstacle.boardItemId.empty() )
+        {
+            autorouterOwnedIds.insert( obstacle.boardItemId );
+        }
+    }
+
+    for( const std::string& id : autorouterOwnedIds )
+    {
+        const bool retainedAsHostItem = std::any_of(
+                aConnections.begin(), aConnections.end(), [&]( const ROUTING_CONNECTION& route )
+                {
+                    return route.complete && route.isExistingBoardRoute
+                           && std::find( route.sourceBoardItemIds.begin(),
+                                         route.sourceBoardItemIds.end(), id )
+                                      != route.sourceBoardItemIds.end();
+                } );
+
+        if( !retainedAsHostItem )
+            removed.insert( id );
     }
 
     if( aSettings.allowRipupExisting )
@@ -1819,11 +1973,16 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     result.metrics.totalConnections = totalConnections;
     ROUTING_OCCUPANCY occupancy( aSettings.gridStepIU );
     occupancy.InitializeBoard( board, aSettings );
-    // AddStatic intentionally does not make source copper satisfy electrical
-    // tasks.  It does, however, expose represented host routes to forced
-    // insertion conflict discovery.
+    // Protected source copper remains collision-only.  Copper materialized by
+    // an earlier stage of this same job has a host UUID too, but stays a live
+    // worker route so rip-up updates connectivity during post-refill repair.
     for( const ROUTING_CONNECTION& route : staticExistingRoutes )
-        occupancy.AddStatic( route );
+    {
+        if( route.isAutorouterOwned )
+            occupancy.Add( route );
+        else
+            occupancy.AddStatic( route );
+    }
     // The search engine builds the immutable obstacle/spatial index once per
     // engine.  Reuse it for every connection in a pass; reconstructing it for
     // each net makes large boards spend most of their runtime re-indexing the
@@ -1940,16 +2099,10 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         int totalItemsFanouted = 0;
         bool maxItemLimitReached = false;
 
-        // A deadline is a normal fallback, not a partially successful
-        // fanout.  Retaining only the early escapes poisons the ordinary
-        // batch search with provisional vias/traces and can create hundreds
-        // of DRC errors.  Keep the shared occupancy and emitted connection
-        // list transactional until the complete fanout stage is known to fit
-        // its budget.
-        const std::vector<ROUTING_CONNECTION> connectionsBeforeFanout = connections;
-        const std::set<int> failedNetsBeforeFanout = failedNets;
-        const int ripupsBeforeFanout = ripups;
-        const int expandedBeforeFanout = totalExpandedNodes;
+        // The source fanout stage retains every successfully inserted escape
+        // when its optional stage deadline expires. Keep a transaction so an
+        // exception can still unwind the worker state, but commit every normal
+        // return path; a user-cancelled proposal is discarded by the session.
         ROUTING_OCCUPANCY::TRANSACTION fanoutTransaction( occupancy );
 
         for( int pass = 0; pass < aSettings.maxFanoutPasses; ++pass )
@@ -1993,18 +2146,55 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 }
 
                 const auto task = tasks.find( pin );
-                if( task == tasks.end() || occupancy.Board()->Connected( pin, task->second.second ) )
+                if( task == tasks.end() )
                     continue;
 
-                ROUTING_NET net = *task->second.first;
+                const ROUTING_NET& taskNet = *task->second.first;
+                const ROUTING_PAD& taskPad = fanoutBoard.pads[pin];
+                const int sourceLayer = taskPad.layers.empty() ? -1 : taskPad.layers.front();
+
+                // RoutingBoard.fanout() returns ALREADY_CONNECTED as soon as
+                // the pin's connected set reaches another layer.  It returns
+                // NO_UNCONNECTED_NETS when no real item of the net remains
+                // outside that set.  Synthetic landing pads are a native
+                // planning detail and must not make either condition false.
+                if( sourceLayer < 0
+                    || occupancy.Board()->ConnectedSetTouchesOtherLayer( pin, sourceLayer ) )
+                {
+                    continue;
+                }
+
+                const auto hasUnconnected = [&]( const std::vector<std::size_t>& aIndices )
+                {
+                    return std::any_of(
+                            aIndices.begin(), aIndices.end(),
+                            [&]( std::size_t aIndex )
+                            {
+                                return aIndex < fanoutBoard.pads.size() && aIndex != pin
+                                       && !fanoutBoard.pads[aIndex].isFanoutTarget
+                                       && !occupancy.Board()->Connected( pin, aIndex );
+                            } );
+                };
+                if( !hasUnconnected( taskNet.padIndices )
+                    && !hasUnconnected( taskNet.planeTargetIndices ) )
+                {
+                    continue;
+                }
+
+                ROUTING_NET net = taskNet;
                 net.connections = { { pin, task->second.second } };
                 const auto pinStarted = std::chrono::steady_clock::now();
-                // This is a per-pin *maximum*, not a value that grows on
-                // each fanout pass.  Multiplying it by the pass number makes
-                // later retries arbitrarily slower and defeats the global
-                // stage deadline on boards with many SMD pins.
-                const std::int64_t pinBudget = std::max<std::int64_t>(
+                // BatchFanout gives harder later passes a linearly increasing
+                // per-pin budget. Saturate rather than overflowing when a
+                // programmatic caller supplies an extreme value.
+                const std::int64_t basePinBudget = std::max<std::int64_t>(
                         0, aSettings.maxFanoutMillisecondsPerPin );
+                const std::int64_t passMultiplier = static_cast<std::int64_t>( pass ) + 1;
+                const std::int64_t pinBudget =
+                        basePinBudget > std::numeric_limits<std::int64_t>::max()
+                                                / passMultiplier
+                                ? std::numeric_limits<std::int64_t>::max()
+                                : basePinBudget * passMultiplier;
                 bool pinTimedOut = false;
                 const ROUTER_CANCEL_CALLBACK pinCancel = [&]()
                 {
@@ -2025,28 +2215,78 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
 
                 ++totalItemsFanouted;
                 const ROUTING_PAD& landing = fanoutBoard.pads[task->second.second];
-                const AUTOROUTE_ENGINE& pinRouteEngine = fanoutEngineFor( net.netCode, landing );
+                const auto reportSearchProgress = [&]( int aSearchExpanded )
+                {
+                    if( !aProgress )
+                        return;
+
+                    ROUTER_PROGRESS progress;
+                    progress.pass = pass + 1;
+                    progress.maxPasses = aSettings.maxFanoutPasses;
+                    progress.totalConnections = fanoutConnectionTotal;
+                    progress.routedConnections = routedPins;
+                    progress.ripups = ripups;
+                    progress.expandedNodes = totalExpandedNodes + aSearchExpanded;
+                    progress.elapsedMilliseconds = elapsedMilliseconds();
+                    progress.stage = "Searching SMD fanout escape";
+                    aProgress( progress );
+                };
+
+                const AUTOROUTE_ENGINE& pinRouteEngine =
+                        fanoutEngineFor( net.netCode, landing );
+                const auto connectionsBeforePin = connections;
                 int expanded = 0;
-                const bool routed = routeNet(
+                const bool taskComplete = routeNet(
                         fanoutBoard, fanoutSettings, net, pass, occupancy, pinRouteEngine,
                         connections, expanded, ripups, pinCancel,
-                        [&]( int aSearchExpanded )
-                        {
-                            if( !aProgress )
-                                return;
-
-                            ROUTER_PROGRESS progress;
-                            progress.pass = pass + 1;
-                            progress.maxPasses = aSettings.maxFanoutPasses;
-                            progress.totalConnections = fanoutConnectionTotal;
-                            progress.routedConnections = routedPins;
-                            progress.ripups = ripups;
-                            progress.expandedNodes = totalExpandedNodes + aSearchExpanded;
-                            progress.elapsedMilliseconds = elapsedMilliseconds();
-                            progress.stage = "Searching SMD fanout escape";
-                            aProgress( progress );
-                        } );
+                        reportSearchProgress );
                 totalExpandedNodes += expanded;
+
+                const auto insertedFanout = std::find_if(
+                        connections.begin(), connections.end(),
+                        [&]( const ROUTING_CONNECTION& aConnection )
+                        {
+                            if( !aConnection.isFanoutConnection )
+                                return false;
+                            return std::none_of(
+                                    connectionsBeforePin.begin(), connectionsBeforePin.end(),
+                                    [&]( const ROUTING_CONNECTION& aBefore )
+                                    { return SameRouteGeometry( aConnection, aBefore ); } );
+                        } );
+
+                // A reference fanout search ends at the first drill it finds;
+                // that drill is not constrained to the planning direction's
+                // provisional landing.  Move the synthetic terminal to the
+                // actual endpoint so the ordinary batch starts from physical
+                // copper rather than from the stale guessed coordinate.
+                if( insertedFanout != connections.end()
+                    && insertedFanout->toPadIndex == task->second.second
+                    && !insertedFanout->nodes.empty() )
+                {
+                    const ROUTER_POINT actualLanding = insertedFanout->nodes.back().point;
+                    ROUTING_PAD& mutableLanding = fanoutBoard.pads[task->second.second];
+                    mutableLanding.position = actualLanding;
+                    mutableLanding.fanoutEscapePath.clear();
+                    for( const ROUTER_NODE& node : insertedFanout->nodes )
+                    {
+                        if( node.layer != mutableLanding.fanoutSourceLayer )
+                            break;
+                        if( mutableLanding.fanoutEscapePath.empty()
+                            || mutableLanding.fanoutEscapePath.back() != node.point )
+                        {
+                            mutableLanding.fanoutEscapePath.push_back( node.point );
+                        }
+                    }
+                    board.pads[task->second.second] = mutableLanding;
+                    occupancy.Board()->RelocateSyntheticPad( task->second.second,
+                                                              actualLanding );
+                }
+
+                // A faithful fanout search can stop at its first inserted
+                // drill without reaching the nominal net destination.  That
+                // is a successful escape even though the synthetic
+                // pad-to-landing task remains electrically incomplete.
+                const bool routed = taskComplete || insertedFanout != connections.end();
 
                 if( aCancel && aCancel() )
                 {
@@ -2121,17 +2361,11 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
 
         if( fanoutTimedOut )
         {
-            connections = connectionsBeforeFanout;
-            failedNets = failedNetsBeforeFanout;
-            ripups = ripupsBeforeFanout;
-            totalExpandedNodes = expandedBeforeFanout;
             result.fanoutTimedOut = true;
             result.message = "SMD fanout stage timed out; continuing with ordinary routing.";
         }
-        else
-        {
-            fanoutTransaction.Commit();
-        }
+
+        fanoutTransaction.Commit();
     }
 
     // Any landing that did not survive the isolated fanout pre-pass must be
@@ -2246,7 +2480,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         {
             if( connection.complete )
             {
-                if( connection.isExistingBoardRoute )
+                if( connection.isExistingBoardRoute && !connection.isAutorouterOwned )
                     occupancy.AddStatic( connection );
                 else
                     occupancy.Add( connection );
@@ -2254,6 +2488,26 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         }
         result.metrics.routedConnections = routedConnectionCount();
     };
+
+    struct ROUTE_ITEM_TASK
+    {
+        const ROUTING_NET* net = nullptr;
+        std::size_t pad = std::numeric_limits<std::size_t>::max();
+    };
+    std::vector<ROUTE_ITEM_TASK> naturalItemOrder;
+    naturalItemOrder.reserve( board.pads.size() );
+    for( std::size_t pad = 0; pad < board.pads.size(); ++pad )
+    {
+        if( board.pads[pad].isFanoutTarget || board.pads[pad].isPlaneTarget )
+            continue;
+
+        const auto net = std::find_if(
+                board.nets.begin(), board.nets.end(),
+                [&]( const ROUTING_NET& aNet )
+                { return aNet.netCode == board.pads[pad].netCode; } );
+        if( net != board.nets.end() && !net->connections.empty() )
+            naturalItemOrder.push_back( { &*net, pad } );
+    }
 
     for( int pass = 0; pass < std::max( 1, aSettings.maxPasses ); ++pass )
     {
@@ -2287,7 +2541,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
 
         complete = true;
 
-        for( const NET_ORDER_ENTRY& entry : orderedNets )
+        for( const ROUTE_ITEM_TASK& task : naturalItemOrder )
         {
             if( aCancel && aCancel() )
             {
@@ -2300,13 +2554,17 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             std::map<int, std::size_t> routedBefore;
             for( const ROUTING_CONNECTION& connection : connections )
             {
-                if( connection.complete && !connection.isExistingBoardRoute )
+                if( connection.complete
+                    && ( !connection.isExistingBoardRoute
+                         || connection.isAutorouterOwned ) )
+                {
                     ++routedBefore[connection.netCode];
+                }
             }
 
             const bool completeNet =
-                    occupancy.Board()->CountMissing( *entry.net ) == 0;
-            const bool retryFailedNet = failedNets.contains( entry.net->netCode );
+                    occupancy.Board()->CountMissing( *task.net ) == 0;
+            const bool retryFailedNet = failedNets.contains( task.net->netCode );
 
             // Keep successful nets stable while negotiated-congestion passes
             // revisit only nets that failed or were ripped up.  Re-routing
@@ -2316,7 +2574,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             if( completeNet && ( pass == 0 || !retryFailedNet ) )
                 continue;
 
-            const bool routed = routeNet( board, aSettings, *entry.net, pass, occupancy,
+            const bool routed = routeNet( board, aSettings, *task.net, pass, occupancy,
                                           routeEngine,
                                           connections, expanded, ripups, aCancel,
                                           [&]( int aSearchExpanded )
@@ -2335,7 +2593,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 searchProgress.elapsedMilliseconds = elapsedMilliseconds();
                 searchProgress.stage = "Searching connection";
                 aProgress( searchProgress );
-            } );
+            }, task.pad, 1 );
             totalExpandedNodes += expanded;
 
             if( aCancel && aCancel() )
@@ -2348,7 +2606,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             if( !routed )
             {
                 complete = false;
-                failedNets.insert( entry.net->netCode );
+                failedNets.insert( task.net->netCode );
 
                 // Only a found path identifies the copper that must be
                 // removed. Never sacrifice an unrelated completed route
@@ -2358,7 +2616,8 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             }
             else
             {
-                failedNets.erase( entry.net->netCode );
+                if( occupancy.Board()->CountMissing( *task.net ) == 0 )
+                    failedNets.erase( task.net->netCode );
             }
 
             // A retry may legally cross an occupied route.  routeNet removes
@@ -2372,8 +2631,12 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             std::map<int, std::size_t> routedAfter;
             for( const ROUTING_CONNECTION& connection : connections )
             {
-                if( connection.complete && !connection.isExistingBoardRoute )
+                if( connection.complete
+                    && ( !connection.isExistingBoardRoute
+                         || connection.isAutorouterOwned ) )
+                {
                     ++routedAfter[connection.netCode];
+                }
             }
 
             for( const auto& [netCode, countBefore] : routedBefore )
@@ -2399,7 +2662,8 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             if( autorouterDebugEnabled() )
             {
                 std::ostringstream message;
-                message << "connection batch net=" << entry.net->netCode << " routed=" << routed
+                message << "connection batch net=" << task.net->netCode
+                        << " itemPad=" << task.pad << " routed=" << routed
                         << " totalRouted=" << result.metrics.routedConnections
                         << " expanded=" << expanded << " retries=" << retries
                         << " ripups=" << ripups;
@@ -2413,9 +2677,19 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             break;
 
         result.metrics.routedConnections = routedConnectionCount();
+        complete = std::all_of(
+                board.nets.begin(), board.nets.end(),
+                [&]( const ROUTING_NET& aNet )
+                { return occupancy.Board()->CountMissing( aNet ) == 0; } );
+        for( const ROUTING_NET& net : board.nets )
+            if( occupancy.Board()->CountMissing( net ) == 0 )
+                failedNets.erase( net.netCode );
         checkpoint();
 
-        if( complete && aSettings.stopAfterFirstComplete )
+        // The source pass returns "no more work" as soon as getAutorouteItems
+        // is empty. Continuing routing passes on a complete board only delays
+        // the separate optimizer and cannot discover another route.
+        if( complete )
             break;
 
         if( batchLoop.Observe( result.metrics.routedConnections, ripups ) )

@@ -30,7 +30,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <board.h>
@@ -47,8 +49,11 @@ namespace KICAD_AUTOROUTER
 class KICAD_BOARD_ADAPTER : public ROUTING_BOARD_INTERFACE
 {
 public:
-    explicit KICAD_BOARD_ADAPTER( BOARD* aBoard ) :
-            m_board( aBoard )
+    explicit KICAD_BOARD_ADAPTER(
+            BOARD* aBoard,
+            std::set<std::string> aAutorouterOwnedBoardItemIds = {} ) :
+            m_board( aBoard ),
+            m_autorouterOwnedBoardItemIds( std::move( aAutorouterOwnedBoardItemIds ) )
     {
     }
 
@@ -87,6 +92,7 @@ private:
 
 private:
     BOARD* m_board;
+    std::set<std::string> m_autorouterOwnedBoardItemIds;
 };
 
 } // namespace KICAD_AUTOROUTER

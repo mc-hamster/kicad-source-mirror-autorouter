@@ -42,11 +42,14 @@ public:
     };
 
     AUTOROUTE_CONTROL( const AUTOROUTER_SETTINGS& aSettings, int aNetCode, int aRetry,
-                       bool aTargetIsPlane = false ) :
+                       bool aTargetIsPlane = false, double aMaxViaRadius = 1.0,
+                       bool aPureSmdNet = false ) :
             m_settings( aSettings ),
             m_netCode( aNetCode ),
             m_retry( aRetry ),
-            m_targetIsPlane( aTargetIsPlane )
+            m_targetIsPlane( aTargetIsPlane ),
+            m_maxViaRadius( aMaxViaRadius ),
+            m_pureSmdNet( aPureSmdNet )
     {
     }
 
@@ -56,6 +59,8 @@ public:
 
     double ViaCost() const;
     double TraceCost( double aLength ) const;
+    double WeightedTraceCost( int aLayer, const ROUTER_POINT& aStart,
+                              const ROUTER_POINT& aEnd ) const;
     double CongestionCost( int aUsage ) const;
     double DirectionCost( int aLayer, const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd ) const;
 
@@ -64,6 +69,8 @@ private:
     int                        m_netCode;
     int                        m_retry;
     bool                       m_targetIsPlane;
+    double                     m_maxViaRadius;
+    bool                       m_pureSmdNet;
 };
 
 } // namespace KICAD_AUTOROUTER

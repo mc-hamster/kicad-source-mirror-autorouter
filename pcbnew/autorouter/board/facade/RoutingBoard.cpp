@@ -608,11 +608,44 @@ void ROUTING_BOARD::ClearRoutes()
     }
 }
 
+void ROUTING_BOARD::RelocateSyntheticPad( std::size_t pad, ROUTER_POINT position )
+{
+    if( pad >= m_impl->snapshot.pads.size() )
+        return;
+
+    ROUTING_PAD& terminal = m_impl->snapshot.pads[pad];
+    if( !terminal.isFanoutTarget && !terminal.isPlaneTarget )
+        return;
+
+    terminal.position = position;
+}
+
 bool ROUTING_BOARD::Connected( std::size_t first, std::size_t second ) const
 {
     const auto left = m_impl->padRoots( first );
     const auto right = m_impl->padRoots( second );
     return std::any_of( left.begin(), left.end(), [&]( ITEM_ID root ) { return right.contains( root ); } );
+}
+
+bool ROUTING_BOARD::ConnectedSetTouchesOtherLayer( std::size_t pad, int layer ) const
+{
+    const auto roots = m_impl->padRoots( pad );
+    if( roots.empty() )
+        return false;
+
+    m_impl->updateComponents();
+    return std::any_of(
+            m_impl->items.begin(), m_impl->items.end(),
+            [&]( const auto& aEntry )
+            {
+                const auto& [id, item] = aEntry;
+                if( !roots.contains( m_impl->components.at( id ) ) )
+                    return false;
+
+                return std::any_of( item.shapes.begin(), item.shapes.end(),
+                                    [&]( const auto& aShape )
+                                    { return aShape.layer != layer; } );
+            } );
 }
 
 std::vector<std::vector<std::size_t>> ROUTING_BOARD::ConnectedPadGroups( int net ) const

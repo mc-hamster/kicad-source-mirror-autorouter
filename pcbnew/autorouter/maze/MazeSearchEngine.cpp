@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -64,7 +65,11 @@ std::int64_t squaredDistance( const ROUTER_POINT& aLeft, const ROUTER_POINT& aRi
 }
 
 
-// Project onto existing copper, not onto the representative pad's centre.
+// Project onto an exact integral point of the existing copper centreline, not
+// merely near that line and not onto the representative pad's centre.  KiCad
+// stores integral coordinates and requires an actual centreline junction for
+// connectivity.  Rounding x/y independently can produce a point a fraction
+// of an IU off an oblique trace, which later appears as a dangling route.
 ROUTER_POINT terminalPoint( const ROUTING_TERMINAL& aTerminal, const ROUTER_POINT& aFrom )
 {
     if( !aTerminal.segmentEnd )
@@ -78,7 +83,18 @@ ROUTER_POINT terminalPoint( const ROUTING_TERMINAL& aTerminal, const ROUTER_POIN
             ( ( static_cast<long double>( aFrom.x ) - start.x ) * dx
               + ( static_cast<long double>( aFrom.y ) - start.y ) * dy ) / lengthSquared,
             0.0L, 1.0L );
-    return { std::llround( start.x + t * dx ), std::llround( start.y + t * dy ) };
+    const std::int64_t integralDx = end.x - start.x;
+    const std::int64_t integralDy = end.y - start.y;
+    const std::int64_t latticeSteps = std::gcd( std::llabs( integralDx ),
+                                                std::llabs( integralDy ) );
+    if( latticeSteps == 0 )
+        return start;
+
+    const std::int64_t step = std::clamp<std::int64_t>(
+            std::llround( t * static_cast<long double>( latticeSteps ) ),
+            0, latticeSteps );
+    return { start.x + integralDx / latticeSteps * step,
+             start.y + integralDy / latticeSteps * step };
 }
 
 
@@ -457,7 +473,7 @@ void ROUTING_OCCUPANCY::InitializeBoard( const BOARD_SNAPSHOT& aBoard,
 {
     auto board = std::make_unique<ROUTING_BOARD>( aBoard, aSettings );
     for( const auto& connection : m_connections )
-        if( !connection.isExistingBoardRoute )
+        if( !connection.isExistingBoardRoute || connection.isAutorouterOwned )
             board->AddRoute( connection );
     m_board = std::move( board );
 }
@@ -567,7 +583,7 @@ void ROUTING_OCCUPANCY::Remove( const ROUTING_CONNECTION& aConnection )
 
     // Copy first: callers may pass a reference into Connections().
     const ROUTING_CONNECTION removed = *connectionIt;
-    if( m_board && !removed.isExistingBoardRoute )
+    if( m_board && ( !removed.isExistingBoardRoute || removed.isAutorouterOwned ) )
         m_board->RemoveRoute( removed );
     m_connections.erase( connectionIt );
 
@@ -1000,6 +1016,31 @@ bool MAZE_SEARCH_ENGINE::isLayerEnabled( int aLayer ) const
 }
 
 
+bool MAZE_SEARCH_ENGINE::isPureSmdNet( int aNetCode ) const
+{
+    bool found = false;
+    for( const ROUTING_PAD& pad : m_board.pads )
+    {
+        if( pad.netCode != aNetCode || pad.isFanoutTarget || pad.isPlaneTarget )
+            continue;
+        found = true;
+        if( !pad.isSmd || pad.layers.size() != 1 )
+            return false;
+    }
+
+    // This mirrors AutorouteControl.isPureSmdNet's Item test: after a net has
+    // acquired trace/via items it is no longer the all-Pin special case.
+    if( std::any_of( m_occupancy.Connections().begin(), m_occupancy.Connections().end(),
+                     [aNetCode]( const ROUTING_CONNECTION& aConnection )
+                     { return aConnection.netCode == aNetCode; } ) )
+    {
+        return false;
+    }
+
+    return found;
+}
+
+
 int MAZE_SEARCH_ENGINE::layerOrdinal( int aLayer ) const
 {
     auto it = std::find_if( m_settings.layers.begin(), m_settings.layers.end(),
@@ -1420,7 +1461,17 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
     const std::int64_t margin = m_board.edgeClearance + geometryRadius;
 
     if( !isInsideBoard( aPoint, margin ) )
+    {
+        if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
+        {
+            autorouterDebugLog( "start point rejected by board outline point=("
+                                + std::to_string( aPoint.x ) + ","
+                                + std::to_string( aPoint.y ) + ",L"
+                                + std::to_string( aLayer ) + ") margin="
+                                + std::to_string( margin ) );
+        }
         return false;
+    }
 
     std::vector<std::size_t> candidateObstacles;
     collectObstacleIndices( aLayer, { aPoint.x, aPoint.y, aPoint.x, aPoint.y },
@@ -1472,22 +1523,52 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
             box.maxY += radius;
 
             if( box.Contains( aPoint ) )
+            {
+                if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
+                    autorouterDebugLog( "start point rejected by rectangle obstacle="
+                                        + std::to_string( obstacleIndex ) + " net="
+                                        + std::to_string( obstacle.netCode ) );
                 return false;
+            }
         }
         else if( obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
         {
             if( pointToSegmentDistance( aPoint, obstacle.start, obstacle.end ) <= radius )
+            {
+                if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
+                    autorouterDebugLog( "start point rejected by segment obstacle="
+                                        + std::to_string( obstacleIndex ) + " net="
+                                        + std::to_string( obstacle.netCode ) + " radius="
+                                        + std::to_string( radius ) + " obstacle=("
+                                        + std::to_string( obstacle.start.x ) + ","
+                                        + std::to_string( obstacle.start.y ) + ")->("
+                                        + std::to_string( obstacle.end.x ) + ","
+                                        + std::to_string( obstacle.end.y ) + ") point=("
+                                        + std::to_string( aPoint.x ) + ","
+                                        + std::to_string( aPoint.y ) + ",L"
+                                        + std::to_string( aLayer ) + ")" );
                 return false;
+            }
         }
         else if( const auto simplex = exactConvexClearanceShape( obstacle, radius ); simplex )
         {
             if( simplex->Contains( PLANAR::POINT( aPoint ) ) )
+            {
+                if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
+                    autorouterDebugLog( "start point rejected by convex obstacle="
+                                        + std::to_string( obstacleIndex ) + " net="
+                                        + std::to_string( obstacle.netCode ) );
                 return false;
+            }
         }
         else if( pointInPolygonWithHoles( aPoint, obstacle.polygon, obstacle.polygonHoles )
                  || pointNearPolygonWithHoles( aPoint, obstacle.polygon,
                                                obstacle.polygonHoles, radius ) )
         {
+            if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
+                autorouterDebugLog( "start point rejected by polygon obstacle="
+                                    + std::to_string( obstacleIndex ) + " net="
+                                    + std::to_string( obstacle.netCode ) );
             return false;
         }
     }
@@ -2995,6 +3076,7 @@ std::optional<ROUTING_VIA_SHOVE_PLAN> MAZE_SEARCH_ENGINE::ShoveViaConnectionPlan
 
         ROUTING_CONNECTION materialized = contact;
         materialized.isExistingBoardRoute = false;
+        materialized.isAutorouterOwned = false;
         materialized.isShoveMovable = true;
         ROUTING_EDGE_STYLE bridgeStyle = contact.edgeStyles.front();
         bridgeStyle.trackWidth = ResolveTrackWidth( contact.netCode, bridgeStyle );
@@ -3658,7 +3740,8 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                                     const ROUTER_CANCEL_CALLBACK& aCancel,
                                     const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress,
                                     const std::vector<ROUTING_TERMINAL>& aStarts,
-                                    const std::vector<ROUTING_TERMINAL>& aTargets ) const
+                                    const std::vector<ROUTING_TERMINAL>& aTargets,
+                                    bool aAllowLegacyFallback ) const
 {
     aExpandedNodes = 0;
     m_roomMetrics = {};
@@ -3670,13 +3753,21 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             ? std::vector<ROUTING_TERMINAL>{ defaultStart } : aStarts;
     const std::vector<ROUTING_TERMINAL> targets = aTargets.empty()
             ? std::vector<ROUTING_TERMINAL>{ defaultTarget } : aTargets;
+    const bool fanoutSearch = aTarget.isFanoutTarget
+                              && aTarget.fanoutSourceLayer >= 0
+                              && aTarget.fanoutTargetLayer >= 0
+                              && !aStarts.empty() && !aTargets.empty();
     for( const auto& terminal : starts )
         if( terminal.pad.netCode != aStart.netCode )
             return std::nullopt;
     for( const auto& terminal : targets )
         if( terminal.pad.netCode != aStart.netCode )
             return std::nullopt;
-    m_allowRipupOccupancy = m_settings.allowRipupRouted && aRetry > 0;
+    // Freerouting's AutorouteConnectionRouter enables rip-up on every
+    // ordinary routing pass.  aRetry is zero-based in the native batch loop;
+    // allowRipupOnFirstIteration therefore controls its pass-one equivalent.
+    m_allowRipupOccupancy = m_settings.allowRipupRouted
+                            && ( aRetry > 0 || m_settings.allowRipupOnFirstIteration );
     const bool debug = autorouterDebugEnabled();
     m_debugObstacleQueries = 0;
     m_debugObstacleCandidates = 0;
@@ -3713,7 +3804,10 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                                          std::max( point.x, end.x ), std::max( point.y, end.y ) }, layer );
     }
     AUTOROUTE_CONTROL control( m_settings, aStart.netCode, aRetry,
-                               aTarget.isPlaneTarget );
+                               aTarget.isPlaneTarget,
+                               std::max( netTrackRadius( aStart.netCode ),
+                                         netViaRadius( aStart.netCode ) ),
+                               isPureSmdNet( aStart.netCode ) );
 
     // A constrained SMD breakout can require one or more local bends before
     // its selected via. BatchFanout preflights that bounded escape rather
@@ -3899,16 +3993,46 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     }
 
     // The rectangular room frontier now compares same-layer routes and
-    // through-drill alternatives in one queue. Unsupported/rejected geometry
+    // through-drill alternatives in one queue. A fanout attempt uses the same
+    // room/drill frontier but terminates at its first layer transition, just
+    // like AutorouteEngine with is_fanout. Unsupported/rejected geometry
     // retains the legacy fallback with the same work budget and cancellation.
     const auto enabledLayers = std::count_if( m_settings.layers.begin(), m_settings.layers.end(),
                                              []( const auto& layer ) { return layer.enabled; } );
-    const auto roomPath = !m_settings.allowVias || enabledLayers == 1
-            ? findRoomConnection( starts, targets, aRetry, aExpandedNodes, aCancel, aProgress )
-            : findMultilayerRoomConnection( starts, targets, aRetry, aExpandedNodes, aCancel, aProgress );
+    m_ignoreRoutableRoomObstacles = false;
+    auto roomPath = !m_settings.allowVias || enabledLayers == 1
+                            ? findRoomConnection( starts, targets, aRetry, aExpandedNodes,
+                                                  aCancel, aProgress )
+                            : findMultilayerRoomConnection( starts, targets, aRetry,
+                                                            aExpandedNodes, aCancel, aProgress,
+                                                            fanoutSearch ? &aTarget : nullptr );
+
+    // ObstacleExpansionRoom in Freerouting lets the frontier cross movable
+    // copper with a pass-scaled rip-up cost.  Until the general obstacle-room
+    // state is available, preserve its most important scheduling behaviour:
+    // prefer a strict free-room path, then perform one room/drill search with
+    // only routable copper removed.  The resulting geometry still carries no
+    // permission to delete copper. FindConflictingConnections and the atomic
+    // forced inserter must shove every victim or consume the caller's bounded
+    // rip-up budget before it can commit.
+    if( !roomPath && m_allowRipupOccupancy && !( aCancel && aCancel() )
+        && aExpandedNodes < effectiveMaxExpandedNodes )
+    {
+        m_ignoreRoutableRoomObstacles = true;
+        roomPath = !m_settings.allowVias || enabledLayers == 1
+                           ? findRoomConnection( starts, targets, aRetry, aExpandedNodes,
+                                                 aCancel, aProgress )
+                           : findMultilayerRoomConnection( starts, targets, aRetry,
+                                                           aExpandedNodes, aCancel, aProgress,
+                                                           fanoutSearch ? &aTarget : nullptr );
+        m_ignoreRoutableRoomObstacles = false;
+    }
+
     if( roomPath )
         return roomPath;
     if( aCancel && aCancel() )
+        return std::nullopt;
+    if( !aAllowLegacyFallback )
         return std::nullopt;
 
     std::priority_queue<OPEN_NODE, std::vector<OPEN_NODE>, OPEN_NODE_COMPARE> open;
@@ -3940,6 +4064,14 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                     || !isPointAllowed( point, layer.layerId, aStart.netCode, false,
                                        netTrackRadius( aStart.netCode ) ) )
                     continue;
+                if( fanoutSearch && layer.layerId != aTarget.fanoutSourceLayer )
+                    continue;
+                if( fanoutSearch && aTarget.fanoutMaxEscapeLength > 0
+                    && distance( point, aStart.position )
+                               > static_cast<double>( aTarget.fanoutMaxEscapeLength ) )
+                {
+                    continue;
+                }
                 ROUTER_NODE start{ point, layer.layerId };
                 if( bestCost.contains( start ) )
                     continue;
@@ -4022,6 +4154,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             ROUTING_CONNECTION result;
             result.netCode = aStart.netCode;
             result.complete = true;
+            result.isFanoutConnection = fanoutSearch;
             result.isPlaneConnection = destination->pad.isPlaneTarget;
             result.toPadIndex = destination->padIndex;
             const ROUTER_POINT finish = terminalPoint( *destination, current.node.point );
@@ -4084,6 +4217,36 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             return result;
         }
 
+        if( fanoutSearch && current.node.layer != aTarget.fanoutSourceLayer )
+        {
+            const auto parent = cameFrom.find( current.node );
+            if( parent != cameFrom.end()
+                && parent->second.layer == aTarget.fanoutSourceLayer
+                && parent->second.point == current.node.point )
+            {
+                ROUTING_CONNECTION result;
+                result.netCode = aStart.netCode;
+                result.complete = true;
+                result.isFanoutConnection = true;
+                result.cost = current.g;
+
+                ROUTER_NODE cursor = current.node;
+                while( true )
+                {
+                    result.nodes.push_back( cursor );
+                    const auto previous = cameFrom.find( cursor );
+                    if( previous == cameFrom.end() )
+                        break;
+                    cursor = previous->second;
+                }
+                std::reverse( result.nodes.begin(), result.nodes.end() );
+                result.fromPadIndex = startOwners.at( result.nodes.front() );
+
+                logSearchState( "END fanout search at first drill" );
+                return result;
+            }
+        }
+
         auto nextNodes = adaptiveNeighbours( current.node, aTarget, landmarks, aStart.netCode );
         for( const ROUTING_TERMINAL& terminal : targets )
         {
@@ -4098,8 +4261,23 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         {
             const bool via = next.layer != current.node.layer;
 
+            if( fanoutSearch && next.layer == aTarget.fanoutSourceLayer
+                && aTarget.fanoutMaxEscapeLength > 0
+                && distance( next.point, aStart.position )
+                           > static_cast<double>( aTarget.fanoutMaxEscapeLength ) )
+            {
+                continue;
+            }
+
             if( via )
             {
+                if( fanoutSearch
+                    && distance( current.node.point, aStart.position )
+                               < static_cast<double>( std::max<std::int64_t>(
+                                       0, aTarget.fanoutMinEscapeLength ) ) )
+                {
+                    continue;
+                }
                 // Match Freerouting's conservative fanout policy: a via is
                 // not allowed to start in a single-layer SMD pad unless the
                 // user explicitly enabled via-in-pad.  Without this guard
@@ -4122,7 +4300,6 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                 continue;
             }
 
-            const double length = distance( current.node.point, next.point );
             const int usage = via ? 0
                                    : m_occupancy.SegmentUsage( current.node, next,
                                                                 aStart.netCode );
@@ -4130,7 +4307,8 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                                         ? static_cast<double>( m_settings.bendCost )
                                         : 0.0;
             const double moveCost = via ? control.ViaCost()
-                                        : control.TraceCost( length )
+                                        : control.TraceCost( distance( current.node.point,
+                                                                       next.point ) )
                                                   + control.CongestionCost( usage )
                                                   + control.DirectionCost( next.layer,
                                                                            current.node.point,

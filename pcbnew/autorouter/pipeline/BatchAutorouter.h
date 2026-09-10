@@ -54,7 +54,9 @@ private:
                    const AUTOROUTE_ENGINE& aEngine,
                    std::vector<ROUTING_CONNECTION>& aConnections, int& aExpandedNodes, int& aRipups,
                    const ROUTER_CANCEL_CALLBACK& aCancel,
-                   const ROUTER_SEARCH_PROGRESS_CALLBACK& aSearchProgress ) const;
+                   const ROUTER_SEARCH_PROGRESS_CALLBACK& aSearchProgress,
+                   std::size_t aPreferredPad = std::numeric_limits<std::size_t>::max(),
+                   int aMaximumNewConnections = 0 ) const;
 
     void buildGeometry( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
                         const std::vector<ROUTING_CONNECTION>& aConnections,

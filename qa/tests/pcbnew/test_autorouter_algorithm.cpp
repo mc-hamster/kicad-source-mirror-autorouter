@@ -322,6 +322,87 @@ BOOST_AUTO_TEST_CASE( FanoutShortcutCannotOverrideAnExplicitTerminalSet )
 }
 
 
+BOOST_AUTO_TEST_CASE( ObliqueTraceTerminalFinishesOnAnExactIntegralLatticePoint )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 10000000, 7000000 };
+    board.pads.push_back( { 1, { 5000000, 5500000 }, { 0 }, "Default", 0, 50000, 0,
+                            100000 } );
+    board.pads.push_back( { 1, { 4000000, 1000000 }, { 0 }, "Default", 0, 50000, 0,
+                            100000 } );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.allowVias = false;
+    settings.gridStepIU = 500000;
+    settings.maxExpandedNodes = 1000;
+
+    ROUTING_TERMINAL source{ board.pads[0], 0 };
+    ROUTING_TERMINAL target{ board.pads[1], 1, ROUTER_POINT{ 7000000, 3000000 } };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    int expanded = 0;
+    const auto result = search.FindConnection( board.pads[0], board.pads[1], 0, expanded,
+                                                {}, {}, { source }, { target } );
+    BOOST_REQUIRE( result );
+    BOOST_REQUIRE( !result->nodes.empty() );
+    BOOST_CHECK( CONTACT_GEOMETRY::OnSegment( target.pad.position, *target.segmentEnd,
+                                               result->nodes.back().point ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutTerminatesAtTheFirstRoomFrontierDrill )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 7000000, 3000000 };
+    board.pads[0].position = { 1000000, 1500000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].position = { 6000000, 1500000 };
+    board.pads[1].layers = { 0 };
+
+    ROUTING_PAD fanoutTarget = board.pads[1];
+    fanoutTarget.position = { 2500000, 1500000 };
+    fanoutTarget.layers = { 1 };
+    fanoutTarget.isFanoutTarget = true;
+    fanoutTarget.fanoutSourceLayer = 0;
+    fanoutTarget.fanoutTargetLayer = 1;
+    fanoutTarget.fanoutSourcePadIndex = 0;
+    fanoutTarget.fanoutMinEscapeLength = 1000000;
+    fanoutTarget.fanoutMaxEscapeLength = 2000000;
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.gridStepIU = 250000;
+    settings.maxExpandedNodes = 10000;
+    settings.allowViaInSmdPad = false;
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    int expanded = 0;
+    const auto result = search.FindConnection(
+            board.pads[0], fanoutTarget, 0, expanded, {}, {},
+            { ROUTING_TERMINAL{ board.pads[0], 0 } },
+            { ROUTING_TERMINAL{ board.pads[1], 1 } } );
+
+    BOOST_REQUIRE( result );
+    BOOST_REQUIRE( result->isFanoutConnection );
+    BOOST_REQUIRE_GE( result->nodes.size(), 2U );
+    BOOST_CHECK_EQUAL( result->nodes.front().layer, 0 );
+    BOOST_CHECK_NE( result->nodes.back().layer, 0 );
+    BOOST_CHECK( result->nodes[result->nodes.size() - 2].point
+                 == result->nodes.back().point );
+    const long double dx = static_cast<long double>( result->nodes.back().point.x )
+                           - board.pads[0].position.x;
+    const long double dy = static_cast<long double>( result->nodes.back().point.y )
+                           - board.pads[0].position.y;
+    const long double drillDistance = std::hypotl( dx, dy );
+    BOOST_CHECK_GE( drillDistance, 1000000.0L );
+    BOOST_CHECK_LE( drillDistance, 2000000.0L );
+    BOOST_CHECK( search.LastRoomSearchMetrics().routed );
+    BOOST_CHECK_GT( search.LastRoomSearchMetrics().drills, 0 );
+}
+
+
 BOOST_AUTO_TEST_CASE( HistoryNeverTradesClearanceForCompletion )
 {
     BOARD_HISTORY history( 1 );
@@ -785,12 +866,13 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
     const ROUTING_RESULT result = pipeline.Run( board, settings, {}, {} );
 
     BOOST_REQUIRE( result.complete );
-    BOOST_CHECK_EQUAL( result.metrics.routedConnections, 3 );
+    // The first fanout item reaches the other SMD pin directly.  Freerouting
+    // then reports the second pin as having no unconnected net items instead
+    // of creating either synthetic escape edge.
+    BOOST_CHECK_EQUAL( result.metrics.routedConnections, 1 );
     const auto prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
     BOOST_CHECK_EQUAL( prepared.pads.size() - board.pads.size(), 2 );
-    // The connected-set frontier may retain either escape stub as useful
-    // same-layer copper. Count that retained work, not a legacy path ordering.
-    BOOST_CHECK_LE( result.metrics.fanoutConnections, 2 );
+    BOOST_CHECK_EQUAL( result.metrics.fanoutConnections, 1 );
     BOOST_CHECK_EQUAL( result.metrics.fanoutConnections,
             std::count_if( result.connections.begin(), result.connections.end(),
                            []( const auto& c ) { return c.isFanoutConnection; } ) );
@@ -813,6 +895,45 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
         BOOST_CHECK( via.position != board.pads[0].position );
         BOOST_CHECK( via.position != board.pads[1].position );
     }
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutTriesTheClosestOfAtMostFourItemsFirst )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 10000000, 3000000 };
+    board.pads.push_back( { 1, { 1000000, 1500000 }, { 0 }, "Default", 0, 100000, 0,
+                            100000, false, true } );
+    board.pads.push_back( { 1, { 4000000, 1500000 }, { 0 }, "Default", 0, 100000, 0,
+                            100000 } );
+    board.pads.push_back( { 1, { 8500000, 1500000 }, { 0 }, "Default", 0, 100000, 0,
+                            100000 } );
+
+    ROUTING_NET net;
+    net.netCode = 1;
+    net.name = "SMALL_FANOUT_NET";
+    net.netClass = "Default";
+    net.viaDiameter = 300000;
+    net.viaDrill = 150000;
+    net.padIndices = { 0, 1, 2 };
+    net.connections = { { 0, 1 }, { 1, 2 } };
+    board.nets.push_back( net );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.optimizationPasses = 0;
+    settings.fanoutMinEscapeLengthIU = 2500000;
+    settings.fanoutMaxEscapeLengthIU = 4500000;
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+
+    const auto fanout = std::find_if(
+            result.connections.begin(), result.connections.end(),
+            []( const ROUTING_CONNECTION& aConnection )
+            { return aConnection.isFanoutConnection && aConnection.fromPadIndex == 0; } );
+    BOOST_REQUIRE( fanout != result.connections.end() );
+    BOOST_CHECK_EQUAL( fanout->toPadIndex, 1U );
 }
 
 
@@ -1607,6 +1728,40 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesCopperClustersAcrossSeveralTracks )
     BOOST_REQUIRE( reroute );
     BOOST_CHECK( reroute->nets.front().connectedPadGroups.empty() );
     BOOST_CHECK_EQUAL( board.Tracks().size(), 4 );
+
+    // A repair pass sees copper emitted by the first autorouter pass as real
+    // BOARD_ITEMs.  It must not freeze connectivity through those items or
+    // classify them as protected user copper merely because they now have a
+    // KiCad UUID.  Mark one item as job-owned and verify that it remains in
+    // the removable route model even though ordinary source rip-up is off.
+    std::string ownedTrackId;
+    for( const PCB_TRACK* track : board.Tracks() )
+    {
+        ownedTrackId = track->m_Uuid.AsString().ToStdString();
+        break;
+    }
+    BOOST_REQUIRE( !ownedTrackId.empty() );
+
+    KICAD_BOARD_ADAPTER repairAdapter( &board, { ownedTrackId } );
+    auto repairSettings = repairAdapter.CreateDefaultSettings();
+    repairSettings.allowRipupExisting = false;
+    const auto repair = repairAdapter.CreateSnapshot( repairSettings );
+    BOOST_REQUIRE( repair );
+    BOOST_CHECK( repair->nets.front().connectedPadGroups.empty() );
+    BOOST_CHECK_GE( repair->nets.front().connections.size(), 2U );
+    BOOST_CHECK( std::any_of(
+            repair->removableExistingRoutes.begin(),
+            repair->removableExistingRoutes.end(), [&]( const ROUTING_OBSTACLE& obstacle )
+            {
+                return obstacle.boardItemId == ownedTrackId
+                       && obstacle.isAutorouterOwned;
+            } ) );
+    BOOST_CHECK( std::none_of(
+            repair->obstacles.begin(), repair->obstacles.end(),
+            [&]( const ROUTING_OBSTACLE& obstacle )
+            {
+                return obstacle.boardItemId == ownedTrackId;
+            } ) );
 }
 
 
@@ -2719,6 +2874,67 @@ BOOST_AUTO_TEST_CASE( ForcedInsertionShovesStaticHostTraceWithoutBorrowingItsCon
     BOOST_CHECK( rejected.state == FOUND_CONNECTION_INSERTER::STATE::BLOCKED );
     BOOST_REQUIRE_EQUAL( fixedOccupancy.Connections().size(), 1U );
     BOOST_CHECK( fixedOccupancy.Connections().front().isExistingBoardRoute );
+}
+
+
+BOOST_AUTO_TEST_CASE( RepairPassCanRipUpAutorouterOwnedHostCopper )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_PAD first = board.pads.front();
+    first.netCode = 2;
+    first.position = { 3000000, 500000 };
+    ROUTING_PAD second = first;
+    second.position = { 3000000, 2500000 };
+    const std::size_t firstIndex = board.pads.size();
+    board.pads.push_back( first );
+    const std::size_t secondIndex = board.pads.size();
+    board.pads.push_back( second );
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices = { firstIndex, secondIndex };
+    foreign.connections = { { firstIndex, secondIndex } };
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION ownedTrace;
+    ownedTrace.netCode = 2;
+    ownedTrace.complete = true;
+    ownedTrace.fromPadIndex = firstIndex;
+    ownedTrace.toPadIndex = secondIndex;
+    ownedTrace.isExistingBoardRoute = true;
+    ownedTrace.isShoveMovable = false;
+    ownedTrace.sourceBoardItemIds = { "job-owned-track" };
+    ownedTrace.nodes = { { first.position, 0 }, { second.position, 0 } };
+    ownedTrace.isAutorouterOwned = true;
+    occupancy.Add( ownedTrace );
+
+    // Unlike protected source copper, a job-owned host item remains genuine
+    // worker-board copper: it satisfies connectivity until the transaction
+    // removes it, and ordinary negotiated-congestion rip-up may replace it.
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.back() ), 0 );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( conflicts.front().isAutorouterOwned );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, conflicts, occupancy, engine, {}, true );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.back() ), 1 );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.front() ), 0 );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( occupancy.Connections().front(), candidate ) );
 }
 
 
@@ -4874,6 +5090,70 @@ BOOST_AUTO_TEST_CASE( OptimizerCannotShortenAwayBranchContacts )
     BOOST_CHECK( !occupancy.Board()->Connected( 0, 2 ) );
 }
 
+
+BOOST_AUTO_TEST_CASE( OptimizerReroutesAWholeConnectionAndKeepsOnlyAnImprovement )
+{
+    auto board = makeBoard();
+    board.bounds.maxY = 4000000;
+
+    ROUTING_OBSTACLE wall;
+    wall.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    wall.netCode = 2;
+    wall.layers = { 0 };
+    wall.box = { 2600000, 1100000, 3400000, 1900000 };
+    board.obstacles.push_back( wall );
+
+    auto settings = makeSettings();
+    settings.layers[1].enabled = false;
+    settings.allowVias = false;
+    settings.optimizationPasses = 1;
+    settings.maxOptimizationAutoroutePasses = 2;
+
+    ROUTING_CONNECTION detour;
+    detour.netCode = 1;
+    detour.complete = true;
+    detour.fromPadIndex = 0;
+    detour.toPadIndex = 1;
+    detour.nodes = { { board.pads[0].position, 0 }, { { 1000000, 3000000 }, 0 },
+                     { { 5000000, 3000000 }, 0 }, { board.pads[1].position, 0 } };
+
+    const auto length = []( const ROUTING_CONNECTION& aConnection )
+    {
+        double result = 0.0;
+        for( std::size_t index = 1; index < aConnection.nodes.size(); ++index )
+        {
+            const long double dx = static_cast<long double>( aConnection.nodes[index].point.x )
+                                   - aConnection.nodes[index - 1].point.x;
+            const long double dy = static_cast<long double>( aConnection.nodes[index].point.y )
+                                   - aConnection.nodes[index - 1].point.y;
+            result += std::sqrt( static_cast<double>( dx * dx + dy * dy ) );
+        }
+        return result;
+    };
+
+    std::vector<ROUTING_CONNECTION> routes{ detour };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( detour );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+
+    const int passes = BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} );
+
+    BOOST_CHECK_EQUAL( passes, 1 );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1U );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    BOOST_CHECK( !SameRouteGeometry( routes.front(), detour ) );
+    BOOST_CHECK_LT( length( routes.front() ), length( detour ) );
+    BOOST_CHECK( std::none_of( routes.front().nodes.begin(), routes.front().nodes.end(),
+                              []( const ROUTER_NODE& aNode )
+                              { return aNode.point.y == 3000000; } ) );
+    int transitions = 0;
+    for( std::size_t index = 1; index < routes.front().nodes.size(); ++index )
+        if( routes.front().nodes[index - 1].layer != routes.front().nodes[index].layer )
+            ++transitions;
+    BOOST_CHECK_EQUAL( transitions, 0 );
+}
+
 BOOST_AUTO_TEST_CASE( ARouteCannotInventCopperAtAVirtualPlaneTarget )
 {
     auto board = makeBoard();
@@ -4994,6 +5274,53 @@ BOOST_AUTO_TEST_CASE( HostSessionValidatesWithoutChangingSourceOrNetCodes )
     BOOST_CHECK_EQUAL( missing, 1 );
 }
 
+
+BOOST_AUTO_TEST_CASE( KiCadAdapterReservesThermalReliefSpokeExits )
+{
+    auto board = makeHostRoutingBoard( true );
+    ZONE* zone = board->Zones().front();
+    zone->SetPadConnection( ZONE_CONNECTION::THERMAL );
+    zone->SetThermalReliefGap( 250000 );
+    zone->SetThermalReliefSpokeWidth( 300000 );
+
+    PAD* groundPad = nullptr;
+    for( PAD* pad : board->GetPads() )
+    {
+        if( pad->GetNetCode() == zone->GetNetCode() )
+        {
+            groundPad = pad;
+            break;
+        }
+    }
+
+    BOOST_REQUIRE( groundPad );
+    BOOST_CHECK( groundPad->FlashLayer( F_Cu ) );
+    BOOST_CHECK( zone->GetLayerSet().Contains( F_Cu ) );
+    BOOST_CHECK( zone->GetBoundingBox().Intersects( groundPad->GetBoundingBox( F_Cu ) ) );
+    BOOST_CHECK( zone->GetBoardOutline().Contains( groundPad->GetPosition() ) );
+    BOOST_CHECK( zone->GetPadConnection() == ZONE_CONNECTION::THERMAL );
+    BOOST_CHECK_EQUAL( zone->GetThermalReliefGap(), 250000 );
+    const auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
+    const auto snapshot = KICAD_BOARD_ADAPTER( board.get() ).CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+
+    const ROUTER_POINT center{ groundPad->ShapePos( F_Cu ).x,
+                               groundPad->ShapePos( F_Cu ).y };
+    BOOST_CHECK_GE( std::count_if(
+                            snapshot->obstacles.begin(), snapshot->obstacles.end(),
+                            [&]( const ROUTING_OBSTACLE& obstacle )
+                            {
+                                return obstacle.netCode == groundPad->GetNetCode()
+                                       && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
+                                       && obstacle.layers
+                                                  == std::vector<int>{ static_cast<int>( F_Cu ) }
+                                       && obstacle.start == center
+                                       && obstacle.end != obstacle.start
+                                       && obstacle.radius == 150000;
+                            } ),
+                    2 );
+}
+
 BOOST_AUTO_TEST_CASE( DrcErrorLimitOverrideSupportsPrivateProposalValidation )
 {
     auto board = makeHostRoutingBoard( false );
@@ -5015,6 +5342,11 @@ BOOST_AUTO_TEST_CASE( HostSessionRepairsAPlaneSplitByTheNewRouting )
     auto board = makeHostRoutingBoard( true );
     auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
     settings.enableFanout = false;
+    // Preserve this fixture's deliberate initial same-layer plane split. The
+    // production defaults now match Freerouting's 50/5 via costs and can
+    // choose the clean via alternative without entering host repair.
+    settings.viaCost = 500;
+    settings.planeViaCost = 50;
     settings.maxPasses = 2;
     settings.maxIterations = 2;
     settings.optimizationPasses = 0;
@@ -5053,6 +5385,8 @@ BOOST_AUTO_TEST_CASE( HostSessionRunsRefillAndRepairOnTheJobWorker )
     auto board = makeHostRoutingBoard( true );
     auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
     settings.enableFanout = false;
+    settings.viaCost = 500;
+    settings.planeViaCost = 50;
     settings.maxPasses = 2;
     settings.maxIterations = 2;
     settings.optimizationPasses = 0;
@@ -5099,6 +5433,8 @@ BOOST_AUTO_TEST_CASE( HostSessionCanCancelAfterRoutingBeforePlaneRepair )
     auto board = makeHostRoutingBoard( true );
     auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
     settings.enableFanout = false;
+    settings.viaCost = 500;
+    settings.planeViaCost = 50;
     settings.maxPasses = 1;
     settings.maxIterations = 1;
     settings.optimizationPasses = 0;
@@ -5339,6 +5675,9 @@ BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles
     auto board = makeBoard();
     auto settings = makeSettings();
     settings.allowVias = false;
+    // This test verifies room-tree invalidation with a hard mutable wall, not
+    // the production batch policy that may negotiate/rip that wall on pass 1.
+    settings.allowRipupOnFirstIteration = false;
     settings.layers.resize( 1 );
     board.obstacles.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE, 0, { 0 }, {}, {},
                                 { 2500000, 0, 3500000, 2200000 } } );
@@ -5360,6 +5699,20 @@ BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles
     occupancy.Add( wall );
     BOOST_CHECK( !engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {} ) );
     BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+
+    // Production pass one negotiates movable copper.  The room engine must
+    // find that proposal itself rather than falling into the unbounded legacy
+    // raster retry; insertion still sees the concrete wall as a victim.
+    settings.allowRipupOnFirstIteration = true;
+    MAZE_SEARCH_ENGINE negotiatedEngine( board, settings, occupancy );
+    const auto negotiated = negotiatedEngine.FindConnection(
+            board.pads[0], board.pads[1], 0, expanded, {} );
+    BOOST_REQUIRE( negotiated );
+    BOOST_CHECK( negotiatedEngine.LastRoomSearchMetrics().routed );
+    const auto conflicts = negotiatedEngine.FindConflictingConnections( *negotiated );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1 );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), wall ) );
+
     occupancy.Remove( wall );
     BOOST_REQUIRE( engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {} ) );
     BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
@@ -5835,6 +6188,82 @@ BOOST_AUTO_TEST_CASE( TraceTailCleanupSplitsAtInteriorViaAndKeepsTheUsefulTrunk 
     optimizer.RemoveRedundantViaTails( routes, {} );
     BOOST_CHECK( routes.front().nodes.back() == via.nodes.front() );
     BOOST_CHECK_EQUAL( occupancy.Connections().size(), routes.size() );
+}
+
+
+BOOST_AUTO_TEST_CASE( RequiredFanoutViaIsNeverReducedToADanglingSourceStub )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads[0].layers = { 0 };
+    board.pads[1].layers = { 1 };
+
+    ROUTING_CONNECTION fanout;
+    fanout.complete = true;
+    fanout.isFanoutConnection = true;
+    fanout.netCode = 1;
+    fanout.fromPadIndex = 0;
+    fanout.nodes = { { board.pads[0].position, 0 }, { { 3000000, 1500000 }, 0 },
+                     { { 3000000, 1500000 }, 1 } };
+    ROUTING_CONNECTION branch;
+    branch.complete = true;
+    branch.netCode = 1;
+    branch.toPadIndex = 1;
+    branch.nodes = { fanout.nodes.back(), { board.pads[1].position, 1 } };
+
+    std::vector<ROUTING_CONNECTION> routes{ fanout, branch };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( fanout );
+    occupancy.Add( branch );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+
+    BATCH_OPTIMIZER( board, settings, occupancy ).RemoveRedundantViaTails( routes, {} );
+    BOOST_REQUIRE_EQUAL( routes.size(), 2U );
+    BOOST_CHECK( routes.front().nodes == fanout.nodes );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( OptimizerPromotesChangedAutorouterOwnedCopperForHostReplacement )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads[0].layers = { 0 };
+    board.pads[1].layers = { 1 };
+
+    ROUTING_CONNECTION trunk;
+    trunk.complete = true;
+    trunk.netCode = 1;
+    trunk.isExistingBoardRoute = true;
+    trunk.isAutorouterOwned = true;
+    trunk.sourceBoardItemIds = { "job-owned-tail" };
+    trunk.nodes = { { board.pads[0].position, 0 }, { { 4000000, 1500000 }, 0 } };
+    ROUTING_CONNECTION via;
+    via.complete = true;
+    via.netCode = 1;
+    via.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+    ROUTING_CONNECTION branch;
+    branch.complete = true;
+    branch.netCode = 1;
+    branch.nodes = { via.nodes.back(), { board.pads[1].position, 1 } };
+
+    std::vector<ROUTING_CONNECTION> routes{ trunk, via, branch };
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    for( const auto& route : routes )
+        occupancy.Add( route );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+
+    BATCH_OPTIMIZER( board, settings, occupancy ).RemoveRedundantViaTails( routes, {} );
+    BOOST_REQUIRE_EQUAL( routes.size(), 3U );
+    BOOST_CHECK( routes.front().nodes.back() == via.nodes.front() );
+    BOOST_CHECK( !routes.front().isExistingBoardRoute );
+    BOOST_CHECK( !routes.front().isAutorouterOwned );
+    BOOST_CHECK_EQUAL_COLLECTIONS(
+            routes.front().sourceBoardItemIds.begin(), routes.front().sourceBoardItemIds.end(),
+            trunk.sourceBoardItemIds.begin(), trunk.sourceBoardItemIds.end() );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
 }
 
 BOOST_AUTO_TEST_CASE( TraceJunctionsUseRealCopperLayerAndExactIntersection )
