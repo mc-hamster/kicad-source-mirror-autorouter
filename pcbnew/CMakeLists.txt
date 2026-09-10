@@ -402,12 +402,12 @@ set( ZONE_MANAGER_SRCS
 if( CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" )
     set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp
         autorouter/geometry/planar/Polyline.cpp autorouter/geometry/planar/Simplex.cpp
-        autorouter/board/optimize/TraceShover.cpp APPEND
+        autorouter/board/optimize/TraceShover.cpp autorouter/board/optimize/ViaOptimizer.cpp APPEND
                   PROPERTY COMPILE_OPTIONS -ffp-contract=off )
 elseif( MSVC )
     set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp
         autorouter/geometry/planar/Polyline.cpp autorouter/geometry/planar/Simplex.cpp
-        autorouter/board/optimize/TraceShover.cpp APPEND
+        autorouter/board/optimize/TraceShover.cpp autorouter/board/optimize/ViaOptimizer.cpp APPEND
                   PROPERTY COMPILE_OPTIONS /fp:strict )
 endif()
 
@@ -458,6 +458,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/geometry/planar/Polyline.cpp
     autorouter/geometry/planar/Simplex.cpp
     autorouter/board/optimize/TraceShover.cpp
+    autorouter/board/optimize/ViaOptimizer.cpp
     autorouter/path/FoundConnectionInserter.cpp
     autorouter/path/FoundConnectionLocator.cpp
     autorouter/path/FoundConnectionLocator45Degree.cpp
@@ -467,6 +468,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/pipeline/BatchFanout.cpp
     autorouter/pipeline/BatchAutorouter.cpp
     autorouter/pipeline/BatchOptimizer.cpp
+    autorouter/pipeline/ReadSortedRouteItems.cpp
     autorouter/pipeline/RoutingPipeline.cpp
 
     array_pad_number_provider.cpp

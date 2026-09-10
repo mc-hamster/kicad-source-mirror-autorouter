@@ -896,6 +896,26 @@ ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
 }
 
 
+ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::ConductionAreaContactsAt(
+        int net, ROUTER_NODE point ) const
+{
+    ITEM_ID_SET result;
+    for( const auto& [id, item] : m_impl->items )
+    {
+        if( item.net != net || !item.conductionArea || !item.area )
+            continue;
+        if( std::find( item.normal.layers.begin(), item.normal.layers.end(), point.layer )
+            == item.normal.layers.end() )
+        {
+            continue;
+        }
+        if( CONTACT_GEOMETRY::ContainsArea( *item.area, point.point ) )
+            result.insert( id );
+    }
+    return result;
+}
+
+
 std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id ) const
 {
     const auto it = m_impl->items.find( id );
@@ -1029,12 +1049,17 @@ struct ROUTING_BOARD::TRANSACTION::STATE
     // Built before editing, pointing at the saved map nodes. Restoring during
     // stack unwinding must never allocate/reindex (and throw a second failure).
     decltype( IMPL::index ) index;
+    std::vector<ROUTER_POINT> padPositions;
 };
 
 ROUTING_BOARD::TRANSACTION::TRANSACTION( ROUTING_BOARD& board ) : m_board( board ),
     m_before( std::make_unique<STATE>( STATE{ board.m_impl->items, board.m_impl->routes,
-                                             board.m_impl->nextId, {} } ) )
+                                             board.m_impl->nextId, {}, {} } ) )
 {
+    m_before->padPositions.reserve( board.m_impl->snapshot.pads.size() );
+    for( const ROUTING_PAD& pad : board.m_impl->snapshot.pads )
+        m_before->padPositions.push_back( pad.position );
+
     for( const auto& [id, item] : m_before->items )
         for( const auto& part : item.shapes )
         {
@@ -1055,6 +1080,9 @@ ROUTING_BOARD::TRANSACTION::~TRANSACTION()
     m_board.m_impl->items.swap( m_before->items );
     m_board.m_impl->routes.swap( m_before->routes );
     std::swap( m_board.m_impl->nextId, m_before->nextId );
+    for( std::size_t i = 0; i < m_before->padPositions.size(); ++i )
+        std::swap( m_board.m_impl->snapshot.pads[i].position,
+                   m_before->padPositions[i] );
     ++m_board.m_impl->revision;
     m_board.m_impl->components.clear();
     m_board.m_impl->componentRevision = std::numeric_limits<std::uint64_t>::max();

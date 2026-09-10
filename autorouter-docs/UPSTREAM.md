@@ -50,7 +50,7 @@ same change.
 | `autoroute/pipeline/AutoroutePassRunner.java` | `pcbnew/autorouter/pipeline/BatchAutorouter.cpp` | The C++ worker is single-threaded per job; the board snapshot makes the pass boundary explicit. |
 | `autoroute/pipeline/AutorouteAirlineCalculator.java` | `pcbnew/autorouter/pipeline/AutorouteAirlineCalculator.h/.cpp` | Computes topology lower bounds for metrics and future board scoring. |
 | `autoroute/pipeline/BatchFanout.java` | `pcbnew/autorouter/pipeline/BatchFanout.h/.cpp` | Snapshot-side SMD fanout and plane-target classification; fanout escapes are synthetic worker pads and become ordinary KiCad vias/tracks at acceptance. |
-| `autoroute/pipeline/BatchOptimizer.java` | `pcbnew/autorouter/pipeline/BatchOptimizer.h/.cpp` | Guarded visibility shortening plus contact-preserving terminal-via and exact-junction trace-tail/overlap cleanup; no upstream shove, pull-tight or via reposition/reroute optimizer. |
+| `autoroute/pipeline/BatchOptimizer.java` | `pcbnew/autorouter/pipeline/BatchOptimizer.h/.cpp`, `ReadSortedRouteItems.h/.cpp` | Active serial whole-connection reroute/pull-tight transaction with source item ordering adapter, contact guards and tail cleanup. Native records still prevent exact item-chain removal/dynamic rescanning. |
 | `autoroute/pipeline/BatchOptimizerMultiThreaded.java` | `pcbnew/autorouter/pipeline/BatchOptimizerMultiThreaded.h` | Serial delegate only; no reference candidate scheduling, parallelism or scoring implementation. |
 | `autoroute/pipeline/OptimizeRouteTask.java` | `pcbnew/autorouter/pipeline/OptimizeRouteTask.h` | Data-only optimization candidate task; never deep-copies a live KiCad `BOARD`. |
 | `autoroute/pipeline/RoutingPipeline.java` | `pcbnew/autorouter/pipeline/RoutingPipeline.h/.cpp` | Stable orchestration seam for future fanout and diagnostics. |
@@ -85,7 +85,7 @@ same change.
 | `RoutingBoardUndoFacade` / board history | `BOARD_COMMIT` | KiCad-provided API; one accepted proposal is one commit |
 | `board.trace.PolylineTrace*` | `PCB_TRACK` segments | `KicadBoardAdapter::CreatePreviewItems` |
 | `autoroute.maze.MazeTraceShover`, `board.optimize.TraceShover` / tighteners | **Not ported.** The similarly named native class only shortens visible paths | `maze/MazeTraceShover.cpp` is legacy cleanup, not reference `checkShoveTraceLine` or recursive trace displacement |
-| `board.optimize.ViaOptimizer` | `ROUTING_VIA` cleanup seam | `pipeline/BatchOptimizer.cpp` and adapter |
+| `board/optimize/ViaOptimizer.java` | `pcbnew/autorouter/board/optimize/ViaOptimizer.h/.cpp` | Active weighted two-trace and bounded plane/fanout via-location candidates. Every replacement is strictly checked; arbitrary source item contact mutation and recursion remain partial. |
 | planar `IntPoint`, `IntBox`, `TileShape`, polygon geometry | `VECTOR2I`, `BOX2I`, `SHAPE_LINE_CHAIN`, `SHAPE_POLY_SET` | Adapter conversion; all worker coordinates are integer KiCad IU |
 | `rules.Net`, `NetClass`, clearance matrix | `NETCLASS`, `BOARD_DESIGN_SETTINGS`, pad/track own clearance, layer settings | `board/KicadBoardAdapter.cpp` |
 | `rules.ViaRule` / via padstacks | Supported through-hole-only subset; entry/exit layers do not define physical span | `rules/ViaRule.h`, `MazeSearchEngine::CanUseSegment`, `BatchAutorouter::buildGeometry` |

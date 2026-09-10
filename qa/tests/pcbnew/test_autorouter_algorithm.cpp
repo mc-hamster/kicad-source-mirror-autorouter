@@ -63,6 +63,8 @@
 #include <autorouter/pipeline/AutoroutePassRunner.h>
 #include <autorouter/pipeline/AutorouteBatchLoop.h>
 #include <autorouter/pipeline/BatchOptimizer.h>
+#include <autorouter/board/optimize/ViaOptimizer.h>
+#include <autorouter/pipeline/ReadSortedRouteItems.h>
 #include <autorouter/pipeline/AutorouteUnroutedReport.h>
 #include <autorouter/pipeline/RoutingPipeline.h>
 
@@ -6740,6 +6742,264 @@ BOOST_AUTO_TEST_CASE( OptimizerPromotesChangedAutorouterOwnedCopperForHostReplac
             routes.front().sourceBoardItemIds.begin(), routes.front().sourceBoardItemIds.end(),
             trunk.sourceBoardItemIds.begin(), trunk.sourceBoardItemIds.end() );
     BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ViaOptimizerTransfersLengthToTheCheaperTraceLayer )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 12000000, 12000000 };
+    board.pads[0].position = { 1000000, 1000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[1].position = { 5000000, 9000000 };
+    board.pads[1].layers = { 1 };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.layers[0].preferredDirection = 1;
+    settings.layers[0].directionCost = 100;
+    settings.layers[1].preferredDirection = 0;
+    settings.optimizationPasses = 1;
+    settings.maxOptimizationItems = 1;
+
+    ROUTING_CONNECTION route;
+    route.complete = true;
+    route.netCode = 1;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { { 5000000, 5000000 }, 0 },
+                    { { 5000000, 5000000 }, 1 }, { board.pads[1].position, 1 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( route );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+
+    // Candidate generation runs with the item removed, just like
+    // BatchOptimizer.optRouteItem's snapshot transaction in the source.
+    const auto movableViaEdges = VIA_OPTIMIZER::MovableViaEdges(
+            route, board, *occupancy.Board() );
+    occupancy.Remove( route );
+    const auto candidates = VIA_OPTIMIZER::Candidates( route, board, settings,
+                                                       *occupancy.Board(), search,
+                                                       movableViaEdges );
+    BOOST_REQUIRE( !candidates.empty() );
+    BOOST_CHECK( std::any_of( candidates.begin(), candidates.end(), [&]( const auto& candidate )
+    {
+        return candidate.nodes[1].point != route.nodes[1].point
+               && candidate.nodes[1].point == candidate.nodes[2].point;
+    } ) );
+    occupancy.Add( route );
+
+    std::vector<ROUTING_CONNECTION> routes{ route };
+    const double before = CONNECTION::FromRoute( route ).TraceLength();
+    const int passes = BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} );
+    BOOST_REQUIRE_EQUAL( passes, 1 );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1 );
+    BOOST_CHECK_LT( CONNECTION::FromRoute( routes.front() ).TraceLength(), before );
+    BOOST_CHECK( routes.front().nodes[1].point == routes.front().nodes[2].point );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ViaOptimizerMovesFanoutTerminalAndItsSyntheticTargetTogether )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads[0].layers = { 0 };
+    ROUTING_PAD landing;
+    landing.netCode = 1;
+    landing.position = { 4000000, 1500000 };
+    landing.layers = { 1 };
+    landing.trackWidth = 100000;
+    landing.isFanoutTarget = true;
+    landing.fanoutTargetLayer = 1;
+    landing.fanoutSourcePadIndex = 0;
+    const std::size_t landingIndex = board.pads.size();
+    board.pads.push_back( landing );
+    board.nets[0].padIndices.push_back( landingIndex );
+    board.nets[0].connections = { { 0, landingIndex } };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.optimizationPasses = 1;
+    settings.maxOptimizationItems = 1;
+
+    ROUTING_CONNECTION fanout;
+    fanout.complete = true;
+    fanout.isFanoutConnection = true;
+    fanout.netCode = 1;
+    fanout.fromPadIndex = 0;
+    fanout.toPadIndex = landingIndex;
+    fanout.nodes = { { board.pads[0].position, 0 }, { landing.position, 0 },
+                     { landing.position, 1 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( fanout );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, landingIndex ) );
+    {
+        ROUTING_BOARD::TRANSACTION transaction( *occupancy.Board() );
+        occupancy.Board()->RelocateSyntheticPad( landingIndex, { 5500000, 2500000 } );
+        BOOST_CHECK( !occupancy.Board()->Connected( 0, landingIndex ) );
+    }
+    BOOST_CHECK( occupancy.Board()->Connected( 0, landingIndex ) );
+
+    std::vector<ROUTING_CONNECTION> routes{ fanout };
+    BOOST_CHECK_EQUAL( BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} ), 1 );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1 );
+    BOOST_CHECK( routes.front().nodes[1].point == routes.front().nodes[2].point );
+    BOOST_CHECK( routes.front().nodes[2].point != landing.position );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, landingIndex ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ViaOptimizerDoesNotStrandTraceAttachedToFanoutVia )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads[0].layers = { 0 };
+    board.pads[1].position = { 8000000, 1500000 };
+    board.pads[1].layers = { 1 };
+    ROUTING_PAD landing;
+    landing.netCode = 1;
+    landing.position = { 4000000, 1500000 };
+    landing.layers = { 1 };
+    landing.trackWidth = 100000;
+    landing.isFanoutTarget = true;
+    landing.fanoutTargetLayer = 1;
+    landing.fanoutSourcePadIndex = 0;
+    const std::size_t landingIndex = board.pads.size();
+    board.pads.push_back( landing );
+    board.nets[0].padIndices.push_back( landingIndex );
+    board.nets[0].connections = { { 0, landingIndex }, { landingIndex, 1 } };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    ROUTING_CONNECTION fanout;
+    fanout.complete = true;
+    fanout.isFanoutConnection = true;
+    fanout.netCode = 1;
+    fanout.fromPadIndex = 0;
+    fanout.toPadIndex = landingIndex;
+    fanout.nodes = { { board.pads[0].position, 0 }, { landing.position, 0 },
+                     { landing.position, 1 } };
+    ROUTING_CONNECTION attached;
+    attached.complete = true;
+    attached.netCode = 1;
+    attached.fromPadIndex = landingIndex;
+    attached.toPadIndex = 1;
+    attached.nodes = { { landing.position, 1 }, { board.pads[1].position, 1 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( fanout );
+    occupancy.Add( attached );
+
+    // Freerouting sees two normal trace contacts at this Via, so it does not
+    // dispatch the one-trace fanout optimization.  Moving only the fanout
+    // record would leave the attached route at the old drill position.
+    BOOST_CHECK( VIA_OPTIMIZER::MovableViaEdges(
+                         fanout, board, *occupancy.Board() ).empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( PlaneViaOptimizerStaysInTheOriginallyContactedArea )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads[0].layers = { 0 };
+    ROUTING_PAD planeTarget;
+    planeTarget.netCode = 1;
+    planeTarget.position = { 5000000, 1500000 };
+    planeTarget.layers = { 1 };
+    planeTarget.trackWidth = 100000;
+    planeTarget.isPlaneTarget = true;
+    const std::size_t targetIndex = board.pads.size();
+    board.pads.push_back( planeTarget );
+    board.pads[1].netCode = 0;
+    board.nets[0].padIndices = { 0, targetIndex };
+    board.nets[0].connections = { { 0, targetIndex } };
+
+    ROUTING_OBSTACLE area;
+    area.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    area.netCode = 1;
+    area.layers = { 1 };
+    area.box = { 4000000, 500000, 5500000, 2500000 };
+    board.conductionAreas.push_back( area );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.optimizationPasses = 1;
+    settings.maxOptimizationItems = 1;
+    ROUTING_CONNECTION plane;
+    plane.complete = true;
+    plane.isPlaneConnection = true;
+    plane.netCode = 1;
+    plane.fromPadIndex = 0;
+    plane.toPadIndex = targetIndex;
+    plane.nodes = { { board.pads[0].position, 0 }, { planeTarget.position, 0 },
+                    { planeTarget.position, 1 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( plane );
+    const auto movableViaEdges = VIA_OPTIMIZER::MovableViaEdges(
+            plane, board, *occupancy.Board() );
+    occupancy.Remove( plane );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    const auto candidates = VIA_OPTIMIZER::Candidates(
+            plane, board, settings, *occupancy.Board(), search, movableViaEdges );
+    BOOST_REQUIRE_EQUAL( candidates.size(), 1 );
+    const ROUTER_NODE movedPlanePoint = candidates.front().nodes[2];
+    BOOST_CHECK_LT( movedPlanePoint.point.x, planeTarget.position.x );
+    BOOST_CHECK( occupancy.Board()->ConductionAreaContactsAt( 1, movedPlanePoint ).size() == 1 );
+    occupancy.Add( plane );
+
+    std::vector<ROUTING_CONNECTION> routes{ plane };
+    BOOST_CHECK_EQUAL( BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} ), 1 );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1 );
+    BOOST_REQUIRE_EQUAL( routes[0].nodes.size(), 3 );
+    BOOST_CHECK( occupancy.Board()->ConductionAreaContactsAt( 1, routes[0].nodes[2] ).size()
+                 == 1 );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, targetIndex ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( OptimizerRouteOrderUsesSourceViaThenTraceItemKeys )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+
+    ROUTING_CONNECTION earlyTrace;
+    earlyTrace.complete = true;
+    earlyTrace.netCode = 2;
+    earlyTrace.nodes = { { { 500000, 500000 }, 0 }, { { 1500000, 500000 }, 0 } };
+    ROUTING_CONNECTION via;
+    via.complete = true;
+    via.netCode = 1;
+    via.nodes = { { { 2000000, 1000000 }, 0 }, { { 2000000, 1000000 }, 1 } };
+    ROUTING_CONNECTION samePointTrace;
+    samePointTrace.complete = true;
+    samePointTrace.netCode = 2;
+    samePointTrace.nodes = { { { 1000000, 1000000 }, 0 },
+                             { { 2000000, 1000000 }, 0 } };
+    ROUTING_CONNECTION attached;
+    attached.complete = true;
+    attached.netCode = 1;
+    attached.nodes = { { { 3000000, 1000000 }, 0 }, { { 4000000, 1000000 }, 0 },
+                       { { 4000000, 1000000 }, 1 }, { { 5000000, 1000000 }, 1 } };
+
+    for( const auto& route : { earlyTrace, via, samePointTrace, attached } )
+        occupancy.Add( route );
+
+    const auto attachedKey = READ_SORTED_ROUTE_ITEMS::Key( *occupancy.Board(), attached );
+    BOOST_REQUIRE( attachedKey );
+    BOOST_CHECK_EQUAL( attachedKey->kind, 0 );
+    BOOST_CHECK( attachedKey->point == attached.nodes[1].point );
+
+    std::vector<ROUTING_CONNECTION> routes{ attached, samePointTrace, via, earlyTrace };
+    READ_SORTED_ROUTE_ITEMS::SortConnections( *occupancy.Board(), routes );
+    BOOST_REQUIRE_EQUAL( routes.size(), 4 );
+    BOOST_CHECK( SameRouteGeometry( routes[0], earlyTrace ) );
+    BOOST_CHECK( SameRouteGeometry( routes[1], via ) );
+    BOOST_CHECK( SameRouteGeometry( routes[2], samePointTrace ) );
+    BOOST_CHECK( SameRouteGeometry( routes[3], attached ) );
 }
 
 BOOST_AUTO_TEST_CASE( TraceJunctionsUseRealCopperLayerAndExactIntersection )

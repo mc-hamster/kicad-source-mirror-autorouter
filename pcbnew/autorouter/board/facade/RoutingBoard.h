@@ -76,6 +76,8 @@ public:
     int FirstCommonLayer( ITEM_ID aFirst, ITEM_ID aSecond ) const;
     ITEM_ID_SET NormalContactsAt( ITEM_ID aTrace, ROUTER_POINT aPoint ) const;
     ITEM_ID_SET NormalConnectedSet( ITEM_ID aItem ) const;
+    /** Exact conduction-area identities containing a same-net point. */
+    ITEM_ID_SET ConductionAreaContactsAt( int aNetCode, ROUTER_NODE aPoint ) const;
     std::optional<ITEM_INFO> GetItemInfo( ITEM_ID aItem ) const;
     std::vector<ITEM_ID> RouteItems( const ROUTING_CONNECTION& aRoute ) const;
     std::optional<ITEM_ID> PadItem( std::size_t aPad ) const;

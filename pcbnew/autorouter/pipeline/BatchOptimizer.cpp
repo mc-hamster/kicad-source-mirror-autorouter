@@ -30,8 +30,10 @@
 
 #include "../AutorouterDebug.h"
 #include "../ItemRouteResult.h"
+#include "../board/optimize/ViaOptimizer.h"
 #include "../maze/MazeTraceShover.h"
 #include "../path/FoundConnectionInserter.h"
+#include "ReadSortedRouteItems.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -400,6 +402,12 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
 
         int consecutiveFailures = 0;
 
+        // ReadSortedRouteItems.next() rescans mutable board items in x/y/layer
+        // order and prefers an unfixed via over a trace at the same location.
+        // Native can only transact on complete connection records, so sort
+        // those records by their first eligible source-style item each pass.
+        READ_SORTED_ROUTE_ITEMS::SortConnections( *m_occupancy.Board(), aConnections );
+
         for( std::size_t connectionIndex = 0;
              connectionIndex < aConnections.size(); )
         {
@@ -425,6 +433,12 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 continue;
             }
 
+            if( !READ_SORTED_ROUTE_ITEMS::Key( *m_occupancy.Board(), connection ) )
+            {
+                ++connectionIndex;
+                continue;
+            }
+
             ++optimizedItems;
             const ROUTING_CONNECTION original = connection;
             const ROUTE_QUALITY before = routeQuality( m_board, aConnections,
@@ -433,6 +447,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             for( auto& group : groups )
                 std::erase_if( group, [&]( std::size_t aPad )
                               { return m_board.pads[aPad].isFanoutTarget; } );
+            const auto movableViaEdges = VIA_OPTIMIZER::MovableViaEdges(
+                    original, m_board, *m_occupancy.Board() );
 
             ROUTING_OCCUPANCY::TRANSACTION transaction( m_occupancy );
             m_occupancy.Remove( original );
@@ -462,6 +478,16 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             bool bestIsDeletion = isImprovement( before, bestQuality )
                                   && preservesPadGroups( groups, *m_occupancy.Board() );
             bool haveBest = bestIsDeletion;
+
+            const auto relocateSyntheticEnds = [&]( const ROUTING_CONNECTION& aRoute )
+            {
+                if( aRoute.nodes.empty() )
+                    return;
+                m_occupancy.Board()->RelocateSyntheticPad( aRoute.fromPadIndex,
+                                                            aRoute.nodes.front().point );
+                m_occupancy.Board()->RelocateSyntheticPad( aRoute.toPadIndex,
+                                                            aRoute.nodes.back().point );
+            };
 
             const auto consider = [&]( ROUTING_CONNECTION aCandidate )
             {
@@ -495,6 +521,13 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 effective.sourceBoardItemIds = original.sourceBoardItemIds;
                 promoteChangedAutorouterCopper( effective, original );
 
+                // ViaOptimizer may move a plane/fanout drill at a synthetic
+                // connection endpoint.  Freerouting moves the Via item itself;
+                // the native planning terminal must follow temporarily so
+                // CountMissing evaluates the same physical copper. Restore it
+                // after this alternative, or retain it with the winner below.
+                relocateSyntheticEnds( effective );
+
                 const ROUTE_QUALITY quality = routeQuality(
                         m_board, aConnections, *m_occupancy.Board(), connectionIndex,
                         &effective );
@@ -504,6 +537,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 // effective candidate restores the post-removal base for the
                 // next alternative without another full board snapshot.
                 m_occupancy.Remove( effective );
+                relocateSyntheticEnds( original );
 
                 if( preserves && isImprovement( before, quality )
                     && ( !haveBest || betterThan( quality, bestQuality ) ) )
@@ -523,6 +557,19 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             simplifyConnection( shortened, search );
             if( !SameRouteGeometry( shortened, original ) )
                 consider( std::move( shortened ) );
+
+            // Freerouting optimizes unfixed Via items before traces at the
+            // same board position.  Translate its weighted two-trace via
+            // repositioning candidates while the original connection is
+            // absent from occupancy, then subject every candidate to the
+            // same atomic insertion/contact/quality gate as a full reroute.
+            for( ROUTING_CONNECTION viaCandidate :
+                 VIA_OPTIMIZER::Candidates( original, m_board, optimizationSettings,
+                                            *m_occupancy.Board(), search,
+                                            movableViaEdges, aCancel ) )
+            {
+                consider( std::move( viaCandidate ) );
+            }
 
             // Freerouting removes the item's complete connection chain and
             // invokes bounded autoroute passes on the remaining components.
@@ -570,6 +617,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             if( bestConnection )
             {
                 m_occupancy.Add( *bestConnection );
+                relocateSyntheticEnds( *bestConnection );
                 connection = std::move( *bestConnection );
                 transaction.Commit();
                 changedThisPass = true;
