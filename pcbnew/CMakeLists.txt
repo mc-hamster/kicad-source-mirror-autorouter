@@ -456,6 +456,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/maze/MazeRipupResolver.cpp
     autorouter/maze/MazeSearchEngine.cpp
     autorouter/maze/MazeSearchEngine90Degree.cpp
+    autorouter/maze/MazeSearchEngine45Degree.cpp
     autorouter/maze/MazeSearchEngineMultilayer.cpp
     autorouter/maze/MazeSearchEngineRooms.cpp
     autorouter/maze/MazeTraceShover.cpp

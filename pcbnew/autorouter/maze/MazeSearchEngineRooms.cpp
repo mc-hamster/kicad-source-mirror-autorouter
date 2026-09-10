@@ -8,6 +8,7 @@
 #include "../AutorouterDebug.h"
 #include "MazeExpansionEngine.h"
 #include "MazeRipupResolver.h"
+#include "MazeSearchEngine45Degree.h"
 #include "../path/Connection.h"
 #include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
@@ -20,6 +21,48 @@ namespace KICAD_AUTOROUTER
 
 namespace
 {
+
+using PLANAR::INT_OCTAGON;
+
+INT_OCTAGON octagonalEnvelope( const std::vector<ROUTER_POINT>& aPoints,
+                               std::int64_t aExpansion )
+{
+    if( aPoints.empty() )
+        return INT_OCTAGON::Empty();
+
+    std::int64_t left = aPoints.front().x;
+    std::int64_t right = left;
+    std::int64_t bottom = aPoints.front().y;
+    std::int64_t top = bottom;
+    std::int64_t upperLeft = aPoints.front().x - aPoints.front().y;
+    std::int64_t lowerRight = upperLeft;
+    std::int64_t lowerLeft = aPoints.front().x + aPoints.front().y;
+    std::int64_t upperRight = lowerLeft;
+    for( const ROUTER_POINT& point : aPoints )
+    {
+        left = std::min( left, point.x );
+        right = std::max( right, point.x );
+        bottom = std::min( bottom, point.y );
+        top = std::max( top, point.y );
+        upperLeft = std::min( upperLeft, point.x - point.y );
+        lowerRight = std::max( lowerRight, point.x - point.y );
+        lowerLeft = std::min( lowerLeft, point.x + point.y );
+        upperRight = std::max( upperRight, point.x + point.y );
+    }
+    return INT_OCTAGON( left, bottom, right, top, upperLeft, lowerRight,
+                        lowerLeft, upperRight ).Normalize().Offset( aExpansion );
+}
+
+
+INT_OCTAGON octagonalEnvelope( const ROUTING_OBSTACLE& aObstacle,
+                               std::int64_t aExpansion )
+{
+    if( aObstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+        return INT_OCTAGON::FromBox( aObstacle.box ).Offset( aExpansion );
+    if( aObstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
+        return octagonalEnvelope( { aObstacle.start, aObstacle.end }, aExpansion );
+    return octagonalEnvelope( aObstacle.polygon, aExpansion );
+}
 
 bool isAxisAlignedRectangle( const std::vector<ROUTER_POINT>& aPolygon )
 {
@@ -123,13 +166,21 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
     const auto radius = aForVia ? netViaRadius( net ) : netTrackRadius( net );
     std::vector<SHAPE_TREE_ENTRY> entries;
     int id = 1;
+    auto addOctagon = [&]( INT_OCTAGON shape )
+    {
+        shape = shape.Normalize();
+        if( shape.Dimension() >= 0 )
+            entries.push_back( { shape.BoundingBox(), id++, 0, aLayer, 0,
+                                 false, true, shape } );
+    };
     auto add = [&]( ROUTER_BOX box, std::int64_t expansion )
     {
-        box.minX -= expansion;
-        box.minY -= expansion;
-        box.maxX += expansion;
-        box.maxY += expansion;
-        entries.push_back( { box, id++, 0, aLayer, 0, false, true } );
+        addOctagon( INT_OCTAGON::FromBox( box ).Offset( expansion ) );
+    };
+    auto addSegment = [&]( ROUTER_POINT start, ROUTER_POINT end,
+                           std::int64_t expansion )
+    {
+        addOctagon( octagonalEnvelope( { start, end }, expansion ) );
     };
     for( auto index : obstacleIndices( aLayer ) )
     {
@@ -145,15 +196,15 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
             if( !obstacle.isHole || ( !aForVia && ( ownHole || obstacle.isExistingRoute ) ) )
                 continue;
         }
-        // The room and drill-page trees are rectangles.  Do not turn a real
-        // diagonal convex contour into its AABB: via.canDrill validates the
-        // full physical stack exactly before a page candidate is accepted.
+        // The drill-page tree remains rectangular.  The 45-degree room tree
+        // retains this exact eight-support envelope instead of treating a
+        // diagonal convex contour as its axis-aligned bounding box.
         if( aSkipGeneralConvex && isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
             continue;
         // One extra IU makes the room boundary legal under the host's
         // inclusive collision predicates; do not apply clearance twice.
-        add( m_obstacleBounds[index], obstacleExpansionRadius(
-                obstacle, net, aLayer, aForVia, radius ) + 1 );
+        addOctagon( octagonalEnvelope( obstacle, obstacleExpansionRadius(
+                obstacle, net, aLayer, aForVia, radius ) + 1 ) );
     }
     // Every attempt sees current copper, including through-via copper on
     // intermediate layers. No stale per-net tree survives add/remove/rip-up.
@@ -223,8 +274,7 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     expansion = std::max( expansion, netViaDrillRadius( net )
                             + otherDrillRadius + m_board.holeToHoleClearance );
             }
-            add( { std::min( from.point.x, to.point.x ), std::min( from.point.y, to.point.y ),
-                   std::max( from.point.x, to.point.x ), std::max( from.point.y, to.point.y ) }, expansion + 1 );
+            addSegment( from.point, to.point, expansion + 1 );
         }
     }
     if( aForVia && !m_settings.allowViaInSmdPad )
@@ -444,12 +494,11 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                         otherDrillRadius + m_board.holeClearance );
             }
 
-            ROUTER_BOX shape{ std::min( from.point.x, to.point.x ) - expansion - 1,
-                              std::min( from.point.y, to.point.y ) - expansion - 1,
-                              std::max( from.point.x, to.point.x ) + expansion + 1,
-                              std::max( from.point.y, to.point.y ) + expansion + 1 };
-            SHAPE_TREE_ENTRY entry{ shape, 0, static_cast<int>( edge ), aLayer,
-                                    connection.netCode, false, true };
+            const INT_OCTAGON octagon = octagonalEnvelope(
+                    { from.point, to.point }, expansion + 1 );
+            SHAPE_TREE_ENTRY entry{ octagon.BoundingBox(), 0,
+                                    static_cast<int>( edge ), aLayer,
+                                    connection.netCode, false, true, octagon };
             std::optional<CONNECTION> topologyConnection;
             if( routeItems.size() == routeItemCount )
                 topologyConnection = CONNECTION::Get(
@@ -485,10 +534,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
     const auto started = std::chrono::steady_clock::now();
     for( const auto& layer : m_settings.layers )
     {
-        if( !layer.enabled || hasGeneralConvexRoomGeometry( net, layer.layerId )
-            || ( aCancel && aCancel() ) )
+        if( !layer.enabled || ( aCancel && aCancel() ) )
             continue;
-        auto terminals = [&]( const auto& source, bool aTarget )
+        auto terminals = [&]( const auto& source )
         {
             std::vector<ROOM_TERMINAL> result;
             for( const auto& terminal : source )
@@ -497,21 +545,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                     continue;
                 const auto start = terminal.pad.position;
                 const auto end = terminal.segmentEnd.value_or( start );
-                // A diagonal source trace still uses exact endpoint seeds;
-                // target traces keep their complete centre-line connection
-                // shape and are intersected with each reached room.
-                if( aTarget || start.x == end.x || start.y == end.y )
-                    result.push_back( { start, end, terminal.padIndex } );
-                else
-                {
-                    result.push_back( { start, start, terminal.padIndex } );
-                    result.push_back( { end, end, terminal.padIndex } );
-                }
+                result.push_back( { start, end, terminal.padIndex } );
             }
             return result;
         };
-        const auto starts = terminals( aStarts, false );
-        const auto targets = terminals( aTargets, true );
+        const auto starts = terminals( aStarts );
+        const auto targets = terminals( aTargets );
         if( starts.empty() || targets.empty() )
             continue;
         const auto ripupEntries = roomRipupObstacles(
@@ -525,12 +564,26 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         const double against = preferred + std::max( 0, layer.directionCost ) / 10.0;
         const double horizontal = layer.preferredDirection == 2 ? against : preferred;
         const double vertical = layer.preferredDirection == 1 ? against : preferred;
-        const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+        auto path = MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                 bounds, entries, layer.layerId, net, starts, targets, std::max<std::int64_t>( 1, radius ),
                 horizontal, vertical, m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
-                aCancel, aProgress, false,
+                aCancel, aProgress,
                 static_cast<double>( std::max( 0, m_settings.bendCost ) )
                         * std::max( 1, m_settings.gridStepIU ), ripupEntries );
+        // Keep the established rectangular frontier as a bounded transition
+        // fallback until the octagonal drill frontier is connected.  General
+        // convex layers must not collapse back to bounding rectangles.
+        if( !path && !hasGeneralConvexRoomGeometry( net, layer.layerId )
+            && aExpanded < m_settings.maxExpandedNodes )
+        {
+            path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+                    bounds, entries, layer.layerId, net, starts, targets,
+                    std::max<std::int64_t>( 1, radius ), horizontal, vertical,
+                    m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
+                    aCancel, aProgress, false,
+                    static_cast<double>( std::max( 0, m_settings.bendCost ) )
+                            * std::max( 1, m_settings.gridStepIU ), ripupEntries );
+        }
         if( !path )
             continue;
         ROUTING_CONNECTION found;

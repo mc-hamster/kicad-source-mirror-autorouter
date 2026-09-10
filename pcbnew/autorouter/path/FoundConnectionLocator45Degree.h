@@ -20,6 +20,7 @@
 #pragma once
 
 #include "../geometry/planar/FloatLine.h"
+#include "../geometry/planar/IntOctagon.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -28,6 +29,13 @@ struct RECTANGULAR_CORRIDOR_STEP
 {
     ROUTER_BOX room;                 // Already compensated trace-centre space.
     std::optional<ROUTER_BOX> door;   // Absent for the final target point.
+    FLOAT_LINE section;
+};
+
+struct OCTAGONAL_CORRIDOR_STEP
+{
+    PLANAR::INT_OCTAGON room;
+    std::optional<PLANAR::INT_OCTAGON> door;
     FLOAT_LINE section;
 };
 
@@ -44,6 +52,8 @@ public:
     static std::optional<std::vector<ROUTER_POINT>> LocateRectangular(
             ROUTER_POINT aStart, const std::vector<RECTANGULAR_CORRIDOR_STEP>& aSteps,
             bool aOrthogonal );
+    static std::optional<std::vector<ROUTER_POINT>> LocateOctagonal(
+            ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps );
 };
 
 } // namespace KICAD_AUTOROUTER

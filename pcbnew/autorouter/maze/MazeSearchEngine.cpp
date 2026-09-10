@@ -1813,23 +1813,21 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
 
         if( obstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
         {
-            ROUTER_BOX box = obstacle.box;
-            box.minX -= radius;
-            box.minY -= radius;
-            box.maxX += radius;
-            box.maxY += radius;
-
-            const ROUTER_POINT topLeft{ box.minX, box.minY };
-            const ROUTER_POINT topRight{ box.maxX, box.minY };
-            const ROUTER_POINT bottomRight{ box.maxX, box.maxY };
-            const ROUTER_POINT bottomLeft{ box.minX, box.maxY };
-            const bool startInside = box.Contains( aStart );
-            const bool endInside = box.Contains( aEnd );
-            if( startInside || endInside
-                || segmentsIntersect( aStart, aEnd, topLeft, topRight )
-                || segmentsIntersect( aStart, aEnd, topRight, bottomRight )
-                || segmentsIntersect( aStart, aEnd, bottomRight, bottomLeft )
-                || segmentsIntersect( aStart, aEnd, bottomLeft, topLeft ) )
+            // Freerouting's 45-degree compensated tree uses the eight
+            // orthogonal/diagonal support lines of an IntOctagon here.  A
+            // square bounding-box enlargement is safe but materially too
+            // conservative: it rejects legal 45-degree traces around a
+            // rectangular corner and invalidates paths produced by the exact
+            // room frontier.  The support octagon circumscribes the true
+            // round offset, so accepting its exterior remains DRC-safe.
+            const PLANAR::INT_OCTAGON clearanceShape =
+                    PLANAR::INT_OCTAGON::FromBox( obstacle.box ).Offset( radius );
+            const auto simplex = clearanceShape.ToSimplex();
+            const PLANAR::POLYLINE path = PLANAR::POLYLINE::FromPoints(
+                    { aStart, aEnd } );
+            if( simplex && ( ( !path.Empty() && simplex->IntersectsSegment( path, 1 ) )
+                             || ( path.Empty()
+                                  && simplex->Contains( PLANAR::POINT( aStart ) ) ) ) )
             {
                 return false;
             }

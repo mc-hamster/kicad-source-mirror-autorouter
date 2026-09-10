@@ -44,6 +44,7 @@
 #include <autorouter/path/FoundConnectionInserter.h>
 #include <autorouter/path/Connection.h>
 #include <autorouter/maze/MazeSearchEngine90Degree.h>
+#include <autorouter/maze/MazeSearchEngine45Degree.h>
 #include <autorouter/maze/MazeExpansionEngine.h>
 #include <autorouter/drill/DrillPageArray.h>
 #include <autorouter/geometry/planar/PolylineArea.h>
@@ -5584,7 +5585,9 @@ BOOST_AUTO_TEST_CASE( GeneralConvexGeometryUsesExactOffsetSupportCornersForDetou
     for( std::size_t index = 1; index < route->nodes.size(); ++index )
         BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes[index - 1],
                                               route->nodes[index] ) );
-    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+    // Exact convex contours are now handled directly by the octagonal room
+    // frontier rather than escaping to the broad visibility graph.
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
 }
 
 
@@ -5682,7 +5685,7 @@ BOOST_AUTO_TEST_CASE( DenseConvexSearchReservesConnectionLocalSupportDoors )
     for( std::size_t index = 1; index < route->nodes.size(); ++index )
         BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes[index - 1],
                                               route->nodes[index] ) );
-    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
 }
 
 
@@ -7133,6 +7136,42 @@ BOOST_AUTO_TEST_CASE( OctagonalRoomSeedPointsBracketEverySupportLineCrossing )
                               {
                                   return CONTACT_GEOMETRY::OnSegment( start, end, point );
                               } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeRoomFrontierRoutesThroughExactOctagonalRooms )
+{
+    using PLANAR::INT_OCTAGON;
+    const ROUTER_BOX bounds{ 0, 0, 1000, 1000 };
+    const INT_OCTAGON diamond( 250, 250, 750, 750,
+                               -250, 250, 750, 1250 );
+    const std::vector<SHAPE_TREE_ENTRY> obstacles{
+        { diamond.BoundingBox(), 1, 0, 0, 0, false, true, diamond }
+    };
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
+            bounds, obstacles, 0, 1,
+            { { { 100, 500 }, { 100, 500 }, 11 } },
+            { { { 500, 100 }, { 500, 100 }, 20 } },
+            10, 1, 1, 10000, expanded, metrics );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE_GE( path->points.size(), 2U );
+    BOOST_CHECK_EQUAL( path->startOwner, 11U );
+    BOOST_CHECK_EQUAL( path->targetOwner, 20U );
+    BOOST_CHECK( path->points.front() == ROUTER_POINT( { 100, 500 } ) );
+    BOOST_CHECK( path->points.back() == ROUTER_POINT( { 500, 100 } ) );
+    BOOST_CHECK( metrics.rooms > 0 );
+    BOOST_CHECK( metrics.doors > 0 );
+    BOOST_CHECK( metrics.sections > 0 );
+    for( std::size_t i = 1; i < path->points.size(); ++i )
+    {
+        const std::int64_t dx = std::abs( path->points[i].x - path->points[i - 1].x );
+        const std::int64_t dy = std::abs( path->points[i].y - path->points[i - 1].y );
+        BOOST_CHECK( dx == 0 || dy == 0 || dx == dy );
+        BOOST_CHECK( INT_OCTAGON::FromBox( bounds ).Contains( path->points[i] ) );
+    }
 }
 
 
