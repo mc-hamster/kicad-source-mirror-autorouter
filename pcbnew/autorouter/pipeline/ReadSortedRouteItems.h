@@ -21,16 +21,7 @@
 namespace KICAD_AUTOROUTER
 {
 
-/**
- * Source-order adapter for BatchOptimizer.ReadSortedRouteItems.
- *
- * Freerouting re-scans mutable Via and PolylineTrace items for every next()
- * call. Native optimization can currently remove only a whole
- * ROUTING_CONNECTION, so each connection is represented by its first eligible
- * source-style item and is optimized once per pass. The item key and via/
- * trace eligibility below are direct translations; item-local partial removal
- * remains a separate parity prerequisite.
- */
+/** Direct translation of BatchOptimizer.ReadSortedRouteItems' mutable scan. */
 class READ_SORTED_ROUTE_ITEMS
 {
 public:
@@ -44,10 +35,40 @@ public:
         bool operator<( const KEY& aOther ) const;
     };
 
+    struct ENTRY
+    {
+        KEY         key;
+        std::size_t connectionIndex = 0;
+    };
+
+    READ_SORTED_ROUTE_ITEMS();
+
+    /**
+     * Return the next mutable Via/PolylineTrace item in source x/y/layer order.
+     *
+     * The worker board is deliberately scanned from scratch for every call.
+     * Accepted optimization edits can therefore contribute a later item in
+     * the same pass, while items at or before the monotonic cursor are not
+     * revisited.  Vias are scanned before traces, so a via wins an exact
+     * x/y/layer tie; every other item at that exact key is skipped just as in
+     * the Java source.
+     */
+    std::optional<ENTRY> Next( const ROUTING_BOARD& aBoard,
+                               const std::vector<ROUTING_CONNECTION>& aConnections );
+
+    const ROUTER_POINT& CurrentPosition() const { return m_minItemCoor; }
+    int CurrentLayer() const { return m_minItemLayer; }
+
     static std::optional<KEY> Key( const ROUTING_BOARD& aBoard,
                                    const ROUTING_CONNECTION& aConnection );
-    static void SortConnections( const ROUTING_BOARD& aBoard,
-                                 std::vector<ROUTING_CONNECTION>& aConnections );
+
+private:
+    static bool PositionLess( const KEY& aLeft, const KEY& aRight );
+    bool IsAfterCursor( const KEY& aKey ) const;
+
+private:
+    ROUTER_POINT m_minItemCoor;
+    int          m_minItemLayer = -1;
 };
 
 } // namespace KICAD_AUTOROUTER

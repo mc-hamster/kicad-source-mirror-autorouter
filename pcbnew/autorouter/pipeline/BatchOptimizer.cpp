@@ -402,22 +402,22 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
 
         int consecutiveFailures = 0;
 
-        // ReadSortedRouteItems.next() rescans mutable board items in x/y/layer
-        // order and prefers an unfixed via over a trace at the same location.
-        // Native can only transact on complete connection records, so sort
-        // those records by their first eligible source-style item each pass.
-        READ_SORTED_ROUTE_ITEMS::SortConnections( *m_occupancy.Board(), aConnections );
+        // ReadSortedRouteItems.next() re-reads the mutable board after every
+        // accepted or rolled-back item transaction.  Keep the source's
+        // monotonic x/y/layer cursor instead of sorting one stale pass list.
+        READ_SORTED_ROUTE_ITEMS sortedRouteItems;
 
-        for( std::size_t connectionIndex = 0;
-             connectionIndex < aConnections.size(); )
+        while( true )
         {
+            const auto next = sortedRouteItems.Next( *m_occupancy.Board(), aConnections );
+            if( !next )
+                break;
+
+            const std::size_t connectionIndex = next->connectionIndex;
             ROUTING_CONNECTION& connection = aConnections[connectionIndex];
 
             if( isProtectedSourceCopper( connection ) )
-            {
-                ++connectionIndex;
                 continue;
-            }
             if( aCancel && aCancel() )
                 break;
 
@@ -428,16 +428,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             }
 
             if( !connection.complete || connection.nodes.size() < 2 )
-            {
-                ++connectionIndex;
                 continue;
-            }
-
-            if( !READ_SORTED_ROUTE_ITEMS::Key( *m_occupancy.Board(), connection ) )
-            {
-                ++connectionIndex;
-                continue;
-            }
 
             ++optimizedItems;
             const ROUTING_CONNECTION original = connection;
@@ -461,7 +452,6 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             // proposal. The transaction restores the removed route here.
             if( hasExternalInteriorContact( original, *m_occupancy.Board() ) )
             {
-                ++connectionIndex;
                 ++consecutiveFailures;
                 if( m_settings.maxOptimizationConsecutiveFailures > 0
                     && consecutiveFailures >= m_settings.maxOptimizationConsecutiveFailures )
@@ -609,10 +599,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             }
 
             if( aCancel && aCancel() )
-            {
-                ++connectionIndex;
                 break;
-            }
 
             if( bestConnection )
             {
@@ -622,7 +609,6 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 transaction.Commit();
                 changedThisPass = true;
                 consecutiveFailures = 0;
-                ++connectionIndex;
             }
             else if( bestIsDeletion )
             {
@@ -634,7 +620,6 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             }
             else
             {
-                ++connectionIndex;
                 ++consecutiveFailures;
             }
 

@@ -6959,7 +6959,7 @@ BOOST_AUTO_TEST_CASE( PlaneViaOptimizerStaysInTheOriginallyContactedArea )
 }
 
 
-BOOST_AUTO_TEST_CASE( OptimizerRouteOrderUsesSourceViaThenTraceItemKeys )
+BOOST_AUTO_TEST_CASE( OptimizerRouteOrderRescansAndUsesSourceCursorSemantics )
 {
     BOARD_SNAPSHOT board = makeBoard();
     AUTOROUTER_SETTINGS settings = makeSettings();
@@ -6994,12 +6994,34 @@ BOOST_AUTO_TEST_CASE( OptimizerRouteOrderUsesSourceViaThenTraceItemKeys )
     BOOST_CHECK( attachedKey->point == attached.nodes[1].point );
 
     std::vector<ROUTING_CONNECTION> routes{ attached, samePointTrace, via, earlyTrace };
-    READ_SORTED_ROUTE_ITEMS::SortConnections( *occupancy.Board(), routes );
-    BOOST_REQUIRE_EQUAL( routes.size(), 4 );
-    BOOST_CHECK( SameRouteGeometry( routes[0], earlyTrace ) );
-    BOOST_CHECK( SameRouteGeometry( routes[1], via ) );
-    BOOST_CHECK( SameRouteGeometry( routes[2], samePointTrace ) );
-    BOOST_CHECK( SameRouteGeometry( routes[3], attached ) );
+    READ_SORTED_ROUTE_ITEMS items;
+    const auto first = items.Next( *occupancy.Board(), routes );
+    BOOST_REQUIRE( first );
+    BOOST_CHECK( SameRouteGeometry( routes[first->connectionIndex], earlyTrace ) );
+
+    // next() reads the board from scratch, so an item inserted after the
+    // previous call but ahead of the old next candidate participates now.
+    ROUTING_CONNECTION inserted;
+    inserted.complete = true;
+    inserted.netCode = 2;
+    inserted.nodes = { { { 1600000, 750000 }, 0 }, { { 1750000, 750000 }, 0 } };
+    occupancy.Add( inserted );
+    routes.push_back( inserted );
+    const auto second = items.Next( *occupancy.Board(), routes );
+    BOOST_REQUIRE( second );
+    BOOST_CHECK( SameRouteGeometry( routes[second->connectionIndex], inserted ) );
+
+    const auto third = items.Next( *occupancy.Board(), routes );
+    BOOST_REQUIRE( third );
+    BOOST_CHECK( SameRouteGeometry( routes[third->connectionIndex], via ) );
+    BOOST_CHECK_EQUAL( third->key.kind, 0 );
+
+    // The source cursor contains only x/y/layer.  Once the via at this exact
+    // key is returned, the trace at the same key is intentionally skipped.
+    const auto fourth = items.Next( *occupancy.Board(), routes );
+    BOOST_REQUIRE( fourth );
+    BOOST_CHECK( SameRouteGeometry( routes[fourth->connectionIndex], attached ) );
+    BOOST_CHECK( !items.Next( *occupancy.Board(), routes ) );
 }
 
 BOOST_AUTO_TEST_CASE( TraceJunctionsUseRealCopperLayerAndExactIntersection )
