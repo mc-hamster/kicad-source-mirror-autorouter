@@ -3,6 +3,7 @@
  */
 #include "Simplex.h"
 #include "IntOctagon.h"
+#include "LineSegment.h"
 
 #include <algorithm>
 #include <array>
@@ -685,6 +686,29 @@ FLOAT_POINT SIMPLEX::CornerApprox( std::size_t aIndex ) const
 }
 
 
+std::vector<POINT> SIMPLEX::BoundedCorners() const
+{
+    std::vector<POINT> result;
+    result.reserve( m_corners.size() );
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( CornerIsBounded( index ) )
+            result.push_back( Corner( index ) );
+    }
+    return result;
+}
+
+
+std::vector<FLOAT_POINT> SIMPLEX::CornerApproxArray() const
+{
+    std::vector<FLOAT_POINT> result;
+    result.reserve( m_borders.size() );
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+        result.push_back( CornerApprox( index ) );
+    return result;
+}
+
+
 bool SIMPLEX::CornerIsBounded( std::size_t aIndex ) const
 {
     if( m_borders.size() < 2 || aIndex >= m_borders.size() )
@@ -889,6 +913,12 @@ std::optional<ROUTER_BOX> SIMPLEX::BoundingBox() const
         }
     }
     return result;
+}
+
+
+std::optional<INT_OCTAGON> SIMPLEX::BoundingOctagon() const
+{
+    return boundingOctagon( *this );
 }
 
 
@@ -1169,6 +1199,64 @@ double SIMPLEX::SmallestRadius() const
 {
     const auto centre = CentreOfGravity();
     return BorderDistance( { centre.first, centre.second } );
+}
+
+
+std::optional<POINT> SIMPLEX::NearestPoint( const POINT& aFromPoint ) const
+{
+    if( Contains( aFromPoint ) )
+        return aFromPoint;
+    return NearestBorderPoint( aFromPoint );
+}
+
+
+std::optional<POINT> SIMPLEX::NearestBorderPoint( const POINT& aFromPoint ) const
+{
+    if( IsEmpty() )
+        return {};
+    if( m_borders.size() == 1 )
+        return m_borders.front().PerpendicularProjection( aFromPoint );
+
+    const FLOAT_POINT from{ aFromPoint.X(), aFromPoint.Y() };
+    double minimumDistance = std::numeric_limits<double>::max();
+    std::size_t minimumIndex = 0;
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            continue;
+        const double distance = CornerApprox( index ).DistanceSquared( from );
+        if( distance < minimumDistance )
+        {
+            minimumDistance = distance;
+            minimumIndex = index;
+        }
+    }
+
+    if( !CornerIsBounded( minimumIndex ) )
+        return {};
+    POINT nearest = Corner( minimumIndex );
+    std::size_t previous = m_borders.size() - 2;
+    std::size_t current = m_borders.size() - 1;
+    for( std::size_t next = 0; next < m_borders.size(); ++next )
+    {
+        const POINT projection =
+                m_borders[current].PerpendicularProjection( aFromPoint );
+        if( ( !CornerIsBounded( current )
+              || m_borders[previous].SideOf( projection ) < 0 )
+            && ( !CornerIsBounded( next )
+                 || m_borders[next].SideOf( projection ) < 0 ) )
+        {
+            const double distance = projection.DistanceSquared( aFromPoint );
+            if( distance < minimumDistance )
+            {
+                minimumDistance = distance;
+                nearest = projection;
+            }
+        }
+        previous = current;
+        current = next;
+    }
+    return nearest;
 }
 
 
@@ -1757,6 +1845,122 @@ bool SIMPLEX::IsContainedIn( ROUTER_BOX aBox ) const
     const auto bounds = BoundingBox();
     return bounds && bounds->minX >= aBox.minX && bounds->minY >= aBox.minY
            && bounds->maxX <= aBox.maxX && bounds->maxY <= aBox.maxY;
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::Turn90Degree(
+        int aFactor, ROUTER_POINT aPole ) const
+{
+    std::vector<LINE> lines;
+    lines.reserve( m_borders.size() );
+    for( const LINE& border : m_borders )
+    {
+        const auto transformed = border.Turn90Degree( aFactor, aPole );
+        if( !transformed )
+            return {};
+        lines.push_back( *transformed );
+    }
+    return GetInstance( std::move( lines ) ).Simplify();
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::RotateApprox(
+        double aAngle, FLOAT_POINT aPole ) const
+{
+    if( aAngle == 0 )
+        return *this;
+
+    std::vector<ROUTER_POINT> corners;
+    corners.reserve( m_borders.size() );
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        const ROUTER_POINT corner = CornerApprox( index ).Rotate(
+                aAngle, aPole ).Round();
+        if( corners.empty() || corners.back() != corner )
+            corners.push_back( corner );
+    }
+
+    // Polygon removes only interior points in its stored linear sequence;
+    // it deliberately does not treat the first and last entries as adjacent
+    // during this normalization pass.
+    bool removed = true;
+    while( removed && corners.size() >= 3 )
+    {
+        removed = false;
+        for( std::size_t index = 1; index + 1 < corners.size(); ++index )
+        {
+            const ROUTER_POINT& previous = corners[index - 1];
+            const ROUTER_POINT& current = corners[index];
+            const ROUTER_POINT& next = corners[index + 1];
+            const INTEGER firstX = INTEGER( next.x ) - previous.x;
+            const INTEGER firstY = INTEGER( next.y ) - previous.y;
+            const INTEGER secondX = INTEGER( current.x ) - previous.x;
+            const INTEGER secondY = INTEGER( current.y ) - previous.y;
+            if( firstX * secondY - firstY * secondX == 0 )
+            {
+                corners.erase( corners.begin() + index );
+                removed = true;
+                break;
+            }
+        }
+    }
+
+    if( corners.size() >= 3 )
+    {
+        std::vector<LINE> lines;
+        lines.reserve( corners.size() );
+        for( std::size_t index = 0; index < corners.size(); ++index )
+        {
+            if( corners[index] == corners[( index + 1 ) % corners.size()] )
+                return Empty();
+            lines.emplace_back( corners[index],
+                                corners[( index + 1 ) % corners.size()] );
+        }
+        return GetInstance( std::move( lines ) ).Simplify();
+    }
+    if( corners.size() == 2 )
+    {
+        const POLYLINE polyline = POLYLINE::FromPoints( corners );
+        const auto segment = LINE_SEGMENT::FromPolyline( polyline, 1 );
+        return segment ? std::optional<SIMPLEX>{ segment->ToSimplex() }
+                       : std::optional<SIMPLEX>{ Empty() };
+    }
+    if( corners.size() == 1 )
+    {
+        return boxSimplexAllowDegenerate(
+                POINT( corners.front() ).SurroundingBox().value() );
+    }
+    return Empty();
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::MirrorVertical( ROUTER_POINT aPole ) const
+{
+    std::vector<LINE> lines;
+    lines.reserve( m_borders.size() );
+    for( const LINE& border : m_borders )
+    {
+        const auto transformed = border.MirrorVertical( aPole );
+        if( !transformed )
+            return {};
+        lines.push_back( *transformed );
+    }
+    return GetInstance( std::move( lines ) ).Simplify();
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::MirrorHorizontal( ROUTER_POINT aPole ) const
+{
+    std::vector<LINE> lines;
+    lines.reserve( m_borders.size() );
+    for( const LINE& border : m_borders )
+    {
+        const auto transformed = border.MirrorHorizontal( aPole );
+        if( !transformed )
+            return {};
+        lines.push_back( *transformed );
+    }
+    return GetInstance( std::move( lines ) ).Simplify();
 }
 
 

@@ -74,7 +74,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--java", default="java")
     parser.add_argument("--javac", default="javac")
-    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "simplex", "tile2", "polyline", "polytransform", "segment", "float", "spring", "octagon", "room45", "neighbours45", "door45"), default="room")
+    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "simplex", "tile2", "tilex", "polyline", "polytransform", "segment", "float", "spring", "octagon", "room45", "neighbours45", "door45"), default="room")
     args = parser.parse_args()
     jar, output = args.reference_jar.resolve(), args.output_dir.resolve()
     verify_reference(jar)
@@ -83,7 +83,7 @@ def main() -> int:
     classes.mkdir()
     drill = args.oracle == "drill"
     main_class = {"room": "RoomSearchOracle", "drill": "app.freerouting.autoroute.maze.DrillSearchOracle",
-                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle", "convex": "ConvexGeometryOracle", "simplex": "SimplexGeometryOracle", "tile2": "TileShapeOracle", "polyline": "PolylineGeometryOracle", "polytransform": "PolylineTransformOracle", "segment": "LineSegmentOracle", "float": "FloatGeometryOracle",
+                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle", "convex": "ConvexGeometryOracle", "simplex": "SimplexGeometryOracle", "tile2": "TileShapeOracle", "tilex": "TileTransformOracle", "polyline": "PolylineGeometryOracle", "polytransform": "PolylineTransformOracle", "segment": "LineSegmentOracle", "float": "FloatGeometryOracle",
                   "spring": "SpringOverOracle", "octagon": "IntOctagonOracle",
                   "room45": "ShapeSearchTree45DegreeOracle",
                   "neighbours45": "Sorted45DegreeRoomNeighboursOracle",
@@ -91,7 +91,7 @@ def main() -> int:
     source = ROOT / "scripts/autorouter" / (main_class.rsplit(".", 1)[-1] + ".java")
     expected = ROOT / f"qa/data/pcbnew/autorouter/{args.oracle}-search-a11c0a42.txt"
     sources = [source]
-    if args.oracle in ("spring", "simplex", "tile2", "polyline", "polytransform", "segment"):
+    if args.oracle in ("spring", "simplex", "tile2", "tilex", "polyline", "polytransform", "segment"):
         sources.append(ROOT / "scripts/autorouter/ConvexGeometryOracle.java")
     commands = [
         [args.javac, "-cp", str(jar), "-d", str(classes), *map(str, sources)],

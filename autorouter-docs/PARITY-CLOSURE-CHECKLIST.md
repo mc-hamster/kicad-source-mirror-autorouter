@@ -105,11 +105,16 @@ intersection rather than converting exact rationals back to doubles, preserving
 even signed-zero and endpoint side decisions. A **512-record** pinned oracle
 covers boxes, arbitrary triangles, rational-corner hexagons and octagons with
 interior, border and exterior probes, intersecting/contained/disjoint peers and
-eight ray directions. The complete native autorouter suite now has **195 passing
-cases**. The production 555 smoke remains host-valid and unchanged at 12/12
-connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853 expanded
-nodes. General shape transforms, exact nearest-point helpers and arbitrary-angle
-search-tree activation remain open.
+eight ray directions. Exact and approximate corner arrays, exact nearest-point
+and nearest-border-point construction, bounding octagons, containment boundary
+queries and the complete general-shape transform family (quarter turns,
+arbitrary-angle rounded rotation and both axis mirrors) are now direct source
+translations. A separate **384-record** oracle covers integral and rational
+queries, signed-zero approximate corners, negative/large turn factors, seven
+angles and translated poles. The complete native autorouter suite now has **196
+passing cases**. The production 555 smoke remains host-valid and unchanged at
+12/12 connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853
+expanded nodes. Arbitrary-angle search-tree activation remains open.
 
 Fixed and negotiated-rip-up trace/via obstacles retain exact octagonal envelopes;
 free-space completion, neighbour gaps, door sections, source-style queue

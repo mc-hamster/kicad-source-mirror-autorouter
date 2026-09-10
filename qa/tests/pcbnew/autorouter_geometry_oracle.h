@@ -322,6 +322,75 @@ inline std::string CheckRecord( const std::string& record )
                << ' ' << simplex.IntersectingBorderLineNo(
                         POINT( rayStart ), direction );
     }
+    else if( tag == "TILEX" )
+    {
+        std::size_t count;
+        in >> count;
+        std::vector<LINE> lines;
+        lines.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            lines.push_back( ReadLine( in ) );
+        const SIMPLEX simplex = SIMPLEX::GetInstance( std::move( lines ) );
+        INTEGER queryX, queryY, queryZ;
+        int factor;
+        double angle;
+        ROUTER_POINT pole;
+        FLOAT_POINT floatPole;
+        in >> queryX >> queryY >> queryZ >> factor >> angle
+           >> pole.x >> pole.y >> floatPole.x >> floatPole.y;
+        const POINT query( queryX, queryY, queryZ );
+
+        const auto printOptionalPoint = [&]( const std::optional<POINT>& aPoint )
+        {
+            if( !aPoint )
+                actual << -1;
+            else
+            {
+                actual << "3 ";
+                Print( actual, *aPoint );
+            }
+        };
+        const auto printTransformed = [&]( const std::optional<SIMPLEX>& aShape )
+        {
+            if( !aShape )
+                throw std::runtime_error( "small tile transform overflowed" );
+            PrintSimplex( actual, *aShape );
+        };
+
+        const auto bounded = simplex.BoundedCorners();
+        actual << bounded.size();
+        for( const POINT& point : bounded )
+        {
+            actual << ' ';
+            Print( actual, point );
+        }
+        const auto approximate = simplex.CornerApproxArray();
+        actual << ' ' << approximate.size() << std::fixed << std::setprecision( 9 );
+        for( FLOAT_POINT point : approximate )
+            actual << ' ' << point.x << ' ' << point.y;
+        const auto octagon = simplex.BoundingOctagon();
+        if( !octagon )
+            throw std::runtime_error( "bounded tile has no octagon" );
+        actual << ' ' << octagon->leftX << ' ' << octagon->bottomY
+               << ' ' << octagon->rightX << ' ' << octagon->topY
+               << ' ' << octagon->upperLeftDiagonalX
+               << ' ' << octagon->lowerRightDiagonalX
+               << ' ' << octagon->lowerLeftDiagonalX
+               << ' ' << octagon->upperRightDiagonalX << ' ';
+        printOptionalPoint( simplex.NearestPoint( query ) );
+        actual << ' ';
+        printOptionalPoint( simplex.NearestBorderPoint( query ) );
+        actual << ' ' << ( simplex.IsOutside( query ) ? 1 : 0 )
+               << ' ' << ( simplex.ContainsOnBorder( simplex.Corner( 0 ) ) ? 1 : 0 )
+               << ' ';
+        printTransformed( simplex.Turn90Degree( factor, pole ) );
+        actual << ' ';
+        printTransformed( simplex.RotateApprox( angle, floatPole ) );
+        actual << ' ';
+        printTransformed( simplex.MirrorVertical( pole ) );
+        actual << ' ';
+        printTransformed( simplex.MirrorHorizontal( pole ) );
+    }
     else if( tag == "POLY" )
     {
         std::size_t count;

@@ -40,6 +40,8 @@ public:
     const std::vector<LINE>& Borders() const { return m_borders; }
     const POINT& Corner( std::size_t i ) const;
     FLOAT_POINT CornerApprox( std::size_t aIndex ) const;
+    std::vector<POINT> BoundedCorners() const;
+    std::vector<FLOAT_POINT> CornerApproxArray() const;
     bool CornerIsBounded( std::size_t aIndex ) const;
     bool IsEmpty() const { return m_borders.empty(); }
     bool IsBounded() const;
@@ -51,6 +53,7 @@ public:
     double MaxWidth() const;
     double MinWidth() const;
     std::optional<ROUTER_BOX> BoundingBox() const;
+    std::optional<INT_OCTAGON> BoundingOctagon() const;
     int BorderLineIndex( const LINE& aLine ) const;
     SIMPLEX RemoveBorderLine( std::size_t aIndex ) const;
     SIMPLEX Intersection( const SIMPLEX& aOther ) const;
@@ -70,6 +73,8 @@ public:
     double Distance( FLOAT_POINT aPoint ) const;
     double BorderDistance( FLOAT_POINT aPoint ) const;
     double SmallestRadius() const;
+    std::optional<POINT> NearestPoint( const POINT& aFromPoint ) const;
+    std::optional<POINT> NearestBorderPoint( const POINT& aFromPoint ) const;
     std::pair<double, double> NearestPointApprox( double aX, double aY ) const;
     std::pair<double, double> NearestBorderPointApprox( double aX, double aY ) const;
     std::vector<FLOAT_POINT> NearestBorderPointsApprox(
@@ -101,6 +106,13 @@ public:
     POINT LeftMostCorner( const POINT& aFromPoint ) const;
     POINT RightMostCorner( const POINT& aFromPoint ) const;
     bool IsContainedIn( ROUTER_BOX aBox ) const;
+    bool IsOutside( const POINT& aPoint ) const { return !Contains( aPoint ); }
+    bool ContainsOnBorder( const POINT& aPoint ) const
+    { return ContainsOnBorderLineNo( aPoint ) >= 0; }
+    std::optional<SIMPLEX> Turn90Degree( int aFactor, ROUTER_POINT aPole ) const;
+    std::optional<SIMPLEX> RotateApprox( double aAngle, FLOAT_POINT aPole ) const;
+    std::optional<SIMPLEX> MirrorVertical( ROUTER_POINT aPole ) const;
+    std::optional<SIMPLEX> MirrorHorizontal( ROUTER_POINT aPole ) const;
     int IntersectingBorderLineNo( const POINT& aPoint,
                                   ROUTER_POINT aDirection ) const;
     bool Contains( const POINT& p ) const;
