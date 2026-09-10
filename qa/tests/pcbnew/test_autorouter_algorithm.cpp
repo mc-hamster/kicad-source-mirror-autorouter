@@ -994,6 +994,49 @@ BOOST_AUTO_TEST_CASE( PadEndpointDoesNotExemptForeignCopper )
 }
 
 
+BOOST_AUTO_TEST_CASE( FinePitchPadEndpointUsesTheNewTraceRadius )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 8000000, 6000000 };
+    board.pads[0].position = { 2000000, 2000000 };
+    board.pads[0].radius = 925000;
+    board.pads[0].clearance = 200000;
+    board.pads[0].trackWidth = 100000;
+    board.pads[1].position = { 6000000, 2000000 };
+
+    // This neighbouring fine-pitch pad is legal relative to the real source
+    // pad contour, and the proposed trace leaves in the opposite direction.
+    // Modelling the source endpoint as pad.radius + pad.clearance creates a
+    // second circular pad and falsely rejects the trace before testing its
+    // actual 50,000-IU half-width.
+    ROUTING_OBSTACLE neighbour;
+    neighbour.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    neighbour.netCode = 2;
+    neighbour.layers = { 0 };
+    neighbour.box = { 1075000, 2970000, 2925000, 3570000 };
+    board.obstacles.push_back( neighbour );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.layers.resize( 1 );
+    settings.allowVias = false;
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+
+    const ROUTER_NODE source{ board.pads[0].position, 0 };
+    const ROUTER_NODE escape{ { 3500000, 2000000 }, 0 };
+    BOOST_CHECK( search.CanUseSegment( 1, source, escape ) );
+
+    ROUTING_OBSTACLE crossing = neighbour;
+    crossing.box = { 2700000, 1900000, 2900000, 2100000 };
+    board.obstacles.push_back( crossing );
+    ROUTING_OCCUPANCY blockedOccupancy( settings.gridStepIU );
+    blockedOccupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE blocked( board, settings, blockedOccupancy );
+    BOOST_CHECK( !blocked.CanUseSegment( 1, source, escape ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( NewViaCannotReuseAnExistingDrill )
 {
     BOARD_SNAPSHOT board = makeBoard();
@@ -1514,12 +1557,15 @@ BOOST_AUTO_TEST_CASE( FanoutUsesBoardViaFallbackAndHonorsItsEscapeEnvelope )
     BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
     const ROUTING_PAD& landing = prepared.pads.back();
     BOOST_REQUIRE( landing.isFanoutTarget );
-    BOOST_CHECK_EQUAL( landing.fanoutViaDiameter, 400000 );
-    BOOST_CHECK_EQUAL( landing.fanoutViaDrill, 200000 );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDiameter, 0 );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDrill, 0 );
     BOOST_CHECK_EQUAL( landing.fanoutMinEscapeLength, 1000000 );
     BOOST_CHECK_EQUAL( landing.fanoutMaxEscapeLength, 1000000 );
-    BOOST_CHECK_EQUAL( landing.position.y, board.pads[0].position.y );
-    BOOST_CHECK_EQUAL( std::llabs( landing.position.x - board.pads[0].position.x ), 1000000 );
+    BOOST_CHECK( landing.position == board.pads[0].position );
+    const auto combinedRule = BATCH_FANOUT::ViaProfilesFor( board, 1, settings );
+    BOOST_REQUIRE_EQUAL( combinedRule.size(), 1U );
+    BOOST_CHECK_EQUAL( combinedRule.front().diameter, 400000 );
+    BOOST_CHECK_EQUAL( combinedRule.front().drill, 200000 );
 
     const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
     BOOST_REQUIRE( result.complete );
@@ -1589,8 +1635,9 @@ BOOST_AUTO_TEST_CASE( FanoutPreservesSelectedMicroviaSpanAndType )
     BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
     const ROUTING_PAD& landing = prepared.pads.back();
     BOOST_REQUIRE( landing.isFanoutTarget );
-    BOOST_CHECK( landing.fanoutViaLayers == std::vector<int>( { 0, 1 } ) );
-    BOOST_CHECK( landing.fanoutViaType == ROUTER_VIA_TYPE::MICROVIA );
+    BOOST_CHECK( landing.position == board.pads[0].position );
+    BOOST_CHECK( landing.fanoutViaLayers.empty() );
+    BOOST_CHECK( landing.fanoutViaType == ROUTER_VIA_TYPE::AUTO );
 
     const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
     BOOST_REQUIRE( result.complete );
@@ -1640,12 +1687,11 @@ BOOST_AUTO_TEST_CASE( FanoutNormalizesNonCardinalEscapeDirections )
     settings.fanoutMinEscapeLengthIU = 1000000;
     settings.fanoutMaxEscapeLengthIU = 1200000;
 
-    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
-    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
-    const ROUTING_PAD& landing = prepared.pads.back();
-    BOOST_REQUIRE( landing.isFanoutTarget );
-    const std::int64_t dx = landing.position.x - board.pads[0].position.x;
-    const std::int64_t dy = landing.position.y - board.pads[0].position.y;
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1U );
+    const std::int64_t dx = result.vias.front().position.x - board.pads[0].position.x;
+    const std::int64_t dy = result.vias.front().position.y - board.pads[0].position.y;
     BOOST_CHECK_NE( dx, 0 );
     BOOST_CHECK_NE( dy, 0 );
     const long double escape = std::sqrt( static_cast<long double>( dx ) * dx
@@ -1708,11 +1754,11 @@ BOOST_AUTO_TEST_CASE( FanoutRefinesBeyondItsLegacyDirectionSet )
     settings.fanoutMinEscapeLengthIU = 1000000;
     settings.fanoutMaxEscapeLengthIU = 1000000;
 
-    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
-    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
-    const ROUTING_PAD& landing = prepared.pads.back();
-    const std::int64_t dx = landing.position.x - board.pads[0].position.x;
-    const std::int64_t dy = landing.position.y - board.pads[0].position.y;
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1U );
+    const std::int64_t dx = result.vias.front().position.x - board.pads[0].position.x;
+    const std::int64_t dy = result.vias.front().position.y - board.pads[0].position.y;
     BOOST_REQUIRE( dx != 0 && dy != 0 );
 
     // Rounding an angular escape to integral IU leaves a sub-IU error. The
@@ -1773,23 +1819,22 @@ BOOST_AUTO_TEST_CASE( FanoutRejectsAStubCrossingSolidBetweenConcaveHoleArms )
     settings.fanoutMinEscapeLengthIU = 2000000;
     settings.fanoutMaxEscapeLengthIU = 2000000;
 
-    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
-    BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 1 );
-    const ROUTING_PAD& landing = prepared.pads.back();
-    BOOST_REQUIRE( landing.isFanoutTarget );
-    BOOST_CHECK_EQUAL( landing.position.x, board.pads[0].position.x );
-    BOOST_CHECK_GT( landing.position.y, board.pads[0].position.y );
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1U );
+    BOOST_CHECK_EQUAL( result.vias.front().position.x, board.pads[0].position.x );
+    BOOST_CHECK_GT( result.vias.front().position.y, board.pads[0].position.y );
 }
 
 
-BOOST_AUTO_TEST_CASE( FanoutUsesBoundedPreflightedBentEscapeBeforeGlobalSearch )
+BOOST_AUTO_TEST_CASE( FanoutRoomSearchFindsBentEscapeWithoutAPlannedLanding )
 {
     // The direct fanout probes are deliberately blocked at every sampled
     // radius. A source-layer wall still leaves a short bent escape: travel
     // above the wall, then place the via on its far side. The old planner
-    // accepted an arbitrary free via point and made the global maze rediscover
-    // this local path. The bounded local search must retain the actual escape
-    // and the maze must consume it without expanding a board-wide frontier.
+    // accepted an arbitrary free via point before routing.  The real fanout
+    // room/drill search must now discover and materialize the bent escape
+    // itself; PrepareSnapshot may not encode a path or landing geometry.
     BOARD_SNAPSHOT board = makeBoard();
     board.bounds = { 0, 0, 7000000, 7000000 };
     board.pads[0].position = { 1000000, 1000000 };
@@ -1876,43 +1921,45 @@ BOOST_AUTO_TEST_CASE( FanoutUsesBoundedPreflightedBentEscapeBeforeGlobalSearch )
     BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 1 );
     const ROUTING_PAD& landing = prepared.pads.back();
     BOOST_REQUIRE( landing.isFanoutTarget );
-    BOOST_REQUIRE_GT( landing.fanoutEscapePath.size(), 2U );
-    BOOST_CHECK( landing.fanoutEscapePath.front() == board.pads[0].position );
-    BOOST_CHECK( landing.fanoutEscapePath.back() == landing.position );
+    BOOST_CHECK( landing.position == board.pads[0].position );
+    BOOST_CHECK( landing.fanoutEscapePath.empty() );
 
-    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
-    occupancy.InitializeBoard( prepared, settings );
-    MAZE_SEARCH_ENGINE engine( prepared, settings, occupancy );
-    int expanded = -1;
-    const auto route = engine.FindConnection( prepared.pads[0], landing, 0, expanded, {} );
-    BOOST_REQUIRE( route );
-    BOOST_CHECK_EQUAL( expanded, 0 );
-    BOOST_REQUIRE_EQUAL( route->nodes.size(), landing.fanoutEscapePath.size() + 1 );
-    for( std::size_t index = 1; index < landing.fanoutEscapePath.size(); ++index )
-        BOOST_CHECK( route->nodes[index].point == landing.fanoutEscapePath[index] );
-    BOOST_CHECK_NE( route->nodes[route->nodes.size() - 2].layer,
-                    route->nodes.back().layer );
-
-    // The connected-set scheduler can also visit the synthetic landing
-    // first. Its reverse fanout edge must consume the same certified bent
-    // escape rather than falling through to a board-wide search that assumes
-    // the two endpoints have a direct source-layer stub.
-    int reverseExpanded = -1;
-    const auto reverse = engine.FindConnection( landing, prepared.pads[0], 0, reverseExpanded,
-                                                {} );
-    BOOST_REQUIRE( reverse );
-    BOOST_CHECK_EQUAL( reverseExpanded, 0 );
-    BOOST_REQUIRE_EQUAL( reverse->nodes.size(), landing.fanoutEscapePath.size() + 1 );
-    BOOST_CHECK( reverse->nodes.front().point == landing.position );
-    BOOST_CHECK_EQUAL( reverse->nodes.front().layer, landing.fanoutTargetLayer );
-    BOOST_CHECK_EQUAL( reverse->nodes[1].layer, landing.fanoutSourceLayer );
-    for( std::size_t index = 2; index < reverse->nodes.size(); ++index )
-    {
-        const std::size_t pathIndex = landing.fanoutEscapePath.size() - index;
-        BOOST_CHECK( reverse->nodes[index].point == landing.fanoutEscapePath[pathIndex] );
-        BOOST_CHECK_EQUAL( reverse->nodes[index].layer, landing.fanoutSourceLayer );
-    }
-    BOOST_CHECK( reverse->nodes.back().point == board.pads[0].position );
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_GE( result.vias.size(), 1U );
+    const auto route = std::max_element(
+            result.connections.begin(), result.connections.end(),
+            []( const ROUTING_CONNECTION& aLeft, const ROUTING_CONNECTION& aRight )
+            {
+                const std::size_t left = aLeft.isFanoutConnection ? aLeft.nodes.size() : 0;
+                const std::size_t right = aRight.isFanoutConnection ? aRight.nodes.size() : 0;
+                return left < right;
+            } );
+    BOOST_REQUIRE( route != result.connections.end() );
+    BOOST_REQUIRE( route->isFanoutConnection );
+    BOOST_REQUIRE_GT( route->nodes.size(), 2U );
+    BOOST_CHECK_GT( result.metrics.expandedNodes, 0 );
+    const auto transitionRoute = std::find_if(
+            result.connections.begin(), result.connections.end(),
+            []( const ROUTING_CONNECTION& aConnection )
+            {
+                return aConnection.isFanoutConnection
+                       && std::adjacent_find(
+                                  aConnection.nodes.begin(), aConnection.nodes.end(),
+                                  []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
+                                  { return aLeft.layer != aRight.layer; } )
+                                  != aConnection.nodes.end();
+            } );
+    BOOST_REQUIRE( transitionRoute != result.connections.end() );
+    const auto transition = std::adjacent_find(
+            transitionRoute->nodes.begin(), transitionRoute->nodes.end(),
+            []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
+            { return aLeft.layer != aRight.layer; } );
+    BOOST_REQUIRE( transition != transitionRoute->nodes.end() );
+    // Dynamic fanout now retains the real source pad as the first node.  The
+    // selected first drill, rather than a synthetic preplanned endpoint,
+    // proves that the room frontier found the bounded bent escape.
+    BOOST_CHECK_GT( transition->point.x, 2000000 );
 }
 
 
@@ -1956,8 +2003,12 @@ BOOST_AUTO_TEST_CASE( FanoutTriesLaterBoardViaProfileWhenEarlierProfileCannotEsc
     BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
     const ROUTING_PAD& landing = prepared.pads.back();
     BOOST_REQUIRE( landing.isFanoutTarget );
-    BOOST_CHECK_EQUAL( landing.fanoutViaDiameter, 300000 );
-    BOOST_CHECK_EQUAL( landing.fanoutViaDrill, 100000 );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDiameter, 0 );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDrill, 0 );
+    const auto combinedRule = BATCH_FANOUT::ViaProfilesFor( board, 1, settings );
+    BOOST_REQUIRE_EQUAL( combinedRule.size(), 2U );
+    BOOST_CHECK_EQUAL( combinedRule[0].diameter, 2000000 );
+    BOOST_CHECK_EQUAL( combinedRule[1].diameter, 300000 );
 
     const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
     BOOST_REQUIRE( result.complete );
@@ -1967,7 +2018,7 @@ BOOST_AUTO_TEST_CASE( FanoutTriesLaterBoardViaProfileWhenEarlierProfileCannotEsc
 }
 
 
-BOOST_AUTO_TEST_CASE( FanoutKeepsEachSelectedViaProfileScopedToItsPin )
+BOOST_AUTO_TEST_CASE( FanoutEvaluatesTheOrderedViaRuleIndependentlyForEachPin )
 {
     // Freerouting's combined ViaRule is evaluated separately for every SMD
     // pin.  Here the first pin can use the large first profile, while the
@@ -2054,19 +2105,17 @@ BOOST_AUTO_TEST_CASE( FanoutKeepsEachSelectedViaProfileScopedToItsPin )
         }
     }
     BOOST_REQUIRE_EQUAL( landingProfiles.size(), 2U );
-    BOOST_CHECK( ( landingProfiles.at( 0 ) == ROUTING_VIA_DIMENSION{ 1200000, 100000 } ) );
-    BOOST_CHECK( ( landingProfiles.at( 1 ) == ROUTING_VIA_DIMENSION{ 300000, 100000 } ) );
+    BOOST_CHECK( ( landingProfiles.at( 0 ) == ROUTING_VIA_DIMENSION{ 0, 0 } ) );
+    BOOST_CHECK( ( landingProfiles.at( 1 ) == ROUTING_VIA_DIMENSION{ 0, 0 } ) );
 
     const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
     BOOST_REQUIRE( result.complete );
-    BOOST_CHECK_EQUAL( std::count_if( result.vias.begin(), result.vias.end(),
-                                      []( const ROUTING_VIA& aVia )
-                                      { return aVia.diameter == 1200000 && aVia.drill == 100000; } ),
-                       1 );
-    BOOST_CHECK_EQUAL( std::count_if( result.vias.begin(), result.vias.end(),
-                                      []( const ROUTING_VIA& aVia )
-                                      { return aVia.diameter == 300000 && aVia.drill == 100000; } ),
-                       1 );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 2U );
+    for( const ROUTING_VIA& via : result.vias )
+    {
+        BOOST_CHECK( ( via.diameter == 1200000 || via.diameter == 300000 )
+                     && via.drill == 100000 );
+    }
 }
 
 
@@ -5648,7 +5697,7 @@ BOOST_AUTO_TEST_CASE( GeneralConvexGeometryDoesNotCloseABoundingBoxCornerWedge )
     BOOST_REQUIRE_EQUAL( route->nodes.size(), 2 );
     BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes.front(),
                                           route->nodes.back() ) );
-    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
 }
 
 
@@ -6087,12 +6136,15 @@ BOOST_AUTO_TEST_CASE( OptimizerCannotShortenAwayBranchContacts )
     BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} );
     BOOST_CHECK( occupancy.Board()->Connected( 0, 2 ) );
     BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
-    BOOST_CHECK( routes.front().nodes == trunk.nodes );
-    // Removing an absent route must not decrement another route's congestion.
-    occupancy.Remove( trunk );
-    occupancy.Remove( trunk );
-    BOOST_CHECK_EQUAL( occupancy.Connections().size(), 1 );
-    BOOST_CHECK( !occupancy.Board()->Connected( 0, 2 ) );
+    BOOST_REQUIRE_EQUAL( routes.size(), 2U );
+    const ROUTING_CONNECTION optimizedTrunk = routes.front();
+    const std::size_t beforeRemoval = occupancy.Connections().size();
+    // Removing an already removed route must not decrement a surviving
+    // branch's congestion or erase it from the mutable item graph.
+    occupancy.Remove( optimizedTrunk );
+    BOOST_CHECK_EQUAL( occupancy.Connections().size(), beforeRemoval - 1 );
+    occupancy.Remove( optimizedTrunk );
+    BOOST_CHECK_EQUAL( occupancy.Connections().size(), beforeRemoval - 1 );
 }
 
 
@@ -6508,8 +6560,8 @@ BOOST_AUTO_TEST_CASE( HostSessionRepairsAPlaneSplitByTheNewRouting )
     // Preserve this fixture's deliberate initial same-layer plane split. The
     // production defaults now match Freerouting's 50/5 via costs and can
     // choose the clean via alternative without entering host repair.
-    settings.viaCost = 500;
-    settings.planeViaCost = 50;
+    settings.viaCost = 50000;
+    settings.planeViaCost = 5000;
     settings.maxPasses = 2;
     settings.maxIterations = 2;
     settings.optimizationPasses = 0;
@@ -6548,8 +6600,8 @@ BOOST_AUTO_TEST_CASE( HostSessionRunsRefillAndRepairOnTheJobWorker )
     auto board = makeHostRoutingBoard( true );
     auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
     settings.enableFanout = false;
-    settings.viaCost = 500;
-    settings.planeViaCost = 50;
+    settings.viaCost = 50000;
+    settings.planeViaCost = 5000;
     settings.maxPasses = 2;
     settings.maxIterations = 2;
     settings.optimizationPasses = 0;
@@ -6596,8 +6648,8 @@ BOOST_AUTO_TEST_CASE( HostSessionCanCancelAfterRoutingBeforePlaneRepair )
     auto board = makeHostRoutingBoard( true );
     auto settings = KICAD_BOARD_ADAPTER( board.get() ).CreateDefaultSettings();
     settings.enableFanout = false;
-    settings.viaCost = 500;
-    settings.planeViaCost = 50;
+    settings.viaCost = 50000;
+    settings.planeViaCost = 5000;
     settings.maxPasses = 1;
     settings.maxIterations = 1;
     settings.optimizationPasses = 0;

@@ -20,9 +20,7 @@
 namespace KICAD_AUTOROUTER
 {
 
-/** Component/pin ordering follows pinned BatchFanout. Landing geometry remains
- * the native synthetic-escape adapter, not reference RoutingBoard.fanout.
- */
+/** Component/pin ordering and per-pin fanout sequencing follow pinned BatchFanout. */
 class BATCH_FANOUT
 {
 public:
@@ -32,15 +30,19 @@ public:
     /**
      * Prepare the worker snapshot for Freerouting's SMD fanout pre-pass.
      *
-     * A fanout is represented as an ordinary router connection from a
-     * single-layer SMD pad to a synthetic landing pad on another enabled
-     * copper layer.  The main batch stage then routes from that landing pad
-     * to the rest of the net.  No KiCad object is created here; the resulting
-     * via/trace is materialized by the normal proposal path.
+     * The synthetic pad is a control/item identity only.  It is initially
+     * colocated with the real SMD pin; the room/drill frontier chooses the
+     * first legal drill and the control item is then moved to that physical
+     * endpoint.  No geometric landing is preselected here.
      */
     static BOARD_SNAPSHOT PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                                            const AUTOROUTER_SETTINGS& aSettings,
                                            const ROUTER_CANCEL_CALLBACK& aCancel = {} );
+
+    /** Ordered netclass ViaRule plus the optional board-rule fanout fallback. */
+    static std::vector<ROUTING_VIA_PROFILE> ViaProfilesFor(
+            const BOARD_SNAPSHOT& aBoard, int aNetCode,
+            const AUTOROUTER_SETTINGS& aSettings );
 
     static std::vector<std::size_t> PlaneTargetsFor( const BOARD_SNAPSHOT& aBoard,
                                                      const ROUTING_NET& aNet );

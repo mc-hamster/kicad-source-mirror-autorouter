@@ -9,6 +9,7 @@
 #include "MazeExpansionEngine.h"
 #include "MazeRipupResolver.h"
 #include "MazeSearchEngine45Degree.h"
+#include "MazeTraceShover.h"
 #include "../path/Connection.h"
 #include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
@@ -639,6 +640,14 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         found.cost = path->ripupCost;
         for( const auto& point : path->points )
             found.nodes.push_back( { point, layer.layerId } );
+        // FoundConnectionLocator removes corners that are no longer needed
+        // after a room/door chain has been reconstructed.  In particular, an
+        // exact convex obstacle can split free space into several rooms even
+        // though the final source-to-target segment merely crosses the
+        // obstacle's bounding-box corner and misses its real contour.  Pull
+        // that chain tight before validating it so the room adapter does not
+        // preserve decomposition-only doglegs.
+        MAZE_TRACE_SHOVER::Shorten( found, *this );
         bool legal = !found.nodes.empty();
         // The first node is an already-existing source/target contact. It may
         // legitimately lie inside its pad or inside the board-edge centre
@@ -968,6 +977,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         bool legal = assignViaStyles( found );
         if( legal )
             removeGeneratedCollinearNodes( found, *this );
+        if( legal )
+            MAZE_TRACE_SHOVER::Shorten( found, *this );
         for( std::size_t i = 1; i < found.nodes.size() && legal; ++i )
         {
             const std::size_t edge = i - 1;
@@ -983,6 +994,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                         << " from=(" << from.point.x << ',' << from.point.y << ",L"
                         << from.layer << ") to=(" << to.point.x << ',' << to.point.y
                         << ",L" << to.layer << ") via=" << isVia
+                        << " start_allowed="
+                        << isPointAllowed( from.point, from.layer, net, isVia,
+                                           endpointRadius( net, from.point ) )
+                        << " end_allowed="
+                        << isPointAllowed( to.point, to.layer, net, isVia,
+                                           endpointRadius( net, to.point ) )
                         << " ripup_cost=" << path->ripupCost
                         << " ripped_groups=" << path->rippedObstacleGroups.size();
                 autorouterDebugLog( message.str() );

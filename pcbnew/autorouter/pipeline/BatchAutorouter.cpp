@@ -1261,6 +1261,14 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                         unconnected.push_back( index );
                     }
                 }
+                for( std::size_t index : aNet.planeTargetIndices )
+                {
+                    if( index < aBoard.pads.size()
+                        && !aOccupancy.Board()->Connected( sourceIndex, index ) )
+                    {
+                        unconnected.push_back( index );
+                    }
+                }
                 std::stable_sort(
                         unconnected.begin(), unconnected.end(),
                         [&]( std::size_t aLeft, std::size_t aRight )
@@ -1271,9 +1279,25 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                                                            aBoard.pads[aRight].position );
                             return left != right ? left < right : aLeft < aRight;
                         } );
+                std::vector<std::vector<ROUTING_TERMINAL>> unconnectedTerminalSets;
+                unconnectedTerminalSets.reserve( unconnected.size() );
                 for( std::size_t index : unconnected )
                 {
                     auto terminals = aOccupancy.Board()->Terminals( index );
+                    // A conduction area is a real reference target item, but
+                    // the native worker stores its geometry as an area rather
+                    // than manufacturing a point terminal.  Its exact sampled
+                    // adapter target still has to participate in the fanout
+                    // item set so the search can terminate at the first drill.
+                    if( terminals.empty() && index < aBoard.pads.size()
+                        && aBoard.pads[index].isPlaneTarget )
+                    {
+                        ROUTING_TERMINAL terminal;
+                        terminal.pad = aBoard.pads[index];
+                        terminal.padIndex = index;
+                        terminals.push_back( std::move( terminal ) );
+                    }
+                    unconnectedTerminalSets.push_back( terminals );
                     destinations.insert( destinations.end(), terminals.begin(),
                                          terminals.end() );
                 }
@@ -1289,8 +1313,7 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                 // without inventing another ratsnest edge.
                 if( !destinations.empty() && unconnected.size() <= 4 )
                 {
-                    destinationAttempts.push_back(
-                            aOccupancy.Board()->Terminals( unconnected.front() ) );
+                    destinationAttempts.push_back( unconnectedTerminalSets.front() );
 
                     if( unconnected.size() > 1 )
                         destinationAttempts.push_back( destinations );
@@ -1300,13 +1323,10 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                     destinationAttempts.push_back( destinations );
                 }
 
-                // Plane-only nets have no ordinary pad destination to place
-                // in the item-set search.  Retain the preflighted synthetic
-                // landing fallback for that case; passing only an explicit
-                // start would disable the local fanout construction without
-                // providing a real destination in return.
-                if( destinations.empty() )
-                    starts.clear();
+                // Plane conduction areas are represented by target terminals
+                // above.  If no real destination remains, the reference
+                // returns FAILED instead of routing toward the synthetic
+                // control item itself.
             }
             else if( targetIsPlane && !source.isExactTarget )
             {
@@ -1332,7 +1352,8 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             // An empty explicit set selects the ordinary pair/synthetic
             // landing behavior in MAZE_SEARCH_ENGINE. All non-fanout routes
             // have exactly one destination attempt.
-            if( destinationAttempts.empty() )
+            if( destinationAttempts.empty()
+                && ( !requestedFanoutTask || !destinations.empty() ) )
                 destinationAttempts.push_back( destinations );
 
             for( std::size_t destinationAttempt = 0;
@@ -2151,6 +2172,15 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         }
 
         net.connections = std::move( fanoutConnections );
+        if( !net.connections.empty() )
+        {
+            // RoutingBoard.fanout() evaluates the netclass ViaRule followed
+            // by the optional board-rule fallback as one ordered rule for
+            // each pin.  Keep that combined rule local to the fanout board;
+            // ordinary routing must continue to use the net's real rule.
+            net.viaProfiles = BATCH_FANOUT::ViaProfilesFor(
+                    board, net.netCode, aSettings );
+        }
         fanoutConnectionTotal += static_cast<int>( net.connections.size() );
     }
 
@@ -2164,46 +2194,6 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         fanoutSettings.allowRipupRouted = aSettings.fanoutRipupAllowed;
 
         AUTOROUTE_ENGINE fanoutRouteEngine( fanoutBoard, fanoutSettings, occupancy );
-        struct FANOUT_ENGINE
-        {
-            int                                  netCode = 0;
-            ROUTING_VIA_PROFILE                  via;
-            std::unique_ptr<AUTOROUTE_ENGINE>    engine;
-        };
-        // Re-indexing a large board for every SMD pin would undo the batch
-        // router's persistent-index performance work.  Cache one immutable
-        // engine per (net, selected ViaRule profile); those engines share the
-        // occupancy transaction but have their own net-local via radii.
-        std::vector<FANOUT_ENGINE> fanoutEngines;
-        const auto fanoutEngineFor = [&]( int aNetCode, const ROUTING_PAD& aLanding )
-                -> const AUTOROUTE_ENGINE&
-        {
-            if( !aLanding.isFanoutTarget || aLanding.fanoutViaDiameter <= 0
-                || aLanding.fanoutViaDrill <= 0 )
-            {
-                return fanoutRouteEngine;
-            }
-
-            const ROUTING_VIA_PROFILE via{ aLanding.fanoutViaDiameter,
-                                            aLanding.fanoutViaDrill,
-                                            aLanding.fanoutViaLayers,
-                                            aLanding.fanoutViaAttachSmdAllowed,
-                                            aLanding.fanoutViaType };
-            const auto found = std::find_if(
-                    fanoutEngines.begin(), fanoutEngines.end(),
-                    [&]( const FANOUT_ENGINE& aEntry )
-                    { return aEntry.netCode == aNetCode && aEntry.via == via; } );
-            if( found != fanoutEngines.end() )
-                return *found->engine;
-
-            FANOUT_ENGINE entry;
-            entry.netCode = aNetCode;
-            entry.via = via;
-            entry.engine = std::make_unique<AUTOROUTE_ENGINE>(
-                    fanoutBoard, fanoutSettings, occupancy, aNetCode, via );
-            fanoutEngines.push_back( std::move( entry ) );
-            return *fanoutEngines.back().engine;
-        };
         const auto orderedPins = BATCH_FANOUT::OrderedPins( fanoutBoard,
                                                              aSettings.fanoutPinOrder,
                                                              fanoutStageCancel );
@@ -2331,7 +2321,6 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 };
 
                 ++totalItemsFanouted;
-                const ROUTING_PAD& landing = fanoutBoard.pads[task->second.second];
                 const auto reportSearchProgress = [&]( int aSearchExpanded )
                 {
                     if( !aProgress )
@@ -2349,12 +2338,10 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     aProgress( progress );
                 };
 
-                const AUTOROUTE_ENGINE& pinRouteEngine =
-                        fanoutEngineFor( net.netCode, landing );
                 const auto connectionsBeforePin = connections;
                 int expanded = 0;
                 const bool taskComplete = routeNet(
-                        fanoutBoard, fanoutSettings, net, pass, occupancy, pinRouteEngine,
+                        fanoutBoard, fanoutSettings, net, pass, occupancy, fanoutRouteEngine,
                         connections, expanded, ripups, pinCancel,
                         reportSearchProgress );
                 totalExpandedNodes += expanded;
@@ -2384,14 +2371,33 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     ROUTING_PAD& mutableLanding = fanoutBoard.pads[task->second.second];
                     mutableLanding.position = actualLanding;
                     mutableLanding.fanoutEscapePath.clear();
-                    for( const ROUTER_NODE& node : insertedFanout->nodes )
+                    for( std::size_t nodeIndex = 0;
+                         nodeIndex < insertedFanout->nodes.size(); ++nodeIndex )
                     {
+                        const ROUTER_NODE& node = insertedFanout->nodes[nodeIndex];
                         if( node.layer != mutableLanding.fanoutSourceLayer )
                             break;
                         if( mutableLanding.fanoutEscapePath.empty()
                             || mutableLanding.fanoutEscapePath.back() != node.point )
                         {
                             mutableLanding.fanoutEscapePath.push_back( node.point );
+                        }
+
+                        if( nodeIndex + 1 < insertedFanout->nodes.size()
+                            && insertedFanout->nodes[nodeIndex + 1].layer != node.layer )
+                        {
+                            const ROUTER_NODE& exit = insertedFanout->nodes[nodeIndex + 1];
+                            mutableLanding.fanoutTargetLayer = exit.layer;
+                            mutableLanding.layers = { exit.layer };
+                            if( nodeIndex < insertedFanout->edgeStyles.size() )
+                            {
+                                const ROUTING_EDGE_STYLE& selected =
+                                        insertedFanout->edgeStyles[nodeIndex];
+                                mutableLanding.fanoutViaDiameter = selected.viaDiameter;
+                                mutableLanding.fanoutViaDrill = selected.viaDrill;
+                                mutableLanding.fanoutViaLayers = selected.viaLayers;
+                                mutableLanding.fanoutViaType = selected.viaType;
+                            }
                         }
                     }
                     board.pads[task->second.second] = mutableLanding;

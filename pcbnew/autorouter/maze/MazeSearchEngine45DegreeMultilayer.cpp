@@ -131,11 +131,29 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         const INT_OCTAGON seed = INT_OCTAGON::FromBox(
                 { point.x, point.y, point.x, point.y } );
         for( const auto& item : space.tree.Overlaps( seed ) )
-            if( item.isRoom )
+            if( item.isRoom && item.BoundingOctagon().Contains( point ) )
                 return space.byId.at( item.objectId );
         auto rooms = space.complete( space.incomplete( {
                 INT_OCTAGON::FromBox( layers[layer].bounds ), layers[layer].id, seed } ) );
-        return rooms.size() == 1 ? rooms.front() : nullptr;
+
+        // ExpansionDrill.calculateExpansionRooms requires exactly one room
+        // containing the drill location.  ShapeSearchTree45Degree may divide
+        // an otherwise empty board-sized room into multiple sections; only
+        // the section whose intersected contained-shape includes this point
+        // is the drill room.  Counting every completed sibling made all
+        // candidates in that page look ambiguous and forced fanout back to
+        // the legacy grid search.
+        ROOM* containing = nullptr;
+        for( ROOM* room : rooms )
+        {
+            if( room->shape->GetOctagon().Contains( point ) )
+            {
+                if( containing )
+                    return nullptr;
+                containing = room;
+            }
+        }
+        return containing;
     };
     enum class KIND { ROOM_ENTRY, PAGE, DRILL_ENTER, DRILL_EXIT, TARGET, FANOUT_TARGET };
     struct STATE
@@ -284,6 +302,11 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         }
     }
     const int targetIdBase = nextItemId;
+    int fanoutEnvelopeRejects = 0;
+    int drillRoomFailures = 0;
+    int drillRoomMismatches = 0;
+    int viaStyleRejects = 0;
+    bool loggedRoomMismatch = false;
     while( !open.empty() && step() )
     {
         const auto index = open.begin()->second;
@@ -320,6 +343,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                              && distance
                                         > static_cast<long double>( via.fanoutMaxDistance ) ) )
                     {
+                        ++fanoutEnvelopeRejects;
                         continue;
                     }
                 }
@@ -339,12 +363,45 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                         if( !layers[i].active )
                             continue;
                         ROOM* room = roomAt( i, drill.location );
-                        if( !room ) { drill.valid = false; break; }
+                        if( !room )
+                        {
+                            ++drillRoomFailures;
+                            if( autorouterDebugEnabled() && drillRoomFailures == 1 )
+                            {
+                                std::ostringstream message;
+                                message << "ROOM45_DRILL_ROOM_MISSING net=" << net
+                                        << " drill=(" << drill.location.x << ','
+                                        << drill.location.y << ") ordinal=" << i
+                                        << " layer=" << layers[i].id;
+                                autorouterDebugLog( message.str() );
+                            }
+                            drill.valid = false;
+                            break;
+                        }
                         drill.rooms[i] = room->shape.get();
                     }
                 }
                 if( !drill.valid || drill.rooms[current.layer] != current.room->shape.get() )
+                {
+                    if( drill.valid )
+                    {
+                        ++drillRoomMismatches;
+                        if( !loggedRoomMismatch && autorouterDebugEnabled() )
+                        {
+                            loggedRoomMismatch = true;
+                            std::ostringstream message;
+                            message << "ROOM45_DRILL_ROOM_MISMATCH net=" << net
+                                    << " drill=(" << drill.location.x << ','
+                                    << drill.location.y << ") layer="
+                                    << layers[current.layer].id << " current_room="
+                                    << current.room->shape->GetId() << " drill_room="
+                                    << ( drill.rooms[current.layer]
+                                                 ? drill.rooms[current.layer]->GetId() : -1 );
+                            autorouterDebugLog( message.str() );
+                        }
+                    }
                     continue;
+                }
                 const auto nearest = MAZE_EXPANSION_ENGINE::Nearest( drill.freeShape, from );
                 const auto cost = MAZE_EXPANSION_ENGINE::ToDrill( drill.freeShape, from, current.g,
                         via.normalCost, true, layer.horizontalCost, layer.verticalCost,
@@ -380,7 +437,10 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                                 current.drill->location, layers[current.layer].id,
                                 layers[to].id );
                         if( !selectedStyle )
+                        {
+                            ++viaStyleRejects;
                             continue;
+                        }
                     }
                     STATE state = current;
                     state.kind = fanoutDrill ? KIND::FANOUT_TARGET : KIND::DRILL_EXIT;
@@ -578,6 +638,10 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                 << " rooms=" << metrics.rooms << " sections=" << metrics.sections
                 << " pages=" << metrics.drillPages << " drills=" << metrics.drills
                 << " transitions=" << metrics.layerTransitions
+                << " envelope_rejects=" << fanoutEnvelopeRejects
+                << " room_failures=" << drillRoomFailures
+                << " room_mismatches=" << drillRoomMismatches
+                << " style_rejects=" << viaStyleRejects
                 << " expanded=" << expanded << " allocation_limit=" << allocationLimit;
         autorouterDebugLog( message.str() );
     }

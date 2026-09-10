@@ -845,7 +845,17 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
 
             const ROUTING_PAD& pad = m_board.pads[padIndex];
             const ROUTER_CELL_KEY key{ pad.position.x, pad.position.y, net.netCode };
-            const std::int64_t radius = pad.radius + pad.clearance;
+            // A terminal is an already-existing copper item; the maze is
+            // validating only the new trace which leaves or enters it.  Using
+            // the pad's largest bounding radius here models that entire pad a
+            // second time as circular candidate copper.  On a legal fine-
+            // pitch package this can reject every pad centre against its
+            // adjacent pin before the first trace segment is considered.
+            // Freerouting starts from the compensated target-item door and
+            // applies the trace half-width to the routed edge.  Preserve that
+            // semantic while retaining the endpoint map as the stable signal
+            // used for same-net pad-hole contact handling.
+            const std::int64_t radius = m_trackRadii[net.netCode];
             auto [radiusIt, inserted] = m_endpointRadii.emplace( key, radius );
             if( !inserted )
                 radiusIt->second = std::max( radiusIt->second, radius );
@@ -1577,7 +1587,10 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                 if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
                     autorouterDebugLog( "start point rejected by rectangle obstacle="
                                         + std::to_string( obstacleIndex ) + " net="
-                                        + std::to_string( obstacle.netCode ) );
+                                        + std::to_string( obstacle.netCode ) + " point=("
+                                        + std::to_string( aPoint.x ) + ","
+                                        + std::to_string( aPoint.y ) + ",L"
+                                        + std::to_string( aLayer ) + ")" );
                 return false;
             }
         }
@@ -1607,7 +1620,10 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                 if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
                     autorouterDebugLog( "start point rejected by convex obstacle="
                                         + std::to_string( obstacleIndex ) + " net="
-                                        + std::to_string( obstacle.netCode ) );
+                                        + std::to_string( obstacle.netCode ) + " point=("
+                                        + std::to_string( aPoint.x ) + ","
+                                        + std::to_string( aPoint.y ) + ",L"
+                                        + std::to_string( aLayer ) + ")" );
                 return false;
             }
         }
@@ -1618,7 +1634,10 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
             if( autorouterDebugEnabled() && m_debugPointChecks == 1 )
                 autorouterDebugLog( "start point rejected by polygon obstacle="
                                     + std::to_string( obstacleIndex ) + " net="
-                                    + std::to_string( obstacle.netCode ) );
+                                    + std::to_string( obstacle.netCode ) + " point=("
+                                    + std::to_string( aPoint.x ) + ","
+                                    + std::to_string( aPoint.y ) + ",L"
+                                    + std::to_string( aLayer ) + ")" );
             return false;
         }
     }
@@ -3971,8 +3990,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             ? std::vector<ROUTING_TERMINAL>{ defaultTarget } : aTargets;
     const bool fanoutSearch = aTarget.isFanoutTarget
                               && aTarget.fanoutSourceLayer >= 0
-                              && aTarget.fanoutTargetLayer >= 0
-                              && !aStarts.empty() && !aTargets.empty();
+                              && aTarget.fanoutTargetLayer >= 0;
     for( const auto& terminal : starts )
         if( terminal.pad.netCode != aStart.netCode )
             return std::nullopt;
@@ -4024,193 +4042,6 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                                std::max( netTrackRadius( aStart.netCode ),
                                          netViaRadius( aStart.netCode ) ),
                                isPureSmdNet( aStart.netCode ) );
-
-    // A constrained SMD breakout can require one or more local bends before
-    // its selected via. BatchFanout preflights that bounded escape rather
-    // than reserving a merely free via coordinate. Consume the exact
-    // source-layer route before invoking the room/grid search: the latter is
-    // board-wide and may otherwise spend its entire node budget rediscovering
-    // a short path that was already certified during fanout planning.
-    //
-    // Keep the old direct construction below for snapshots created by older
-    // callers (or data-only tests) that do not carry this optional metadata.
-    if( aStarts.empty() && aTargets.empty()
-        && aTarget.isFanoutTarget && aTarget.fanoutSourceLayer >= 0
-        && aTarget.fanoutTargetLayer >= 0 && aTarget.fanoutEscapePath.size() >= 2
-        && aTarget.fanoutEscapePath.front() == aStart.position
-        && aTarget.fanoutEscapePath.back() == aTarget.position
-        && isOnPadLayer( aStart, aTarget.fanoutSourceLayer )
-        && isOnPadLayer( aTarget, aTarget.fanoutTargetLayer ) )
-    {
-        ROUTING_CONNECTION planned;
-        planned.netCode = aStart.netCode;
-        planned.complete = true;
-        planned.nodes.reserve( aTarget.fanoutEscapePath.size() + 1 );
-        for( const ROUTER_POINT& point : aTarget.fanoutEscapePath )
-            planned.nodes.push_back( { point, aTarget.fanoutSourceLayer } );
-        planned.nodes.push_back( { aTarget.position, aTarget.fanoutTargetLayer } );
-
-        bool allowed = assignViaStyles( planned );
-        for( std::size_t index = 1; index < planned.nodes.size(); ++index )
-        {
-            if( aCancel && aCancel() )
-                return std::nullopt;
-
-            const ROUTER_NODE& first = planned.nodes[index - 1];
-            const ROUTER_NODE& second = planned.nodes[index];
-            const bool via = first.layer != second.layer;
-            const ROUTING_EDGE_STYLE* style = via ? &planned.edgeStyles[index - 1] : nullptr;
-            if( !CanUseSegment( planned.netCode, first, second, via, style ) )
-            {
-                allowed = false;
-                break;
-            }
-
-            planned.cost += control.TraceCost( distance( first.point, second.point ) );
-            if( via )
-                planned.cost += control.ViaCost();
-        }
-
-        if( allowed )
-        {
-            if( debug )
-                autorouterDebugLog( "END search via planned local fanout path" );
-            return planned;
-        }
-    }
-
-    // The connection scheduler is allowed to orient an edge from an already
-    // escaped landing back toward its source SMD pad.  The forward case above
-    // consumes a bounded bent path verbatim, but the former reverse shortcut
-    // below reconstructed only a straight stub.  That sent a perfectly
-    // preflighted bent breakout back through the board-wide maze (or failed
-    // outright under a tight node budget).  Reverse the exact same local
-    // geometry instead.  This is still a connection-local adapter, not a
-    // replacement for RoutingBoard.fanout's item-set maze search.
-    if( aStarts.empty() && aTargets.empty()
-        && aStart.isFanoutTarget && aStart.fanoutSourceLayer >= 0
-        && aStart.fanoutTargetLayer >= 0 && aStart.fanoutEscapePath.size() >= 2
-        && aStart.fanoutEscapePath.back() == aStart.position
-        && aStart.fanoutEscapePath.front() == aTarget.position
-        && isOnPadLayer( aStart, aStart.fanoutTargetLayer )
-        && isOnPadLayer( aTarget, aStart.fanoutSourceLayer ) )
-    {
-        ROUTING_CONNECTION planned;
-        planned.netCode = aStart.netCode;
-        planned.complete = true;
-        planned.nodes.reserve( aStart.fanoutEscapePath.size() + 1 );
-        planned.nodes.push_back( { aStart.position, aStart.fanoutTargetLayer } );
-        planned.nodes.push_back( { aStart.position, aStart.fanoutSourceLayer } );
-        for( auto point = std::next( aStart.fanoutEscapePath.rbegin() );
-             point != aStart.fanoutEscapePath.rend(); ++point )
-        {
-            planned.nodes.push_back( { *point, aStart.fanoutSourceLayer } );
-        }
-
-        bool allowed = assignViaStyles( planned );
-        for( std::size_t index = 1; index < planned.nodes.size(); ++index )
-        {
-            if( aCancel && aCancel() )
-                return std::nullopt;
-
-            const ROUTER_NODE& first = planned.nodes[index - 1];
-            const ROUTER_NODE& second = planned.nodes[index];
-            const bool via = first.layer != second.layer;
-            const ROUTING_EDGE_STYLE* style = via ? &planned.edgeStyles[index - 1] : nullptr;
-            if( !CanUseSegment( planned.netCode, first, second, via, style ) )
-            {
-                allowed = false;
-                break;
-            }
-
-            planned.cost += control.TraceCost( distance( first.point, second.point ) );
-            if( via )
-                planned.cost += control.ViaCost();
-        }
-
-        if( allowed )
-        {
-            if( debug )
-                autorouterDebugLog( "END search via reversed planned local fanout path" );
-            return planned;
-        }
-    }
-
-    // Plane fanout has an intentionally simple first-stage topology: a short
-    // source-layer stub ending at the synthetic landing point, followed by a
-    // via at that point.  Try that direct visibility construction before the
-    // general maze frontier.  It both preserves the Freerouting fanout shape
-    // and avoids spending the whole expansion budget rediscovering a path that
-    // the visibility graph already describes.  If any exact snapshot rule
-    // rejects the stub or via, the normal search remains the fallback.
-    if( aStarts.empty() && aTargets.empty()
-        && aTarget.isFanoutTarget && aTarget.fanoutSourceLayer >= 0
-        && aTarget.fanoutTargetLayer >= 0
-        && isOnPadLayer( aStart, aTarget.fanoutSourceLayer )
-        && isOnPadLayer( aTarget, aTarget.fanoutTargetLayer ) )
-    {
-        const ROUTER_NODE source{ aStart.position, aTarget.fanoutSourceLayer };
-        const ROUTER_NODE landing{ aTarget.position, aTarget.fanoutSourceLayer };
-        const ROUTER_NODE destination{ aTarget.position, aTarget.fanoutTargetLayer };
-        const auto viaStyle = SelectViaStyle( aStart.netCode, landing, destination );
-
-        const bool stubAllowed = isSegmentAllowed(
-                source.point, landing.point, source.layer, aStart.netCode, false,
-                netTrackRadius( aStart.netCode ), -1 );
-        if( viaStyle && stubAllowed )
-        {
-            ROUTING_CONNECTION direct;
-            direct.netCode = aStart.netCode;
-            direct.complete = true;
-            direct.cost = control.TraceCost( distance( source.point, landing.point ) )
-                          + control.ViaCost();
-            direct.nodes = { source, landing, destination };
-            direct.edgeStyles = { {}, *viaStyle };
-
-            if( debug )
-                autorouterDebugLog( "END search via direct fanout path" );
-
-            return direct;
-        }
-    }
-
-    // The batch net walk may reach an escaped fanout landing from the rest of
-    // the net before it reaches the original SMD pad.  In that orientation the
-    // synthetic landing is the search source rather than the target.  Treat
-    // the same two-stage fanout as reversible so a short, already-certified
-    // fanout stub is not sent through the full-board maze search (where the
-    // layer transition at the landing can consume the entire expansion
-    // budget).
-    if( aStarts.empty() && aTargets.empty()
-        && aStart.isFanoutTarget && aStart.fanoutSourceLayer >= 0
-        && aStart.fanoutTargetLayer >= 0
-        && isOnPadLayer( aStart, aStart.fanoutTargetLayer )
-        && isOnPadLayer( aTarget, aStart.fanoutSourceLayer ) )
-    {
-        const ROUTER_NODE source{ aStart.position, aStart.fanoutTargetLayer };
-        const ROUTER_NODE landing{ aStart.position, aStart.fanoutSourceLayer };
-        const ROUTER_NODE destination{ aTarget.position, aStart.fanoutSourceLayer };
-        const auto viaStyle = SelectViaStyle( aStart.netCode, source, landing );
-
-        const bool stubAllowed = isSegmentAllowed(
-                landing.point, destination.point, destination.layer, aStart.netCode, false,
-                -1, netTrackRadius( aStart.netCode ) );
-        if( viaStyle && stubAllowed )
-        {
-            ROUTING_CONNECTION direct;
-            direct.netCode = aStart.netCode;
-            direct.complete = true;
-            direct.cost = control.TraceCost( distance( landing.point, destination.point ) )
-                          + control.ViaCost();
-            direct.nodes = { source, landing, destination };
-            direct.edgeStyles = { *viaStyle, {} };
-
-            if( debug )
-                autorouterDebugLog( "END search via reversed direct fanout path" );
-
-            return direct;
-        }
-    }
 
     // The rectangular room frontier now compares same-layer routes and
     // through-drill alternatives in one queue. A fanout attempt uses the same
@@ -4350,7 +4181,22 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                     target.position = terminalPoint( terminal, current.node.point );
                     return canFinish( current.node, target, aStart.netCode );
                 } );
-        if( destination != targets.end() )
+        const auto fanoutDrillParent = fanoutSearch
+                                               && current.node.layer
+                                                          != aTarget.fanoutSourceLayer
+                ? cameFrom.find( current.node )
+                : cameFrom.end();
+        const bool reachedFanoutDrill =
+                fanoutDrillParent != cameFrom.end()
+                && fanoutDrillParent->second.layer == aTarget.fanoutSourceLayer
+                && fanoutDrillParent->second.point == current.node.point;
+
+        // A fanout search terminates at its first drill even when the drill
+        // happens to touch a destination item on the exit layer.  Checking
+        // the ordinary destination first incorrectly appended the rest of a
+        // plane/trace target and turned one fanout operation into a complete
+        // net route.
+        if( destination != targets.end() && !reachedFanoutDrill )
         {
             ROUTING_CONNECTION result;
             result.netCode = aStart.netCode;
@@ -4421,37 +4267,31 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             return result;
         }
 
-        if( fanoutSearch && current.node.layer != aTarget.fanoutSourceLayer )
+        if( reachedFanoutDrill )
         {
-            const auto parent = cameFrom.find( current.node );
-            if( parent != cameFrom.end()
-                && parent->second.layer == aTarget.fanoutSourceLayer
-                && parent->second.point == current.node.point )
+            ROUTING_CONNECTION result;
+            result.netCode = aStart.netCode;
+            result.complete = true;
+            result.isFanoutConnection = true;
+            result.cost = current.g;
+
+            ROUTER_NODE cursor = current.node;
+            while( true )
             {
-                ROUTING_CONNECTION result;
-                result.netCode = aStart.netCode;
-                result.complete = true;
-                result.isFanoutConnection = true;
-                result.cost = current.g;
-
-                ROUTER_NODE cursor = current.node;
-                while( true )
-                {
-                    result.nodes.push_back( cursor );
-                    const auto previous = cameFrom.find( cursor );
-                    if( previous == cameFrom.end() )
-                        break;
-                    cursor = previous->second;
-                }
-                std::reverse( result.nodes.begin(), result.nodes.end() );
-                result.fromPadIndex = startOwners.at( result.nodes.front() );
-
-                if( !assignViaStyles( result ) )
-                    continue;
-
-                logSearchState( "END fanout search at first drill" );
-                return result;
+                result.nodes.push_back( cursor );
+                const auto previous = cameFrom.find( cursor );
+                if( previous == cameFrom.end() )
+                    break;
+                cursor = previous->second;
             }
+            std::reverse( result.nodes.begin(), result.nodes.end() );
+            result.fromPadIndex = startOwners.at( result.nodes.front() );
+
+            if( !assignViaStyles( result ) )
+                continue;
+
+            logSearchState( "END fanout search at first drill" );
+            return result;
         }
 
         auto nextNodes = adaptiveNeighbours( current.node, aTarget, landmarks, aStart.netCode );
