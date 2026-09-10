@@ -402,11 +402,13 @@ set( ZONE_MANAGER_SRCS
 if( CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" )
     set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp
         autorouter/geometry/planar/Polyline.cpp autorouter/geometry/planar/Simplex.cpp
+        autorouter/geometry/planar/IntOctagon.cpp
         autorouter/board/optimize/TraceShover.cpp autorouter/board/optimize/ViaOptimizer.cpp APPEND
                   PROPERTY COMPILE_OPTIONS -ffp-contract=off )
 elseif( MSVC )
     set_property( SOURCE autorouter/maze/DestinationDistance.cpp autorouter/pipeline/BatchFanout.cpp
         autorouter/geometry/planar/Polyline.cpp autorouter/geometry/planar/Simplex.cpp
+        autorouter/geometry/planar/IntOctagon.cpp
         autorouter/board/optimize/TraceShover.cpp autorouter/board/optimize/ViaOptimizer.cpp APPEND
                   PROPERTY COMPILE_OPTIONS /fp:strict )
 endif()
@@ -434,6 +436,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/board/KicadRoutingSession.cpp
     autorouter/board/facade/RoutingBoard.cpp
     autorouter/board/searchtree/ShapeSearchTree90Degree.cpp
+    autorouter/board/searchtree/ShapeSearchTree45Degree.cpp
     autorouter/datastructures/MinAreaTree.cpp
     autorouter/drill/DrillPage.cpp
     autorouter/drill/DrillPageArray.cpp
@@ -458,6 +461,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/path/Connection.cpp
     autorouter/geometry/planar/Polyline.cpp
     autorouter/geometry/planar/Simplex.cpp
+    autorouter/geometry/planar/IntOctagon.cpp
     autorouter/board/optimize/TraceShover.cpp
     autorouter/board/optimize/ViaOptimizer.cpp
     autorouter/path/FoundConnectionInserter.cpp

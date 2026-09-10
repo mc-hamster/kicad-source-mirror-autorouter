@@ -1,0 +1,99 @@
+/*
+ * This file is part of KiCad, licensed under GPL version 3 or later.
+ * Direct C++ translation of Freerouting geometry/planar/IntOctagon.java at
+ * a11c0a42d1b3827e5126429c5c9820c4ab5bec7c (GPL-3.0).
+ */
+#pragma once
+
+#include "Line.h"
+#include "Simplex.h"
+
+#include <array>
+#include <optional>
+
+namespace KICAD_AUTOROUTER::PLANAR
+{
+
+/** Integer convex octagon bounded by the four orthogonal and four 45-degree
+ * support directions used by Freerouting's 45-degree search tree.
+ *
+ * Diagonal coordinates are support-line intercepts: upper/lower-left and
+ * lower/right constrain x-y, while lower/upper-right constrain x+y.  Public
+ * immutable-looking fields deliberately retain the source representation and
+ * constructor order so geometry oracle records can be compared directly.
+ */
+class INT_OCTAGON
+{
+public:
+    static constexpr std::int64_t CRITICAL_COORDINATE = 33554432;
+
+    std::int64_t leftX;
+    std::int64_t bottomY;
+    std::int64_t rightX;
+    std::int64_t topY;
+    std::int64_t upperLeftDiagonalX;
+    std::int64_t lowerRightDiagonalX;
+    std::int64_t lowerLeftDiagonalX;
+    std::int64_t upperRightDiagonalX;
+
+    INT_OCTAGON( std::int64_t aLeftX, std::int64_t aBottomY,
+                 std::int64_t aRightX, std::int64_t aTopY,
+                 std::int64_t aUpperLeftDiagonalX,
+                 std::int64_t aLowerRightDiagonalX,
+                 std::int64_t aLowerLeftDiagonalX,
+                 std::int64_t aUpperRightDiagonalX ) :
+            leftX( aLeftX ), bottomY( aBottomY ), rightX( aRightX ), topY( aTopY ),
+            upperLeftDiagonalX( aUpperLeftDiagonalX ),
+            lowerRightDiagonalX( aLowerRightDiagonalX ),
+            lowerLeftDiagonalX( aLowerLeftDiagonalX ),
+            upperRightDiagonalX( aUpperRightDiagonalX )
+    {
+    }
+
+    static INT_OCTAGON Empty();
+    static INT_OCTAGON FromBox( const ROUTER_BOX& aBox );
+
+    bool IsEmpty() const;
+    bool IsNormalized() const;
+    bool IsIntBox() const;
+    int Dimension() const;
+    ROUTER_BOX BoundingBox() const;
+    ROUTER_POINT Corner( int aIndex ) const;
+    std::int64_t CornerX( int aIndex ) const;
+    std::int64_t CornerY( int aIndex ) const;
+    double Area() const;
+    LINE BorderLine( int aIndex ) const;
+
+    INT_OCTAGON TranslateBy( ROUTER_POINT aVector ) const;
+    double MaxWidth() const;
+    double MinWidth() const;
+    INT_OCTAGON Offset( double aDistance ) const;
+    INT_OCTAGON Enlarge( double aOffset ) const { return Offset( aOffset ); }
+
+    bool Contains( ROUTER_POINT aPoint ) const;
+    bool IsContainedIn( const ROUTER_BOX& aBox ) const;
+    bool IsContainedIn( const INT_OCTAGON& aOther ) const;
+    bool Intersects( const INT_OCTAGON& aOther ) const;
+    bool Overlaps( const INT_OCTAGON& aOther ) const;
+
+    INT_OCTAGON Union( const INT_OCTAGON& aOther ) const;
+    INT_OCTAGON Intersection( const INT_OCTAGON& aOther ) const;
+    INT_OCTAGON Normalize() const;
+
+    /** Source Side values encoded as -1=ON_THE_LEFT, 0=COLLINEAR,
+     * +1=ON_THE_RIGHT. */
+    int SideOfBorderLine( std::int64_t aX, std::int64_t aY, int aBorderIndex ) const;
+    int Compare( const INT_OCTAGON& aOther, int aEdgeIndex ) const;
+
+    std::int64_t LeftXValue( std::int64_t aY ) const;
+    std::int64_t RightXValue( std::int64_t aY ) const;
+    std::int64_t LowerYValue( std::int64_t aX ) const;
+    std::int64_t UpperYValue( std::int64_t aX ) const;
+
+    std::optional<SIMPLEX> ToSimplex() const;
+
+    bool operator==( const INT_OCTAGON& aOther ) const;
+    bool operator!=( const INT_OCTAGON& aOther ) const { return !( *this == aOther ); }
+};
+
+} // namespace KICAD_AUTOROUTER::PLANAR

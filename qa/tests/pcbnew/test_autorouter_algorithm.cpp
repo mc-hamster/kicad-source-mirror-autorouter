@@ -38,6 +38,7 @@
 #include <autorouter/maze/AutorouteEngine.h>
 #include <autorouter/board/model/items/NormalContacts.h>
 #include <autorouter/geometry/planar/ContactGeometry.h>
+#include <autorouter/geometry/planar/IntOctagon.h>
 #include <autorouter/geometry/planar/Simplex.h>
 #include <autorouter/board/optimize/TraceShover.h>
 #include <autorouter/path/FoundConnectionInserter.h>
@@ -60,6 +61,7 @@
 #include <autorouter/BoardHistory.h>
 #include <autorouter/rules/ViaRule.h>
 #include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
+#include <autorouter/board/searchtree/ShapeSearchTree45Degree.h>
 #include <autorouter/pipeline/BatchFanout.h>
 #include <autorouter/pipeline/AutoroutePassRunner.h>
 #include <autorouter/pipeline/AutorouteBatchLoop.h>
@@ -185,6 +187,155 @@ BOOST_AUTO_TEST_CASE( OrthogonalRoomRestraintMatchesPinnedFreerouting )
         ++cases;
     }
     BOOST_CHECK_EQUAL( cases, 512 );
+}
+
+
+BOOST_AUTO_TEST_CASE( IntOctagonCoreGeometryMatchesPinnedFreerouting )
+{
+    using PLANAR::INT_OCTAGON;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/octagon-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+
+    auto readOctagon = [&]()
+    {
+        std::array<std::int64_t, 8> value;
+        for( auto& coordinate : value )
+            input >> coordinate;
+        BOOST_REQUIRE( !input.fail() );
+        return INT_OCTAGON( value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7] );
+    };
+    auto readDouble = [&]()
+    {
+        std::string value;
+        input >> value;
+        BOOST_REQUIRE( !input.fail() );
+        return std::stod( value );
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "IntOctagon oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "OCTAGON" );
+            const INT_OCTAGON raw = readOctagon();
+            const INT_OCTAGON otherRaw = readOctagon();
+            ROUTER_POINT point;
+            ROUTER_POINT probe;
+            input >> point.x >> point.y >> probe.x >> probe.y;
+            const double distance = readDouble();
+
+            const INT_OCTAGON expectedNormalized = readOctagon();
+            int expectedDimension;
+            int expectedIsNormalized;
+            input >> expectedDimension >> expectedIsNormalized;
+            const double expectedArea = readDouble();
+            const INT_OCTAGON actual = raw.Normalize();
+            BOOST_CHECK( actual == expectedNormalized );
+            BOOST_CHECK_EQUAL( actual.Dimension(), expectedDimension );
+            BOOST_CHECK_EQUAL( actual.IsNormalized(), expectedIsNormalized != 0 );
+            BOOST_CHECK_EQUAL( actual.Area(), expectedArea );
+            if( !actual.IsEmpty() )
+            {
+                for( int corner = 0; corner < 8; ++corner )
+                {
+                    ROUTER_POINT expected;
+                    input >> expected.x >> expected.y;
+                    BOOST_CHECK( actual.Corner( corner ) == expected );
+                    BOOST_CHECK_EQUAL( actual.CornerX( corner ), expected.x );
+                    BOOST_CHECK_EQUAL( actual.CornerY( corner ), expected.y );
+                }
+            }
+
+            BOOST_CHECK( actual.Offset( distance ) == readOctagon() );
+            const INT_OCTAGON other = otherRaw.Normalize();
+            BOOST_CHECK( actual.Union( other ) == readOctagon() );
+            BOOST_CHECK( actual.Intersection( other ) == readOctagon() );
+            int contained;
+            int intersects;
+            int overlaps;
+            int containsPoint;
+            std::int64_t leftAtY;
+            std::int64_t rightAtY;
+            std::int64_t lowerAtX;
+            std::int64_t upperAtX;
+            input >> contained >> intersects >> overlaps >> containsPoint
+                  >> leftAtY >> rightAtY >> lowerAtX >> upperAtX;
+            BOOST_CHECK_EQUAL( actual.IsContainedIn( other ), contained != 0 );
+            BOOST_CHECK_EQUAL( actual.Intersects( other ), intersects != 0 );
+            BOOST_CHECK_EQUAL( actual.Overlaps( other ), overlaps != 0 );
+            BOOST_CHECK_EQUAL( actual.Contains( point ), containsPoint != 0 );
+            BOOST_CHECK_EQUAL( actual.LeftXValue( probe.y ), leftAtY );
+            BOOST_CHECK_EQUAL( actual.RightXValue( probe.y ), rightAtY );
+            BOOST_CHECK_EQUAL( actual.LowerYValue( probe.x ), lowerAtX );
+            BOOST_CHECK_EQUAL( actual.UpperYValue( probe.x ), upperAtX );
+            for( int border = 0; border < 8; ++border )
+            {
+                int side;
+                int comparison;
+                input >> side >> comparison;
+                BOOST_CHECK_EQUAL( actual.SideOfBorderLine( point.x, point.y, border ), side );
+                BOOST_CHECK_EQUAL( actual.Compare( other, border ), comparison );
+            }
+            int isBox;
+            input >> isBox;
+            BOOST_CHECK_EQUAL( actual.IsIntBox(), isBox != 0 );
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeRoomRestraintMatchesPinnedFreerouting )
+{
+    using PLANAR::INT_OCTAGON;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/room45-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readOctagon = [&]()
+    {
+        std::array<std::int64_t, 8> value;
+        for( auto& coordinate : value )
+            input >> coordinate;
+        BOOST_REQUIRE( !input.fail() );
+        return INT_OCTAGON( value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7] );
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "45-degree room oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "ROOM45" );
+            const INT_OCTAGON room = readOctagon();
+            const INT_OCTAGON contained = readOctagon();
+            const INT_OCTAGON obstacle = readOctagon();
+            std::size_t expectedCount;
+            input >> expectedCount;
+
+            const auto actual = SHAPE_SEARCH_TREE_45_DEGREE::RestrainShape(
+                    { room, 3, contained }, obstacle );
+            BOOST_REQUIRE_EQUAL( actual.size(), expectedCount );
+            for( const auto& candidate : actual )
+            {
+                BOOST_CHECK( candidate.shape == readOctagon() );
+                BOOST_CHECK( candidate.containedShape == readOctagon() );
+                BOOST_CHECK_EQUAL( candidate.layer, 3 );
+            }
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
 }
 
 

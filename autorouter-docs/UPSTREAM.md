@@ -60,6 +60,7 @@ same change.
 | `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h/.cpp` | Active rectangular 90/45-degree corridor locator; composed with through-drill transitions. Full convex/acute/thin-room and pin-exit behavior remain unported. |
 | `autoroute/path/FoundConnectionLocatorAnyAngle.java` | `pcbnew/autorouter/path/FoundConnectionLocatorAnyAngle.h` | Alias of the generic locator, not an any-angle locator implementation. |
 | `autoroute/expansion/*.java` | `pcbnew/autorouter/expansion/*.h/.cpp` plus `ExpansionGraph` | Orthogonal neighbours, free-room lifecycle and door sections now run in the rectangular slice. Other angle/obstacle classes remain unported; rectangular drill-room linkage is now active. ExpansionGraph is still the separate legacy visibility graph. |
+| `board/searchtree/ShapeSearchTree45Degree.java` | `pcbnew/autorouter/board/searchtree/ShapeSearchTree45Degree.h/.cpp` | Source octagonal leaf filtering, completion, divide-large-room and recursive restraint are production-built; restraint is checked by 2,048 pinned Java records. The active room lifecycle still needs octagonal neighbours/doors/drills before selecting this tree. |
 | `autoroute/drill/DrillPage.java` | `pcbnew/autorouter/drill/DrillPage.h/.cpp` | Lazy rectangular free-drill cutouts with source piece order, centroid/pin-centre selection, net/policy cache and separate reset/invalidate semantics. |
 | `autoroute/drill/DrillPageArray.java` | `pcbnew/autorouter/drill/DrillPageArray.h/.cpp` | Active, attempt-owned, resource-bounded row-major page array. Area-only overlap queries use the source bounding-page range. ExpansionGraph still has legacy landmark sampling for fallback. |
 | `autoroute/drill/ExpansionDrill.java` | `pcbnew/autorouter/drill/ExpansionDrill.h` | Drill centroid/region, rooms across the full physical stack, per-layer occupation and source hash. Through transitions materialize as ordinary `PCB_VIA`; general padstacks are not implemented. |
@@ -86,7 +87,7 @@ same change.
 | `board.trace.PolylineTrace*` | `PCB_TRACK` segments | `KicadBoardAdapter::CreatePreviewItems` |
 | `autoroute.maze.MazeTraceShover`, `board.optimize.TraceShover` / tighteners | **Not ported.** The similarly named native class only shortens visible paths | `maze/MazeTraceShover.cpp` is legacy cleanup, not reference `checkShoveTraceLine` or recursive trace displacement |
 | `board/optimize/ViaOptimizer.java` | `pcbnew/autorouter/board/optimize/ViaOptimizer.h/.cpp` | Active weighted two-trace and bounded plane/fanout via-location candidates. Every replacement is strictly checked; arbitrary source item contact mutation and recursion remain partial. |
-| planar `IntPoint`, `IntBox`, `TileShape`, polygon geometry | `VECTOR2I`, `BOX2I`, `SHAPE_LINE_CHAIN`, `SHAPE_POLY_SET` | Adapter conversion; all worker coordinates are integer KiCad IU |
+| planar `IntPoint`, `RationalPoint`, `Line`, `IntBox`, `IntOctagon`, `Simplex`, `Polyline` | Source-named data-only types plus KiCad adapter conversion | `geometry/planar/`; exact rational lines, bounded simplex/polyline operations and core octagon operations are present. `IntOctagon` and 45-degree restraint have 4,096 direct source-oracle records. Full `TileShape`, polygon/circle offsets and cutout/projection APIs remain open. |
 | `rules.Net`, `NetClass`, clearance matrix | `NETCLASS`, `BOARD_DESIGN_SETTINGS`, pad/track own clearance, layer settings | `board/KicadBoardAdapter.cpp` |
 | `rules.ViaRule` / via padstacks | Supported through-hole-only subset; entry/exit layers do not define physical span | `rules/ViaRule.h`, `MazeSearchEngine::CanUseSegment`, `BatchAutorouter::buildGeometry` |
 | `drc.DesignRulesChecker` | KiCad DRC engine and adapter collision checks | `KicadRoutingSession` refills/validates private proposals before acceptance. QA independently materializes and checks them again. Raw worker checks alone cannot validate a proposal |
@@ -142,6 +143,7 @@ same change.
 |---|---|---|
 | `datastructures/MinAreaTree.java` | `datastructures/MinAreaTree.h/.cpp` | Insertion ties, removal and dynamically pruned traversal; rectangle entries with stable handles. |
 | `board/searchtree/ShapeSearchTree90Degree.java` | Same relative path, `.h/.cpp` | Complete-shape traversal/ignore semantics plus restraint; caller supplies expanded shapes. |
+| `board/searchtree/ShapeSearchTree45Degree.java` | Same relative path, `.h/.cpp` | Exact octagonal broad/narrow tree, completion and restraint. Built and oracle-tested, but not yet selected by the rectangular maze lifecycle. |
 | `autoroute/expansion/SortedOrthogonalRoomNeighbours.java` | `expansion/SortedOrthogonalRoomNeighbours.h/.cpp` | Free-room ordering and gaps; obstacle-room branch not ported. |
 | `autoroute/expansion/ExpansionDoor.java` | `expansion/ExpansionDoor.h/.cpp` | Rectangle overlap/line sections, narrow-door handling, explicit host section-budget guard. |
 | `autoroute/maze/AutorouteEngine.java`, `MazeSearchEngine.java` | `maze/MazeSearchEngine90Degree.h/.cpp` | Active free-room lifecycle/frontier; shared lifecycle now resides in `RoomSearchContext.h`, with the through-drill frontier in `MazeSearchEngineMultilayer.cpp`. No shove/rip-up rooms. |
@@ -159,8 +161,12 @@ Additional drill milestone mapping:
 | `autoroute/maze/MazeExpansionEngine`, `MazeSearchEngine` | `maze/MazeExpansionEngine.h`, `MazeSearchEngineMultilayer.cpp` | One room/page/drill-layer queue with reference page/drill cost primitives. Heuristic, target IDs and geometry adapter remain partial. |
 | `board/facade/RoutingBoard.removeTraceTails` and normal-contact splitting | `board/facade/RoutingBoard.cpp`, `pipeline/BatchOptimizer.cpp` | Native exact-junction trimming of generated trace tails/overlapping ends, preserving real pad/plane groups. Not the complete source item-chain/normalization algorithm. |
 
-The Java executable is used only by `scripts/autorouter/{Room,Drill}SearchOracle.java`
-and A/B QA; it is not linked, launched, or required by the native editor.
+The Java executable is used only by the QA oracle sources in
+`scripts/autorouter/` and A/B QA; it is not linked, launched, or required by
+the native editor. The octagon goldens were generated from a clean GitHub
+checkout of `a11c0a42` (JAR SHA-256
+`1804b9a8e8fd1bcb5ee29b4249c709c2bf27bdc55547dc488bf6e8e380c39325`),
+not from the protected local reference checkout.
 
 ## Direct destination translation — 2026-09-08
 

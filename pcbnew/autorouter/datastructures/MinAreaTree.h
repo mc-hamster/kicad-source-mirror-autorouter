@@ -6,12 +6,24 @@
 
 #include <functional>
 #include "../geometry/planar/IntBox.h"
+#include "../geometry/planar/IntOctagon.h"
 
 namespace KICAD_AUTOROUTER
 {
 /** A compensated shape, with identity independent of its bounding rectangle. */
 struct SHAPE_TREE_ENTRY
 {
+    SHAPE_TREE_ENTRY() = default;
+    SHAPE_TREE_ENTRY( ROUTER_BOX aShape, int aObjectId = 0, int aShapeIndex = 0,
+                      int aLayer = 0, int aNet = 0, bool aIsRoom = false,
+                      bool aObstacle = true,
+                      std::optional<PLANAR::INT_OCTAGON> aOctagon = {} ) :
+            shape( aShape ), objectId( aObjectId ), shapeIndex( aShapeIndex ),
+            layer( aLayer ), net( aNet ), isRoom( aIsRoom ), obstacle( aObstacle ),
+            octagon( std::move( aOctagon ) )
+    {
+    }
+
     ROUTER_BOX shape;
     int objectId = 0;
     int shapeIndex = 0;
@@ -19,10 +31,19 @@ struct SHAPE_TREE_ENTRY
     int net = 0;
     bool isRoom = false;
     bool obstacle = true;
+    // Exact 45-degree shape.  The minimum-area tree deliberately indexes its
+    // bounding box; ShapeSearchTree45Degree applies this shape as the exact
+    // narrow phase after traversal reaches a leaf.
+    std::optional<PLANAR::INT_OCTAGON> octagon;
 
     bool IsTraceObstacle( int aNet ) const
     {
         return obstacle && ( isRoom || net == 0 || net != aNet );
+    }
+
+    PLANAR::INT_OCTAGON BoundingOctagon() const
+    {
+        return octagon ? *octagon : PLANAR::INT_OCTAGON::FromBox( shape );
     }
 };
 
