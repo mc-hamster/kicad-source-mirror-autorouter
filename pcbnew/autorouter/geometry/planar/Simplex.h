@@ -52,6 +52,11 @@ public:
      * meaning as Java's null return for a lower-dimensional inner shape. */
     std::optional<std::vector<SIMPLEX>> CutoutFrom( const SIMPLEX& aOuter ) const;
     std::optional<SIMPLEX> TranslateBy( ROUTER_POINT aVector ) const;
+    std::optional<SIMPLEX> Offset( double aWidth ) const;
+    std::optional<SIMPLEX> Enlarge( double aOffset ) const;
+    std::pair<double, double> CentreOfGravity() const;
+    std::pair<double, double> NearestPointApprox( double aX, double aY ) const;
+    std::pair<double, double> NearestBorderPointApprox( double aX, double aY ) const;
     int IndexOfRightMostCorner( const POINT& aFromPoint ) const;
     bool Contains( const POINT& p ) const;
     bool ContainsInside( const POINT& p ) const;

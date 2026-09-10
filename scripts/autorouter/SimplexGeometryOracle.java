@@ -16,6 +16,10 @@ public class SimplexGeometryOracle {
     }
   }
 
+  private static void point(StringBuilder out, FloatPoint value) {
+    out.append(String.format(Locale.ROOT, "%.9f %.9f", value.x, value.y));
+  }
+
   private static Line[] polygon(int[][] points) {
     Line[] result = new Line[points.length];
     for (int index = 0; index < points.length; ++index) {
@@ -171,6 +175,36 @@ public class SimplexGeometryOracle {
           out.append(' ').append(piece.dimension());
         }
       }
+      System.out.println(out);
+    }
+
+    double[] widths = {0.0, 0.49, 0.5, 1.0, 1.4, 2.5, 6.25,
+                       -0.49, -0.5, -1.0, -2.5, -5.5};
+    for (int record = 0; record < 192; ++record) {
+      int dx = random.nextInt(81) - 40;
+      int dy = random.nextInt(81) - 40;
+      Line[] supplied = shuffled(input(new int[]{0, 1, 7}[record % 3], dx, dy), random);
+      Simplex simplex = Simplex.getInstance(supplied);
+      double width = widths[record % widths.length];
+      FloatPoint query = new FloatPoint(dx + (record % 9) * 9 - 36,
+                                        dy + (record % 7) * 11 - 33);
+
+      StringBuilder out = new StringBuilder("SOFF ").append(supplied.length);
+      for (Line border : supplied) {
+        out.append(' ').append(line(border));
+      }
+      out.append(' ').append(Double.toString(width));
+      out.append(' ').append(String.format(Locale.ROOT, "%.9f %.9f", query.x, query.y));
+      out.append(' ');
+      lines(out, simplex.offset(width));
+      out.append(' ');
+      lines(out, simplex.enlarge(width));
+      out.append(' ');
+      point(out, simplex.centreOfGravity());
+      out.append(' ');
+      point(out, simplex.nearestPointApprox(query));
+      out.append(' ');
+      point(out, simplex.nearestBorderPointApprox(query));
       System.out.println(out);
     }
   }

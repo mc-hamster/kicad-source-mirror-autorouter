@@ -957,20 +957,19 @@ bool INT_OCTAGON::IsIntBox() const
 
 std::optional<SIMPLEX> INT_OCTAGON::ToSimplex() const
 {
-    if( Dimension() != 2 )
-        return {};
+    if( IsEmpty() )
+        return SIMPLEX::Empty();
 
-    std::vector<ROUTER_POINT> corners;
-    corners.reserve( 8 );
-    for( int i = 0; i < 8; ++i )
-    {
-        const ROUTER_POINT corner = Corner( i );
-        if( corners.empty() || corners.back() != corner )
-            corners.push_back( corner );
-    }
-    if( corners.size() > 1 && corners.front() == corners.back() )
-        corners.pop_back();
-    return SIMPLEX::FromConvexPolygon( corners );
+    // IntOctagon.toSimplex constructs all eight source border supports and
+    // then removes redundant lines.  Retaining these exact anchors is
+    // important for deterministic line identity after enlarge/intersection;
+    // rebuilding from corners creates equivalent geometry but different
+    // Line values.
+    std::vector<LINE> lines;
+    lines.reserve( 8 );
+    for( int index = 0; index < 8; ++index )
+        lines.push_back( BorderLine( index ) );
+    return SIMPLEX::GetInstance( std::move( lines ) );
 }
 
 

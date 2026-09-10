@@ -1,6 +1,7 @@
 /* QA-only differential reader. Expectations come from the pinned Java JAR. */
 #pragma once
 #include <autorouter/board/optimize/TraceShover.h>
+#include <iomanip>
 #include <sstream>
 
 namespace AUTOROUTER_GEOMETRY_QA
@@ -165,6 +166,32 @@ inline std::string CheckRecord( const std::string& record )
                 actual << ' ' << piece.Dimension();
             }
         }
+    }
+    else if( tag == "SOFF" )
+    {
+        std::size_t count;
+        in >> count;
+        std::vector<LINE> supplied;
+        supplied.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            supplied.push_back( ReadLine( in ) );
+        double width, queryX, queryY;
+        in >> width >> queryX >> queryY;
+        const SIMPLEX simplex = SIMPLEX::GetInstance( std::move( supplied ) );
+        const auto offset = simplex.Offset( width );
+        const auto enlarged = simplex.Enlarge( width );
+        if( !offset || !enlarged )
+            throw std::runtime_error( "small simplex offset overflowed" );
+        PrintSimplex( actual, *offset );
+        actual << ' ';
+        PrintSimplex( actual, *enlarged );
+        const auto gravity = simplex.CentreOfGravity();
+        const auto nearest = simplex.NearestPointApprox( queryX, queryY );
+        const auto nearestBorder = simplex.NearestBorderPointApprox( queryX, queryY );
+        actual << std::fixed << std::setprecision( 9 )
+               << ' ' << gravity.first << ' ' << gravity.second
+               << ' ' << nearest.first << ' ' << nearest.second
+               << ' ' << nearestBorder.first << ' ' << nearestBorder.second;
     }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );

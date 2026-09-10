@@ -53,7 +53,7 @@ def normalize_simplex_records(raw: str) -> str:
     warning = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ WARN\s+"
                          r"Simplex\.cutout_from only implemented for 2-dim simplex")
     for line in raw.splitlines():
-        if line.startswith(("SIMPLEX ", "SCUT ")):
+        if line.startswith(("SIMPLEX ", "SCUT ", "SOFF ")):
             records.append(line)
         elif not warning.fullmatch(line):
             raise ValueError(f"unexpected simplex oracle diagnostic: {line}")
@@ -61,6 +61,8 @@ def normalize_simplex_records(raw: str) -> str:
         raise ValueError("incomplete simplex primitive output")
     if sum(line.startswith("SCUT ") for line in records) != 256:
         raise ValueError("incomplete simplex cutout output")
+    if sum(line.startswith("SOFF ") for line in records) != 192:
+        raise ValueError("incomplete simplex offset output")
     return "\n".join(records) + "\n"
 
 

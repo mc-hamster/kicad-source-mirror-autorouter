@@ -2,6 +2,7 @@
  * TileShape.entrancePoints/cutout(Polyline), Freerouting a11c0a42.
  */
 #include "Simplex.h"
+#include "IntOctagon.h"
 
 #include <algorithm>
 #include <array>
@@ -375,6 +376,162 @@ void appendSupport( std::vector<LINE>& aLines, const DIVISION_LINE& aDivision,
         aLines.push_back( *support );
 }
 
+
+std::optional<LINE> translateSupport( const LINE& aLine, double aDistance )
+{
+    const INTEGER divisor = Gcd( aLine.Dx(), aLine.Dy() );
+    if( divisor == 0 )
+        return {};
+    const INTEGER exactDx = aLine.Dx() / divisor;
+    const INTEGER exactDy = aLine.Dy() / divisor;
+    if( exactDx < std::numeric_limits<std::int64_t>::min()
+        || exactDx > std::numeric_limits<std::int64_t>::max()
+        || exactDy < std::numeric_limits<std::int64_t>::min()
+        || exactDy > std::numeric_limits<std::int64_t>::max() )
+    {
+        return {};
+    }
+
+    const std::int64_t dx = exactDx.convert_to<std::int64_t>();
+    const std::int64_t dy = exactDy.convert_to<std::int64_t>();
+    const double dxSquared = static_cast<double>( dx ) * dx;
+    const double dySquared = static_cast<double>( dy ) * dy;
+    const double length = std::sqrt( dxSquared + dySquared );
+    ROUTER_POINT shift{};
+
+    // Java Math.round is floor(value + 0.5), including for negative ties.
+    const auto javaRound = []( double aValue )
+    {
+        const double rounded = std::floor( aValue + 0.5 );
+        if( rounded < static_cast<double>( std::numeric_limits<std::int64_t>::min() )
+            || rounded > static_cast<double>( std::numeric_limits<std::int64_t>::max() ) )
+        {
+            return std::optional<std::int64_t>{};
+        }
+        return std::optional<std::int64_t>{ static_cast<std::int64_t>( rounded ) };
+    };
+
+    if( dxSquared <= dySquared )
+    {
+        const auto relativeX = javaRound( aDistance * length / dy );
+        if( !relativeX || *relativeX == std::numeric_limits<std::int64_t>::min() )
+            return {};
+        shift.x = -*relativeX;
+    }
+    else
+    {
+        const auto relativeY = javaRound( aDistance * length / dx );
+        if( !relativeY )
+            return {};
+        shift.y = *relativeY;
+    }
+
+    const auto newA = translatedPoint( aLine.a, shift );
+    if( !newA )
+        return {};
+    const auto newB = translatedPoint( *newA, { dx, dy } );
+    if( !newB )
+        return {};
+    return LINE( *newA, *newB );
+}
+
+
+std::optional<std::int64_t> floorRational( const INTEGER& aNumerator,
+                                           const INTEGER& aDenominator )
+{
+    INTEGER result = aNumerator / aDenominator;
+    if( aNumerator < 0 && aNumerator % aDenominator != 0 )
+        --result;
+    if( result < std::numeric_limits<std::int64_t>::min()
+        || result > std::numeric_limits<std::int64_t>::max() )
+    {
+        return {};
+    }
+    return result.convert_to<std::int64_t>();
+}
+
+
+std::optional<std::int64_t> ceilRational( const INTEGER& aNumerator,
+                                          const INTEGER& aDenominator )
+{
+    INTEGER result = aNumerator / aDenominator;
+    if( aNumerator > 0 && aNumerator % aDenominator != 0 )
+        ++result;
+    if( result < std::numeric_limits<std::int64_t>::min()
+        || result > std::numeric_limits<std::int64_t>::max() )
+    {
+        return {};
+    }
+    return result.convert_to<std::int64_t>();
+}
+
+
+std::optional<INT_OCTAGON> boundingOctagon( const SIMPLEX& aSimplex )
+{
+    if( aSimplex.IsEmpty() || !aSimplex.IsBounded() )
+        return {};
+
+    std::int64_t left = std::numeric_limits<std::int64_t>::max();
+    std::int64_t bottom = std::numeric_limits<std::int64_t>::max();
+    std::int64_t right = std::numeric_limits<std::int64_t>::min();
+    std::int64_t top = std::numeric_limits<std::int64_t>::min();
+    std::int64_t upperLeft = std::numeric_limits<std::int64_t>::max();
+    std::int64_t lowerRight = std::numeric_limits<std::int64_t>::min();
+    std::int64_t lowerLeft = std::numeric_limits<std::int64_t>::max();
+    std::int64_t upperRight = std::numeric_limits<std::int64_t>::min();
+
+    for( std::size_t index = 0; index < aSimplex.Borders().size(); ++index )
+    {
+        const POINT& corner = aSimplex.Corner( index );
+        const auto lx = floorRational( corner.x, corner.z );
+        const auto ly = floorRational( corner.y, corner.z );
+        const auto rx = ceilRational( corner.x, corner.z );
+        const auto uy = ceilRational( corner.y, corner.z );
+        const auto ulx = floorRational( corner.x - corner.y, corner.z );
+        const auto lrx = ceilRational( corner.x - corner.y, corner.z );
+        const auto llx = floorRational( corner.x + corner.y, corner.z );
+        const auto urx = ceilRational( corner.x + corner.y, corner.z );
+        if( !lx || !ly || !rx || !uy || !ulx || !lrx || !llx || !urx )
+            return {};
+        left = std::min( left, *lx );
+        bottom = std::min( bottom, *ly );
+        right = std::max( right, *rx );
+        top = std::max( top, *uy );
+        upperLeft = std::min( upperLeft, *ulx );
+        lowerRight = std::max( lowerRight, *lrx );
+        lowerLeft = std::min( lowerLeft, *llx );
+        upperRight = std::max( upperRight, *urx );
+    }
+
+    return INT_OCTAGON( left, bottom, right, top, upperLeft, lowerRight,
+                        lowerLeft, upperRight );
+}
+
+
+std::pair<double, double> projectToLine( double aX, double aY,
+                                         const LINE& aLine )
+{
+    const long double dx = aLine.Dx().convert_to<long double>();
+    const long double dy = aLine.Dy().convert_to<long double>();
+    const long double lengthSquared = dx * dx + dy * dy;
+    const long double ratio =
+            ( ( static_cast<long double>( aX ) - aLine.a.x ) * dx
+              + ( static_cast<long double>( aY ) - aLine.a.y ) * dy )
+            / lengthSquared;
+    return { static_cast<double>( aLine.a.x + ratio * dx ),
+             static_cast<double>( aLine.a.y + ratio * dy ) };
+}
+
+
+int sideOfApprox( const LINE& aLine, const std::pair<double, double>& aPoint )
+{
+    const long double value = aLine.Dy().convert_to<long double>()
+                                      * ( aPoint.first - aLine.a.x )
+                              - aLine.Dx().convert_to<long double>()
+                                      * ( aPoint.second - aLine.a.y );
+    return value > 0 ? 1 : value < 0 ? -1 : 0;
+}
+
 } // namespace
 
 
@@ -702,6 +859,132 @@ std::optional<SIMPLEX> SIMPLEX::TranslateBy( ROUTER_POINT aVector ) const
         result.emplace_back( *a, *b );
     }
     return SIMPLEX( std::move( result ), UNCHECKED_TAG{} );
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::Offset( double aWidth ) const
+{
+    if( aWidth == 0 )
+        return *this;
+
+    std::vector<LINE> result;
+    result.reserve( m_borders.size() );
+    for( const LINE& border : m_borders )
+    {
+        const auto translated = translateSupport( border, -aWidth );
+        if( !translated )
+            return {};
+        result.push_back( *translated );
+    }
+
+    if( aWidth < 0 )
+        return GetInstance( std::move( result ) );
+    return SIMPLEX( std::move( result ), UNCHECKED_TAG{} );
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::Enlarge( double aOffset ) const
+{
+    if( aOffset == 0 )
+        return *this;
+    const auto offsetSimplex = Offset( aOffset );
+    const auto bounds = boundingOctagon( *this );
+    if( !offsetSimplex || !bounds )
+        return Empty();
+    const auto offsetBounds = bounds->Offset( aOffset ).ToSimplex();
+    if( !offsetBounds )
+        return Empty();
+    return offsetSimplex->Intersection( *offsetBounds );
+}
+
+
+std::pair<double, double> SIMPLEX::CentreOfGravity() const
+{
+    if( IsEmpty() || !IsBounded() )
+        return { 0, 0 };
+    double x = 0;
+    double y = 0;
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        x += Corner( index ).X();
+        y += Corner( index ).Y();
+    }
+    return { x / m_corners.size(), y / m_corners.size() };
+}
+
+
+std::pair<double, double> SIMPLEX::NearestBorderPointApprox(
+        double aX, double aY ) const
+{
+    if( IsEmpty() )
+        return { aX, aY };
+    if( m_borders.size() == 1 )
+        return projectToLine( aX, aY, m_borders.front() );
+    if( Dimension() == 0 && CornerIsBounded( 0 ) )
+        return { Corner( 0 ).X(), Corner( 0 ).Y() };
+
+    std::pair<double, double> nearest{ aX, aY };
+    long double minimum = std::numeric_limits<long double>::infinity();
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            continue;
+        const double x = Corner( index ).X();
+        const double y = Corner( index ).Y();
+        const long double dx = static_cast<long double>( x ) - aX;
+        const long double dy = static_cast<long double>( y ) - aY;
+        const long double distance = dx * dx + dy * dy;
+        if( distance < minimum )
+        {
+            minimum = distance;
+            nearest = { x, y };
+        }
+    }
+
+    std::size_t previous = m_borders.size() - 2;
+    std::size_t current = m_borders.size() - 1;
+    for( std::size_t next = 0; next < m_borders.size(); ++next )
+    {
+        const auto projection = projectToLine( aX, aY, m_borders[current] );
+        if( ( !CornerIsBounded( current )
+              || sideOfApprox( m_borders[previous], projection ) < 0 )
+            && ( !CornerIsBounded( next )
+                 || sideOfApprox( m_borders[next], projection ) < 0 ) )
+        {
+            const long double dx = static_cast<long double>( projection.first ) - aX;
+            const long double dy = static_cast<long double>( projection.second ) - aY;
+            const long double distance = dx * dx + dy * dy;
+            if( distance < minimum )
+            {
+                minimum = distance;
+                nearest = projection;
+            }
+        }
+        previous = current;
+        current = next;
+    }
+    return nearest;
+}
+
+
+std::pair<double, double> SIMPLEX::NearestPointApprox(
+        double aX, double aY ) const
+{
+    if( !IsEmpty() )
+    {
+        bool contains = true;
+        for( const LINE& border : m_borders )
+        {
+            if( sideOfApprox( border, { aX, aY } ) > 0 )
+            {
+                contains = false;
+                break;
+            }
+        }
+        if( contains )
+            return { aX, aY };
+    }
+    return NearestBorderPointApprox( aX, aY );
 }
 
 
