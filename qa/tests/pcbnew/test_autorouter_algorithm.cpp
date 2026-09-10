@@ -5647,6 +5647,63 @@ BOOST_AUTO_TEST_CASE( OptimizerCannotShortenAwayBranchContacts )
 }
 
 
+BOOST_AUTO_TEST_CASE( OptimizerRipsAndReroutesTheExactThreeArmForkItemSet )
+{
+    auto board = makeBoard();
+    board.bounds.maxY = 6000000;
+    ROUTING_PAD branchPad = board.pads[0];
+    branchPad.position = { 3000000, 3000000 };
+    board.pads.push_back( branchPad );
+    board.nets[0].padIndices.push_back( 2 );
+    board.nets[0].connections.push_back( { 0, 2 } );
+
+    auto settings = makeSettings();
+    settings.layers[1].enabled = false;
+    settings.allowVias = false;
+    settings.optimizationPasses = 1;
+    settings.maxOptimizationItems = 1;
+    settings.maxOptimizationAutoroutePasses = 2;
+
+    const ROUTER_POINT fork{ 3000000, 5000000 };
+    ROUTING_CONNECTION trunk;
+    trunk.netCode = 1;
+    trunk.complete = true;
+    trunk.nodes = { { board.pads[0].position, 0 }, { { 1000000, 5000000 }, 0 },
+                    { fork, 0 }, { { 5000000, 5000000 }, 0 },
+                    { board.pads[1].position, 0 } };
+    ROUTING_CONNECTION branch;
+    branch.netCode = 1;
+    branch.complete = true;
+    branch.nodes = { { branchPad.position, 0 }, { fork, 0 } };
+    std::vector<ROUTING_CONNECTION> routes{ trunk, branch };
+    const double oldLength = CONNECTION::FromRoute( trunk ).TraceLength()
+                             + CONNECTION::FromRoute( branch ).TraceLength();
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( trunk );
+    occupancy.Add( branch );
+    BOOST_REQUIRE_EQUAL( occupancy.Board()->RouteItems( trunk ).size(), 2U );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 2 ) );
+
+    BATCH_OPTIMIZER( board, settings, occupancy ).Optimize( routes, {} );
+
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 2 ) );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets[0] ), 0 );
+    double newLength = 0.0;
+    for( const auto& route : routes )
+        newLength += CONNECTION::FromRoute( route ).TraceLength();
+    BOOST_CHECK_LT( newLength, oldLength );
+    BOOST_CHECK( std::none_of( routes.begin(), routes.end(), [&]( const auto& route )
+    {
+        return std::find_if( route.nodes.begin(), route.nodes.end(), [&]( const auto& node )
+                            { return node.point == fork; } ) != route.nodes.end();
+    } ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( OptimizerReroutesAWholeConnectionAndKeepsOnlyAnImprovement )
 {
     auto board = makeBoard();

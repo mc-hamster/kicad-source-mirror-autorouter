@@ -5,6 +5,7 @@
 #pragma once
 
 #include <map>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -35,6 +36,7 @@ public:
     {
         ITEM_ID                  id = 0;
         int                      netCode = 0;
+        std::size_t              padIndex = std::numeric_limits<std::size_t>::max();
         ITEM_KIND                kind = ITEM_KIND::UNKNOWN;
         bool                     routable = false;
         ROUTER_POINT             first;

@@ -27,7 +27,9 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <set>
 #include <sstream>
+#include <tuple>
 
 #include "../AutorouterDebug.h"
 #include "../BoardHistory.h"
@@ -215,35 +217,113 @@ bool preservesPadGroups( const std::vector<std::vector<std::size_t>>& aGroups,
 }
 
 
-bool hasExternalInteriorContact( const ROUTING_CONNECTION& aConnection,
-                                 const ROUTING_BOARD& aBoard )
+ROUTING_BOARD::ITEM_ID_SET optimizerRippedItems( const ROUTING_BOARD& aBoard,
+                                                 ROUTING_BOARD::ITEM_ID aSelected )
 {
-    if( aConnection.nodes.size() < 2 )
-        return false;
+    const auto selected = aBoard.GetItemInfo( aSelected );
+    if( !selected || !selected->routable )
+        return {};
 
-    const ROUTER_POINT front = aConnection.nodes.front().point;
-    const ROUTER_POINT back = aConnection.nodes.back().point;
-    for( std::size_t index = 1; index < aConnection.nodes.size(); ++index )
+    // BatchOptimizer.optRouteItem first expands an unfixed trace selection to
+    // every unfixed trace touching either endpoint of a fork. It then takes
+    // Item.getConnectionItems(NONE) for each expanded item.
+    ROUTING_BOARD::ITEM_ID_SET selectedItems{ aSelected };
+    if( selected->kind == ROUTING_BOARD::ITEM_KIND::TRACE )
     {
-        const ROUTER_NODE& first = aConnection.nodes[index - 1];
-        const ROUTER_NODE& second = aConnection.nodes[index];
-        if( first.layer != second.layer )
-            continue;
-
-        for( const ROUTER_POINT& junction :
-             aBoard.TraceJunctions( aConnection.netCode, first, second ) )
+        for( ROUTER_POINT endpoint : { selected->first, selected->last } )
         {
-            // The two connection ends are intentionally free to move: the
-            // reroute starts from their complete post-removal components.
-            // Any other contact belongs to a branch/via that is outside this
-            // ROUTING_CONNECTION. Moving only the trunk would strand that
-            // item even when pad connectivity happened to remain satisfied.
-            if( junction != front && junction != back )
-                return true;
+            const auto contacts = aBoard.NormalContactsAt( aSelected, endpoint );
+            const bool onlyUnfixedTraces = std::all_of(
+                    contacts.begin(), contacts.end(), [&]( ROUTING_BOARD::ITEM_ID aContact )
+                    {
+                        const auto item = aBoard.GetItemInfo( aContact );
+                        return item && item->routable
+                               && item->kind == ROUTING_BOARD::ITEM_KIND::TRACE;
+                    } );
+            if( onlyUnfixedTraces )
+                selectedItems.insert( contacts.begin(), contacts.end() );
         }
     }
 
-    return false;
+    ROUTING_BOARD::ITEM_ID_SET result;
+    for( ROUTING_BOARD::ITEM_ID item : selectedItems )
+    {
+        const auto connection = aBoard.GetConnectionItems( item );
+        result.insert( connection.begin(), connection.end() );
+    }
+    return result;
+}
+
+
+struct ITEM_BOUNDARY
+{
+    ROUTER_NODE node;
+    ROUTING_BOARD::ITEM_ID outsideItem = 0;
+    std::size_t padIndex = std::numeric_limits<std::size_t>::max();
+};
+
+
+std::vector<ITEM_BOUNDARY> itemBoundaries( const ROUTING_BOARD& aBoard,
+                                          const ROUTING_BOARD::ITEM_ID_SET& aItems )
+{
+    std::vector<ITEM_BOUNDARY> result;
+    std::set<std::tuple<ROUTING_BOARD::ITEM_ID, std::int64_t, std::int64_t, int>> seen;
+    for( ROUTING_BOARD::ITEM_ID item : aItems )
+    {
+        for( ROUTING_BOARD::ITEM_ID contact : aBoard.GetNormalContacts( item ) )
+        {
+            if( aItems.contains( contact ) )
+                continue;
+            const auto point = aBoard.NormalContactPoint( item, contact );
+            const int layer = aBoard.FirstCommonLayer( item, contact );
+            const auto outside = aBoard.GetItemInfo( contact );
+            if( !point || layer < 0 || !outside )
+                continue;
+            const auto key = std::tuple{ contact, point->x, point->y, layer };
+            if( seen.insert( key ).second )
+                result.push_back( { { *point, layer }, contact, outside->padIndex } );
+        }
+    }
+    return result;
+}
+
+
+std::int64_t normalTrackWidth( const BOARD_SNAPSHOT& aBoard, int aNetCode )
+{
+    for( const ROUTING_NET& net : aBoard.nets )
+    {
+        if( net.netCode != aNetCode )
+            continue;
+        std::int64_t width = 0;
+        for( std::size_t pad : net.padIndices )
+            if( pad < aBoard.pads.size() )
+                width = std::max( width, aBoard.pads[pad].trackWidth );
+        return width > 0 ? width : 150000;
+    }
+    return 150000;
+}
+
+
+std::int64_t netClearance( const BOARD_SNAPSHOT& aBoard, int aNetCode )
+{
+    const auto net = std::find_if( aBoard.nets.begin(), aBoard.nets.end(),
+                                   [&]( const ROUTING_NET& aNet )
+                                   { return aNet.netCode == aNetCode; } );
+    return net == aBoard.nets.end() ? 0 : std::max<std::int64_t>( 0, net->clearance );
+}
+
+
+ROUTING_PAD boundaryPad( const ITEM_BOUNDARY& aBoundary, int aNetCode,
+                         std::int64_t aWidth, std::int64_t aClearance )
+{
+    ROUTING_PAD result;
+    result.netCode = aNetCode;
+    result.position = aBoundary.node.point;
+    result.layers = { aBoundary.node.layer };
+    result.trackWidth = aWidth;
+    result.clearance = aClearance;
+    result.isExactTarget = true;
+    return result;
 }
 }
 
@@ -485,7 +565,9 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 break;
 
             const std::size_t connectionIndex = next->connectionIndex;
-            ROUTING_CONNECTION& connection = aConnections[connectionIndex];
+            if( connectionIndex >= aConnections.size() )
+                continue;
+            const ROUTING_CONNECTION original = aConnections[connectionIndex];
 
             AUTOROUTER_SETTINGS itemOptimizationSettings = optimizationSettings;
             if( next->key.kind == 1 )
@@ -499,7 +581,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             }
             MAZE_SEARCH_ENGINE search( m_board, itemOptimizationSettings, m_occupancy );
 
-            if( isProtectedSourceCopper( connection ) )
+            if( isProtectedSourceCopper( original ) )
                 continue;
             if( aCancel && aCancel() )
                 break;
@@ -510,31 +592,47 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 return completedPasses;
             }
 
-            if( !connection.complete || connection.nodes.size() < 2 )
+            if( !original.complete || original.nodes.size() < 2 )
                 continue;
 
             ++optimizedItems;
-            const ROUTING_CONNECTION original = connection;
             const ROUTE_QUALITY before = routeQuality( m_board, aConnections,
                                                        *m_occupancy.Board() );
-            auto groups = m_occupancy.Board()->ConnectedPadGroups( connection.netCode );
+            auto groups = m_occupancy.Board()->ConnectedPadGroups( original.netCode );
             for( auto& group : groups )
                 std::erase_if( group, [&]( std::size_t aPad )
                               { return m_board.pads[aPad].isFanoutTarget; } );
             const auto movableViaEdges = VIA_OPTIMIZER::MovableViaEdges(
                     original, m_board, *m_occupancy.Board() );
 
-            ROUTING_OCCUPANCY::TRANSACTION transaction( m_occupancy );
-            m_occupancy.Remove( original );
-
-            // Connection.get() in Freerouting stops a candidate chain at
-            // forks. Native route records can still contain a trunk whose
-            // interior is contacted by another record. Until that graph is
-            // split into the same chains, fail closed instead of moving the
-            // trunk and leaving an unconnected branch end in the KiCad
-            // proposal. The transaction restores the removed route here.
-            if( hasExternalInteriorContact( original, *m_occupancy.Board() ) )
+            const auto rippedItems = optimizerRippedItems( *m_occupancy.Board(),
+                                                            next->key.item );
+            if( rippedItems.empty() )
             {
+                ++consecutiveFailures;
+                continue;
+            }
+
+            const auto boundaries = itemBoundaries( *m_occupancy.Board(), rippedItems );
+            std::vector<std::string> sourceBoardItemIds;
+            for( ROUTING_BOARD::ITEM_ID item : rippedItems )
+            {
+                const auto itemRoute = m_occupancy.Board()->ItemRoute( item );
+                if( !itemRoute )
+                    continue;
+                for( const std::string& id : itemRoute->sourceBoardItemIds )
+                    if( std::find( sourceBoardItemIds.begin(), sourceBoardItemIds.end(), id )
+                        == sourceBoardItemIds.end() )
+                    {
+                        sourceBoardItemIds.push_back( id );
+                    }
+            }
+
+            const std::vector<ROUTING_CONNECTION> connectionsBefore = aConnections;
+            ROUTING_OCCUPANCY::TRANSACTION transaction( m_occupancy );
+            if( !m_occupancy.RemoveItems( rippedItems ) )
+            {
+                aConnections = connectionsBefore;
                 ++consecutiveFailures;
                 if( m_settings.maxOptimizationConsecutiveFailures > 0
                     && consecutiveFailures >= m_settings.maxOptimizationConsecutiveFailures )
@@ -543,11 +641,35 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 }
                 continue;
             }
+            aConnections = m_occupancy.Connections();
 
-            std::optional<ROUTING_CONNECTION> bestConnection;
-            ROUTE_QUALITY bestQuality = routeQuality( m_board, aConnections,
-                                                       *m_occupancy.Board(),
-                                                       connectionIndex );
+            // Several boundary contacts may already belong to the same
+            // post-removal copper component. BatchAutorouter sees components,
+            // not raw contact count, so retain one deterministic representative.
+            std::vector<ITEM_BOUNDARY> boundaryComponents;
+            std::vector<std::set<ROUTING_BOARD::ITEM_ID>> boundarySets;
+            for( const ITEM_BOUNDARY& boundary : boundaries )
+            {
+                const auto component = m_occupancy.Board()->ConnectedSet(
+                        boundary.outsideItem );
+                if( component.empty() )
+                    continue;
+                const bool represented = std::any_of(
+                        boundarySets.begin(), boundarySets.end(), [&]( const auto& existing )
+                        {
+                            return std::any_of( component.begin(), component.end(),
+                                                [&]( auto id ) { return existing.contains( id ); } );
+                        } );
+                if( !represented )
+                {
+                    boundaryComponents.push_back( boundary );
+                    boundarySets.emplace_back( component.begin(), component.end() );
+                }
+            }
+
+            std::vector<ROUTING_CONNECTION> bestConnections;
+            ROUTE_QUALITY bestQuality = routeQuality( m_board, m_occupancy.Connections(),
+                                                       *m_occupancy.Board() );
             bool bestIsDeletion = isImprovement( before, bestQuality )
                                   && preservesPadGroups( groups, *m_occupancy.Board() );
             bool haveBest = bestIsDeletion;
@@ -560,6 +682,21 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                                                             aRoute.nodes.front().point );
                 m_occupancy.Board()->RelocateSyntheticPad( aRoute.toPadIndex,
                                                             aRoute.nodes.back().point );
+            };
+
+            const auto saveCandidate = [&]( const std::vector<ROUTING_CONNECTION>& aCandidate )
+            {
+                const ROUTE_QUALITY quality = routeQuality(
+                        m_board, m_occupancy.Connections(), *m_occupancy.Board() );
+                const bool preserves = preservesPadGroups( groups, *m_occupancy.Board() );
+                if( preserves && isImprovement( before, quality )
+                    && ( !haveBest || betterThan( quality, bestQuality ) ) )
+                {
+                    bestConnections = aCandidate;
+                    bestQuality = quality;
+                    bestIsDeletion = false;
+                    haveBest = true;
+                }
             };
 
             const auto consider = [&]( ROUTING_CONNECTION aCandidate )
@@ -576,6 +713,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 aCandidate.sourceBoardItemIds = original.sourceBoardItemIds;
                 promoteChangedAutorouterCopper( aCandidate, original );
 
+                ROUTING_OCCUPANCY::TRANSACTION candidateTransaction( m_occupancy );
                 const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
                         aCandidate, {}, m_occupancy, search, aCancel, false );
                 if( inserted.state != FOUND_CONNECTION_INSERTER::STATE::INSERTED
@@ -593,33 +731,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 effective.isFanoutConnection = original.isFanoutConnection;
                 effective.sourceBoardItemIds = original.sourceBoardItemIds;
                 promoteChangedAutorouterCopper( effective, original );
-
-                // ViaOptimizer may move a plane/fanout drill at a synthetic
-                // connection endpoint.  Freerouting moves the Via item itself;
-                // the native planning terminal must follow temporarily so
-                // CountMissing evaluates the same physical copper. Restore it
-                // after this alternative, or retain it with the winner below.
                 relocateSyntheticEnds( effective );
-
-                const ROUTE_QUALITY quality = routeQuality(
-                        m_board, aConnections, *m_occupancy.Board(), connectionIndex,
-                        &effective );
-                const bool preserves = preservesPadGroups( groups, *m_occupancy.Board() );
-                // Insert owns its own atomic transaction. With an empty
-                // victim list it cannot move another route, so removing its
-                // effective candidate restores the post-removal base for the
-                // next alternative without another full board snapshot.
-                m_occupancy.Remove( effective );
-                relocateSyntheticEnds( original );
-
-                if( preserves && isImprovement( before, quality )
-                    && ( !haveBest || betterThan( quality, bestQuality ) ) )
-                {
-                    bestConnection = std::move( effective );
-                    bestQuality = quality;
-                    bestIsDeletion = false;
-                    haveBest = true;
-                }
+                saveCandidate( { std::move( effective ) } );
             };
 
             // Pull-tight remains useful when the complete maze cannot find a
@@ -644,21 +757,13 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 consider( std::move( viaCandidate ) );
             }
 
-            // Freerouting removes the item's complete connection chain and
-            // invokes bounded autoroute passes on the remaining components.
-            // Native ROUTING_CONNECTION records already delimit a connection;
-            // route between its post-removal pad components and keep only a
-            // lexicographically better, contact-preserving candidate.
-            const bool validPads = original.fromPadIndex < m_board.pads.size()
-                                   && original.toPadIndex < m_board.pads.size();
-            if( validPads && !original.isFanoutConnection
+            // The source reruns BatchAutorouter after deleting the exact item
+            // set. Route the resulting boundary components, rather than the
+            // stale from/to pads of the compound insertion request. A fork can
+            // therefore produce several replacement PolylineTrace records.
+            if( boundaryComponents.size() >= 2 && !original.isFanoutConnection
                 && !( aCancel && aCancel() ) )
             {
-                const ROUTING_PAD& from = m_board.pads[original.fromPadIndex];
-                const ROUTING_PAD& to = m_board.pads[original.toPadIndex];
-                const auto starts = m_occupancy.Board()->Terminals( original.fromPadIndex );
-                const auto targets = m_occupancy.Board()->Terminals( original.toPadIndex );
-
                 for( int retry = 0;
                      retry < std::max( 1, m_settings.maxOptimizationAutoroutePasses );
                      ++retry )
@@ -666,43 +771,100 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                     if( aCancel && aCancel() )
                         break;
 
-                    int expanded = 0;
-                    auto rerouted = search.FindConnection( from, to, retry, expanded,
-                                                           aCancel, {}, starts, targets, false );
-                    if( rerouted )
+                    ROUTING_OCCUPANCY::TRANSACTION candidateTransaction( m_occupancy );
+                    std::vector<ROUTING_CONNECTION> reroutedConnections;
+                    bool routedAll = true;
+                    const ITEM_BOUNDARY& anchor = boundaryComponents.front();
+                    for( std::size_t boundaryIndex = 1;
+                         boundaryIndex < boundaryComponents.size(); ++boundaryIndex )
                     {
-                        consider( std::move( *rerouted ) );
-                        // An item-local batch pass is complete after its one
-                        // disconnected component has routed. Later retries
-                        // exist for failed attempts; they are not alternative
-                        // searches after success.
-                        break;
+                        const ITEM_BOUNDARY& target = boundaryComponents[boundaryIndex];
+                        if( m_occupancy.Board()->ConnectedSet( anchor.outsideItem )
+                                    .contains( target.outsideItem ) )
+                        {
+                            continue;
+                        }
+
+                        const std::int64_t width = normalTrackWidth( m_board,
+                                                                     original.netCode );
+                        const std::int64_t clearance = netClearance( m_board,
+                                                                     original.netCode );
+                        const ROUTING_PAD from = boundaryPad( anchor, original.netCode,
+                                                              width, clearance );
+                        const ROUTING_PAD to = boundaryPad( target, original.netCode,
+                                                            width, clearance );
+                        int expanded = 0;
+                        auto rerouted = search.FindConnection( from, to, retry, expanded,
+                                                               aCancel, {}, {}, {}, false );
+                        if( !rerouted )
+                        {
+                            routedAll = false;
+                            break;
+                        }
+
+                        rerouted->complete = true;
+                        rerouted->netCode = original.netCode;
+                        rerouted->fromPadIndex = anchor.padIndex;
+                        rerouted->toPadIndex = target.padIndex;
+                        rerouted->isPlaneConnection = original.isPlaneConnection;
+                        if( reroutedConnections.empty() )
+                            rerouted->sourceBoardItemIds = sourceBoardItemIds;
+
+                        const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+                                *rerouted, {}, m_occupancy, search, aCancel, false );
+                        if( inserted.state != FOUND_CONNECTION_INSERTER::STATE::INSERTED
+                            || !inserted.shoved.empty() )
+                        {
+                            routedAll = false;
+                            break;
+                        }
+
+                        ROUTING_CONNECTION effective = inserted.connection
+                                ? *inserted.connection : std::move( *rerouted );
+                        effective.complete = true;
+                        effective.fromPadIndex = anchor.padIndex;
+                        effective.toPadIndex = target.padIndex;
+                        effective.isPlaneConnection = original.isPlaneConnection;
+                        if( reroutedConnections.empty() )
+                            effective.sourceBoardItemIds = sourceBoardItemIds;
+                        reroutedConnections.push_back( std::move( effective ) );
                     }
+
+                    if( routedAll )
+                        saveCandidate( reroutedConnections );
+                    if( routedAll && haveBest )
+                        break;
                 }
             }
 
             if( aCancel && aCancel() )
-                break;
-
-            if( bestConnection )
             {
-                m_occupancy.Add( *bestConnection );
-                relocateSyntheticEnds( *bestConnection );
-                connection = std::move( *bestConnection );
+                aConnections = connectionsBefore;
+                break;
+            }
+
+            if( !bestConnections.empty() )
+            {
+                for( const ROUTING_CONNECTION& connection : bestConnections )
+                {
+                    m_occupancy.Add( connection );
+                    relocateSyntheticEnds( connection );
+                }
                 transaction.Commit();
+                aConnections = m_occupancy.Connections();
                 changedThisPass = true;
                 consecutiveFailures = 0;
             }
             else if( bestIsDeletion )
             {
                 transaction.Commit();
-                aConnections.erase( aConnections.begin()
-                                    + static_cast<std::ptrdiff_t>( connectionIndex ) );
+                aConnections = m_occupancy.Connections();
                 changedThisPass = true;
                 consecutiveFailures = 0;
             }
             else
             {
+                aConnections = connectionsBefore;
                 ++consecutiveFailures;
             }
 

@@ -1037,6 +1037,7 @@ std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id )
     ITEM_INFO result;
     result.id = item.id;
     result.netCode = item.net;
+    result.padIndex = item.pad;
     result.routable = item.routable;
     result.first = item.normal.first;
     result.last = item.normal.last;
