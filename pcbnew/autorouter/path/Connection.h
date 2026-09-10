@@ -20,11 +20,16 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <vector>
 
 #include "../AutorouterTypes.h"
 
 namespace KICAD_AUTOROUTER
 {
+
+class ROUTING_BOARD;
 
 /**
  * Freerouting equivalent: autoroute/path/Connection.
@@ -37,14 +42,20 @@ class CONNECTION
 {
 public:
     static CONNECTION FromRoute( const ROUTING_CONNECTION& aRoute );
+    /** Direct translation of Freerouting Connection.get(Item). */
+    static std::optional<CONNECTION> Get( const ROUTING_BOARD& aBoard,
+                                          std::uint64_t aItem );
 
     bool IsComplete() const { return m_complete; }
     int  NetCode() const { return m_netCode; }
+    bool HasStartPoint() const { return m_hasStartPoint; }
+    bool HasEndPoint() const { return m_hasEndPoint; }
     const ROUTER_POINT& StartPoint() const { return m_startPoint; }
     const ROUTER_POINT& EndPoint() const { return m_endPoint; }
     int                 StartLayer() const { return m_startLayer; }
     int                 EndLayer() const { return m_endLayer; }
     std::size_t         ItemCount() const { return m_itemCount; }
+    const std::vector<std::uint64_t>& Items() const { return m_items; }
     double              TraceLength() const { return m_traceLength; }
     double              Detour() const;
 
@@ -55,8 +66,11 @@ private:
     int          m_startLayer = -1;
     int          m_endLayer = -1;
     std::size_t  m_itemCount = 0;
+    std::vector<std::uint64_t> m_items;
     double       m_traceLength = 0.0;
     bool         m_complete = false;
+    bool         m_hasStartPoint = false;
+    bool         m_hasEndPoint = false;
 };
 
 } // namespace KICAD_AUTOROUTER

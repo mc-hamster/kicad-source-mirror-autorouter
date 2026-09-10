@@ -2512,6 +2512,71 @@ BOOST_AUTO_TEST_CASE( NormalContactsSplitGeneratedBranchesAndRollbackIdentity )
     BOOST_CHECK( !copper.NormalConnectedSet( *copper.PadItem( 0 ) ).contains( *copper.PadItem( 1 ) ) );
 }
 
+
+BOOST_AUTO_TEST_CASE( ConnectionGetUsesSourcePolylineItemsForksAndReverseIdOrder )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_PAD branchPad = board.pads[0];
+    branchPad.position = { 3000000, 2600000 };
+    board.pads.push_back( branchPad );
+    board.nets[0].padIndices.push_back( 2 );
+
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION trunk;
+    trunk.netCode = 1;
+    trunk.complete = true;
+    trunk.nodes = { { board.pads[0].position, 0 }, { { 2000000, 2000000 }, 0 },
+                    { { 3000000, 2000000 }, 0 }, { board.pads[1].position, 0 } };
+    copper.AddRoute( trunk );
+
+    // Corners of one same-width PolylineTrace are not separate source Items.
+    const auto unsplit = copper.RouteItems( trunk );
+    BOOST_REQUIRE_EQUAL( unsplit.size(), 1U );
+    const auto connection = CONNECTION::Get( copper, unsplit.front() );
+    BOOST_REQUIRE( connection );
+    BOOST_CHECK( connection->IsComplete() );
+    BOOST_CHECK_EQUAL( connection->ItemCount(), 1U );
+    BOOST_CHECK_EQUAL( connection->Items().front(), unsplit.front() );
+    BOOST_CHECK_CLOSE( connection->TraceLength(),
+                       std::hypot( 1000000.0, 500000.0 ) + 1000000.0
+                               + std::hypot( 2000000.0, 500000.0 ),
+                       1e-9 );
+
+    ROUTING_CONNECTION branch;
+    branch.netCode = 1;
+    branch.complete = true;
+    branch.nodes = { { branchPad.position, 0 }, { { 3000000, 2000000 }, 0 } };
+    copper.AddRoute( branch );
+
+    const auto split = copper.RouteItems( trunk );
+    const auto branchItems = copper.RouteItems( branch );
+    BOOST_REQUIRE_EQUAL( split.size(), 2U );
+    BOOST_REQUIRE_EQUAL( branchItems.size(), 1U );
+    const ROUTER_POINT fork{ 3000000, 2000000 };
+    const auto forkContacts = copper.NormalContactsAt( split.front(), fork );
+    BOOST_REQUIRE_EQUAL( forkContacts.size(), 2U );
+    BOOST_CHECK_GT( *forkContacts.begin(), *std::next( forkContacts.begin() ) );
+
+    for( auto id : split )
+    {
+        const auto part = CONNECTION::Get( copper, id );
+        BOOST_REQUIRE( part );
+        BOOST_CHECK( part->IsComplete() );
+        BOOST_CHECK_EQUAL( part->ItemCount(), 1U );
+        BOOST_CHECK( part->StartPoint() == fork || part->EndPoint() == fork );
+    }
+
+    ROUTING_CONNECTION layered;
+    layered.netCode = 1;
+    layered.complete = true;
+    layered.nodes = { { { 0, 0 }, 0 }, { { 1000, 0 }, 0 },
+                      { { 1000, 0 }, 1 }, { { 2000, 0 }, 1 },
+                      { { 3000, 0 }, 1 } };
+    layered.edgeStyles.resize( layered.nodes.size() - 1 );
+    BOOST_CHECK_EQUAL( CONNECTION::FromRoute( layered ).ItemCount(), 3U );
+}
+
 BOOST_AUTO_TEST_CASE( RetainedTraceContactsSplitVirtuallyAndRestoreOnRejectedInsertion )
 {
     auto board = makeBoard(); auto settings = makeSettings();

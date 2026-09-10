@@ -8,6 +8,7 @@
 #include "../AutorouterDebug.h"
 #include "MazeExpansionEngine.h"
 #include "MazeRipupResolver.h"
+#include "../path/Connection.h"
 #include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
@@ -281,16 +282,30 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
 
         const ROUTING_CONNECTION& connection = routes[routeIndex];
         std::vector<std::size_t> edgeGroups;
+        std::vector<std::size_t> edgeItemOrdinals;
         edgeGroups.reserve( connection.nodes.empty() ? 0 : connection.nodes.size() - 1 );
+        edgeItemOrdinals.reserve( edgeGroups.capacity() );
+        std::size_t routeItemCount = 0;
         for( std::size_t edge = 0; edge + 1 < connection.nodes.size(); ++edge )
         {
             const bool continuesTrace = edge > 0
                     && connection.nodes[edge - 1].layer == connection.nodes[edge].layer
-                    && connection.nodes[edge].layer == connection.nodes[edge + 1].layer;
+                    && connection.nodes[edge].layer == connection.nodes[edge + 1].layer
+                    && EdgeStyle( connection, edge - 1 ).trackWidth
+                               == EdgeStyle( connection, edge ).trackWidth
+                    && EdgeStyle( connection, edge - 1 ).clearance
+                               == EdgeStyle( connection, edge ).clearance;
             if( !continuesTrace )
+            {
                 ++nextItemGroup;
+                ++routeItemCount;
+            }
             edgeGroups.push_back( nextItemGroup - 1 );
+            edgeItemOrdinals.push_back( routeItemCount - 1 );
         }
+        const std::vector<ROUTING_BOARD::ITEM_ID> routeItems = m_occupancy.Board()
+                ? m_occupancy.Board()->RouteItems( connection )
+                : std::vector<ROUTING_BOARD::ITEM_ID>{};
         const bool movableRoute = connection.isShoveMovable
                                   && ( !connection.isExistingBoardRoute
                                        || connection.isAutorouterOwned
@@ -435,9 +450,15 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                               std::max( from.point.y, to.point.y ) + expansion + 1 };
             SHAPE_TREE_ENTRY entry{ shape, 0, static_cast<int>( edge ), aLayer,
                                     connection.netCode, false, true };
+            std::optional<CONNECTION> topologyConnection;
+            if( routeItems.size() == routeItemCount )
+                topologyConnection = CONNECTION::Get(
+                        *m_occupancy.Board(), routeItems[edgeItemOrdinals[edge]] );
+
             const int ripupCost = resolver.CheckRipup(
                     connection, edge, netTrackRadius( connection.netCode ), context,
-                    nextDouble(), additionalViaTraceHalfWidths );
+                    nextDouble(), additionalViaTraceHalfWidths,
+                    topologyConnection ? &*topologyConnection : nullptr );
             if( ripupCost >= 0 )
                 result.push_back( { std::move( entry ), edgeGroups[edge], ripupCost,
                                     routeIndex } );

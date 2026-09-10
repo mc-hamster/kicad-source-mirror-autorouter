@@ -43,7 +43,7 @@ same change.
 | `autoroute/maze/MazeListElement.java` | `pcbnew/autorouter/maze/MazeListElement.h` | Pinned f/g/door-ID/section ordering key, including equal-key suppression. Host target/room identity remains an adaptation. |
 | `autoroute/maze/MazeSearchElement.java` | `pcbnew/autorouter/maze/MazeSearchElement.h` | Value backtracking record for immutable snapshot search. |
 | `autoroute/maze/MazeFanoutDiagnostics.java` | `pcbnew/autorouter/maze/MazeFanoutDiagnostics.h` | Optional callback diagnostics with no GUI or logger dependency. |
-| `autoroute/maze/MazeRipupResolver.java` | `pcbnew/autorouter/maze/MazeRipupResolver.h/.cpp` | Substitute conflict selection; not upstream item-local rip-up semantics. |
+| `autoroute/maze/MazeRipupResolver.java` | `pcbnew/autorouter/maze/MazeRipupResolver.h/.cpp` | Active obstacle-room cost translation. Uses exact mutable `Connection.get()` chains when route-to-item mapping is unambiguous; static/fork-split source routes still use connection-record reconstruction and partial-route rip-up is not ported. |
 | `autoroute/maze/MazeTraceShover.java` | `pcbnew/autorouter/maze/MazeTraceShover.h/.cpp` | Visibility shortening and redundant-via cleanup used by the optimizer. |
 | `autoroute/pipeline/BatchAutorouter.java` | `pcbnew/autorouter/pipeline/BatchAutorouter.h/.cpp` | Substitute pad-graph batching, retries and result materialization; not a port of the connected-item routing pipeline. |
 | `autoroute/pipeline/BatchAutorouterThread.java` | `pcbnew/autorouter/pipeline/BatchAutorouterThread.h/.cpp` | Algorithm-side worker entry; `AUTOROUTER_JOB` owns the wx-safe native thread. |
@@ -54,7 +54,7 @@ same change.
 | `autoroute/pipeline/BatchOptimizerMultiThreaded.java` | `pcbnew/autorouter/pipeline/BatchOptimizerMultiThreaded.h` | Serial delegate only; no reference candidate scheduling, parallelism or scoring implementation. |
 | `autoroute/pipeline/OptimizeRouteTask.java` | `pcbnew/autorouter/pipeline/OptimizeRouteTask.h` | Data-only optimization candidate task; never deep-copies a live KiCad `BOARD`. |
 | `autoroute/pipeline/RoutingPipeline.java` | `pcbnew/autorouter/pipeline/RoutingPipeline.h/.cpp` | Stable orchestration seam for future fanout and diagnostics. |
-| `autoroute/path/Connection.java` | `pcbnew/autorouter/path/Connection.h/.cpp` plus `ROUTING_CONNECTION` | Data-only value wrapper; path nodes retain layer transitions. |
+| `autoroute/path/Connection.java` | `pcbnew/autorouter/path/Connection.h/.cpp` plus `ROUTING_CONNECTION` | Direct reverse-ID normal-contact chain/fork traversal over mutable source-shaped polyline/via items, including terminal layers, item set, trace length and detour. Curved/rational contacts and source connection caching remain open. |
 | `autoroute/path/FoundConnectionInserter.java` | `pcbnew/autorouter/path/FoundConnectionInserter.h/.cpp` | Result-edge emitter only, not reference forced insertion, contact splitting/normalization, neckdown or transactional rollback. Host materialization remains in the KiCad adapter/session. |
 | `autoroute/path/FoundConnectionLocator.java` | `pcbnew/autorouter/path/FoundConnectionLocator.h/.cpp` | Unwired wrapper that invokes search again; not the upstream door-section backtrace locator. |
 | `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h/.cpp` | Active rectangular 90/45-degree corridor locator; composed with through-drill transitions. Full convex/acute/thin-room and pin-exit behavior remain unported. |
@@ -79,7 +79,7 @@ same change.
 
 | Freerouting concept | KiCad equivalent | Native file |
 |---|---|---|
-| `board.facade.RoutingBoard` | Partial mutable copper/contact graph with R-tree queries and transactions; not upstream normal-contact, forced insertion or room semantics | `board/facade/RoutingBoard.h/.cpp`; input capture remains in `KicadBoardAdapter` |
+| `board.facade.RoutingBoard` | Partial mutable copper/contact graph with R-tree queries, source-order normal contacts, polyline items/junction splitting and transactions; forced insertion and room mutation are still incomplete | `board/facade/RoutingBoard.h/.cpp`; input capture remains in `KicadBoardAdapter` |
 | `RoutingBoardSearchFacade` / shape search tree | Snapshot obstacles, outline and keepouts | `board/KicadBoardAdapter.cpp`, `maze/MazeSearchEngine.cpp` |
 | `RoutingBoardOperations` | Live edits use `BOARD_COMMIT` on the editor thread; a private `BOARD` is used by host validation on the worker. Neither implements reference forced insertion | `AutorouterTool.cpp`, `board/KicadRoutingSession.cpp` |
 | `RoutingBoardUndoFacade` / board history | `BOARD_COMMIT` | KiCad-provided API; one accepted proposal is one commit |

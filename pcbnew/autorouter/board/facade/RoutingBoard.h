@@ -6,6 +6,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -19,6 +20,28 @@ class ROUTING_BOARD
 {
 public:
     using ITEM_ID = std::uint64_t;
+    using ITEM_ID_SET = std::set<ITEM_ID, std::greater<ITEM_ID>>;
+
+    enum class ITEM_KIND
+    {
+        UNKNOWN,
+        TRACE,
+        DRILL,
+        AREA
+    };
+
+    /** Read-only source-item view used by Connection.get(). */
+    struct ITEM_INFO
+    {
+        ITEM_ID                  id = 0;
+        int                      netCode = 0;
+        ITEM_KIND                kind = ITEM_KIND::UNKNOWN;
+        bool                     routable = false;
+        ROUTER_POINT             first;
+        ROUTER_POINT             last;
+        std::vector<int>         layers;
+        double                   traceLength = 0.0;
+    };
 
     ROUTING_BOARD( const BOARD_SNAPSHOT& aSnapshot, const AUTOROUTER_SETTINGS& aSettings );
     ~ROUTING_BOARD();
@@ -48,9 +71,12 @@ public:
     /** Routing topology: exact endpoint/centre contacts, not copper overlap.
      * Kept separate from ConnectedSet(), which answers host physical connectivity.
      */
-    std::set<ITEM_ID> GetNormalContacts( ITEM_ID aItem ) const;
+    ITEM_ID_SET GetNormalContacts( ITEM_ID aItem ) const;
     std::optional<ROUTER_POINT> NormalContactPoint( ITEM_ID aFirst, ITEM_ID aSecond ) const;
-    std::set<ITEM_ID> NormalConnectedSet( ITEM_ID aItem ) const;
+    int FirstCommonLayer( ITEM_ID aFirst, ITEM_ID aSecond ) const;
+    ITEM_ID_SET NormalContactsAt( ITEM_ID aTrace, ROUTER_POINT aPoint ) const;
+    ITEM_ID_SET NormalConnectedSet( ITEM_ID aItem ) const;
+    std::optional<ITEM_INFO> GetItemInfo( ITEM_ID aItem ) const;
     std::vector<ITEM_ID> RouteItems( const ROUTING_CONNECTION& aRoute ) const;
     std::optional<ITEM_ID> PadItem( std::size_t aPad ) const;
     std::size_t ItemCount() const;

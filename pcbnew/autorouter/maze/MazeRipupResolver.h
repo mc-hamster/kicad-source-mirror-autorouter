@@ -32,6 +32,8 @@
 namespace KICAD_AUTOROUTER
 {
 
+class CONNECTION;
+
 class MAZE_RIPUP_RESOLVER
 {
 public:
@@ -57,7 +59,8 @@ public:
     int CheckRipup( const ROUTING_CONNECTION& aConnection, std::size_t aEdgeIndex,
                     std::int64_t aFallbackTraceHalfWidth, const CONTEXT& aContext,
                     double aRandomNumber = 0.0,
-                    const std::vector<std::int64_t>& aAdditionalViaTraceHalfWidths = {} ) const;
+                    const std::vector<std::int64_t>& aAdditionalViaTraceHalfWidths = {},
+                    const CONNECTION* aTopologyConnection = nullptr ) const;
 
     static double FanoutViaRipupCostFactor( std::int64_t aTraceHalfWidth,
                                             double aTraceLength );

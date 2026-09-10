@@ -6,6 +6,7 @@
 #include "RoutingBoard.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -92,12 +93,14 @@ struct ROUTING_BOARD::IMPL
         int net = 0;
         std::size_t pad = NO_PAD;
         bool dynamic = false;
+        bool routable = false;
         bool conductionArea = false;
         std::vector<LAYER_SHAPE> shapes;
         std::set<ITEM_ID> contacts;
-        std::set<ITEM_ID> normalContacts;
+        ITEM_ID_SET normalContacts;
         NORMAL_CONTACT_ITEM normal;
         std::optional<ROUTING_OBSTACLE> trace;
+        std::vector<ROUTER_POINT> traceCorners;
         std::shared_ptr<const ROUTING_OBSTACLE> area;
         std::vector<ROUTING_TERMINAL> terminals;
     };
@@ -138,6 +141,7 @@ struct ROUTING_BOARD::IMPL
         result.id = id;
         result.net = net;
         result.dynamic = dynamic;
+        result.routable = dynamic;
         return result;
     }
 
@@ -232,7 +236,7 @@ struct ROUTING_BOARD::IMPL
         items.erase( it );
     }
 
-    // Split straight copper in the WORKER graph at exact centre-line contacts.
+    // Split polyline copper in the WORKER graph at exact centre-line contacts.
     // Retained copper is split virtually only: the original host item is not
     // edited/deleted, and these pieces never become result-emitter output.
     void normalizeJunctions( const std::vector<ITEM_ID>& added )
@@ -241,9 +245,17 @@ struct ROUTING_BOARD::IMPL
         std::map<ITEM_ID, std::vector<ROUTER_POINT>> cuts;
         auto cut = [&]( const ITEM& item, ROUTER_POINT p )
         {
-            if( item.trace && p != item.normal.first && p != item.normal.last
-                && OnSegment( item.normal.first, item.normal.last, p ) )
-                cuts[item.id].push_back( p );
+            if( !item.trace || p == item.normal.first || p == item.normal.last )
+                return;
+
+            for( std::size_t segment = 1; segment < item.traceCorners.size(); ++segment )
+            {
+                if( OnSegment( item.traceCorners[segment - 1], item.traceCorners[segment], p ) )
+                {
+                    cuts[item.id].push_back( p );
+                    break;
+                }
+            }
         };
         for( auto id : added )
         {
@@ -271,10 +283,22 @@ struct ROUTING_BOARD::IMPL
                 {
                     cut( item, c ); cut( item, d );
                     cut( other, a ); cut( other, b );
-                    if( auto p = Intersection( a, b, c, d ) )
+                    for( std::size_t itemSegment = 1;
+                         itemSegment < item.traceCorners.size(); ++itemSegment )
                     {
-                        cut( item, *p );
-                        cut( other, *p );
+                        for( std::size_t otherSegment = 1;
+                             otherSegment < other.traceCorners.size(); ++otherSegment )
+                        {
+                            if( auto p = Intersection(
+                                        item.traceCorners[itemSegment - 1],
+                                        item.traceCorners[itemSegment],
+                                        other.traceCorners[otherSegment - 1],
+                                        other.traceCorners[otherSegment] ) )
+                            {
+                                cut( item, *p );
+                                cut( other, *p );
+                            }
+                        }
                     }
                 }
                 else if( item.normal.kind == KIND::DRILL && other.normal.kind == KIND::TRACE )
@@ -286,40 +310,74 @@ struct ROUTING_BOARD::IMPL
         for( auto& [id, points] : cuts )
         {
             const auto original = items.at( id );
-            const auto start = original.normal.first, end = original.normal.last;
-            points.push_back( start );
-            points.push_back( end );
-            std::sort( points.begin(), points.end(), [&]( auto a, auto b )
-            {
-                if( start.x != end.x )
-                    return start.x < end.x ? a.x < b.x : a.x > b.x;
-                return start.y < end.y ? a.y < b.y : a.y > b.y;
-            } );
+            std::sort( points.begin(), points.end(), []( auto left, auto right )
+            { return left.x != right.x ? left.x < right.x : left.y < right.y; } );
             points.erase( std::unique( points.begin(), points.end() ), points.end() );
+
+            std::vector<ROUTER_POINT> expanded;
+            expanded.push_back( original.traceCorners.front() );
+            for( std::size_t segment = 1; segment < original.traceCorners.size(); ++segment )
+            {
+                const ROUTER_POINT start = original.traceCorners[segment - 1];
+                const ROUTER_POINT end = original.traceCorners[segment];
+                std::vector<ROUTER_POINT> segmentCuts;
+                for( ROUTER_POINT point : points )
+                    if( point != start && point != end && OnSegment( start, end, point ) )
+                        segmentCuts.push_back( point );
+
+                const bool sortByX = std::abs( end.x - start.x ) >= std::abs( end.y - start.y );
+                std::sort( segmentCuts.begin(), segmentCuts.end(), [&]( auto left, auto right )
+                {
+                    if( sortByX )
+                        return start.x < end.x ? left.x < right.x : left.x > right.x;
+                    return start.y < end.y ? left.y < right.y : left.y > right.y;
+                } );
+                expanded.insert( expanded.end(), segmentCuts.begin(), segmentCuts.end() );
+                expanded.push_back( end );
+            }
+
             removeItem( id );
             std::vector<ITEM_ID> replacements;
-            for( std::size_t i = 1; i < points.size(); ++i )
+            std::size_t pieceStart = 0;
+            for( std::size_t i = 1; i < expanded.size(); ++i )
             {
+                const bool splitHere = i + 1 == expanded.size()
+                        || std::find( points.begin(), points.end(), expanded[i] ) != points.end();
+                if( !splitHere )
+                    continue;
+
                 // Preserve the original identity on the first half. Only the
                 // additional halves allocate IDs; unrelated items never move.
                 ITEM piece = original;
-                piece.id = i == 1 ? id : nextId++;
+                piece.id = replacements.empty() ? id : nextId++;
                 piece.contacts.clear();
                 piece.normalContacts.clear();
                 piece.shapes.clear();
-                piece.normal.first = points[i - 1];
-                piece.normal.last = points[i];
-                piece.trace->start = points[i - 1];
-                piece.trace->end = points[i];
-                for( auto& terminal : piece.terminals )
+                piece.terminals.clear();
+                piece.traceCorners.assign( expanded.begin() + pieceStart,
+                                           expanded.begin() + i + 1 );
+                piece.normal.first = piece.traceCorners.front();
+                piece.normal.last = piece.traceCorners.back();
+                for( std::size_t segment = 1; segment < piece.traceCorners.size(); ++segment )
                 {
-                    terminal.pad.position = points[i - 1];
-                    terminal.segmentEnd = points[i];
+                    ROUTING_OBSTACLE trace = *piece.trace;
+                    trace.start = piece.traceCorners[segment - 1];
+                    trace.end = piece.traceCorners[segment];
+                    if( segment == 1 )
+                        piece.trace = trace;
+                    addShape( piece, trace );
+
+                    ROUTING_PAD terminal;
+                    terminal.netCode = piece.net;
+                    terminal.position = trace.start;
+                    terminal.layers = trace.layers;
+                    terminal.trackWidth = 2 * trace.radius;
+                    piece.terminals.push_back( { terminal, NO_PAD, trace.end } );
                 }
-                addShape( piece, *piece.trace );
                 auto [it, inserted] = items.emplace( piece.id, std::move( piece ) );
                 indexItem( it->second );
                 replacements.push_back( it->first );
+                pieceStart = i;
             }
             for( auto& route : routes )
             {
@@ -454,7 +512,11 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
             item.normal.first = copper.start;
             item.normal.last = copper.end;
             if( item.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE )
+            {
                 item.trace = copper;
+                item.traceCorners = { copper.start, copper.end };
+                item.routable = copper.isMovable || copper.isAutorouterOwned;
+            }
             else
                 item.trace.reset();
             for( int layer : copper.layers )
@@ -537,14 +599,19 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
     }
 
     TRANSACTION transaction( *this );
-    for( std::size_t i = 1; i < route.nodes.size(); ++i )
+    std::size_t edge = 0;
+    while( edge + 1 < route.nodes.size() )
     {
-        const auto& from = route.nodes[i - 1];
-        const auto& to = route.nodes[i];
+        const auto& from = route.nodes[edge];
+        const auto& to = route.nodes[edge + 1];
         if( from == to )
+        {
+            ++edge;
             continue;
+        }
+
         const bool via = from.layer != to.layer;
-        const ROUTING_EDGE_STYLE& style = EdgeStyle( route, i - 1 );
+        const ROUTING_EDGE_STYLE& style = EdgeStyle( route, edge );
         const std::int64_t edgeWidth = style.trackWidth > 0 ? style.trackWidth : width;
         const std::int64_t edgeDiameter = style.viaDiameter > 0 ? style.viaDiameter : diameter;
         const std::vector<int> edgeLayers = via
@@ -562,19 +629,63 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         item.normal.kind = via ? NORMAL_CONTACT_ITEM::KIND::DRILL
                                : NORMAL_CONTACT_ITEM::KIND::TRACE;
         item.normal.first = from.point;
-        item.normal.last = to.point;
-        if( !via )
-            item.trace = copper;
-        state.addShape( item, copper );
-        for( int layer : copper.layers )
+        if( via )
         {
-            ROUTING_PAD terminal;
-            terminal.netCode = route.netCode;
-            terminal.position = from.point;
-            terminal.layers = { layer };
-            terminal.trackWidth = edgeWidth;
-            item.terminals.push_back( { terminal, NO_PAD, via ? std::nullopt
-                                                              : std::optional( to.point ) } );
+            item.normal.last = to.point;
+            state.addShape( item, copper );
+            for( int layer : copper.layers )
+            {
+                ROUTING_PAD terminal;
+                terminal.netCode = route.netCode;
+                terminal.position = from.point;
+                terminal.layers = { layer };
+                terminal.trackWidth = edgeWidth;
+                item.terminals.push_back( { terminal, NO_PAD, std::nullopt } );
+            }
+            ++edge;
+        }
+        else
+        {
+            // Insert a same-layer, same-style run as one PolylineTrace item,
+            // exactly as InsertFoundConnectionAlgo does.  Corners are path
+            // geometry, not separate source Item identities.
+            std::size_t lastEdge = edge;
+            while( lastEdge + 2 < route.nodes.size()
+                   && route.nodes[lastEdge + 1].layer == route.nodes[lastEdge + 2].layer )
+            {
+                const ROUTING_EDGE_STYLE& nextStyle = EdgeStyle( route, lastEdge + 1 );
+                if( nextStyle.trackWidth != style.trackWidth
+                    || nextStyle.clearance != style.clearance )
+                {
+                    break;
+                }
+                ++lastEdge;
+            }
+
+            item.normal.last = route.nodes[lastEdge + 1].point;
+            item.trace = copper;
+            item.traceCorners.push_back( from.point );
+            for( std::size_t traceEdge = edge; traceEdge <= lastEdge; ++traceEdge )
+            {
+                const ROUTER_NODE& traceFrom = route.nodes[traceEdge];
+                const ROUTER_NODE& traceTo = route.nodes[traceEdge + 1];
+                if( traceFrom.point == traceTo.point )
+                    continue;
+
+                ROUTING_OBSTACLE segment = copper;
+                segment.start = traceFrom.point;
+                segment.end = traceTo.point;
+                state.addShape( item, segment );
+                item.traceCorners.push_back( traceTo.point );
+
+                ROUTING_PAD terminal;
+                terminal.netCode = route.netCode;
+                terminal.position = traceFrom.point;
+                terminal.layers = { traceFrom.layer };
+                terminal.trackWidth = edgeWidth;
+                item.terminals.push_back( { terminal, NO_PAD, traceTo.point } );
+            }
+            edge = lastEdge + 1;
         }
         record.items.push_back( item.id );
         state.indexItem( item );
@@ -706,10 +817,10 @@ std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::ConnectedSet( ITEM_ID item ) con
     return result;
 }
 
-std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::GetNormalContacts( ITEM_ID id ) const
+ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetNormalContacts( ITEM_ID id ) const
 {
     const auto it = m_impl->items.find( id );
-    return it == m_impl->items.end() ? std::set<ITEM_ID>{} : it->second.normalContacts;
+    return it == m_impl->items.end() ? ITEM_ID_SET{} : it->second.normalContacts;
 }
 
 std::optional<ROUTER_POINT> ROUTING_BOARD::NormalContactPoint( ITEM_ID first, ITEM_ID second ) const
@@ -720,11 +831,58 @@ std::optional<ROUTER_POINT> ROUTING_BOARD::NormalContactPoint( ITEM_ID first, IT
     return a->second.normal.Point( b->second.normal );
 }
 
-std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
+
+int ROUTING_BOARD::FirstCommonLayer( ITEM_ID first, ITEM_ID second ) const
+{
+    const auto a = m_impl->items.find( first ), b = m_impl->items.find( second );
+    if( a == m_impl->items.end() || b == m_impl->items.end() || first == second )
+        return -1;
+
+    int result = std::numeric_limits<int>::max();
+    for( int layer : a->second.normal.layers )
+        if( std::find( b->second.normal.layers.begin(), b->second.normal.layers.end(), layer )
+            != b->second.normal.layers.end() )
+            result = std::min( result, layer );
+
+    return result == std::numeric_limits<int>::max() ? -1 : result;
+}
+
+
+ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalContactsAt( ITEM_ID trace,
+                                                             ROUTER_POINT point ) const
+{
+    const auto source = m_impl->items.find( trace );
+    if( source == m_impl->items.end()
+        || source->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
+        || ( point != source->second.normal.first && point != source->second.normal.last ) )
+    {
+        return {};
+    }
+
+    ITEM_ID_SET result;
+    for( ITEM_ID id : source->second.normalContacts )
+    {
+        const auto& contact = m_impl->items.at( id );
+        if( contact.normal.kind == NORMAL_CONTACT_ITEM::KIND::AREA )
+        {
+            if( contact.area && CONTACT_GEOMETRY::ContainsArea( *contact.area, point ) )
+                result.insert( id );
+        }
+        else if( const auto contactPoint = source->second.normal.Point( contact.normal );
+                 contactPoint && *contactPoint == point )
+        {
+            result.insert( id );
+        }
+    }
+    return result;
+}
+
+
+ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
 {
     if( !m_impl->items.contains( id ) )
         return {};
-    std::set<ITEM_ID> result{ id };
+    ITEM_ID_SET result{ id };
     std::vector<ITEM_ID> pending{ id };
     while( !pending.empty() )
     {
@@ -733,6 +891,47 @@ std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::NormalConnectedSet( ITEM_ID id )
         for( auto contact : m_impl->items.at( current ).normalContacts )
             if( result.insert( contact ).second )
                 pending.push_back( contact );
+    }
+    return result;
+}
+
+
+std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id ) const
+{
+    const auto it = m_impl->items.find( id );
+    if( it == m_impl->items.end() )
+        return std::nullopt;
+
+    const IMPL::ITEM& item = it->second;
+    ITEM_INFO result;
+    result.id = item.id;
+    result.netCode = item.net;
+    result.routable = item.routable;
+    result.first = item.normal.first;
+    result.last = item.normal.last;
+    result.layers = item.normal.layers;
+    switch( item.normal.kind )
+    {
+    case NORMAL_CONTACT_ITEM::KIND::TRACE:
+        result.kind = ITEM_KIND::TRACE;
+        for( std::size_t i = 1; i < item.traceCorners.size(); ++i )
+        {
+            const long double dx = static_cast<long double>( item.traceCorners[i].x )
+                                   - item.traceCorners[i - 1].x;
+            const long double dy = static_cast<long double>( item.traceCorners[i].y )
+                                   - item.traceCorners[i - 1].y;
+            result.traceLength += std::sqrt( static_cast<double>( dx * dx + dy * dy ) );
+        }
+        break;
+    case NORMAL_CONTACT_ITEM::KIND::DRILL:
+        result.kind = ITEM_KIND::DRILL;
+        break;
+    case NORMAL_CONTACT_ITEM::KIND::AREA:
+        result.kind = ITEM_KIND::AREA;
+        break;
+    default:
+        result.kind = ITEM_KIND::UNKNOWN;
+        break;
     }
     return result;
 }

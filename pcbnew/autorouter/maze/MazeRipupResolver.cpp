@@ -51,7 +51,8 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
                                      const CONTEXT& aContext,
                                      double aRandomNumber,
                                      const std::vector<std::int64_t>&
-                                             aAdditionalViaTraceHalfWidths ) const
+                                             aAdditionalViaTraceHalfWidths,
+                                     const CONNECTION* aTopologyConnection ) const
 {
     if( !aConnection.complete || !HasValidEdgeStyles( aConnection )
         || aEdgeIndex + 1 >= aConnection.nodes.size() )
@@ -127,7 +128,9 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
     double detour = 1.0;
     if( fanoutFactor <= 1.0 && !aContext.isFanout )
     {
-        const CONNECTION connection = CONNECTION::FromRoute( aConnection );
+        const CONNECTION routeConnection = CONNECTION::FromRoute( aConnection );
+        const CONNECTION& connection = aTopologyConnection ? *aTopologyConnection
+                                                           : routeConnection;
         detour = std::max( connection.Detour(), 1e-12 );
     }
 
