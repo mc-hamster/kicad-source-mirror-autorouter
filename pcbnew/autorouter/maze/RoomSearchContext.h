@@ -6,9 +6,11 @@
 #include "MazeSearchEngine90Degree.h"
 #include "../expansion/CompleteFreeSpaceExpansionRoom.h"
 #include "../expansion/ExpansionDoor.h"
+#include "../expansion/ObstacleExpansionRoom.h"
 #include "../expansion/SortedOrthogonalRoomNeighbours.h"
 #include <map>
 #include <memory>
+#include <cstdlib>
 #include <unordered_map>
 namespace KICAD_AUTOROUTER::DETAIL
 {
@@ -25,7 +27,8 @@ public:
     ROOM_SEARCH( ROUTER_BOX bounds, const std::vector<SHAPE_TREE_ENTRY>& obstacles,
                  int layer, int net, double offset, int maxExpanded, int& expanded,
                  ROOM_SEARCH_METRICS& metrics, const ROUTER_CANCEL_CALLBACK& cancel,
-                 const ROUTER_SEARCH_PROGRESS_CALLBACK& progress, int* sharedNextId = nullptr ) :
+                 const ROUTER_SEARCH_PROGRESS_CALLBACK& progress, int* sharedNextId = nullptr,
+                 const std::vector<ROOM_RIPUP_OBSTACLE>& ripupObstacles = {} ) :
             tree( bounds ), layer( layer ), net( net ), offset( offset ),
             maxExpanded( maxExpanded ), expanded( expanded ), metrics( metrics ),
             cancel( cancel ), progress( progress ), nextId( sharedNextId ? *sharedNextId : localNextId )
@@ -37,9 +40,88 @@ public:
             tree.Insert( entry );
             nextId = std::max( nextId, entry.objectId + 1 );
         }
+        for( const ROOM_RIPUP_OBSTACLE& obstacle : ripupObstacles )
+        {
+            if( cancel && cancel() )
+                break;
+            // Room IDs share the same sequence as completed free rooms.  A
+            // caller's tree-object ID names the source shape, not a globally
+            // unique expansion room (especially across copper layers).
+            const int id = nextId++;
+            auto room = std::make_unique<ROOM>();
+            room->shape = std::make_unique<OBSTACLE_EXPANSION_ROOM>(
+                    id, layer, obstacle.shape.shape, obstacle.group,
+                    std::max( obstacle.ripupCost, 1 ), obstacle.shape.shapeIndex );
+            room->complete = true;
+            ROOM* raw = room.get();
+            byId.emplace( id, raw );
+            byShape.emplace( room->shape.get(), raw );
+            rooms.push_back( std::move( room ) );
+            SHAPE_TREE_ENTRY entry = obstacle.shape;
+            entry.objectId = id;
+            entry.layer = layer;
+            entry.isRoom = true;
+            entry.obstacle = true;
+            tree.Insert( entry );
+            ++metrics.rooms;
+            ++metrics.obstacleRooms;
+        }
+        // Consecutive compensated shapes of one route overlap at corners.
+        // Freerouting creates a 2-D door between those obstacle rooms so one
+        // paid item can be traversed as a continuous chain.
+        for( std::size_t first = 0; first < rooms.size(); ++first )
+        {
+            auto* firstObstacle = dynamic_cast<OBSTACLE_EXPANSION_ROOM*>(
+                    rooms[first]->shape.get() );
+            if( !firstObstacle )
+                continue;
+            for( std::size_t second = first + 1; second < rooms.size(); ++second )
+            {
+                auto* secondObstacle = dynamic_cast<OBSTACLE_EXPANSION_ROOM*>(
+                        rooms[second]->shape.get() );
+                if( !secondObstacle || firstObstacle->GetGroup() != secondObstacle->GetGroup()
+                    || std::abs( firstObstacle->GetShapeIndex()
+                                 - secondObstacle->GetShapeIndex() ) != 1
+                    || INT_BOX::Dimension( INT_BOX::Intersection(
+                            firstObstacle->GetShape(), secondObstacle->GetShape() ) ) != 2 )
+                {
+                    continue;
+                }
+                door( rooms[first].get(), rooms[second].get() );
+            }
+        }
+        // Obstacle rooms are complete on creation, but their surrounding
+        // free-space doors are calculated lazily by Freerouting when the
+        // frontier first reaches them.  Seed the equivalent incomplete rooms
+        // here; completeNeighbours() still performs the expensive completion
+        // only on demand.  Do this before inserting the host's synthetic
+        // centre-space borders: bounds clip these seeds, whereas treating a
+        // clipped obstacle as touching a synthetic border would hide all the
+        // other open sides.  Two-dimensional overlaps are not boundary
+        // neighbours. Same-route overlap doors were installed above.
+        std::vector<ROOM*> obstacleRooms;
+        for( const auto& room : rooms )
+            if( dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( room->shape.get() ) )
+                obstacleRooms.push_back( room.get() );
+        for( ROOM* obstacleRoom : obstacleRooms )
+        {
+            auto entries = neighbours( obstacleRoom->shape->GetShape() );
+            std::erase_if( entries, [&]( const SHAPE_TREE_ENTRY& entry )
+            {
+                return entry.objectId == obstacleRoom->shape->GetId()
+                       || INT_BOX::Dimension( INT_BOX::Intersection(
+                                  obstacleRoom->shape->GetShape(), entry.shape ) ) > 1;
+            } );
+            SORTED_ORTHOGONAL_ROOM_NEIGHBOURS sorted(
+                    obstacleRoom->shape->GetShape(), entries );
+            for( const auto& gap : sorted.ObstacleIncompleteRooms( tree.Bounds(), layer ) )
+                door( obstacleRoom, incomplete( gap ) );
+        }
+
         // Model the four boundary restraints explicitly, as the upstream tree
-        // does for the board outline. Merely clipping completion to bounds is
-        // insufficient: neighbour gap generation needs these touching sides.
+        // does for the board outline. Merely clipping free-room completion to
+        // bounds is insufficient: neighbour gap generation needs these
+        // touching sides.
         const ROUTER_BOX borders[] = {
             { bounds.minX, bounds.minY, bounds.maxX, bounds.minY },
             { bounds.maxX, bounds.minY, bounds.maxX, bounds.maxY },

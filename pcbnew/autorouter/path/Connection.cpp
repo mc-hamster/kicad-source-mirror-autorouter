@@ -42,7 +42,10 @@ CONNECTION CONNECTION::FromRoute( const ROUTING_CONNECTION& aRoute )
     CONNECTION result;
     result.m_netCode = aRoute.netCode;
     result.m_complete = aRoute.complete;
-    result.m_itemCount = aRoute.nodes.size();
+    // Each native edge materializes as one trace or via item.  Counting
+    // nodes added a fictitious item to every connection and inflated the
+    // source detour formula by 0.1 even for one straight trace.
+    result.m_itemCount = aRoute.nodes.empty() ? 0 : aRoute.nodes.size() - 1;
 
     if( !aRoute.nodes.empty() )
     {

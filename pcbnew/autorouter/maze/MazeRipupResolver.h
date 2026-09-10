@@ -23,7 +23,7 @@
 
 #pragma once
 
-#include <optional>
+#include <cstddef>
 #include <vector>
 
 #include "../AutorouterTypes.h"
@@ -35,21 +35,32 @@ namespace KICAD_AUTOROUTER
 class MAZE_RIPUP_RESOLVER
 {
 public:
-    /**
-     * Select the least valuable previously routed connection to make room for
-     * a higher-priority retry.  Net-class priority is preserved first; length
-     * and route cost are used as deterministic tie breakers.  The pass-scaled
-     * rip-up cost makes later passes more willing to evict long/congested
-     * routes, matching Freerouting's startRipupCosts behavior.
-     */
-    std::optional<std::size_t> SelectVictim( const std::vector<ROUTING_CONNECTION>& aConnections,
-                                             const std::vector<ROUTING_NET>& aNets,
-                                             int aCurrentNet,
-                                             int aRipupCost = 0 ) const;
+    static constexpr int ALREADY_RIPPED_COST = 1;
 
-private:
-    int priorityFor( int aNetCode, const std::vector<ROUTING_NET>& aNets ) const;
-    double lengthFor( const ROUTING_CONNECTION& aConnection ) const;
+    struct CONTEXT
+    {
+        int  ripupCosts = 0;
+        int  startRipupCosts = 0;
+        int  ripupPassNo = 1;
+        bool isFanout = false;
+        bool removeUnconnectedVias = false;
+    };
+
+    /** Source-shaped MazeRipupResolver.checkRipup cost for one native item.
+     *
+     * aEdgeIndex identifies the tree shape which created the obstacle room.
+     * The complete connection supplies Connection.getDetour() and adjacent
+     * trace contacts for a via.  aFallbackTraceHalfWidth is used only when the
+     * edge has no explicit style.  aRandomNumber is Java Random.nextDouble()
+     * for randomized passes and is ignored on all other passes.
+     */
+    int CheckRipup( const ROUTING_CONNECTION& aConnection, std::size_t aEdgeIndex,
+                    std::int64_t aFallbackTraceHalfWidth, const CONTEXT& aContext,
+                    double aRandomNumber = 0.0,
+                    const std::vector<std::int64_t>& aAdditionalViaTraceHalfWidths = {} ) const;
+
+    static double FanoutViaRipupCostFactor( std::int64_t aTraceHalfWidth,
+                                            double aTraceLength );
 };
 
 } // namespace KICAD_AUTOROUTER

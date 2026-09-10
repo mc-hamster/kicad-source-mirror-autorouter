@@ -3043,14 +3043,30 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::ShoveViaConnection(
                 moved.nodes = { { candidate, viaStart.layer }, { candidate, viaEnd.layer } };
                 moved.edgeStyles = { viaStyle };
 
-                if( CanInsertSegment( moved.netCode, moved.nodes.front(), moved.nodes.back(),
-                                      &moved.edgeStyles.front() )
-                    && clearsTransientCopper( moved )
-                    && hasStaticViaDrillClearance( moved, aStaticDrillObstacles )
-                    && preservesConductionAreaContacts( source, moved )
-                    && ( !aPlacementFilter || aPlacementFilter( moved ) ) )
+                const bool insertable = CanInsertSegment(
+                        moved.netCode, moved.nodes.front(), moved.nodes.back(),
+                        &moved.edgeStyles.front() );
+                const bool clearsTransient = insertable && clearsTransientCopper( moved );
+                const bool clearsDrills = clearsTransient
+                        && hasStaticViaDrillClearance( moved, aStaticDrillObstacles );
+                const bool preservesAreas = clearsDrills
+                        && preservesConductionAreaContacts( source, moved );
+                const bool passesPlacement = preservesAreas
+                        && ( !aPlacementFilter || aPlacementFilter( moved ) );
+                if( passesPlacement )
                 {
                     return moved;
+                }
+                if( autorouterDebugEnabled() )
+                {
+                    std::ostringstream message;
+                    message << "VIA_SHOVE_REJECTED from=(" << viaStart.point.x << ','
+                            << viaStart.point.y << ") candidate=(" << candidate.x << ','
+                            << candidate.y << ") insertable=" << insertable
+                            << " transient=" << clearsTransient << " drills=" << clearsDrills
+                            << " areas=" << preservesAreas << " placement="
+                            << passesPlacement;
+                    autorouterDebugLog( message.str() );
                 }
 
                 continue;
@@ -4162,7 +4178,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     // retains the legacy fallback with the same work budget and cancellation.
     const auto enabledLayers = std::count_if( m_settings.layers.begin(), m_settings.layers.end(),
                                              []( const auto& layer ) { return layer.enabled; } );
-    m_ignoreRoutableRoomObstacles = false;
+    m_useRoutableObstacleRooms = m_allowRipupOccupancy;
     auto roomPath = !m_settings.allowVias || enabledLayers == 1
                             ? findRoomConnection( starts, targets, aRetry, aExpandedNodes,
                                                   aCancel, aProgress )
@@ -4170,26 +4186,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                                                             aExpandedNodes, aCancel, aProgress,
                                                             fanoutSearch ? &aTarget : nullptr );
 
-    // ObstacleExpansionRoom in Freerouting lets the frontier cross movable
-    // copper with a pass-scaled rip-up cost.  Until the general obstacle-room
-    // state is available, preserve its most important scheduling behaviour:
-    // prefer a strict free-room path, then perform one room/drill search with
-    // only routable copper removed.  The resulting geometry still carries no
-    // permission to delete copper. FindConflictingConnections and the atomic
-    // forced inserter must shove every victim or consume the caller's bounded
-    // rip-up budget before it can commit.
-    if( !roomPath && m_allowRipupOccupancy && !( aCancel && aCancel() )
-        && aExpandedNodes < effectiveMaxExpandedNodes )
-    {
-        m_ignoreRoutableRoomObstacles = true;
-        roomPath = !m_settings.allowVias || enabledLayers == 1
-                           ? findRoomConnection( starts, targets, aRetry, aExpandedNodes,
-                                                 aCancel, aProgress )
-                           : findMultilayerRoomConnection( starts, targets, aRetry,
-                                                           aExpandedNodes, aCancel, aProgress,
-                                                           fanoutSearch ? &aTarget : nullptr );
-        m_ignoreRoutableRoomObstacles = false;
-    }
+    m_useRoutableObstacleRooms = false;
 
     if( roomPath )
         return roomPath;

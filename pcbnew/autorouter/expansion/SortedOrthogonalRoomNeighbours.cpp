@@ -116,4 +116,97 @@ SORTED_ORTHOGONAL_ROOM_NEIGHBOURS::IncompleteRooms( ROUTER_BOX aBounds, int aLay
     }
     return result;
 }
+
+
+std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM>
+SORTED_ORTHOGONAL_ROOM_NEIGHBOURS::ObstacleIncompleteRooms(
+        ROUTER_BOX aBounds, int aLayer ) const
+{
+    std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> result;
+    auto insert = [&]( ROUTER_BOX box )
+    {
+        const ROUTER_BOX contained = INT_BOX::Intersection( m_room, box );
+        if( INT_BOX::Dimension( box ) == 2 && INT_BOX::Dimension( contained ) > 0 )
+            result.emplace_back( box, aLayer, contained );
+    };
+
+    // Direct counterpart of
+    // calculateIncompleteRoomsWithEmptyNeighbours(ObstacleExpansionRoom).
+    if( m_neighbours.empty() )
+    {
+        insert( { aBounds.minX, aBounds.minY, aBounds.maxX, m_room.minY } );
+        insert( { m_room.maxX, aBounds.minY, aBounds.maxX, aBounds.maxY } );
+        insert( { aBounds.minX, m_room.maxY, aBounds.maxX, aBounds.maxY } );
+        insert( { aBounds.minX, aBounds.minY, m_room.minX, aBounds.maxY } );
+        return result;
+    }
+
+    const NEIGHBOUR* previous = &m_neighbours.back();
+    for( const NEIGHBOUR& next : m_neighbours )
+    {
+        const ROUTER_BOX& p = previous->intersection;
+        const ROUTER_BOX& n = next.intersection;
+        if( !INT_BOX::Intersects( p, n ) )
+        {
+            switch( next.firstSide )
+            {
+            case 0:
+                if( previous->lastSide == 0 )
+                {
+                    if( p.maxX < n.minX )
+                        insert( { p.maxX, aBounds.minY, n.minX, m_room.minY } );
+                }
+                else if( p.minY > m_room.minY || n.minX > m_room.minX )
+                {
+                    // Obstacle-to-free-space doors must be one-dimensional.
+                    if( previous->lastSide == 3 )
+                        insert( { aBounds.minX, m_room.minY, m_room.minX, p.minY } );
+                    insert( { m_room.minX, aBounds.minY, n.minX, m_room.minY } );
+                }
+                break;
+            case 1:
+                if( previous->lastSide == 1 )
+                {
+                    if( p.maxY < n.minY )
+                        insert( { m_room.maxX, p.maxY, aBounds.maxX, n.minY } );
+                }
+                else if( p.maxX < m_room.maxX || n.minY > m_room.minY )
+                {
+                    if( previous->lastSide == 0 )
+                        insert( { p.maxX, aBounds.minY, m_room.maxX, m_room.minY } );
+                    insert( { m_room.maxX, m_room.minY, aBounds.maxX, n.minY } );
+                }
+                break;
+            case 2:
+                if( previous->lastSide == 2 )
+                {
+                    if( p.minX > n.maxX )
+                        insert( { n.maxX, m_room.maxY, p.minX, aBounds.maxY } );
+                }
+                else if( p.maxY < m_room.maxY || n.maxX < m_room.maxX )
+                {
+                    if( previous->lastSide == 1 )
+                        insert( { m_room.maxX, p.maxY, aBounds.maxX, m_room.maxY } );
+                    insert( { n.maxX, m_room.maxY, m_room.maxX, aBounds.maxY } );
+                }
+                break;
+            case 3:
+                if( previous->lastSide == 3 )
+                {
+                    if( p.minY > n.maxY )
+                        insert( { aBounds.minX, n.maxY, m_room.minX, p.minY } );
+                }
+                else if( n.maxY < m_room.maxY || p.minX > m_room.minX )
+                {
+                    if( previous->lastSide == 2 )
+                        insert( { m_room.minX, m_room.maxY, p.minX, aBounds.maxY } );
+                    insert( { aBounds.minX, n.maxY, m_room.minX, m_room.maxY } );
+                }
+                break;
+            }
+        }
+        previous = &next;
+    }
+    return result;
+}
 } // namespace KICAD_AUTOROUTER

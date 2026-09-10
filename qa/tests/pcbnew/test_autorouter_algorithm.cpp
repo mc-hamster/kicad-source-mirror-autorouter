@@ -41,11 +41,13 @@
 #include <autorouter/geometry/planar/Simplex.h>
 #include <autorouter/board/optimize/TraceShover.h>
 #include <autorouter/path/FoundConnectionInserter.h>
+#include <autorouter/path/Connection.h>
 #include <autorouter/maze/MazeSearchEngine90Degree.h>
 #include <autorouter/maze/MazeExpansionEngine.h>
 #include <autorouter/drill/DrillPageArray.h>
 #include <autorouter/geometry/planar/PolylineArea.h>
 #include <autorouter/maze/MazeListElement.h>
+#include <autorouter/maze/MazeRipupResolver.h>
 #include <autorouter/path/FoundConnectionLocator45Degree.h>
 #include <autorouter/expansion/ExpansionGraph.h>
 #include <autorouter/expansion/ExpansionDoor.h>
@@ -5829,6 +5831,79 @@ BOOST_AUTO_TEST_CASE( RoomTreeCompletionNeighboursAndSectionsMatchPinnedFreerout
     BOOST_CHECK( input.eof() );
 }
 
+BOOST_AUTO_TEST_CASE( MazeRipupCostUsesWidthDetourFanoutAndPassRandomization )
+{
+    ROUTING_CONNECTION trace;
+    trace.netCode = 2;
+    trace.complete = true;
+    trace.nodes = { { { 0, 0 }, 0 }, { { 1000, 0 }, 0 } };
+    trace.edgeStyles = { { 200 } };
+
+    MAZE_RIPUP_RESOLVER resolver;
+    MAZE_RIPUP_RESOLVER::CONTEXT context;
+    context.ripupCosts = 100;
+    context.startRipupCosts = 100;
+    context.ripupPassNo = 1;
+    BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context ), 10000 );
+
+    trace.nodes = { { { 0, 0 }, 0 }, { { 500, 500 }, 0 }, { { 1000, 0 }, 0 } };
+    trace.edgeStyles = { { 200 }, { 200 } };
+    const double detour = CONNECTION::FromRoute( trace ).Detour();
+    BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context ),
+                       std::max( static_cast<int>( 10000.0 / detour ), 1 ) );
+
+    trace.isFanoutConnection = true;
+    const double protection = MAZE_RIPUP_RESOLVER::FanoutViaRipupCostFactor(
+            100, std::hypot( 500.0, 500.0 ) );
+    BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context ),
+                       std::max( static_cast<int>( 10000.0 * protection ), 1 ) );
+
+    trace.isFanoutConnection = false;
+    context.ripupCosts = 400;
+    context.ripupPassNo = 4;
+    const double randomizedDetour = detour * ( 0.5 + 0.25 * 0.25 );
+    BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context, 0.25 ),
+                       std::max( static_cast<int>( 40000.0 / randomizedDetour ), 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ObstacleRoomFrontierChoosesBetweenDetourAndRipupCost )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    const std::vector<ROOM_TERMINAL> starts{ { { 1000, 5000 }, { 1000, 5000 }, 0 } };
+    const std::vector<ROOM_TERMINAL> targets{ { { 9000, 5000 }, { 9000, 5000 }, 1 } };
+    const SHAPE_TREE_ENTRY shape{ { 4500, 2000, 5500, 8000 }, 7, 0, 0, 2,
+                                  false, true };
+
+    const auto route = [&]( int aRipupCost )
+    {
+        int expanded = 0;
+        ROOM_SEARCH_METRICS metrics;
+        const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+                bounds, {}, 0, 1, starts, targets, 100, 1, 1, 10000,
+                expanded, metrics, {}, {}, false, 0,
+                { ROOM_RIPUP_OBSTACLE{ shape, 42, aRipupCost } } );
+        BOOST_REQUIRE( path );
+        return std::pair{ *path, metrics };
+    };
+
+    const auto [detour, detourMetrics] = route( 100000 );
+    BOOST_CHECK( detour.rippedObstacleGroups.empty() );
+    BOOST_CHECK_EQUAL( detour.ripupCost, 0 );
+    BOOST_CHECK_EQUAL( detourMetrics.rippedRooms, 0 );
+    BOOST_CHECK( std::any_of( detour.points.begin(), detour.points.end(),
+                              []( const ROUTER_POINT& aPoint )
+                              { return aPoint.y <= 2000 || aPoint.y >= 8000; } ) );
+
+    const auto [ripped, rippedMetrics] = route( 100 );
+    BOOST_REQUIRE_EQUAL( ripped.rippedObstacleGroups.size(), 1U );
+    BOOST_CHECK_EQUAL( ripped.rippedObstacleGroups.front(), 42U );
+    BOOST_CHECK_EQUAL( ripped.ripupCost, 100 );
+    BOOST_CHECK_EQUAL( rippedMetrics.rippedRooms, 1 );
+    BOOST_CHECK_EQUAL( rippedMetrics.ripupCost, 100 );
+}
+
+
 BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles )
 {
     auto board = makeBoard();
@@ -5868,6 +5943,9 @@ BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles
             board.pads[0], board.pads[1], 0, expanded, {} );
     BOOST_REQUIRE( negotiated );
     BOOST_CHECK( negotiatedEngine.LastRoomSearchMetrics().routed );
+    BOOST_CHECK_EQUAL( negotiatedEngine.LastRoomSearchMetrics().obstacleRooms, 1 );
+    BOOST_CHECK_EQUAL( negotiatedEngine.LastRoomSearchMetrics().rippedRooms, 1 );
+    BOOST_CHECK_GT( negotiatedEngine.LastRoomSearchMetrics().ripupCost, 0 );
     const auto conflicts = negotiatedEngine.FindConflictingConnections( *negotiated );
     BOOST_REQUIRE_EQUAL( conflicts.size(), 1 );
     BOOST_CHECK( SameRouteGeometry( conflicts.front(), wall ) );

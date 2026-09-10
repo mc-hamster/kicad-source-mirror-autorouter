@@ -80,7 +80,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     int nextRoomId = 1;
     for( const auto& layer : layers )
         spaces.push_back( std::make_unique<ROOM_SEARCH>( layer.bounds, layer.obstacles,
-                layer.id, net, sectionOffset, maxExpanded, expanded, metrics, cancel, progress, &nextRoomId ) );
+                layer.id, net, sectionOffset, maxExpanded, expanded, metrics, cancel, progress,
+                &nextRoomId, layer.ripupObstacles ) );
 
     // `active` controls whether a layer can carry a trace-room state; it
     // must not make that physical copper layer transparent to a manufactured
@@ -154,6 +155,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         std::size_t owner = 0;
         std::size_t targetOwner = 0;
         int itemId = 0;
+        int ripupCost = 0;
     };
     constexpr auto NONE = std::numeric_limits<std::size_t>::max();
     std::deque<STATE> states;
@@ -313,6 +315,13 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     state.layer = to; state.section = to;
                     state.room = spaces[to]->byShape.at( current.drill->rooms[to] );
                     state.parent = index;
+                    if( const auto* obstacle =
+                                dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                                        state.room->shape.get() ) )
+                    {
+                        state.ripupCost = obstacle->GetRipupCost();
+                        state.g += state.ripupCost;
+                    }
                     state.f = fanoutDrill ? state.g : state.g + remaining( from, to );
                     push( state );
                     ++metrics.layerTransitions;
@@ -326,11 +335,24 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     {}, current.owner,
                     current.kind == KIND::FANOUT_TARGET
                             ? std::numeric_limits<std::size_t>::max()
-                            : current.targetOwner };
+                            : current.targetOwner,
+                    {}, 0 };
             std::vector<std::size_t> chain;
             for( auto i = index; i != NONE; i = states[i].parent )
                 chain.push_back( i );
             std::reverse( chain.begin(), chain.end() );
+            std::set<std::size_t> rippedGroups;
+            for( std::size_t entry : chain )
+            {
+                const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                        states[entry].room ? states[entry].room->shape.get() : nullptr );
+                if( obstacle && states[entry].ripupCost > 0 )
+                {
+                    rippedGroups.insert( obstacle->GetGroup() );
+                    result.ripupCost += states[entry].ripupCost;
+                }
+            }
+            result.rippedObstacleGroups.assign( rippedGroups.begin(), rippedGroups.end() );
             result.nodes.push_back( { states[chain.front()].entry.Middle().Round(),
                                       layers[states[chain.front()].layer].id } );
             bool valid = true;
@@ -361,7 +383,12 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     result.nodes.push_back( { ( *located )[j], layers[after.layer].id } );
             }
             if( valid && !( cancel && cancel() ) )
-            { metrics.routed = true; return result; }
+            {
+                metrics.rippedRooms += static_cast<int>( result.rippedObstacleGroups.size() );
+                metrics.ripupCost += result.ripupCost;
+                metrics.routed = true;
+                return result;
+            }
             continue;
         }
         if( current.door && !occupied.emplace( current.door, current.section ).second )
@@ -401,10 +428,23 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 double bend = 0;
                 if( current.parent != NONE && states[current.parent].layer == current.layer )
                     bend = MAZE_LIST_ELEMENT::BendPenalty( states[current.parent].entry.Middle(), from, to, layer.bendCost );
+                int ripupCost = 0;
+                if( const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                            next->shape.get() ) )
+                {
+                    const auto* currentObstacle =
+                            dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                                    current.room->shape.get() );
+                    ripupCost = currentObstacle
+                                            && currentObstacle->GetGroup()
+                                                       == obstacle->GetGroup()
+                                        ? 1 : obstacle->GetRipupCost();
+                }
                 STATE state;
                 state.room = next; state.layer = current.layer; state.door = door; state.section = section;
-                state.entry = sections[section]; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend;
+                state.entry = sections[section]; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend + ripupCost;
                 state.f = state.g + remaining( to, current.layer ); state.parent = index; state.owner = current.owner;
+                state.ripupCost = ripupCost;
                 push( state );
             }
         }

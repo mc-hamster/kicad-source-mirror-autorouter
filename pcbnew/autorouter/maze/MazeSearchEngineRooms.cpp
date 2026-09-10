@@ -7,6 +7,8 @@
 #include "MazeSearchEngine.h"
 #include "../AutorouterDebug.h"
 #include "MazeExpansionEngine.h"
+#include "MazeRipupResolver.h"
+#include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
 #include <algorithm>
@@ -65,6 +67,37 @@ bool isGeneralConvexRoomObstacle( const ROUTING_OBSTACLE& aObstacle, int aNet,
     return PLANAR::SIMPLEX::FromConvexPolygon( aObstacle.polygon ).has_value();
 }
 
+
+bool areaTouchesVia( const ROUTING_OBSTACLE& aArea, ROUTER_POINT aCenter,
+                     std::int64_t aViaRadius )
+{
+    if( aArea.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+    {
+        ROUTER_BOX expanded = aArea.box;
+        expanded.minX -= aViaRadius;
+        expanded.minY -= aViaRadius;
+        expanded.maxX += aViaRadius;
+        expanded.maxY += aViaRadius;
+        return expanded.Contains( aCenter );
+    }
+
+    if( aArea.kind != ROUTER_OBSTACLE_KIND::POLYGON )
+        return false;
+
+    if( CONTACT_GEOMETRY::ContainsArea( aArea, aCenter ) )
+        return true;
+
+    // The straight convex subset has an exact rational support-line test.
+    // Non-convex areas and holes stay conservative: a centre outside their
+    // copper is not invented as a normal contact merely from an AABB hit.
+    if( aArea.polygonHoles.empty() )
+        if( const auto expanded = PLANAR::SIMPLEX::FromConvexPolygon(
+                    aArea.polygon, std::max<std::int64_t>( 0, aViaRadius ) ) )
+            return expanded->Contains( PLANAR::POINT( aCenter ) );
+
+    return false;
+}
+
 } // namespace
 
 
@@ -83,7 +116,8 @@ bool MAZE_SEARCH_ENGINE::hasGeneralConvexRoomGeometry( int aNet, int aLayer ) co
 
 std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         int net, int aLayer, bool aForVia, bool aSkipGeneralConvex,
-        const ROUTER_CANCEL_CALLBACK& aCancel ) const
+        const ROUTER_CANCEL_CALLBACK& aCancel,
+        const std::vector<ROOM_RIPUP_OBSTACLE>* aRipupObstacles ) const
 {
     const auto radius = aForVia ? netViaRadius( net ) : netTrackRadius( net );
     std::vector<SHAPE_TREE_ENTRY> entries;
@@ -122,19 +156,13 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
     }
     // Every attempt sees current copper, including through-via copper on
     // intermediate layers. No stale per-net tree survives add/remove/rip-up.
-    for( const auto& connection : m_occupancy.Connections() )
+    const auto& routes = m_occupancy.Connections();
+    for( std::size_t routeIndex = 0; routeIndex < routes.size(); ++routeIndex )
     {
         if( aCancel && aCancel() )
             return {};
 
-        const bool movableRoute = !connection.isExistingBoardRoute
-                                  || connection.isAutorouterOwned
-                                  || m_settings.allowRipupExisting;
-        if( m_ignoreRoutableRoomObstacles && movableRoute
-            && connection.netCode != net )
-        {
-            continue;
-        }
+        const ROUTING_CONNECTION& connection = routes[routeIndex];
 
         if( connection.netCode == net )
         {
@@ -150,26 +178,49 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         }
         for( std::size_t i = 1; i < connection.nodes.size(); ++i )
         {
+            const std::size_t edge = i - 1;
+            const bool representedByRipupRoom = aRipupObstacles
+                    && std::any_of( aRipupObstacles->begin(), aRipupObstacles->end(),
+                                    [&]( const ROOM_RIPUP_OBSTACLE& aObstacle )
+                                    {
+                                        return aObstacle.group == routeIndex
+                                               && aObstacle.shape.shapeIndex
+                                                          == static_cast<int>( edge )
+                                               && aObstacle.shape.layer == aLayer;
+                                    } );
+            if( representedByRipupRoom )
+                continue;
+
             const auto& from = connection.nodes[i - 1];
             const auto& to = connection.nodes[i];
+            const ROUTING_EDGE_STYLE& style = EdgeStyle( connection, edge );
             std::int64_t expansion;
             if( from.layer == to.layer )
             {
                 if( from.layer != aLayer )
                     continue;
-                expansion = radius + netTrackRadius( connection.netCode )
-                            + pairClearance( net, connection.netCode, aLayer );
+                const std::int64_t otherRadius = style.trackWidth > 0
+                        ? style.trackWidth / 2 : netTrackRadius( connection.netCode );
+                expansion = radius + otherRadius
+                            + edgePairClearance( net, connection.netCode, aLayer, 0,
+                                                 style.clearance );
             }
             else
             {
-                // This port manufactures through vias. Entry/exit trace
-                // layers do not limit their copper on the physical stack.
+                if( !VIA_RULE::SpansLayer( m_settings, from.layer, to.layer, style, aLayer ) )
+                    continue;
+                const std::int64_t otherViaRadius = style.viaDiameter > 0
+                        ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
+                const std::int64_t otherDrillRadius = style.viaDrill > 0
+                        ? style.viaDrill / 2 : netViaDrillRadius( connection.netCode );
                 expansion = radius + std::max(
-                        netViaRadius( connection.netCode ) + pairClearance( net, connection.netCode, aLayer ),
-                        netViaDrillRadius( connection.netCode ) + m_board.holeClearance );
+                        otherViaRadius
+                                + edgePairClearance( net, connection.netCode, aLayer, 0,
+                                                     style.clearance ),
+                        otherDrillRadius + m_board.holeClearance );
                 if( aForVia )
                     expansion = std::max( expansion, netViaDrillRadius( net )
-                            + netViaDrillRadius( connection.netCode ) + m_board.holeToHoleClearance );
+                            + otherDrillRadius + m_board.holeToHoleClearance );
             }
             add( { std::min( from.point.x, to.point.x ), std::min( from.point.y, to.point.y ),
                    std::max( from.point.x, to.point.x ), std::max( from.point.y, to.point.y ) }, expansion + 1 );
@@ -181,6 +232,205 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                 add( { pad.position.x, pad.position.y, pad.position.x, pad.position.y },
                      std::max<std::int64_t>( 1, pad.radius ) + radius + 1 );
     return entries;
+}
+
+
+std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
+        int net, int aLayer, bool aForVia, int aRetry, bool aFanout,
+        const ROUTER_CANCEL_CALLBACK& aCancel ) const
+{
+    std::vector<ROOM_RIPUP_OBSTACLE> result;
+    if( !m_useRoutableObstacleRooms || aForVia )
+        return result;
+
+    const std::int64_t radius = netTrackRadius( net );
+    MAZE_RIPUP_RESOLVER resolver;
+    MAZE_RIPUP_RESOLVER::CONTEXT context;
+    context.startRipupCosts = std::max( 0, m_settings.startRipupCost );
+    context.ripupPassNo = std::max( 1, aRetry + 1 );
+    context.ripupCosts = context.startRipupCosts * context.ripupPassNo;
+    context.isFanout = aFanout;
+
+    // Java seeds one deterministic Random with ripupCosts.  The native
+    // rectangular adapter calculates item-room costs before queue expansion,
+    // so derive the same nextDouble sequence in stable route/edge order.
+    constexpr std::uint64_t multiplier = 0x5DEECE66DULL;
+    constexpr std::uint64_t addend = 0xBULL;
+    constexpr std::uint64_t mask = ( 1ULL << 48 ) - 1;
+    std::uint64_t randomState =
+            ( static_cast<std::uint64_t>( context.ripupCosts ) ^ multiplier ) & mask;
+    auto nextBits = [&]( int aBits )
+    {
+        randomState = ( randomState * multiplier + addend ) & mask;
+        return randomState >> ( 48 - aBits );
+    };
+    auto nextDouble = [&]()
+    {
+        const std::uint64_t high = nextBits( 26 );
+        const std::uint64_t low = nextBits( 27 );
+        return static_cast<double>( ( high << 27 ) + low )
+               / static_cast<double>( 1ULL << 53 );
+    };
+
+    const auto& routes = m_occupancy.Connections();
+    for( std::size_t routeIndex = 0; routeIndex < routes.size(); ++routeIndex )
+    {
+        if( aCancel && aCancel() )
+            return {};
+
+        const ROUTING_CONNECTION& connection = routes[routeIndex];
+        const bool movableRoute = connection.isShoveMovable
+                                  && ( !connection.isExistingBoardRoute
+                                       || connection.isAutorouterOwned
+                                       || m_settings.allowRipupExisting );
+        if( !movableRoute || connection.netCode == net || !connection.complete
+            || !HasValidEdgeStyles( connection ) )
+        {
+            continue;
+        }
+
+        for( std::size_t edge = 0; edge + 1 < connection.nodes.size(); ++edge )
+        {
+            const ROUTER_NODE& from = connection.nodes[edge];
+            const ROUTER_NODE& to = connection.nodes[edge + 1];
+            const ROUTING_EDGE_STYLE& style = EdgeStyle( connection, edge );
+            std::vector<std::int64_t> additionalViaTraceHalfWidths;
+            bool unrippableNormalContact = false;
+            if( from.layer != to.layer && from.point == to.point )
+            {
+                const std::vector<int> viaLayers = VIA_RULE::LayersFor(
+                        m_settings, from.layer, to.layer, &style );
+                const auto onViaLayer = [&]( int aCandidateLayer )
+                {
+                    return std::find( viaLayers.begin(), viaLayers.end(), aCandidateLayer )
+                           != viaLayers.end();
+                };
+                const std::int64_t viaRadius = style.viaDiameter > 0
+                        ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
+
+                // Via.getNormalContacts() rejects rip-up as soon as a pin or
+                // conduction area is present; forced insertion may still
+                // move the via transactionally while preserving that contact.
+                for( const ROUTING_PAD& pad : m_board.pads )
+                {
+                    if( pad.netCode != connection.netCode || pad.position != from.point )
+                        continue;
+                    if( std::any_of( viaLayers.begin(), viaLayers.end(),
+                                    [&]( int aViaLayer )
+                                    { return isOnPadLayer( pad, aViaLayer ); } ) )
+                    {
+                        unrippableNormalContact = true;
+                        break;
+                    }
+                }
+                for( const ROUTING_OBSTACLE& area : m_board.conductionAreas )
+                {
+                    if( unrippableNormalContact || area.netCode != connection.netCode )
+                        continue;
+                    for( const int viaLayer : viaLayers )
+                    {
+                        if( ( area.layers.empty()
+                              || std::find( area.layers.begin(), area.layers.end(), viaLayer )
+                                         != area.layers.end() )
+                            && areaTouchesVia( area, from.point, viaRadius ) )
+                        {
+                            unrippableNormalContact = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Snapshot reconstruction keeps an imported via and each
+                // contacted trace as separate native connections. Rebuild
+                // the source Via.getNormalContacts() width/fixed-state view.
+                for( std::size_t contactRouteIndex = 0;
+                     contactRouteIndex < routes.size() && !unrippableNormalContact;
+                     ++contactRouteIndex )
+                {
+                    if( contactRouteIndex == routeIndex )
+                        continue;
+                    const ROUTING_CONNECTION& contact = routes[contactRouteIndex];
+                    if( contact.netCode != connection.netCode
+                        || !HasValidEdgeStyles( contact ) )
+                    {
+                        continue;
+                    }
+                    for( std::size_t contactEdge = 0;
+                         contactEdge + 1 < contact.nodes.size(); ++contactEdge )
+                    {
+                        const ROUTER_NODE& contactFrom = contact.nodes[contactEdge];
+                        const ROUTER_NODE& contactTo = contact.nodes[contactEdge + 1];
+                        const ROUTING_EDGE_STYLE& contactStyle = EdgeStyle(
+                                contact, contactEdge );
+                        if( contactFrom.layer != contactTo.layer )
+                        {
+                            if( contactFrom.point == from.point
+                                && contactTo.point == from.point )
+                                unrippableNormalContact = true;
+                            continue;
+                        }
+                        if( !onViaLayer( contactFrom.layer )
+                            || ( contactFrom.point != from.point
+                                 && contactTo.point != from.point ) )
+                        {
+                            continue;
+                        }
+                        if( !contact.isShoveMovable )
+                        {
+                            unrippableNormalContact = true;
+                            break;
+                        }
+                        additionalViaTraceHalfWidths.push_back(
+                                contactStyle.trackWidth > 0
+                                        ? contactStyle.trackWidth / 2
+                                        : netTrackRadius( contact.netCode ) );
+                    }
+                }
+            }
+
+            if( unrippableNormalContact )
+                continue;
+
+            std::int64_t expansion = 0;
+            if( from.layer == to.layer )
+            {
+                if( from.layer != aLayer )
+                    continue;
+                const std::int64_t otherRadius = style.trackWidth > 0
+                        ? style.trackWidth / 2 : netTrackRadius( connection.netCode );
+                expansion = radius + otherRadius
+                            + edgePairClearance( net, connection.netCode, aLayer, 0,
+                                                 style.clearance );
+            }
+            else
+            {
+                if( !VIA_RULE::SpansLayer( m_settings, from.layer, to.layer, style, aLayer ) )
+                    continue;
+                const std::int64_t otherViaRadius = style.viaDiameter > 0
+                        ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
+                const std::int64_t otherDrillRadius = style.viaDrill > 0
+                        ? style.viaDrill / 2 : netViaDrillRadius( connection.netCode );
+                expansion = radius + std::max(
+                        otherViaRadius
+                                + edgePairClearance( net, connection.netCode, aLayer, 0,
+                                                     style.clearance ),
+                        otherDrillRadius + m_board.holeClearance );
+            }
+
+            ROUTER_BOX shape{ std::min( from.point.x, to.point.x ) - expansion - 1,
+                              std::min( from.point.y, to.point.y ) - expansion - 1,
+                              std::max( from.point.x, to.point.x ) + expansion + 1,
+                              std::max( from.point.y, to.point.y ) + expansion + 1 };
+            SHAPE_TREE_ENTRY entry{ shape, 0, static_cast<int>( edge ), aLayer,
+                                    connection.netCode, false, true };
+            const int ripupCost = resolver.CheckRipup(
+                    connection, edge, netTrackRadius( connection.netCode ), context,
+                    nextDouble(), additionalViaTraceHalfWidths );
+            if( ripupCost >= 0 )
+                result.push_back( { std::move( entry ), routeIndex, ripupCost } );
+        }
+    }
+    return result;
 }
 
 
@@ -197,6 +447,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
                              m_board.bounds.maxX - margin, m_board.bounds.maxY - margin };
     std::optional<ROUTING_CONNECTION> best;
+    std::int64_t bestRipupCost = 0;
     const auto started = std::chrono::steady_clock::now();
     for( const auto& layer : m_settings.layers )
     {
@@ -228,7 +479,10 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         const auto targets = terminals( aTargets );
         if( starts.empty() || targets.empty() )
             continue;
-        const auto entries = roomObstacles( net, layer.layerId, false, false, aCancel );
+        const auto ripupEntries = roomRipupObstacles(
+                net, layer.layerId, false, aRetry, false, aCancel );
+        const auto entries = roomObstacles( net, layer.layerId, false, false, aCancel,
+                                            &ripupEntries );
         // Geometric per-axis costs for the isolated no-via frontier. The
         // existing dialog's direction penalty is mapped here, not substituted
         // into the legacy queue's incompatible grid-normalized heuristic.
@@ -241,7 +495,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                 horizontal, vertical, m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
                 aCancel, aProgress, false,
                 static_cast<double>( std::max( 0, m_settings.bendCost ) )
-                        * std::max( 1, m_settings.gridStepIU ) );
+                        * std::max( 1, m_settings.gridStepIU ), ripupEntries );
         if( !path )
             continue;
         ROUTING_CONNECTION found;
@@ -249,6 +503,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         found.fromPadIndex = path->startOwner;
         found.toPadIndex = path->targetOwner;
         found.complete = true;
+        found.cost = path->ripupCost;
         for( const auto& point : path->points )
             found.nodes.push_back( { point, layer.layerId } );
         bool legal = !found.nodes.empty();
@@ -257,11 +512,25 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
             const auto& from = found.nodes[i == 0 ? i : i - 1];
             const auto& to = found.nodes[i];
             legal = CanUseSegment( net, from, to );
+            if( !legal && autorouterDebugEnabled() )
+            {
+                std::ostringstream message;
+                message << "ROOM_PATH_REJECTED net=" << net << " edge="
+                        << ( i == 0 ? 0 : i - 1 ) << " from=(" << from.point.x << ','
+                        << from.point.y << ",L" << from.layer << ") to=(" << to.point.x
+                        << ',' << to.point.y << ",L" << to.layer << ") ripup_cost="
+                        << path->ripupCost << " ripped_groups="
+                        << path->rippedObstacleGroups.size();
+                autorouterDebugLog( message.str() );
+            }
             found.cost += std::abs( static_cast<double>( to.point.x ) - from.point.x ) * horizontal
                           + std::abs( static_cast<double>( to.point.y ) - from.point.y ) * vertical;
         }
         if( legal && ( !best || found.cost < best->cost ) )
+        {
+            bestRipupCost = path->ripupCost;
             best = std::move( found );
+        }
     }
     m_roomMetrics.routed = best.has_value();
     if( autorouterDebugEnabled() )
@@ -284,7 +553,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         AUTOROUTE_CONTROL control( m_settings, net, aRetry, false,
                                    std::max( netTrackRadius( net ), netViaRadius( net ) ),
                                    isPureSmdNet( net ) );
-        best->cost = 0;
+        best->cost = bestRipupCost;
         for( std::size_t i = 1; i < best->nodes.size(); ++i )
         {
             const auto& from = best->nodes[i - 1];
@@ -373,7 +642,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         layer.active = setting->enabled && !hasGeneralConvexRoomGeometry( net, id );
         layer.bounds = bounds;
         if( layer.active )
-            layer.obstacles = roomObstacles( net, id, false, false, cancel );
+        {
+            layer.ripupObstacles = roomRipupObstacles(
+                    net, id, false, retry, fanoutTarget != nullptr, cancel );
+            layer.obstacles = roomObstacles( net, id, false, false, cancel,
+                                             &layer.ripupObstacles );
+        }
         const double preferred = std::max( 1, m_settings.traceLengthCost );
         const double against = preferred + std::max( 0, setting->directionCost ) / 10.0;
         layer.horizontalCost = setting->preferredDirection == 2 ? against : preferred;
@@ -413,6 +687,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         ROUTING_CONNECTION found;
         found.netCode = net; found.fromPadIndex = path->startOwner; found.toPadIndex = path->targetOwner;
         found.complete = true; found.nodes = path->nodes;
+        found.cost = path->ripupCost;
         found.isFanoutConnection = fanoutTarget != nullptr;
         bool legal = assignViaStyles( found );
         for( std::size_t i = 0; i < found.nodes.size() && legal; ++i )

@@ -237,7 +237,12 @@ public:
 private:
     std::vector<SHAPE_TREE_ENTRY> roomObstacles( int aNet, int aLayer, bool aForVia,
                                                bool aSkipGeneralConvex,
-                                               const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+                                               const ROUTER_CANCEL_CALLBACK& aCancel,
+                                               const std::vector<ROOM_RIPUP_OBSTACLE>*
+                                                       aRipupObstacles = nullptr ) const;
+    std::vector<ROOM_RIPUP_OBSTACLE> roomRipupObstacles(
+            int aNet, int aLayer, bool aForVia, int aRetry, bool aFanout,
+            const ROUTER_CANCEL_CALLBACK& aCancel ) const;
     /** The rectangular room/frontier cannot faithfully represent an arbitrary
      * convex contour. A layer which contains one stays on the exact visibility
      * fallback; other physical layers may still use rooms.  Drill candidates
@@ -256,13 +261,11 @@ private:
             const ROUTER_CANCEL_CALLBACK& aCancel,
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const;
     mutable ROOM_SEARCH_METRICS m_roomMetrics;
-    // The reference frontier can enter a routable obstacle room after paying
-    // its rip-up cost.  The rectangular native slice first searches strict
-    // free rooms, then (only when negotiated rip-up is enabled) repeats the
-    // room search without movable route obstacles.  Final conflict discovery
-    // and transactional forced insertion remain authoritative.  This flag is
-    // attempt-local and never removes fixed/user copper.
-    mutable bool m_ignoreRoutableRoomObstacles = false;
+    // Negotiated attempts keep movable copper in the tree as explicit
+    // ObstacleExpansionRooms.  Free rooms still route around it; entering one
+    // pays the source-shaped pass/detour/fanout-protection cost.  Final exact
+    // conflict discovery and transactional insertion remain authoritative.
+    mutable bool m_useRoutableObstacleRooms = false;
 
     struct OPEN_NODE
     {

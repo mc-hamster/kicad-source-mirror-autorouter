@@ -7,19 +7,22 @@
  * radius already applied), not upstream's half-clearance compensated shapes.
  * Consequently the locator does not shrink them a second time. It emits a
  * 90/45-degree polyline through the backtracked corridor inside convex rooms.
- * The full upstream locator, thin-room/shove logic and layer/drill frontier
+ * Paid rectangular obstacle rooms participate in this same frontier. The full
+ * upstream locator, thin-room/shove geometry and general-convex frontier
  * remain separate work; this class is not a claim of complete engine parity.
  */
 #include "MazeSearchEngine90Degree.h"
 #include "MazeListElement.h"
 #include "RoomSearchContext.h"
 #include "RoomCostSpace.h"
+#include "../AutorouterDebug.h"
 
 #include <deque>
 #include <map>
 #include <memory>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 #include "../expansion/CompleteFreeSpaceExpansionRoom.h"
 #include "../expansion/ExpansionDoor.h"
@@ -51,7 +54,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         double aHorizontalCost, double aVerticalCost, int aMaxExpanded,
         int& aExpanded, ROOM_SEARCH_METRICS& aMetrics,
         const ROUTER_CANCEL_CALLBACK& aCancel, const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress,
-        bool aOrthogonal, double aBendCost )
+        bool aOrthogonal, double aBendCost,
+        const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles )
 {
     if( aStarts.empty() || aTargets.empty() || INT_BOX::Dimension( aBounds ) != 2
         || !std::isfinite( aSectionOffset ) || aSectionOffset <= 0
@@ -78,7 +82,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                 std::min( target.start.x, target.end.x ), std::min( target.start.y, target.end.y ),
                 std::max( target.start.x, target.end.x ), std::max( target.start.y, target.end.y ) } ), 0 );
     ROOM_SEARCH search( aBounds, aObstacles, aLayer, aNet, aSectionOffset,
-                        aMaxExpanded, aExpanded, aMetrics, aCancel, aProgress );
+                        aMaxExpanded, aExpanded, aMetrics, aCancel, aProgress, nullptr,
+                        aRipupObstacles );
     struct STATE
     {
         ROOM* room;
@@ -91,6 +96,7 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         std::size_t owner;
         std::optional<std::size_t> target;
         std::uint32_t targetItemId = 0;
+        int ripupCost = 0;
     };
     constexpr auto NONE = std::numeric_limits<std::size_t>::max();
     std::deque<STATE> states;
@@ -162,11 +168,23 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         const STATE current = states[index];
         if( current.target )
         {
-            ROOM_PATH path{ {}, current.owner, *current.target };
+            ROOM_PATH path{ {}, current.owner, *current.target, {}, 0 };
             std::vector<std::size_t> entries;
             for( auto i = index; i != NONE; i = states[i].parent )
                 entries.push_back( i );
             std::reverse( entries.begin(), entries.end() );
+            std::set<std::size_t> rippedGroups;
+            for( std::size_t entry : entries )
+            {
+                const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                        states[entry].room ? states[entry].room->shape.get() : nullptr );
+                if( obstacle && states[entry].ripupCost > 0 )
+                {
+                    rippedGroups.insert( obstacle->GetGroup() );
+                    path.ripupCost += states[entry].ripupCost;
+                }
+            }
+            path.rippedObstacleGroups.assign( rippedGroups.begin(), rippedGroups.end() );
             std::vector<RECTANGULAR_CORRIDOR_STEP> corridor;
             for( std::size_t i = 1; i < entries.size(); ++i )
             {
@@ -179,8 +197,16 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
             const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateRectangular(
                     states[entries.front()].entry.Middle().Round(), corridor, aOrthogonal );
             if( !located )
+            {
+                if( autorouterDebugEnabled() )
+                    autorouterDebugLog( "ROOM_LOCATOR_REJECTED states="
+                                        + std::to_string( entries.size() )
+                                        + " corridors=" + std::to_string( corridor.size() ) );
                 continue;
+            }
             path.points = *located;
+            aMetrics.rippedRooms += static_cast<int>( path.rippedObstacleGroups.size() );
+            aMetrics.ripupCost += path.ripupCost;
             aMetrics.routed = true;
             return path;
         }
@@ -230,11 +256,38 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                     }
                     bend = MAZE_LIST_ELEMENT::BendPenalty( centre, from, to, aBendCost );
                 }
-                const double g = current.g + cost( from, to ) + bend;
+                int ripupCost = 0;
+                if( const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                            next->shape.get() ) )
+                {
+                    const auto* currentObstacle =
+                            dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                                    current.room->shape.get() );
+                    ripupCost = currentObstacle
+                                            && currentObstacle->GetGroup()
+                                                       == obstacle->GetGroup()
+                                        ? 1 : obstacle->GetRipupCost();
+                }
+                const double g = current.g + cost( from, to ) + bend + ripupCost;
                 push( { next, door, section, sections[section], g, g + distance( to ),
-                        index, current.owner, {} } );
+                        index, current.owner, {}, 0, ripupCost } );
             }
         }
+    }
+    if( autorouterDebugEnabled() )
+    {
+        std::ostringstream message;
+        message << "ROOM_FRONTIER_EXHAUSTED layer=" << aLayer << " rooms=";
+        for( const auto& room : search.rooms )
+        {
+            const auto& box = room->shape->GetShape();
+            message << " {id=" << room->shape->GetId() << ",box=(" << box.minX << ','
+                    << box.minY << ',' << box.maxX << ',' << box.maxY << "),obstacle="
+                    << room->shape->IsObstacle() << ",complete=" << room->complete
+                    << ",active=" << room->active << ",doors="
+                    << room->shape->GetDoors().size() << '}';
+        }
+        autorouterDebugLog( message.str() );
     }
     return std::nullopt;
 }

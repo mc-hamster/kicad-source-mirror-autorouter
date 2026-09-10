@@ -28,10 +28,24 @@ namespace KICAD_AUTOROUTER
 class OBSTACLE_EXPANSION_ROOM : public EXPANSION_ROOM
 {
 public:
-    OBSTACLE_EXPANSION_ROOM( int aId, int aLayer, ROUTER_BOX aShape ) :
-            EXPANSION_ROOM( aId, aLayer, aShape, true )
+    OBSTACLE_EXPANSION_ROOM( int aId, int aLayer, ROUTER_BOX aShape,
+                             std::size_t aGroup = std::numeric_limits<std::size_t>::max(),
+                             int aRipupCost = 0, int aShapeIndex = 0 ) :
+            EXPANSION_ROOM( aId, aLayer, aShape, true ),
+            m_group( aGroup ),
+            m_ripupCost( aRipupCost ),
+            m_shapeIndex( aShapeIndex )
     {
     }
+
+    std::size_t GetGroup() const { return m_group; }
+    int         GetRipupCost() const { return m_ripupCost; }
+    int         GetShapeIndex() const { return m_shapeIndex; }
+
+private:
+    std::size_t m_group;
+    int         m_ripupCost;
+    int         m_shapeIndex;
 };
 
 } // namespace KICAD_AUTOROUTER

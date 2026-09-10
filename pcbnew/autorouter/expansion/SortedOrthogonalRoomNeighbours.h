@@ -26,7 +26,7 @@
 namespace KICAD_AUTOROUTER
 {
 
-/** Freerouting a11c0a42: boundary ordering/gaps for free (not shove) rooms. */
+/** Freerouting a11c0a42: boundary ordering/gaps for free and obstacle rooms. */
 class SORTED_ORTHOGONAL_ROOM_NEIGHBOURS
 {
 public:
@@ -43,6 +43,8 @@ public:
     const std::vector<NEIGHBOUR>& Neighbours() const { return m_neighbours; }
     int FirstUnrestrainedSide() const;
     std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> IncompleteRooms(
+            ROUTER_BOX aBounds, int aLayer ) const;
+    std::vector<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM> ObstacleIncompleteRooms(
             ROUTER_BOX aBounds, int aLayer ) const;
 
 private:

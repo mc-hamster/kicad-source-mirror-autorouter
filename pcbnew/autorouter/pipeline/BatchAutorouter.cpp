@@ -1500,6 +1500,20 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         const auto conflicts = aSettings.allowRipupRouted
                 ? aEngine.FindConflictingConnections( *connection )
                 : std::vector<ROUTING_CONNECTION>{};
+        if( autorouterDebugEnabled() )
+        {
+            std::ostringstream message;
+            message << "candidate net=" << connection->netCode << " nodes=";
+            for( const ROUTER_NODE& node : connection->nodes )
+                message << " (" << node.point.x << ',' << node.point.y << ",L"
+                        << node.layer << ')';
+            message << " conflicts=" << conflicts.size();
+            for( const ROUTING_CONNECTION& conflict : conflicts )
+                message << " {net=" << conflict.netCode << ",existing="
+                        << conflict.isExistingBoardRoute << ",movable="
+                        << conflict.isShoveMovable << ",nodes=" << conflict.nodes.size() << '}';
+            autorouterDebugLog( message.str() );
+        }
         const std::size_t remainingRipups = static_cast<std::size_t>(
                 std::max( 0, aSettings.maxRipups - aRipups ) );
         // A source-style forced shove preserves every victim instead of

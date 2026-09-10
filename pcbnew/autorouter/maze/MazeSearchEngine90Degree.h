@@ -19,7 +19,24 @@ struct ROOM_SEARCH_METRICS
     int drills = 0;
     int layerTransitions = 0;
     int destinationQueries = 0;
+    int obstacleRooms = 0;
+    int rippedRooms = 0;
+    std::int64_t ripupCost = 0;
     bool routed = false;
+};
+
+/** A compensated shape belonging to one movable foreign connection item.
+ *
+ * The shape remains in the room tree so ordinary free rooms are restrained by
+ * it, but it also owns an ObstacleExpansionRoom which the frontier may enter
+ * after paying ripupCost.  group identifies all tree shapes belonging to the
+ * same native connection item.
+ */
+struct ROOM_RIPUP_OBSTACLE
+{
+    SHAPE_TREE_ENTRY shape;
+    std::size_t      group = std::numeric_limits<std::size_t>::max();
+    int              ripupCost = 0;
 };
 
 struct ROOM_TERMINAL
@@ -34,6 +51,8 @@ struct ROOM_PATH
     std::vector<ROUTER_POINT> points;
     std::size_t startOwner;
     std::size_t targetOwner;
+    std::vector<std::size_t> rippedObstacleGroups;
+    std::int64_t ripupCost = 0;
 };
 
 struct ROOM_LAYER
@@ -42,6 +61,7 @@ struct ROOM_LAYER
     bool active = true;
     ROUTER_BOX bounds;
     std::vector<SHAPE_TREE_ENTRY> obstacles;
+    std::vector<ROOM_RIPUP_OBSTACLE> ripupObstacles;
     std::vector<ROOM_TERMINAL> starts;
     std::vector<ROOM_TERMINAL> targets;
     double horizontalCost = 1;
@@ -74,13 +94,16 @@ struct ROOM_MULTILAYER_PATH
     std::vector<ROUTER_NODE> nodes;
     std::size_t startOwner;
     std::size_t targetOwner;
+    std::vector<std::size_t> rippedObstacleGroups;
+    std::int64_t ripupCost = 0;
 };
 
 /**
  * Active rectangular room/door search, with a full-stack through-drill
- * frontier for multilayer attempts. No shove, rip-up, neckdown or
- * obstacle-room traversal is claimed by this slice. The caller
- * supplies compensated rectangles and independently checks every output edge.
+ * frontier for multilayer attempts. Movable rectangular trace/via shapes are
+ * represented by paid obstacle-room states; actual shove/rip-up and neckdown
+ * remain insertion responsibilities. The caller supplies compensated
+ * rectangles and independently checks every output edge.
  */
 class MAZE_SEARCH_ENGINE_90_DEGREE
 {
@@ -93,7 +116,8 @@ public:
             int& aExpanded, ROOM_SEARCH_METRICS& aMetrics,
             const ROUTER_CANCEL_CALLBACK& aCancel = {},
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {}, bool aOrthogonal = true,
-            double aBendCost = 0 );
+            double aBendCost = 0,
+            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {} );
 
     // Layers are in physical stack order, with explicit (possibly nonordinal)
     // host IDs. Inactive layers are retained for full through-drill validation.
