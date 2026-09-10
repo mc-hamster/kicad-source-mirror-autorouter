@@ -508,6 +508,54 @@ std::optional<INT_OCTAGON> boundingOctagon( const SIMPLEX& aSimplex )
 }
 
 
+std::optional<INT_OCTAGON> exactIntOctagon( const SIMPLEX& aSimplex )
+{
+    if( !aSimplex.IsIntOctagon() )
+        return {};
+    if( aSimplex.IsEmpty() )
+        return INT_OCTAGON::Empty();
+
+    constexpr std::int64_t critical = INT_OCTAGON::CRITICAL_COORDINATE;
+    std::int64_t right = critical, top = critical;
+    std::int64_t lowerRight = critical, upperRight = critical;
+    std::int64_t left = -critical, bottom = -critical;
+    std::int64_t lowerLeft = -critical, upperLeft = -critical;
+    for( const LINE& line : aSimplex.Borders() )
+    {
+        if( line.a.y == line.b.y )
+        {
+            if( line.b.x >= line.a.x )
+                bottom = line.a.y;
+            if( line.b.x <= line.a.x )
+                top = line.a.y;
+        }
+        if( line.a.x == line.b.x )
+        {
+            if( line.b.y >= line.a.y )
+                right = line.a.x;
+            if( line.b.y <= line.a.y )
+                left = line.a.x;
+        }
+        if( line.a.y < line.b.y )
+        {
+            if( line.a.x < line.b.x )
+                lowerRight = line.a.x - line.a.y;
+            else if( line.a.x > line.b.x )
+                upperRight = line.a.x + line.a.y;
+        }
+        else if( line.a.y > line.b.y )
+        {
+            if( line.a.x < line.b.x )
+                lowerLeft = line.a.x + line.a.y;
+            else if( line.a.x > line.b.x )
+                upperLeft = line.a.x - line.a.y;
+        }
+    }
+    return INT_OCTAGON( left, bottom, right, top, upperLeft, lowerRight,
+                        lowerLeft, upperRight ).Normalize();
+}
+
+
 std::pair<double, double> projectToLine( double aX, double aY,
                                          const LINE& aLine )
 {
@@ -681,6 +729,95 @@ bool SIMPLEX::IsIntOctagon() const
             return false;
     }
     return true;
+}
+
+
+double SIMPLEX::Area() const
+{
+    if( !IsBounded() )
+        return std::numeric_limits<double>::max();
+    if( Dimension() < 2 )
+        return 0;
+
+    long double twiceArea = 0;
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        const POINT& current = Corner( index );
+        const POINT& next = Corner( NextNo( index ) );
+        twiceArea += static_cast<long double>( current.X() ) * next.Y()
+                     - static_cast<long double>( current.Y() ) * next.X();
+    }
+    return static_cast<double>( std::abs( twiceArea ) / 2 );
+}
+
+
+double SIMPLEX::Circumference() const
+{
+    if( !IsBounded() )
+        return std::numeric_limits<std::int32_t>::max();
+    if( IsEmpty() )
+        return 0;
+
+    double result = 0;
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+        result += std::sqrt( Corner( index ).DistanceSquared( Corner( PrevNo( index ) ) ) );
+    return result;
+}
+
+
+double SIMPLEX::MaxWidth() const
+{
+    if( !IsBounded() )
+        return std::numeric_limits<std::int32_t>::max();
+    double maximum = std::numeric_limits<std::int32_t>::min();
+    double secondMaximum = std::numeric_limits<std::int32_t>::min();
+    const auto gravity = CentreOfGravity();
+    for( const LINE& line : m_borders )
+    {
+        const double distance = std::abs( static_cast<double>(
+                line.Dy().convert_to<long double>() * ( gravity.first - line.a.x )
+                - line.Dx().convert_to<long double>() * ( gravity.second - line.a.y ) )
+                / std::hypot( line.Dx().convert_to<double>(),
+                              line.Dy().convert_to<double>() ) );
+        if( distance > maximum )
+        {
+            secondMaximum = maximum;
+            maximum = distance;
+        }
+        else if( distance > secondMaximum )
+        {
+            secondMaximum = distance;
+        }
+    }
+    return maximum + secondMaximum;
+}
+
+
+double SIMPLEX::MinWidth() const
+{
+    if( !IsBounded() )
+        return std::numeric_limits<std::int32_t>::max();
+    double minimum = std::numeric_limits<std::int32_t>::max();
+    double secondMinimum = std::numeric_limits<std::int32_t>::max();
+    const auto gravity = CentreOfGravity();
+    for( const LINE& line : m_borders )
+    {
+        const double distance = std::abs( static_cast<double>(
+                line.Dy().convert_to<long double>() * ( gravity.first - line.a.x )
+                - line.Dx().convert_to<long double>() * ( gravity.second - line.a.y ) )
+                / std::hypot( line.Dx().convert_to<double>(),
+                              line.Dy().convert_to<double>() ) );
+        if( distance < minimum )
+        {
+            secondMinimum = minimum;
+            minimum = distance;
+        }
+        else if( distance < secondMinimum )
+        {
+            secondMinimum = distance;
+        }
+    }
+    return minimum + secondMinimum;
 }
 
 
@@ -985,6 +1122,224 @@ std::pair<double, double> SIMPLEX::NearestPointApprox(
             return { aX, aY };
     }
     return NearestBorderPointApprox( aX, aY );
+}
+
+
+int SIMPLEX::EqualsCorner( const POINT& aPoint ) const
+{
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( CornerIsBounded( index ) && Corner( index ) == aPoint )
+            return static_cast<int>( index );
+    }
+    return -1;
+}
+
+
+int SIMPLEX::ContainsOnBorderLineNo( const POINT& aPoint ) const
+{
+    int containingLine = -1;
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        const int side = m_borders[index].SideOf( aPoint );
+        if( side > 0 )
+            return -1;
+        if( side == 0 )
+            containingLine = static_cast<int>( index );
+    }
+    return containingLine;
+}
+
+
+std::vector<int> SIMPLEX::TouchingSides( const SIMPLEX& aOther ) const
+{
+    if( IsEmpty() || aOther.IsEmpty() )
+        return {};
+
+    const LINE left( { 0, 0 }, { -1, 0 } );
+    int side2 = -1;
+    LINE direction2 = aOther.m_borders.front();
+    for( std::size_t index = 0; index < aOther.m_borders.size(); ++index )
+    {
+        if( aOther.m_borders[index].CompareDirection( left ) >= 0 )
+        {
+            side2 = static_cast<int>( index );
+            direction2 = aOther.m_borders[index].Opposite();
+            break;
+        }
+    }
+    if( side2 < 0 )
+        return {};
+
+    std::size_t side1 = 0;
+    LINE direction1 = m_borders.front();
+    const std::size_t maximum = m_borders.size() + aOther.m_borders.size();
+    for( std::size_t iteration = 0; iteration < maximum; ++iteration )
+    {
+        const int comparison = direction2.CompareDirection( direction1 );
+        if( comparison == 0
+            && m_borders[side1].EqualOrOpposite( aOther.m_borders[side2] ) )
+        {
+            return { static_cast<int>( side1 ), side2 };
+        }
+        if( comparison >= 0 )
+        {
+            side1 = NextNo( side1 );
+            direction1 = m_borders[side1];
+        }
+        else
+        {
+            side2 = ( side2 + 1 ) % static_cast<int>( aOther.m_borders.size() );
+            direction2 = aOther.m_borders[side2].Opposite();
+        }
+    }
+    return {};
+}
+
+
+double SIMPLEX::DistanceToTheLeft( const LINE& aLine ) const
+{
+    double result = std::numeric_limits<std::int32_t>::max();
+    const double dx = aLine.Dx().convert_to<double>();
+    const double dy = aLine.Dy().convert_to<double>();
+    const double length = std::hypot( dx, dy );
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            continue;
+        const POINT& corner = Corner( index );
+        if( aLine.SideOf( corner ) < 0 )
+            return -1;
+        const double determinant = dy * ( corner.X() - aLine.a.x )
+                                   - dx * ( corner.Y() - aLine.a.y );
+        result = std::min( result, determinant / length );
+    }
+    return result;
+}
+
+
+int SIMPLEX::SideOf( const LINE& aLine ) const
+{
+    bool onTheLeft = false;
+    bool onTheRight = false;
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            continue;
+        const int side = aLine.SideOf( Corner( index ) );
+        if( side > 0 )
+            onTheRight = true;
+        else if( side < 0 )
+            onTheLeft = true;
+        if( onTheLeft && onTheRight )
+            return 0;
+    }
+    return onTheLeft ? 1 : -1;
+}
+
+
+bool SIMPLEX::IsIntersectedInteriorBy( const POINT& aStart, const POINT& aEnd,
+                                       const LINE& aLine ) const
+{
+    std::vector<int> startSides;
+    std::vector<int> endSides;
+    startSides.reserve( m_borders.size() );
+    endSides.reserve( m_borders.size() );
+    for( const LINE& border : m_borders )
+    {
+        const int startSide = border.SideOf( aStart );
+        const int endSide = border.SideOf( aEnd );
+        if( startSide != -1 && endSide != -1 )
+            return false;
+        startSides.push_back( startSide );
+        endSides.push_back( endSide );
+    }
+    if( std::all_of( startSides.begin(), startSides.end(),
+                     []( int aSide ) { return aSide == -1; } )
+        || std::all_of( endSides.begin(), endSides.end(),
+                        []( int aSide ) { return aSide == -1; } ) )
+    {
+        return true;
+    }
+
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        if( startSides[index] == endSides[index] )
+            continue;
+        if( ( startSides[index] == 0 && endSides[index] == 1 )
+            || ( endSides[index] == 0 && startSides[index] == 1 ) )
+        {
+            continue;
+        }
+        const std::size_t next = NextNo( index );
+        if( !CornerIsBounded( index ) || !CornerIsBounded( next ) )
+            continue;
+        const int firstCornerSide = aLine.SideOf( Corner( index ) );
+        const int nextCornerSide = aLine.SideOf( Corner( next ) );
+        if( ( firstCornerSide == 1 && nextCornerSide == -1 )
+            || ( firstCornerSide == -1 && nextCornerSide == 1 ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+std::vector<SIMPLEX> SIMPLEX::DivideIntoSections(
+        double aMaximumSectionWidth ) const
+{
+    if( IsEmpty() )
+        return { *this };
+    const auto bounds = BoundingBox();
+    if( !bounds || aMaximumSectionWidth <= 0 )
+        return {};
+    const double width = static_cast<double>( bounds->maxX - bounds->minX );
+    const double height = static_cast<double>( bounds->maxY - bounds->minY );
+    const int xCount = static_cast<int>( std::ceil( width / aMaximumSectionWidth ) );
+    const int yCount = static_cast<int>( std::ceil( height / aMaximumSectionWidth ) );
+    if( xCount <= 0 || yCount <= 0 )
+        return {};
+    const std::int64_t sectionWidth = static_cast<std::int64_t>(
+            std::ceil( width / xCount ) );
+    const std::int64_t sectionHeight = static_cast<std::int64_t>(
+            std::ceil( height / yCount ) );
+
+    std::vector<SIMPLEX> result;
+    for( int y = 0; y < yCount; ++y )
+    {
+        const std::int64_t lowerY = bounds->minY + y * sectionHeight;
+        const std::int64_t upperY = y == yCount - 1 ? bounds->maxY
+                                                     : lowerY + sectionHeight;
+        for( int x = 0; x < xCount; ++x )
+        {
+            const std::int64_t leftX = bounds->minX + x * sectionWidth;
+            const std::int64_t rightX = x == xCount - 1 ? bounds->maxX
+                                                         : leftX + sectionWidth;
+            SIMPLEX section = Intersection( Box( { leftX, lowerY, rightX, upperY } ) );
+            if( section.Dimension() != 2 )
+                continue;
+
+            // intersectionWithSimplify converts axis/45-degree results to
+            // IntBox/IntOctagon before the caller sees them.  Convert those
+            // values back to Simplex here while retaining their source line
+            // anchors; this is observable in later stable line ordering.
+            if( section.IsIntBox() )
+            {
+                const auto sectionBounds = section.BoundingBox();
+                if( sectionBounds )
+                    section = Box( *sectionBounds );
+            }
+            else if( const auto octagon = exactIntOctagon( section ) )
+            {
+                const auto simplified = octagon->ToSimplex();
+                if( simplified )
+                    section = *simplified;
+            }
+            result.push_back( std::move( section ) );
+        }
+    }
+    return result;
 }
 
 

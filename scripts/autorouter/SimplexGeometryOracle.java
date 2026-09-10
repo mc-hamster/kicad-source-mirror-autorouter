@@ -81,6 +81,12 @@ public class SimplexGeometryOracle {
     return result.toArray(Line[]::new);
   }
 
+  private static int side(Side value) {
+    if (value == Side.ON_THE_LEFT) return 1;
+    if (value == Side.ON_THE_RIGHT) return -1;
+    return 0;
+  }
+
   public static void main(String[] args) throws Exception {
     Random random = new Random(230104);
     for (int record = 0; record < 512; ++record) {
@@ -205,6 +211,75 @@ public class SimplexGeometryOracle {
       point(out, simplex.nearestPointApprox(query));
       out.append(' ');
       point(out, simplex.nearestBorderPointApprox(query));
+      System.out.println(out);
+    }
+
+    for (int record = 0; record < 256; ++record) {
+      int dx = random.nextInt(81) - 40;
+      int dy = random.nextInt(81) - 40;
+      Line[] supplied;
+      Line[] otherSupplied;
+      if ((record & 1) == 0) {
+        supplied = polygon(new int[][]{{dx - 20, dy - 12}, {dx + 19, dy - 12},
+                                        {dx + 19, dy + 14}, {dx - 20, dy + 14}});
+        otherSupplied = polygon(new int[][]{{dx + 19, dy - 8}, {dx + 37, dy - 8},
+                                             {dx + 37, dy + 11}, {dx + 19, dy + 11}});
+      } else {
+        supplied = input(record % 4 == 1 ? 1 : 7, dx, dy);
+        otherSupplied = polygon(new int[][]{{dx + 70, dy - 9}, {dx + 90, dy - 9},
+                                             {dx + 90, dy + 17}, {dx + 70, dy + 17}});
+      }
+      supplied = shuffled(supplied, random);
+      otherSupplied = shuffled(otherSupplied, random);
+      Simplex simplex = Simplex.getInstance(supplied);
+      Simplex other = Simplex.getInstance(otherSupplied);
+      Line probe = switch (record % 3) {
+        case 0 -> new Line(dx - 60, dy - 20, dx + 60, dy - 20);
+        case 1 -> new Line(dx + 38, dy - 60, dx + 38, dy + 60);
+        default -> new Line(dx - 55, dy + 31, dx + 48, dy - 27);
+      };
+      IntPoint segmentStart;
+      IntPoint segmentEnd;
+      if (record % 3 == 0) {
+        segmentStart = new IntPoint(dx - 60, dy);
+        segmentEnd = new IntPoint(dx + 60, dy);
+      } else if (record % 3 == 1) {
+        segmentStart = new IntPoint(dx - 60, dy + 45);
+        segmentEnd = new IntPoint(dx + 60, dy + 45);
+      } else {
+        segmentStart = new IntPoint(dx - 20, dy - 12);
+        segmentEnd = new IntPoint(dx + 19, dy - 12);
+      }
+      Line segmentLine = new Line(segmentStart, segmentEnd);
+      double sectionWidth = 9.0 + record % 11;
+
+      StringBuilder out = new StringBuilder("STILE ").append(supplied.length);
+      for (Line border : supplied) out.append(' ').append(line(border));
+      out.append(' ').append(otherSupplied.length);
+      for (Line border : otherSupplied) out.append(' ').append(line(border));
+      out.append(' ').append(line(probe));
+      out.append(' ').append(segmentStart.x).append(' ').append(segmentStart.y)
+         .append(' ').append(segmentEnd.x).append(' ').append(segmentEnd.y);
+      out.append(' ').append(Double.toString(sectionWidth));
+
+      out.append(' ').append(String.format(Locale.ROOT, "%.9f %.9f %.9f %.9f",
+          simplex.area(), simplex.circumference(), simplex.maxWidth(), simplex.minWidth()));
+      out.append(' ').append(simplex.equalsCorner(simplex.corner(0)));
+      out.append(' ').append(simplex.containsOnBorderLineNo(simplex.corner(0)));
+      int[] touching = simplex.touchingSides(other);
+      out.append(' ').append(touching.length);
+      for (int value : touching) out.append(' ').append(value);
+      out.append(' ').append(String.format(Locale.ROOT, "%.9f",
+          simplex.distanceToTheLeft(probe)));
+      out.append(' ').append(side(simplex.sideOf(probe)));
+      out.append(' ').append(simplex.isIntersectedInteriorBy(
+          segmentStart, segmentEnd, segmentLine) ? 1 : 0);
+      TileShape[] sections = simplex.divideIntoSections(sectionWidth);
+      out.append(' ').append(sections.length);
+      for (TileShape section : sections) {
+        out.append(' ');
+        lines(out, section.toSimplex());
+      }
       System.out.println(out);
     }
   }

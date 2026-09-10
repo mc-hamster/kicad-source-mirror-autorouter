@@ -43,7 +43,7 @@ BOOST_AUTO_TEST_CASE( SimplexNormalizationAndIntersectionMatchPinnedJava )
             BOOST_CHECK_MESSAGE( mismatch.empty(), mismatch );
         }
     }
-    BOOST_CHECK_EQUAL( count, 960 );
+    BOOST_CHECK_EQUAL( count, 1216 );
 }
 
 BOOST_AUTO_TEST_CASE( GeneralConvexPolylineAreaCutoutIsBoundedAndFailClosed )

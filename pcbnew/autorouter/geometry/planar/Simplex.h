@@ -42,6 +42,10 @@ public:
     int Dimension() const;
     bool IsIntBox() const;
     bool IsIntOctagon() const;
+    double Area() const;
+    double Circumference() const;
+    double MaxWidth() const;
+    double MinWidth() const;
     std::optional<ROUTER_BOX> BoundingBox() const;
     int BorderLineIndex( const LINE& aLine ) const;
     SIMPLEX RemoveBorderLine( std::size_t aIndex ) const;
@@ -57,6 +61,19 @@ public:
     std::pair<double, double> CentreOfGravity() const;
     std::pair<double, double> NearestPointApprox( double aX, double aY ) const;
     std::pair<double, double> NearestBorderPointApprox( double aX, double aY ) const;
+    int EqualsCorner( const POINT& aPoint ) const;
+    int ContainsOnBorderLineNo( const POINT& aPoint ) const;
+    std::vector<int> TouchingSides( const SIMPLEX& aOther ) const;
+    double DistanceToTheLeft( const LINE& aLine ) const;
+    /** Source Side encoding: +1=ON_THE_LEFT, -1=ON_THE_RIGHT, 0=COLLINEAR. */
+    int SideOf( const LINE& aLine ) const;
+    bool IsIntersectedInteriorBy( const POINT& aStart, const POINT& aEnd,
+                                  const LINE& aLine ) const;
+    std::vector<SIMPLEX> DivideIntoSections( double aMaximumSectionWidth ) const;
+    std::size_t NextNo( std::size_t aIndex ) const
+    { return ( aIndex + 1 ) % m_borders.size(); }
+    std::size_t PrevNo( std::size_t aIndex ) const
+    { return ( aIndex + m_borders.size() - 1 ) % m_borders.size(); }
     int IndexOfRightMostCorner( const POINT& aFromPoint ) const;
     bool Contains( const POINT& p ) const;
     bool ContainsInside( const POINT& p ) const;

@@ -193,6 +193,47 @@ inline std::string CheckRecord( const std::string& record )
                << ' ' << nearest.first << ' ' << nearest.second
                << ' ' << nearestBorder.first << ' ' << nearestBorder.second;
     }
+    else if( tag == "STILE" )
+    {
+        std::size_t count;
+        in >> count;
+        std::vector<LINE> supplied;
+        for( std::size_t index = 0; index < count; ++index )
+            supplied.push_back( ReadLine( in ) );
+        in >> count;
+        std::vector<LINE> otherSupplied;
+        for( std::size_t index = 0; index < count; ++index )
+            otherSupplied.push_back( ReadLine( in ) );
+        const LINE probe = ReadLine( in );
+        ROUTER_POINT segmentStart, segmentEnd;
+        double sectionWidth;
+        in >> segmentStart.x >> segmentStart.y >> segmentEnd.x >> segmentEnd.y
+           >> sectionWidth;
+
+        const SIMPLEX simplex = SIMPLEX::GetInstance( std::move( supplied ) );
+        const SIMPLEX other = SIMPLEX::GetInstance( std::move( otherSupplied ) );
+        actual << std::fixed << std::setprecision( 9 )
+               << simplex.Area() << ' ' << simplex.Circumference() << ' '
+               << simplex.MaxWidth() << ' ' << simplex.MinWidth();
+        actual << ' ' << simplex.EqualsCorner( simplex.Corner( 0 ) );
+        actual << ' ' << simplex.ContainsOnBorderLineNo( simplex.Corner( 0 ) );
+        const auto touching = simplex.TouchingSides( other );
+        actual << ' ' << touching.size();
+        for( int side : touching )
+            actual << ' ' << side;
+        actual << ' ' << simplex.DistanceToTheLeft( probe );
+        actual << ' ' << simplex.SideOf( probe );
+        actual << ' ' << ( simplex.IsIntersectedInteriorBy(
+                POINT( segmentStart ), POINT( segmentEnd ),
+                LINE( segmentStart, segmentEnd ) ) ? 1 : 0 );
+        const auto sections = simplex.DivideIntoSections( sectionWidth );
+        actual << ' ' << sections.size();
+        for( const SIMPLEX& section : sections )
+        {
+            actual << ' ';
+            PrintSimplex( actual, section );
+        }
+    }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );
     std::string expected; std::getline( in >> std::ws, expected );
