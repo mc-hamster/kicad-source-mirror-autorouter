@@ -1,12 +1,53 @@
 /* QA only: invokes the actual pinned Sorted45DegreeRoomNeighbours internals. */
 import app.freerouting.autoroute.expansion.*;
+import app.freerouting.autoroute.maze.AutorouteEngine;
+import app.freerouting.board.facade.BasicBoard;
+import app.freerouting.board.facade.RoutingBoard;
+import app.freerouting.board.model.items.Trace;
 import app.freerouting.board.searchtree.SearchTreeObject;
+import app.freerouting.board.trace.PolylineTrace;
 import app.freerouting.geometry.planar.*;
 import java.lang.reflect.*;
 import java.util.*;
+import sun.misc.Unsafe;
 
 public class Sorted45DegreeRoomNeighboursOracle {
   private record Input(int id, IntOctagon shape) {}
+
+  private static Unsafe unsafe() throws Exception {
+    Field field = Unsafe.class.getDeclaredField("theUnsafe");
+    field.setAccessible(true);
+    return (Unsafe) field.get(null);
+  }
+
+  private static AutorouteEngine engine(IntBox bounds) throws Exception {
+    Unsafe unsafe = unsafe();
+    RoutingBoard board = (RoutingBoard) unsafe.allocateInstance(RoutingBoard.class);
+    Field boundingBox = BasicBoard.class.getField("boundingBox");
+    unsafe.putObject(board, unsafe.objectFieldOffset(boundingBox), bounds);
+    AutorouteEngine engine = (AutorouteEngine) unsafe.allocateInstance(AutorouteEngine.class);
+    Field boardField = AutorouteEngine.class.getField("board");
+    unsafe.putObject(engine, unsafe.objectFieldOffset(boardField), board);
+    return engine;
+  }
+
+  private static ObstacleExpansionRoom obstacleRoom(IntOctagon shape) throws Exception {
+    Unsafe unsafe = unsafe();
+    PolylineTrace trace = (PolylineTrace) unsafe.allocateInstance(PolylineTrace.class);
+    Field layer = Trace.class.getDeclaredField("layer");
+    unsafe.putInt(trace, unsafe.objectFieldOffset(layer), 2);
+    ObstacleExpansionRoom room =
+        (ObstacleExpansionRoom) unsafe.allocateInstance(ObstacleExpansionRoom.class);
+    Field item = ObstacleExpansionRoom.class.getDeclaredField("item");
+    Field index = ObstacleExpansionRoom.class.getDeclaredField("indexInItem");
+    Field roomShape = ObstacleExpansionRoom.class.getDeclaredField("shape");
+    Field doors = ObstacleExpansionRoom.class.getDeclaredField("doors");
+    unsafe.putObject(room, unsafe.objectFieldOffset(item), trace);
+    unsafe.putInt(room, unsafe.objectFieldOffset(index), 0);
+    unsafe.putObject(room, unsafe.objectFieldOffset(roomShape), shape);
+    unsafe.putObject(room, unsafe.objectFieldOffset(doors), new ArrayList<ExpansionDoor>());
+    return room;
+  }
 
   private static void appendOctagon(StringBuilder out, IntOctagon octagon) {
     out.append(' ').append(octagon.leftX)
@@ -65,6 +106,17 @@ public class Sorted45DegreeRoomNeighboursOracle {
     Field edgesField = klass.getDeclaredField("edgeInteriorTouchesObstacle");
     edgesField.setAccessible(true);
     Field sortedField = klass.getField("sortedNeighbours");
+    Method calculateGaps = klass.getDeclaredMethod("calculateNewIncompleteRooms", AutorouteEngine.class);
+    calculateGaps.setAccessible(true);
+    Method calculateEdgeGaps =
+        klass.getDeclaredMethod(
+            "calculateEdgeIncompleteRoomsOfObstacleExpansionRoom",
+            int.class,
+            int.class,
+            AutorouteEngine.class);
+    calculateEdgeGaps.setAccessible(true);
+    Field incompleteRooms = AutorouteEngine.class.getDeclaredField("incompleteExpansionRooms");
+    incompleteRooms.setAccessible(true);
 
     Random random = new Random(452230100L);
     IntOctagon board = new IntBox(-300, -300, 300, 300).toIntOctagon();
@@ -134,6 +186,40 @@ public class Sorted45DegreeRoomNeighboursOracle {
         out.append(' ').append(object.getId());
         appendOctagon(out, intersection);
         out.append(' ').append(first).append(' ').append(last);
+      }
+      AutorouteEngine engine = engine(board.boundingBox());
+      if (!sorted.isEmpty()) calculateGaps.invoke(sorter, engine);
+      @SuppressWarnings("unchecked")
+      List<IncompleteFreeSpaceExpansionRoom> gaps =
+          (List<IncompleteFreeSpaceExpansionRoom>) incompleteRooms.get(engine);
+      out.append(" GAPS ").append(gaps == null ? 0 : gaps.size());
+      if (gaps != null) {
+        for (IncompleteFreeSpaceExpansionRoom gap : gaps) {
+          appendOctagon(out, gap.getShape().boundingOctagon());
+          appendOctagon(out, gap.getContainedShape().boundingOctagon());
+        }
+      }
+      ObstacleExpansionRoom obstacleRoom = obstacleRoom(room);
+      Object obstacleSorter = constructor.newInstance(obstacleRoom, obstacleRoom);
+      for (Input input : inputs) {
+        IntOctagon intersection = room.intersection(input.shape());
+        CompleteFreeSpaceExpansionRoom neighbour =
+            new CompleteFreeSpaceExpansionRoom(input.shape(), 2, input.id());
+        add.invoke(obstacleSorter, neighbour, input.shape(), intersection);
+      }
+      AutorouteEngine obstacleEngine = engine(board.boundingBox());
+      SortedSet<?> obstacleSorted = (SortedSet<?>) sortedField.get(obstacleSorter);
+      if (obstacleSorted.isEmpty()) calculateEdgeGaps.invoke(obstacleSorter, 0, 7, obstacleEngine);
+      else calculateGaps.invoke(obstacleSorter, obstacleEngine);
+      @SuppressWarnings("unchecked")
+      List<IncompleteFreeSpaceExpansionRoom> obstacleGaps =
+          (List<IncompleteFreeSpaceExpansionRoom>) incompleteRooms.get(obstacleEngine);
+      out.append(" OBSTACLE_GAPS ").append(obstacleGaps == null ? 0 : obstacleGaps.size());
+      if (obstacleGaps != null) {
+        for (IncompleteFreeSpaceExpansionRoom gap : obstacleGaps) {
+          appendOctagon(out, gap.getShape().boundingOctagon());
+          appendOctagon(out, gap.getContainedShape().boundingOctagon());
+        }
       }
       System.out.println(out);
     }

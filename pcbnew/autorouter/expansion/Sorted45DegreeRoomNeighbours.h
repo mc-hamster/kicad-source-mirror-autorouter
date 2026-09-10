@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../datastructures/MinAreaTree.h"
+#include "../board/searchtree/ShapeSearchTree45Degree.h"
 
 #include <array>
 
@@ -38,11 +39,39 @@ public:
             const PLANAR::INT_OCTAGON& aRoom,
             const std::array<bool, 8>& aEdgeTouches );
 
+    /** Source calculateNewIncompleteRooms branches, without room/door object
+     * allocation.  Returned shapes are ready for the caller's ownership
+     * layer to attach with their exact octagonal overlap doors. */
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> IncompleteRooms(
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer ) const;
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> ObstacleIncompleteRooms(
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer ) const;
+
 private:
     static int compare( const NEIGHBOUR& aLeft, const NEIGHBOUR& aRight );
     void addNeighbour( const SHAPE_TREE_ENTRY& aEntry,
                        const PLANAR::INT_OCTAGON& aShape,
                        const PLANAR::INT_OCTAGON& aIntersection );
+    void insertIncompleteRoom(
+            std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+            int aLayer, std::int64_t aLeftX, std::int64_t aBottomY,
+            std::int64_t aRightX, std::int64_t aTopY,
+            std::int64_t aUpperLeftDiagonalX,
+            std::int64_t aLowerRightDiagonalX,
+            std::int64_t aLowerLeftDiagonalX,
+            std::int64_t aUpperRightDiagonalX ) const;
+    void appendObstacleEdgeRooms(
+            std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer,
+            int aFromSide, int aToSide ) const;
+    void appendObstacleGapRooms(
+            std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer,
+            const NEIGHBOUR& aPrevious, const NEIGHBOUR& aNext ) const;
+    void appendFreeGapRoom(
+            std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer,
+            const NEIGHBOUR& aPrevious, const NEIGHBOUR& aNext ) const;
 
     PLANAR::INT_OCTAGON m_room;
     std::array<bool, 8> m_edgeTouches{};

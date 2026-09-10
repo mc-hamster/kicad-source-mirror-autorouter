@@ -179,6 +179,534 @@ int SORTED_45_DEGREE_ROOM_NEIGHBOURS::compare(
 }
 
 
+void SORTED_45_DEGREE_ROOM_NEIGHBOURS::insertIncompleteRoom(
+        std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+        int aLayer, std::int64_t aLeftX, std::int64_t aBottomY,
+        std::int64_t aRightX, std::int64_t aTopY,
+        std::int64_t aUpperLeftDiagonalX, std::int64_t aLowerRightDiagonalX,
+        std::int64_t aLowerLeftDiagonalX, std::int64_t aUpperRightDiagonalX ) const
+{
+    const INT_OCTAGON shape = INT_OCTAGON(
+            aLeftX, aBottomY, aRightX, aTopY,
+            aUpperLeftDiagonalX, aLowerRightDiagonalX,
+            aLowerLeftDiagonalX, aUpperRightDiagonalX ).Normalize();
+    if( shape.Dimension() != 2 )
+        return;
+    const INT_OCTAGON contained = m_room.Intersection( shape );
+    if( !contained.IsEmpty() && contained.Dimension() > 0 )
+        aResult.push_back( { shape, aLayer, contained } );
+}
+
+
+void SORTED_45_DEGREE_ROOM_NEIGHBOURS::appendObstacleEdgeRooms(
+        std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+        const INT_OCTAGON& aBoardBounds, int aLayer,
+        int aFromSide, int aToSide ) const
+{
+    const ROUTER_POINT initialCorner = m_room.Corner( aFromSide );
+    int currentSide = aFromSide;
+    for( ;; )
+    {
+        const int nextSide = ( currentSide + 1 ) % 8;
+        if( initialCorner != m_room.Corner( nextSide ) )
+        {
+            INT_OCTAGON shape = aBoardBounds;
+            switch( currentSide )
+            {
+            case 0: shape.topY = m_room.bottomY; break;
+            case 1: shape.upperLeftDiagonalX = m_room.lowerRightDiagonalX; break;
+            case 2: shape.leftX = m_room.rightX; break;
+            case 3: shape.lowerLeftDiagonalX = m_room.upperRightDiagonalX; break;
+            case 4: shape.bottomY = m_room.topY; break;
+            case 5: shape.lowerRightDiagonalX = m_room.upperLeftDiagonalX; break;
+            case 6: shape.rightX = m_room.leftX; break;
+            case 7: shape.upperRightDiagonalX = m_room.lowerLeftDiagonalX; break;
+            default: return;
+            }
+            insertIncompleteRoom( aResult, aLayer, shape.leftX, shape.bottomY,
+                                  shape.rightX, shape.topY,
+                                  shape.upperLeftDiagonalX,
+                                  shape.lowerRightDiagonalX,
+                                  shape.lowerLeftDiagonalX,
+                                  shape.upperRightDiagonalX );
+        }
+        if( currentSide == aToSide )
+            break;
+        currentSide = nextSide;
+    }
+}
+
+
+void SORTED_45_DEGREE_ROOM_NEIGHBOURS::appendObstacleGapRooms(
+        std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+        const INT_OCTAGON& aBoardBounds, int aLayer,
+        const NEIGHBOUR& aPrevious, const NEIGHBOUR& aNext ) const
+{
+    const int fromSide = aPrevious.lastTouchingSide;
+    const int toSide = aNext.firstTouchingSide;
+    if( fromSide == toSide && &aPrevious != &aNext )
+        return;
+
+    INT_OCTAGON shape = aBoardBounds;
+    switch( fromSide )
+    {
+    case 0:
+        shape.topY = m_room.bottomY;
+        shape.upperLeftDiagonalX = aPrevious.intersection.lowerRightDiagonalX;
+        break;
+    case 1:
+        shape.upperLeftDiagonalX = m_room.lowerRightDiagonalX;
+        shape.leftX = aPrevious.intersection.rightX;
+        break;
+    case 2:
+        shape.leftX = m_room.rightX;
+        shape.lowerLeftDiagonalX = aPrevious.intersection.upperRightDiagonalX;
+        break;
+    case 3:
+        shape.lowerLeftDiagonalX = m_room.upperRightDiagonalX;
+        shape.bottomY = aPrevious.intersection.topY;
+        break;
+    case 4:
+        shape.bottomY = m_room.topY;
+        shape.lowerRightDiagonalX = aPrevious.intersection.upperLeftDiagonalX;
+        break;
+    case 5:
+        shape.lowerRightDiagonalX = m_room.upperLeftDiagonalX;
+        shape.rightX = aPrevious.intersection.leftX;
+        break;
+    case 6:
+        shape.rightX = m_room.leftX;
+        shape.upperRightDiagonalX = aPrevious.intersection.lowerLeftDiagonalX;
+        break;
+    case 7:
+        shape.upperRightDiagonalX = m_room.lowerLeftDiagonalX;
+        shape.topY = aPrevious.intersection.bottomY;
+        break;
+    }
+    insertIncompleteRoom( aResult, aLayer, shape.leftX, shape.bottomY,
+                          shape.rightX, shape.topY, shape.upperLeftDiagonalX,
+                          shape.lowerRightDiagonalX, shape.lowerLeftDiagonalX,
+                          shape.upperRightDiagonalX );
+
+    shape = aBoardBounds;
+    switch( toSide )
+    {
+    case 0:
+        shape.topY = m_room.bottomY;
+        shape.upperRightDiagonalX = aNext.intersection.lowerLeftDiagonalX;
+        break;
+    case 1:
+        shape.upperLeftDiagonalX = m_room.lowerRightDiagonalX;
+        shape.topY = aNext.intersection.bottomY;
+        break;
+    case 2:
+        shape.leftX = m_room.rightX;
+        shape.upperLeftDiagonalX = aNext.intersection.lowerRightDiagonalX;
+        break;
+    case 3:
+        shape.lowerLeftDiagonalX = m_room.upperRightDiagonalX;
+        shape.leftX = aNext.intersection.rightX;
+        break;
+    case 4:
+        shape.bottomY = m_room.topY;
+        shape.lowerLeftDiagonalX = aNext.intersection.upperRightDiagonalX;
+        break;
+    case 5:
+        shape.lowerRightDiagonalX = m_room.upperLeftDiagonalX;
+        shape.bottomY = aNext.intersection.topY;
+        break;
+    case 6:
+        shape.rightX = m_room.leftX;
+        shape.lowerRightDiagonalX = aNext.intersection.upperLeftDiagonalX;
+        break;
+    case 7:
+        shape.upperRightDiagonalX = m_room.lowerLeftDiagonalX;
+        shape.rightX = aNext.intersection.leftX;
+        break;
+    }
+    insertIncompleteRoom( aResult, aLayer, shape.leftX, shape.bottomY,
+                          shape.rightX, shape.topY, shape.upperLeftDiagonalX,
+                          shape.lowerRightDiagonalX, shape.lowerLeftDiagonalX,
+                          shape.upperRightDiagonalX );
+
+    const int firstFreeSide = ( fromSide + 1 ) % 8;
+    if( firstFreeSide != toSide )
+        appendObstacleEdgeRooms( aResult, aBoardBounds, aLayer,
+                                 firstFreeSide, ( toSide + 7 ) % 8 );
+}
+
+
+std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
+SORTED_45_DEGREE_ROOM_NEIGHBOURS::IncompleteRooms(
+        const INT_OCTAGON& aBoardBounds, int aLayer ) const
+{
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> result;
+    if( m_neighbours.empty() )
+        return result;
+
+    const NEIGHBOUR* previous = &m_neighbours.back();
+    for( const NEIGHBOUR& next : m_neighbours )
+    {
+        if( !next.intersection.Intersects( previous->intersection ) )
+        {
+            INT_OCTAGON shape = aBoardBounds;
+            switch( next.firstTouchingSide )
+            {
+            case 0:
+                if( previous->intersection.lowerLeftDiagonalX
+                    < next.intersection.lowerLeftDiagonalX )
+                {
+                    shape.upperRightDiagonalX = next.intersection.lowerLeftDiagonalX;
+                    shape.topY = previous->intersection.bottomY;
+                    if( previous->lastTouchingSide == 0 )
+                        shape.upperLeftDiagonalX = previous->intersection.lowerRightDiagonalX;
+                }
+                else if( previous->intersection.lowerLeftDiagonalX
+                         > next.intersection.lowerLeftDiagonalX )
+                {
+                    shape.rightX = next.intersection.leftX;
+                    shape.upperRightDiagonalX = previous->intersection.lowerLeftDiagonalX;
+                }
+                else
+                    shape.upperRightDiagonalX = next.intersection.lowerLeftDiagonalX;
+                break;
+            case 1:
+                if( previous->intersection.bottomY < next.intersection.bottomY )
+                {
+                    shape.topY = next.intersection.bottomY;
+                    shape.upperLeftDiagonalX = previous->intersection.lowerRightDiagonalX;
+                    if( previous->lastTouchingSide == 1 )
+                        shape.leftX = previous->intersection.rightX;
+                }
+                else if( previous->intersection.bottomY > next.intersection.bottomY )
+                {
+                    shape.topY = previous->intersection.bottomY;
+                    shape.upperRightDiagonalX = next.intersection.lowerLeftDiagonalX;
+                }
+                else
+                    shape.topY = next.intersection.bottomY;
+                break;
+            case 2:
+                if( previous->intersection.lowerRightDiagonalX
+                    > next.intersection.lowerRightDiagonalX )
+                {
+                    shape.upperLeftDiagonalX = next.intersection.lowerRightDiagonalX;
+                    shape.leftX = previous->intersection.rightX;
+                    if( previous->lastTouchingSide == 2 )
+                        shape.lowerLeftDiagonalX = previous->intersection.upperRightDiagonalX;
+                }
+                else if( previous->intersection.lowerRightDiagonalX
+                         < next.intersection.lowerRightDiagonalX )
+                {
+                    shape.topY = next.intersection.bottomY;
+                    shape.upperLeftDiagonalX = previous->intersection.lowerRightDiagonalX;
+                }
+                else
+                    shape.upperLeftDiagonalX = next.intersection.lowerRightDiagonalX;
+                break;
+            case 3:
+                if( previous->intersection.rightX > next.intersection.rightX )
+                {
+                    shape.leftX = next.intersection.rightX;
+                    shape.lowerLeftDiagonalX = previous->intersection.upperRightDiagonalX;
+                    if( previous->lastTouchingSide == 3 )
+                        shape.bottomY = previous->intersection.topY;
+                }
+                else if( previous->intersection.rightX < next.intersection.rightX )
+                {
+                    shape.leftX = previous->intersection.rightX;
+                    shape.upperLeftDiagonalX = next.intersection.lowerRightDiagonalX;
+                }
+                else
+                    shape.leftX = next.intersection.rightX;
+                break;
+            case 4:
+                if( previous->intersection.upperRightDiagonalX
+                    > next.intersection.upperRightDiagonalX )
+                {
+                    shape.lowerLeftDiagonalX = next.intersection.upperRightDiagonalX;
+                    shape.bottomY = previous->intersection.topY;
+                    if( previous->lastTouchingSide == 4 )
+                        shape.lowerRightDiagonalX = previous->intersection.upperLeftDiagonalX;
+                }
+                else if( previous->intersection.upperRightDiagonalX
+                         < next.intersection.upperRightDiagonalX )
+                {
+                    shape.leftX = next.intersection.rightX;
+                    shape.lowerLeftDiagonalX = previous->intersection.upperRightDiagonalX;
+                }
+                else
+                    shape.lowerLeftDiagonalX = next.intersection.upperRightDiagonalX;
+                break;
+            case 5:
+                if( previous->intersection.topY > next.intersection.topY )
+                {
+                    shape.bottomY = next.intersection.topY;
+                    shape.lowerRightDiagonalX = previous->intersection.upperLeftDiagonalX;
+                    if( previous->lastTouchingSide == 5 )
+                        shape.rightX = previous->intersection.leftX;
+                }
+                else if( previous->intersection.topY < next.intersection.topY )
+                {
+                    shape.bottomY = previous->intersection.topY;
+                    shape.lowerLeftDiagonalX = next.intersection.upperRightDiagonalX;
+                }
+                else
+                    shape.bottomY = next.intersection.topY;
+                break;
+            case 6:
+                if( previous->intersection.upperLeftDiagonalX
+                    < next.intersection.upperLeftDiagonalX )
+                {
+                    shape.lowerRightDiagonalX = next.intersection.upperLeftDiagonalX;
+                    shape.rightX = previous->intersection.leftX;
+                    if( previous->lastTouchingSide == 6 )
+                        shape.upperRightDiagonalX = previous->intersection.lowerLeftDiagonalX;
+                }
+                else if( previous->intersection.upperLeftDiagonalX
+                         > next.intersection.upperLeftDiagonalX )
+                {
+                    shape.bottomY = next.intersection.topY;
+                    shape.lowerRightDiagonalX = previous->intersection.upperLeftDiagonalX;
+                }
+                else
+                    shape.lowerRightDiagonalX = next.intersection.upperLeftDiagonalX;
+                break;
+            case 7:
+                if( previous->intersection.leftX < next.intersection.leftX )
+                {
+                    shape.rightX = next.intersection.leftX;
+                    shape.upperRightDiagonalX = previous->intersection.lowerLeftDiagonalX;
+                    if( previous->lastTouchingSide == 7 )
+                        shape.topY = previous->intersection.bottomY;
+                }
+                else if( previous->intersection.leftX > next.intersection.leftX )
+                {
+                    shape.rightX = previous->intersection.leftX;
+                    shape.lowerRightDiagonalX = next.intersection.upperLeftDiagonalX;
+                }
+                else
+                    shape.rightX = next.intersection.leftX;
+                break;
+            }
+            insertIncompleteRoom( result, aLayer, shape.leftX, shape.bottomY,
+                                  shape.rightX, shape.topY,
+                                  shape.upperLeftDiagonalX,
+                                  shape.lowerRightDiagonalX,
+                                  shape.lowerLeftDiagonalX,
+                                  shape.upperRightDiagonalX );
+        }
+        previous = &next;
+    }
+    return result;
+}
+
+
+void SORTED_45_DEGREE_ROOM_NEIGHBOURS::appendFreeGapRoom(
+        std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aResult,
+        const INT_OCTAGON& aBoardBounds, int aLayer,
+        const NEIGHBOUR& aPrevious, const NEIGHBOUR& aNext ) const
+{
+    INT_OCTAGON shape = aBoardBounds;
+    switch( aNext.firstTouchingSide )
+    {
+    case 0:
+        if( aPrevious.intersection.lowerLeftDiagonalX
+            < aNext.intersection.lowerLeftDiagonalX )
+        {
+            shape.upperRightDiagonalX = aNext.intersection.lowerLeftDiagonalX;
+            shape.topY = aPrevious.intersection.bottomY;
+            if( aPrevious.lastTouchingSide == 0 )
+                shape.upperLeftDiagonalX = aPrevious.intersection.lowerRightDiagonalX;
+        }
+        else if( aPrevious.intersection.lowerLeftDiagonalX
+                 > aNext.intersection.lowerLeftDiagonalX )
+        {
+            shape.rightX = aNext.intersection.leftX;
+            shape.upperRightDiagonalX = aPrevious.intersection.lowerLeftDiagonalX;
+        }
+        else
+            shape.upperRightDiagonalX = aNext.intersection.lowerLeftDiagonalX;
+        break;
+    case 1:
+        if( aPrevious.intersection.bottomY < aNext.intersection.bottomY )
+        {
+            shape.topY = aNext.intersection.bottomY;
+            shape.upperLeftDiagonalX = aPrevious.intersection.lowerRightDiagonalX;
+            if( aPrevious.lastTouchingSide == 1 )
+                shape.leftX = aPrevious.intersection.rightX;
+        }
+        else if( aPrevious.intersection.bottomY > aNext.intersection.bottomY )
+        {
+            shape.topY = aPrevious.intersection.bottomY;
+            shape.upperRightDiagonalX = aNext.intersection.lowerLeftDiagonalX;
+        }
+        else
+            shape.topY = aNext.intersection.bottomY;
+        break;
+    case 2:
+        if( aPrevious.intersection.lowerRightDiagonalX
+            > aNext.intersection.lowerRightDiagonalX )
+        {
+            shape.upperLeftDiagonalX = aNext.intersection.lowerRightDiagonalX;
+            shape.leftX = aPrevious.intersection.rightX;
+            if( aPrevious.lastTouchingSide == 2 )
+                shape.lowerLeftDiagonalX = aPrevious.intersection.upperRightDiagonalX;
+        }
+        else if( aPrevious.intersection.lowerRightDiagonalX
+                 < aNext.intersection.lowerRightDiagonalX )
+        {
+            shape.topY = aNext.intersection.bottomY;
+            shape.upperLeftDiagonalX = aPrevious.intersection.lowerRightDiagonalX;
+        }
+        else
+            shape.upperLeftDiagonalX = aNext.intersection.lowerRightDiagonalX;
+        break;
+    case 3:
+        if( aPrevious.intersection.rightX > aNext.intersection.rightX )
+        {
+            shape.leftX = aNext.intersection.rightX;
+            shape.lowerLeftDiagonalX = aPrevious.intersection.upperRightDiagonalX;
+            if( aPrevious.lastTouchingSide == 3 )
+                shape.bottomY = aPrevious.intersection.topY;
+        }
+        else if( aPrevious.intersection.rightX < aNext.intersection.rightX )
+        {
+            shape.leftX = aPrevious.intersection.rightX;
+            shape.upperLeftDiagonalX = aNext.intersection.lowerRightDiagonalX;
+        }
+        else
+            shape.leftX = aNext.intersection.rightX;
+        break;
+    case 4:
+        if( aPrevious.intersection.upperRightDiagonalX
+            > aNext.intersection.upperRightDiagonalX )
+        {
+            shape.lowerLeftDiagonalX = aNext.intersection.upperRightDiagonalX;
+            shape.bottomY = aPrevious.intersection.topY;
+            if( aPrevious.lastTouchingSide == 4 )
+                shape.lowerRightDiagonalX = aPrevious.intersection.upperLeftDiagonalX;
+        }
+        else if( aPrevious.intersection.upperRightDiagonalX
+                 < aNext.intersection.upperRightDiagonalX )
+        {
+            shape.leftX = aNext.intersection.rightX;
+            shape.lowerLeftDiagonalX = aPrevious.intersection.upperRightDiagonalX;
+        }
+        else
+            shape.lowerLeftDiagonalX = aNext.intersection.upperRightDiagonalX;
+        break;
+    case 5:
+        if( aPrevious.intersection.topY > aNext.intersection.topY )
+        {
+            shape.bottomY = aNext.intersection.topY;
+            shape.lowerRightDiagonalX = aPrevious.intersection.upperLeftDiagonalX;
+            if( aPrevious.lastTouchingSide == 5 )
+                shape.rightX = aPrevious.intersection.leftX;
+        }
+        else if( aPrevious.intersection.topY < aNext.intersection.topY )
+        {
+            shape.bottomY = aPrevious.intersection.topY;
+            shape.lowerLeftDiagonalX = aNext.intersection.upperRightDiagonalX;
+        }
+        else
+            shape.bottomY = aNext.intersection.topY;
+        break;
+    case 6:
+        if( aPrevious.intersection.upperLeftDiagonalX
+            < aNext.intersection.upperLeftDiagonalX )
+        {
+            shape.lowerRightDiagonalX = aNext.intersection.upperLeftDiagonalX;
+            shape.rightX = aPrevious.intersection.leftX;
+            if( aPrevious.lastTouchingSide == 6 )
+                shape.upperRightDiagonalX = aPrevious.intersection.lowerLeftDiagonalX;
+        }
+        else if( aPrevious.intersection.upperLeftDiagonalX
+                 > aNext.intersection.upperLeftDiagonalX )
+        {
+            shape.bottomY = aNext.intersection.topY;
+            shape.lowerRightDiagonalX = aPrevious.intersection.upperLeftDiagonalX;
+        }
+        else
+            shape.lowerRightDiagonalX = aNext.intersection.upperLeftDiagonalX;
+        break;
+    case 7:
+        if( aPrevious.intersection.leftX < aNext.intersection.leftX )
+        {
+            shape.rightX = aNext.intersection.leftX;
+            shape.upperRightDiagonalX = aPrevious.intersection.lowerLeftDiagonalX;
+            if( aPrevious.lastTouchingSide == 7 )
+                shape.topY = aPrevious.intersection.bottomY;
+        }
+        else if( aPrevious.intersection.leftX > aNext.intersection.leftX )
+        {
+            shape.rightX = aPrevious.intersection.leftX;
+            shape.lowerRightDiagonalX = aNext.intersection.upperLeftDiagonalX;
+        }
+        else
+            shape.rightX = aNext.intersection.leftX;
+        break;
+    }
+    insertIncompleteRoom( aResult, aLayer, shape.leftX, shape.bottomY,
+                          shape.rightX, shape.topY,
+                          shape.upperLeftDiagonalX,
+                          shape.lowerRightDiagonalX,
+                          shape.lowerLeftDiagonalX,
+                          shape.upperRightDiagonalX );
+}
+
+
+std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
+SORTED_45_DEGREE_ROOM_NEIGHBOURS::ObstacleIncompleteRooms(
+        const INT_OCTAGON& aBoardBounds, int aLayer ) const
+{
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> result;
+    if( m_neighbours.empty() )
+    {
+        appendObstacleEdgeRooms( result, aBoardBounds, aLayer, 0, 7 );
+        return result;
+    }
+    if( m_neighbours.size() == 1 )
+    {
+        appendObstacleGapRooms( result, aBoardBounds, aLayer,
+                                m_neighbours.front(), m_neighbours.front() );
+        return result;
+    }
+
+    const NEIGHBOUR* previous = &m_neighbours.back();
+    for( const NEIGHBOUR& next : m_neighbours )
+    {
+        bool insertRoom;
+        if( m_neighbours.size() == 2 )
+        {
+            const INT_OCTAGON intersection = next.intersection.Intersection(
+                    previous->intersection );
+            if( intersection.IsEmpty() )
+                insertRoom = true;
+            else if( intersection.Dimension() >= 1 )
+                insertRoom = false;
+            else if( previous->lastTouchingSide == next.firstTouchingSide )
+                insertRoom = false;
+            else
+                insertRoom = previous->lastTouchingSide
+                             != ( next.firstTouchingSide + 1 ) % 8;
+        }
+        else
+            insertRoom = !next.intersection.Intersects( previous->intersection );
+
+        if( insertRoom )
+        {
+            if( next.firstTouchingSide != previous->lastTouchingSide )
+                appendObstacleGapRooms( result, aBoardBounds, aLayer, *previous, next );
+            else
+                appendFreeGapRoom( result, aBoardBounds, aLayer, *previous, next );
+        }
+        previous = &next;
+    }
+    return result;
+}
+
+
 INT_OCTAGON SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
         const INT_OCTAGON& aRoom, const std::array<bool, 8>& aEdgeTouches )
 {

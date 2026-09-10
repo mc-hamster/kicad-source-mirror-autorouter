@@ -409,6 +409,31 @@ BOOST_AUTO_TEST_CASE( FortyFiveDegreeNeighbourOrderingMatchesPinnedFreerouting )
                 BOOST_CHECK_EQUAL( neighbour.firstTouchingSide, first );
                 BOOST_CHECK_EQUAL( neighbour.lastTouchingSide, last );
             }
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "GAPS" );
+            std::size_t expectedGapCount;
+            input >> expectedGapCount;
+            const auto gaps = actual.IncompleteRooms(
+                    INT_OCTAGON::FromBox( { -300, -300, 300, 300 } ), 2 );
+            BOOST_REQUIRE_EQUAL( gaps.size(), expectedGapCount );
+            for( const auto& gap : gaps )
+            {
+                BOOST_CHECK( gap.shape == readOctagon() );
+                BOOST_CHECK( gap.containedShape == readOctagon() );
+                BOOST_CHECK_EQUAL( gap.layer, 2 );
+            }
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "OBSTACLE_GAPS" );
+            input >> expectedGapCount;
+            const auto obstacleGaps = actual.ObstacleIncompleteRooms(
+                    INT_OCTAGON::FromBox( { -300, -300, 300, 300 } ), 2 );
+            BOOST_REQUIRE_EQUAL( obstacleGaps.size(), expectedGapCount );
+            for( const auto& gap : obstacleGaps )
+            {
+                BOOST_CHECK( gap.shape == readOctagon() );
+                BOOST_CHECK( gap.containedShape == readOctagon() );
+                BOOST_CHECK_EQUAL( gap.layer, 2 );
+            }
             BOOST_REQUIRE( !input.fail() );
         }
     }
