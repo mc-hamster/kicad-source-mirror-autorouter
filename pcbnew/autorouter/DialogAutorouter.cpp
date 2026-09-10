@@ -175,6 +175,15 @@ DIALOG_AUTOROUTER_SETTINGS::DIALOG_AUTOROUTER_SETTINGS(
                                               m_settings.optimizationPasses, 0, 1000000 );
     m_maxOptimizationItems = addIntegerControl( content, costGrid, _( "Maximum optimization items" ),
                                                 m_settings.maxOptimizationItems, 0, 100000000 );
+    costGrid->Add( new wxStaticText( content, wxID_ANY,
+                                     _( "Optimization improvement threshold (%)" ) ), 0,
+                   wxALIGN_CENTER_VERTICAL );
+    m_optimizationImprovementThreshold = new wxSpinCtrlDouble(
+            content, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize,
+            wxSP_ARROW_KEYS, 0.0, 100.0,
+            100.0 * m_settings.optimizationImprovementThreshold, 0.1 );
+    m_optimizationImprovementThreshold->SetDigits( 2 );
+    costGrid->Add( m_optimizationImprovementThreshold, 0, wxEXPAND );
     m_maxRipups = addIntegerControl( content, costGrid, _( "Maximum rip-ups" ), m_settings.maxRipups, 0,
                                      1000000 );
     m_maxExpandedNodes = addIntegerControl( content, costGrid, _( "Maximum expanded nodes" ),
@@ -320,6 +329,8 @@ AUTOROUTER_SETTINGS DIALOG_AUTOROUTER_SETTINGS::GetSettings() const
     result.maxPasses = m_maxPasses->GetValue();
     result.optimizationPasses = m_optimizationPasses->GetValue();
     result.maxOptimizationItems = m_maxOptimizationItems->GetValue();
+    result.optimizationImprovementThreshold =
+            m_optimizationImprovementThreshold->GetValue() / 100.0;
     result.maxRipups = m_maxRipups->GetValue();
     result.maxExpandedNodes = m_maxExpandedNodes->GetValue();
     result.maxFanoutPasses = m_maxFanoutPasses->GetValue();

@@ -159,6 +159,16 @@ struct AUTOROUTER_SETTINGS
     // candidate lexicographically (incompletes, vias, then trace length).
     int  maxOptimizationAutoroutePasses = 6;
     int  maxOptimizationConsecutiveFailures = 50;
+    // Freerouting stops before a pass when the remaining theoretical score
+    // gain, or after a pass when its actual relative gain, is below 1%.
+    // Zero disables only the percentage threshold; an unchanged pass still
+    // converges normally.
+    double optimizationImprovementThreshold = 0.01;
+    // The first optimizer phase protects existing copper with higher rip-up
+    // prices.  These values are retained independently even while the native
+    // item-level rip-up subset remains fail-closed for unsupported contacts.
+    int    optimizationAdditionalRipupCostFactorAtStart = 10;
+    double optimizationTraceRipupCostFactor = 0.6;
     int  maxRipups = 128;
     int  maxExpandedNodes = 250000;
     // Pinned Freerouting v2.3.0 defaults. Normal convergence guards stop the

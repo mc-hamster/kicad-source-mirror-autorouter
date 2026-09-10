@@ -124,6 +124,10 @@ AUTOROUTER_SETTINGS makeSettings()
     settings.maxPasses = 3;
     settings.maxIterations = 2;
     settings.optimizeAfterComplete = true;
+    // Most optimizer unit tests exercise a specific item mutation and set a
+    // small pass cap. Disable the production 1% score guard in this common
+    // fixture; dedicated tests below cover the default source threshold.
+    settings.optimizationImprovementThreshold = 0.0;
     return settings;
 }
 
@@ -6989,6 +6993,45 @@ BOOST_AUTO_TEST_CASE( ViaOptimizerTransfersLengthToTheCheaperTraceLayer )
     BOOST_CHECK_LT( CONNECTION::FromRoute( routes.front() ).TraceLength(), before );
     BOOST_CHECK( routes.front().nodes[1].point == routes.front().nodes[2].point );
     BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( OptimizerUsesSourceScoreThresholdAndTwoRipupCostPhases )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.optimizationPasses = 10;
+    settings.optimizationImprovementThreshold = 0.01;
+
+    // A complete, short one-connection board is already within one percent
+    // of the theoretical score 1000. BatchOptimizer.runBatchLoop() stops
+    // before opening pass one in this case.
+    ROUTING_CONNECTION complete;
+    complete.complete = true;
+    complete.netCode = 1;
+    complete.fromPadIndex = 0;
+    complete.toPadIndex = 1;
+    complete.nodes = { { board.pads[0].position, 0 },
+                       { board.pads[1].position, 0 } };
+
+    ROUTING_OCCUPANCY completeOccupancy( settings.gridStepIU );
+    completeOccupancy.InitializeBoard( board, settings );
+    completeOccupancy.Add( complete );
+    std::vector<ROUTING_CONNECTION> completeRoutes{ complete };
+    BOOST_CHECK_EQUAL( BATCH_OPTIMIZER( board, settings, completeOccupancy )
+                               .Optimize( completeRoutes, {} ),
+                       0 );
+    BOOST_CHECK( completeRoutes.front().nodes == complete.nodes );
+
+    // When the score is not near its ceiling, a no-improvement pass with the
+    // source's increased rip-up prices must force exactly one more pass at
+    // normal prices before ordinary convergence stops the optimizer.
+    ROUTING_OCCUPANCY incompleteOccupancy( settings.gridStepIU );
+    incompleteOccupancy.InitializeBoard( board, settings );
+    std::vector<ROUTING_CONNECTION> noRoutes;
+    BOOST_CHECK_EQUAL( BATCH_OPTIMIZER( board, settings, incompleteOccupancy )
+                               .Optimize( noRoutes, {} ),
+                       2 );
 }
 
 

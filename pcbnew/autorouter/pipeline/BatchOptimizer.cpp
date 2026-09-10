@@ -26,9 +26,11 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <sstream>
 
 #include "../AutorouterDebug.h"
+#include "../BoardHistory.h"
 #include "../ItemRouteResult.h"
 #include "../board/optimize/ViaOptimizer.h"
 #include "../maze/MazeTraceShover.h"
@@ -98,8 +100,29 @@ struct ROUTE_QUALITY
 {
     int    incomplete = 0;
     int    vias = 0;
+    int    bends = 0;
     double length = 0.0;
 };
+
+
+int bendCount( const ROUTING_CONNECTION& aConnection )
+{
+    int result = 0;
+
+    for( std::size_t node = 1; node + 1 < aConnection.nodes.size(); ++node )
+    {
+        if( aConnection.nodes[node - 1].layer != aConnection.nodes[node].layer
+            || aConnection.nodes[node].layer != aConnection.nodes[node + 1].layer
+            || EdgeStyle( aConnection, node - 1 ) != EdgeStyle( aConnection, node ) )
+        {
+            continue;
+        }
+
+        ++result;
+    }
+
+    return result;
+}
 
 
 ROUTE_QUALITY routeQuality( const BOARD_SNAPSHOT& aBoard,
@@ -119,16 +142,41 @@ ROUTE_QUALITY routeQuality( const BOARD_SNAPSHOT& aBoard,
             continue;
 
         result.vias += viaCount( aConnections[index] );
+        result.bends += bendCount( aConnections[index] );
         result.length += traceLength( aConnections[index] );
     }
 
     if( aReplacement && aReplacement->complete )
     {
         result.vias += viaCount( *aReplacement );
+        result.bends += bendCount( *aReplacement );
         result.length += traceLength( *aReplacement );
     }
 
     return result;
+}
+
+
+double optimizerScore( const BOARD_SNAPSHOT& aBoard, const ROUTE_QUALITY& aQuality,
+                       const AUTOROUTER_SETTINGS& aSettings )
+{
+    const int maximumConnections = std::accumulate(
+            aBoard.nets.begin(), aBoard.nets.end(), 0,
+            []( int aTotal, const ROUTING_NET& aNet )
+            { return aTotal + static_cast<int>( aNet.connections.size() ); } );
+
+    ROUTING_RESULT snapshot;
+    snapshot.metrics.totalConnections = maximumConnections;
+    snapshot.metrics.unroutedConnections = aQuality.incomplete;
+    snapshot.metrics.viaCount = aQuality.vias;
+    snapshot.metrics.bendCount = aQuality.bends;
+    snapshot.metrics.routedLengthIU = static_cast<std::int64_t>(
+            std::llround( aQuality.length ) );
+    // Every optimizer candidate is accepted only after strict insertion and
+    // the outer pipeline performs the independent full proposal DRC.  The
+    // Java pass-score call also omits its expensive full DRC here.
+    snapshot.metrics.drcViolations = 0;
+    return BOARD_HISTORY::NormalizedScore( snapshot, aSettings );
 }
 
 
@@ -387,16 +435,39 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
     // this item-local transaction; Freerouting's wider rip-up optimization is
     // represented by subsequent ordinary batch passes, while this native
     // slice remains monotonically safe.
-    AUTOROUTER_SETTINGS optimizationSettings = m_settings;
-    optimizationSettings.allowRipupRouted = false;
-    MAZE_SEARCH_ENGINE search( m_board, optimizationSettings, m_occupancy );
     int completedPasses = 0;
     int optimizedItems = 0;
+    bool useIncreasedRipupCosts = true;
 
     for( int pass = 0; pass < std::max( 0, m_settings.optimizationPasses ); ++pass )
     {
         if( aCancel && aCancel() )
             break;
+
+        const ROUTE_QUALITY passBefore = routeQuality( m_board, aConnections,
+                                                       *m_occupancy.Board() );
+        const double scoreBeforePass = optimizerScore( m_board, passBefore, m_settings );
+        const double threshold = std::max( 0.0, m_settings.optimizationImprovementThreshold );
+        if( threshold > 0.0 && scoreBeforePass * ( 1.0 + threshold ) >= 1000.0 )
+            break;
+
+        AUTOROUTER_SETTINGS optimizationSettings = m_settings;
+        optimizationSettings.allowRipupRouted = false;
+        // BatchOptimizer alternates its preferred-direction costs by pass to
+        // generate a different legal candidate ordering.  On even source
+        // pass numbers both directions use the preferred (minimum) cost.
+        if( ( pass + 1 ) % 2 == 0 )
+            for( ROUTER_LAYER_SETTINGS& layer : optimizationSettings.layers )
+                layer.preferredDirection = 0;
+
+        if( useIncreasedRipupCosts )
+        {
+            const std::int64_t scaled = static_cast<std::int64_t>(
+                    optimizationSettings.startRipupCost )
+                    * std::max( 1, m_settings.optimizationAdditionalRipupCostFactorAtStart );
+            optimizationSettings.startRipupCost = static_cast<int>( std::clamp<std::int64_t>(
+                    scaled, 0, std::numeric_limits<int>::max() ) );
+        }
 
         bool changedThisPass = false;
 
@@ -415,6 +486,18 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
 
             const std::size_t connectionIndex = next->connectionIndex;
             ROUTING_CONNECTION& connection = aConnections[connectionIndex];
+
+            AUTOROUTER_SETTINGS itemOptimizationSettings = optimizationSettings;
+            if( next->key.kind == 1 )
+            {
+                const double scaled = std::round(
+                        std::max( 0.0, m_settings.optimizationTraceRipupCostFactor )
+                        * itemOptimizationSettings.startRipupCost );
+                itemOptimizationSettings.startRipupCost = static_cast<int>(
+                        std::clamp( scaled, 0.0,
+                                    static_cast<double>( std::numeric_limits<int>::max() ) ) );
+            }
+            MAZE_SEARCH_ENGINE search( m_board, itemOptimizationSettings, m_occupancy );
 
             if( isProtectedSourceCopper( connection ) )
                 continue;
@@ -554,7 +637,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             // absent from occupancy, then subject every candidate to the
             // same atomic insertion/contact/quality gate as a full reroute.
             for( ROUTING_CONNECTION viaCandidate :
-                 VIA_OPTIMIZER::Candidates( original, m_board, optimizationSettings,
+                 VIA_OPTIMIZER::Candidates( original, m_board, itemOptimizationSettings,
                                             *m_occupancy.Board(), search,
                                             movableViaEdges, aCancel ) )
             {
@@ -632,11 +715,24 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
 
         ++completedPasses;
 
-        // The reference stops when a pass is below its improvement threshold.
-        // Native shortening has no speculative reroute candidate yet, so an
-        // unchanged geometry is exactly zero improvement and further passes
-        // would be identical.
+        const ROUTE_QUALITY passAfter = routeQuality( m_board, aConnections,
+                                                      *m_occupancy.Board() );
+        const double scoreAfterPass = optimizerScore( m_board, passAfter, m_settings );
+
+        // The source always gives a no-improvement increased-cost pass one
+        // more chance using normal prices, regardless of the threshold.
+        if( useIncreasedRipupCosts && scoreAfterPass <= scoreBeforePass )
+        {
+            useIncreasedRipupCosts = false;
+            continue;
+        }
+
         if( !changedThisPass )
+            break;
+
+        const double improvement = scoreBeforePass > 0.0
+                ? ( scoreAfterPass - scoreBeforePass ) / scoreBeforePass : 0.0;
+        if( improvement < threshold )
             break;
     }
 

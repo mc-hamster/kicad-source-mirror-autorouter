@@ -76,6 +76,7 @@ private:
     wxSpinCtrl*       m_maxPasses = nullptr;
     wxSpinCtrl*       m_optimizationPasses = nullptr;
     wxSpinCtrl*       m_maxOptimizationItems = nullptr;
+    wxSpinCtrlDouble* m_optimizationImprovementThreshold = nullptr;
     wxSpinCtrl*       m_maxRipups = nullptr;
     wxSpinCtrl*       m_maxExpandedNodes = nullptr;
     wxSpinCtrl*       m_maxFanoutPasses = nullptr;
