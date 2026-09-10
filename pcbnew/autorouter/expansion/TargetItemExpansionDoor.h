@@ -70,6 +70,14 @@ public:
             const ROUTER_POINT& aFrom,
             const PLANAR::INT_OCTAGON& aRoom );
 
+    /** Exact unrestricted-angle variant.  The source intersects the target
+     * shape with an arbitrary TileShape; the native worker keeps that room as
+     * a rational SIMPLEX and solves every support inequality on the segment's
+     * primitive lattice parameter before choosing the nearest legal point. */
+    static std::optional<ROUTER_POINT> NearestIntegralPointInRoom(
+            const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+            const ROUTER_POINT& aFrom, const PLANAR::SIMPLEX& aRoom );
+
     /**
      * Return a bounded set of exact lattice points which represents an
      * integral segment in an orthogonal room decomposition.
@@ -89,6 +97,10 @@ public:
     static std::vector<ROUTER_POINT> IntegralRoomSeedPoints(
             const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
             const std::vector<PLANAR::INT_OCTAGON>& aFortyFiveDegreeCuts );
+
+    static std::vector<ROUTER_POINT> IntegralRoomSeedPoints(
+            const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+            const std::vector<PLANAR::SIMPLEX>& aAnyAngleCuts );
 
 private:
     std::size_t  m_padIndex;

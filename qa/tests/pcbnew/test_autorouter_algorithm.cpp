@@ -47,12 +47,15 @@
 #include <autorouter/path/Connection.h>
 #include <autorouter/maze/MazeSearchEngine90Degree.h>
 #include <autorouter/maze/MazeSearchEngine45Degree.h>
+#include <autorouter/maze/MazeSearchEngineAnyAngle.h>
+#include <autorouter/maze/RoomSearchContextAnyAngle.h>
 #include <autorouter/maze/MazeExpansionEngine.h>
 #include <autorouter/drill/DrillPageArray.h>
 #include <autorouter/geometry/planar/PolylineArea.h>
 #include <autorouter/maze/MazeListElement.h>
 #include <autorouter/maze/MazeRipupResolver.h>
 #include <autorouter/path/FoundConnectionLocator45Degree.h>
+#include <autorouter/path/FoundConnectionLocatorAnyAngle.h>
 #include <autorouter/expansion/ExpansionGraph.h>
 #include <autorouter/expansion/ExpansionDoor.h>
 #include <autorouter/expansion/TargetItemExpansionDoor.h>
@@ -7751,6 +7754,220 @@ BOOST_AUTO_TEST_CASE( TargetItemDoorClipsExactLatticeToOctagonalRoom )
             BOOST_CHECK( room.Contains( *actual ) );
             BOOST_CHECK( CONTACT_GEOMETRY::OnSegment( start, end, *actual ) );
         }
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( TargetItemDoorClipsExactLatticeToGeneralConvexRoom )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    std::mt19937 random( 12098917 );
+    std::uniform_int_distribution<int> coordinate( -80, 80 );
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        const int left = coordinate( random );
+        const int bottom = coordinate( random );
+        const int width = 30 + test % 61;
+        const int height = 30 + ( test / 61 ) % 61;
+        const std::vector<ROUTER_POINT> polygon{
+            { left, bottom }, { left + width, bottom + 3 },
+            { left + width - 7, bottom + height },
+            { left + 5, bottom + height - 4 } };
+        const auto room = SIMPLEX::FromConvexPolygon( polygon );
+        BOOST_REQUIRE( room );
+
+        const ROUTER_POINT start{ coordinate( random ), coordinate( random ) };
+        const ROUTER_POINT end{ coordinate( random ), coordinate( random ) };
+        const ROUTER_POINT from{ coordinate( random ), coordinate( random ) };
+        const auto actual = TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                start, end, from, *room );
+
+        const auto dx = end.x - start.x;
+        const auto dy = end.y - start.y;
+        const auto divisor = std::gcd( std::abs( dx ), std::abs( dy ) );
+        std::optional<ROUTER_POINT> expected;
+        boost::multiprecision::cpp_int bestDistance;
+        if( divisor == 0 )
+        {
+            if( room->Contains( POINT( start ) ) )
+                expected = start;
+        }
+        else
+        {
+            const auto stepX = dx / divisor;
+            const auto stepY = dy / divisor;
+            for( std::int64_t index = 0; index <= divisor; ++index )
+            {
+                const ROUTER_POINT point{ start.x + index * stepX,
+                                          start.y + index * stepY };
+                if( !room->Contains( POINT( point ) ) )
+                    continue;
+                const boost::multiprecision::cpp_int deltaX = point.x - from.x;
+                const boost::multiprecision::cpp_int deltaY = point.y - from.y;
+                const auto distance = deltaX * deltaX + deltaY * deltaY;
+                if( !expected || distance <= bestDistance )
+                {
+                    expected = point;
+                    bestDistance = distance;
+                }
+            }
+        }
+        BOOST_CHECK( actual == expected );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralRoomSeedPointsBracketEverySupportLineCrossing )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    const ROUTER_POINT start{ -120, -60 };
+    const ROUTER_POINT end{ 120, 60 };
+    const auto cut = SIMPLEX::FromConvexPolygon(
+            { { -45, -30 }, { 50, -12 }, { 38, 43 }, { -58, 27 } } );
+    BOOST_REQUIRE( cut );
+    const auto seeds = TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+            start, end, std::vector<SIMPLEX>{ *cut } );
+    BOOST_CHECK_LT( seeds.size(), 64U );
+    BOOST_CHECK( seeds.front() == start );
+    BOOST_CHECK( seeds.back() == end );
+
+    std::set<std::pair<std::int64_t, std::int64_t>> seedSet;
+    for( const ROUTER_POINT& point : seeds )
+        seedSet.emplace( point.x, point.y );
+    const auto divisor = std::gcd( std::abs( end.x - start.x ),
+                                   std::abs( end.y - start.y ) );
+    const ROUTER_POINT step{ ( end.x - start.x ) / divisor,
+                             ( end.y - start.y ) / divisor };
+    ROUTER_POINT previous = start;
+    bool previousInside = cut->Contains( POINT( previous ) );
+    for( std::int64_t index = 1; index <= divisor; ++index )
+    {
+        const ROUTER_POINT current{ start.x + index * step.x,
+                                    start.y + index * step.y };
+        const bool currentInside = cut->Contains( POINT( current ) );
+        if( currentInside != previousInside )
+        {
+            BOOST_CHECK( seedSet.contains( { previous.x, previous.y } ) );
+            BOOST_CHECK( seedSet.contains( { current.x, current.y } ) );
+        }
+        previous = current;
+        previousInside = currentInside;
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralRoomLifecycleKeepsExactConvexSupports )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    const ROUTER_BOX bounds{ 0, 0, 1000, 1000 };
+    const auto obstacle = SIMPLEX::FromConvexPolygon(
+            { { 350, 250 }, { 760, 410 }, { 620, 790 }, { 280, 660 } } );
+    BOOST_REQUIRE( obstacle );
+    const std::vector<SHAPE_TREE_ENTRY> obstacles{
+        { obstacle->BoundingBox().value(), 1, 0, 0, 0, false, true, {}, *obstacle }
+    };
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const ROUTER_CANCEL_CALLBACK cancel;
+    const ROUTER_SEARCH_PROGRESS_CALLBACK progress;
+    KICAD_AUTOROUTER::DETAIL::ROOM_SEARCH_ANY_ANGLE search(
+            bounds, obstacles, 0, 1, 10, 10000, expanded, metrics,
+            cancel, progress );
+    const SIMPLEX seed = SIMPLEX::FromBox( { 100, 500, 100, 500 } );
+    const auto complete = search.complete( search.incomplete(
+            { SIMPLEX::Box( bounds ), 0, seed } ) );
+    BOOST_REQUIRE( !complete.empty() );
+    BOOST_CHECK( complete.front()->shape->UsesGeneralShape() );
+    BOOST_CHECK( complete.front()->shape->GetSimplex().Contains(
+            POINT( ROUTER_POINT{ 100, 500 } ) ) );
+    BOOST_CHECK_LT( complete.front()->shape->GetSimplex().Intersection(
+                            *obstacle ).Dimension(), 2 );
+    BOOST_CHECK_GT( metrics.rooms, 0 );
+    BOOST_CHECK_GT( metrics.doors, 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( AnyAngleRoomFrontierRoutesThroughExactGeneralConvexRooms )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    const ROUTER_BOX bounds{ 0, 0, 1000, 1000 };
+    const auto obstacle = SIMPLEX::FromConvexPolygon(
+            { { 350, 220 }, { 760, 410 }, { 650, 790 }, { 290, 650 } } );
+    BOOST_REQUIRE( obstacle );
+    const std::vector<SHAPE_TREE_ENTRY> obstacles{
+        { obstacle->BoundingBox().value(), 1, 0, 0, 0, false, true, {}, *obstacle }
+    };
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
+            bounds, obstacles, 0, 1,
+            { { { 100, 500 }, { 100, 500 }, 11 } },
+            { { { 900, 500 }, { 900, 500 }, 20 } },
+            10, 1, 1, 10000, expanded, metrics );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE_GE( path->points.size(), 3U );
+    BOOST_CHECK_EQUAL( path->startOwner, 11U );
+    BOOST_CHECK_EQUAL( path->targetOwner, 20U );
+    BOOST_CHECK( path->points.front() == ROUTER_POINT( { 100, 500 } ) );
+    BOOST_CHECK( path->points.back() == ROUTER_POINT( { 900, 500 } ) );
+    BOOST_CHECK_GT( metrics.rooms, 0 );
+    BOOST_CHECK_GT( metrics.doors, 0 );
+    BOOST_CHECK_GT( metrics.sections, 0 );
+    for( const ROUTER_POINT& point : path->points )
+    {
+        BOOST_CHECK( SIMPLEX::Box( bounds ).Contains( POINT( point ) ) );
+        BOOST_CHECK( !obstacle->ContainsInside( POINT( point ) ) );
+    }
+    BOOST_CHECK( std::any_of(
+            path->points.begin() + 1, path->points.end() - 1,
+            []( const ROUTER_POINT& point ) { return point.y != 500; } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesOnlyRepresentableExactDoorPoints )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    const SIMPLEX left = SIMPLEX::Box( { 0, 0, 100, 100 } );
+    const SIMPLEX right = SIMPLEX::Box( { 100, 20, 200, 120 } );
+    const SIMPLEX door = right.Intersection( left );
+    BOOST_REQUIRE_EQUAL( door.Dimension(), 1 );
+    const auto nearest = FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralPoint(
+            door, { 10, 63 } );
+    BOOST_REQUIRE( nearest );
+    BOOST_CHECK( *nearest == ROUTER_POINT( { 100, 63 } ) );
+
+    const std::vector<GENERAL_CORRIDOR_STEP> corridor{
+        { left, door, { { 100, 20 }, { 100, 100 } } },
+        { right, {}, { { 180, 90 }, { 180, 90 } } }
+    };
+    const auto path = FOUND_CONNECTION_LOCATOR_ANY_ANGLE::Locate(
+            { 10, 63 }, corridor );
+    BOOST_REQUIRE( path );
+    BOOST_CHECK( path->front() == ROUTER_POINT( { 10, 63 } ) );
+    BOOST_CHECK( path->back() == ROUTER_POINT( { 180, 90 } ) );
+    BOOST_CHECK( left.Contains( POINT( path->at( 1 ) ) ) );
+    BOOST_CHECK( right.Contains( POINT( path->at( 1 ) ) ) );
+
+    const auto rationalOnly = SIMPLEX::FromConvexPolygon(
+            { { 0, 0 }, { 1, 2 }, { -1, 3 } } );
+    BOOST_REQUIRE( rationalOnly );
+    const SIMPLEX rationalPoint = rationalOnly->Intersection(
+            SIMPLEX::GetInstance( { PLANAR::LINE( { 0, 1 }, { 2, 0 } ),
+                                    PLANAR::LINE( { 2, 0 }, { 0, 1 } ) } ) );
+    if( rationalPoint.Dimension() == 0 )
+    {
+        const auto exact = FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralPoint(
+                rationalPoint, { 0, 0 } );
+        if( !rationalPoint.Corner( 0 ).Integral() )
+            BOOST_CHECK( !exact );
     }
 }
 

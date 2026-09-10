@@ -9,6 +9,7 @@
 #include "MazeExpansionEngine.h"
 #include "MazeRipupResolver.h"
 #include "MazeSearchEngine45Degree.h"
+#include "MazeSearchEngineAnyAngle.h"
 #include "MazeTraceShover.h"
 #include "../path/Connection.h"
 #include "../geometry/planar/ContactGeometry.h"
@@ -211,12 +212,13 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                                      : netViaDrillRadius( net );
     std::vector<SHAPE_TREE_ENTRY> entries;
     int id = 1;
-    auto addOctagon = [&]( INT_OCTAGON shape )
+    auto addOctagon = [&]( INT_OCTAGON shape,
+                           std::optional<PLANAR::SIMPLEX> simplex = std::nullopt )
     {
         shape = shape.Normalize();
         if( shape.Dimension() >= 0 )
             entries.push_back( { shape.BoundingBox(), id++, 0, aLayer, 0,
-                                 false, true, shape } );
+                                 false, true, shape, std::move( simplex ) } );
     };
     auto add = [&]( ROUTER_BOX box, std::int64_t expansion )
     {
@@ -225,7 +227,18 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
     auto addSegment = [&]( ROUTER_POINT start, ROUTER_POINT end,
                            std::int64_t expansion )
     {
-        addOctagon( octagonalEnvelope( { start, end }, expansion ) );
+        std::optional<PLANAR::SIMPLEX> simplex;
+        if( start != end )
+            simplex = PLANAR::SIMPLEX::FromExpandedSegment(
+                    start, end, expansion );
+        else
+        {
+            simplex = PLANAR::SIMPLEX::Box(
+                    { start.x - expansion, start.y - expansion,
+                      start.x + expansion, start.y + expansion } );
+        }
+        addOctagon( octagonalEnvelope( { start, end }, expansion ),
+                    std::move( simplex ) );
     };
     for( auto index : obstacleIndices( aLayer ) )
     {
@@ -248,8 +261,14 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
             continue;
         // One extra IU makes the room boundary legal under the host's
         // inclusive collision predicates; do not apply clearance twice.
-        addOctagon( octagonalEnvelope( obstacle, obstacleExpansionRadius(
-                obstacle, net, aLayer, aForVia, radius, drillRadius ) + 1 ) );
+        const std::int64_t expansion = obstacleExpansionRadius(
+                obstacle, net, aLayer, aForVia, radius, drillRadius ) + 1;
+        std::optional<PLANAR::SIMPLEX> simplex;
+        if( isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
+            simplex = PLANAR::SIMPLEX::FromConvexPolygon(
+                    obstacle.polygon, expansion );
+        addOctagon( octagonalEnvelope( obstacle, expansion ),
+                    std::move( simplex ) );
     }
     // Every attempt sees current copper, including through-via copper on
     // intermediate layers. No stale per-net tree survives add/remove/rip-up.
@@ -542,9 +561,16 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
 
             const INT_OCTAGON octagon = octagonalEnvelope(
                     { from.point, to.point }, expansion + 1 );
+            std::optional<PLANAR::SIMPLEX> simplex;
+            if( from.point != to.point )
+                simplex = PLANAR::SIMPLEX::FromExpandedSegment(
+                        from.point, to.point, expansion + 1 );
+            else
+                simplex = octagon.ToSimplex();
             SHAPE_TREE_ENTRY entry{ octagon.BoundingBox(), 0,
                                     static_cast<int>( edge ), aLayer,
-                                    connection.netCode, false, true, octagon };
+                                    connection.netCode, false, true, octagon,
+                                    std::move( simplex ) };
             std::optional<CONNECTION> topologyConnection;
             if( routeItems.size() == routeItemCount )
                 topologyConnection = CONNECTION::Get(
@@ -610,16 +636,26 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         const double against = preferred + std::max( 0, layer.directionCost ) / 10.0;
         const double horizontal = layer.preferredDirection == 2 ? against : preferred;
         const double vertical = layer.preferredDirection == 1 ? against : preferred;
-        auto path = MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
-                bounds, entries, layer.layerId, net, starts, targets, std::max<std::int64_t>( 1, radius ),
-                horizontal, vertical, m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
-                aCancel, aProgress,
-                static_cast<double>( std::max( 0, m_settings.bendCost ) )
-                        * std::max( 1, m_settings.gridStepIU ), ripupEntries );
+        const bool anyAngle = hasGeneralConvexRoomGeometry( net, layer.layerId );
+        auto path = anyAngle
+                ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
+                        bounds, entries, layer.layerId, net, starts, targets,
+                        std::max<std::int64_t>( 1, radius ), horizontal, vertical,
+                        m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
+                        aCancel, aProgress,
+                        static_cast<double>( std::max( 0, m_settings.bendCost ) )
+                                * std::max( 1, m_settings.gridStepIU ), ripupEntries )
+                : MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
+                        bounds, entries, layer.layerId, net, starts, targets,
+                        std::max<std::int64_t>( 1, radius ), horizontal, vertical,
+                        m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
+                        aCancel, aProgress,
+                        static_cast<double>( std::max( 0, m_settings.bendCost ) )
+                                * std::max( 1, m_settings.gridStepIU ), ripupEntries );
         // Keep the established rectangular frontier as a bounded transition
         // fallback until the octagonal drill frontier is connected.  General
         // convex layers must not collapse back to bounding rectangles.
-        if( !path && !hasGeneralConvexRoomGeometry( net, layer.layerId )
+        if( !path && !anyAngle
             && aExpanded < m_settings.maxExpandedNodes )
         {
             path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(

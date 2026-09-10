@@ -464,6 +464,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/maze/MazeSearchEngine.cpp
     autorouter/maze/MazeSearchEngine90Degree.cpp
     autorouter/maze/MazeSearchEngine45Degree.cpp
+    autorouter/maze/MazeSearchEngineAnyAngle.cpp
     autorouter/maze/MazeSearchEngine45DegreeMultilayer.cpp
     autorouter/maze/MazeSearchEngineMultilayer.cpp
     autorouter/maze/MazeSearchEngineRooms.cpp
@@ -481,6 +482,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/path/FoundConnectionInserter.cpp
     autorouter/path/FoundConnectionLocator.cpp
     autorouter/path/FoundConnectionLocator45Degree.cpp
+    autorouter/path/FoundConnectionLocatorAnyAngle.cpp
     autorouter/pipeline/AutorouteConnectionRouter.cpp
     autorouter/pipeline/AutorouteAirlineCalculator.cpp
     autorouter/pipeline/BatchAutorouterThread.cpp

@@ -19,12 +19,34 @@
 
 #pragma once
 
-#include "FoundConnectionLocator.h"
+#include "../geometry/planar/FloatLine.h"
+#include "../geometry/planar/Simplex.h"
 
 namespace KICAD_AUTOROUTER
 {
 
-/** Freerouting-compatible locator name for visibility/any-angle routing. */
-using FOUND_CONNECTION_LOCATOR_ANY_ANGLE = FOUND_CONNECTION_LOCATOR;
+struct GENERAL_CORRIDOR_STEP
+{
+    PLANAR::SIMPLEX room;
+    std::optional<PLANAR::SIMPLEX> door;
+    FLOAT_LINE section;
+};
+
+/** Realizer for a backtracked unrestricted-angle room corridor.
+ *
+ * Unlike the former alias to the legacy grid search, this operates on exact
+ * rational room and door shapes.  It chooses only integral points proven to
+ * lie in the relevant SIMPLEX; a rational passage with no legal KiCad lattice
+ * point fails closed rather than rounding through a compensated obstacle.
+ */
+class FOUND_CONNECTION_LOCATOR_ANY_ANGLE
+{
+public:
+    static std::optional<ROUTER_POINT> NearestIntegralPoint(
+            const PLANAR::SIMPLEX& aShape, ROUTER_POINT aFrom );
+
+    static std::optional<std::vector<ROUTER_POINT>> Locate(
+            ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps );
+};
 
 } // namespace KICAD_AUTOROUTER

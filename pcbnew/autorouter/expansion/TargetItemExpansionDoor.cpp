@@ -99,6 +99,21 @@ bool constrainAxis( const WIDE& aOrigin, const WIDE& aStep,
 }
 
 
+bool constrainNonPositive( const WIDE& aOrigin, const WIDE& aStep,
+                           WIDE& aFirst, WIDE& aLast )
+{
+    if( aStep == 0 )
+        return aOrigin <= 0;
+
+    if( aStep > 0 )
+        aLast = std::min( aLast, floorDivide( -aOrigin, aStep ) );
+    else
+        aFirst = std::max( aFirst, ceilDivide( aOrigin, -aStep ) );
+
+    return aFirst <= aLast;
+}
+
+
 void addCutIndices( const WIDE& aOrigin, const WIDE& aStep,
                     std::int64_t aCoordinate, const WIDE& aLast,
                     std::set<WIDE>& aIndices )
@@ -161,6 +176,52 @@ std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRo
 
     return ROUTER_POINT{ ( WIDE( aStart.x ) + index * stepX ).convert_to<std::int64_t>(),
                          ( WIDE( aStart.y ) + index * stepY ).convert_to<std::int64_t>() };
+}
+
+
+std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+        const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+        const ROUTER_POINT& aFrom, const PLANAR::SIMPLEX& aRoom )
+{
+    if( aRoom.Dimension() < 0 )
+        return std::nullopt;
+
+    const WIDE dx = WIDE( aEnd.x ) - aStart.x;
+    const WIDE dy = WIDE( aEnd.y ) - aStart.y;
+    const WIDE divisor = greatestCommonDivisor( dx, dy );
+
+    if( divisor == 0 )
+        return aRoom.Contains( PLANAR::POINT( aStart ) )
+                       ? std::optional( aStart ) : std::nullopt;
+
+    const WIDE stepX = dx / divisor;
+    const WIDE stepY = dy / divisor;
+    WIDE first = 0;
+    WIDE last = divisor;
+
+    // SIMPLEX interiors are the right/non-positive side of every directed
+    // support.  Substitute p(k)=start+k*step and solve the resulting exact
+    // linear inequality for the integral lattice index k.
+    for( const PLANAR::LINE& border : aRoom.Borders() )
+    {
+        const WIDE borderDx = border.Dx();
+        const WIDE borderDy = border.Dy();
+        const WIDE origin = borderDy * ( WIDE( aStart.x ) - border.a.x )
+                            - borderDx * ( WIDE( aStart.y ) - border.a.y );
+        const WIDE step = borderDy * stepX - borderDx * stepY;
+        if( !constrainNonPositive( origin, step, first, last ) )
+            return std::nullopt;
+    }
+
+    const WIDE denominator = stepX * stepX + stepY * stepY;
+    const WIDE numerator = ( WIDE( aFrom.x ) - aStart.x ) * stepX
+                           + ( WIDE( aFrom.y ) - aStart.y ) * stepY;
+    const WIDE index = std::clamp( nearestInteger( numerator, denominator ), first, last );
+    const ROUTER_POINT result{
+            ( WIDE( aStart.x ) + index * stepX ).convert_to<std::int64_t>(),
+            ( WIDE( aStart.y ) + index * stepY ).convert_to<std::int64_t>() };
+    return aRoom.Contains( PLANAR::POINT( result ) )
+                   ? std::optional( result ) : std::nullopt;
 }
 
 
@@ -232,6 +293,70 @@ std::vector<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
         addCutIndices( aStart.x, stepX, cut.maxX, divisor, indices );
         addCutIndices( aStart.y, stepY, cut.minY, divisor, indices );
         addCutIndices( aStart.y, stepY, cut.maxY, divisor, indices );
+    }
+
+    std::vector<ROUTER_POINT> result;
+    result.reserve( indices.size() );
+    for( const WIDE& index : indices )
+    {
+        result.push_back( {
+                ( WIDE( aStart.x ) + index * stepX ).convert_to<std::int64_t>(),
+                ( WIDE( aStart.y ) + index * stepY ).convert_to<std::int64_t>() } );
+    }
+    return result;
+}
+
+
+std::vector<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+        const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+        const std::vector<PLANAR::SIMPLEX>& aAnyAngleCuts )
+{
+    const WIDE dx = WIDE( aEnd.x ) - aStart.x;
+    const WIDE dy = WIDE( aEnd.y ) - aStart.y;
+    const WIDE divisor = greatestCommonDivisor( dx, dy );
+    if( divisor == 0 )
+        return { aStart };
+
+    const WIDE stepX = dx / divisor;
+    const WIDE stepY = dy / divisor;
+    std::set<WIDE> indices{ 0, divisor };
+    if( divisor > 1 )
+    {
+        indices.insert( 1 );
+        indices.insert( divisor - 1 );
+    }
+
+    // A segment can enter or leave a convex room only at one of its support
+    // lines.  Sample the lattice points bracketing every exact crossing; this
+    // is the unrestricted equivalent of the x/y/diagonal cut enumeration.
+    for( const PLANAR::SIMPLEX& cut : aAnyAngleCuts )
+    {
+        for( const PLANAR::LINE& border : cut.Borders() )
+        {
+            const WIDE borderDx = border.Dx();
+            const WIDE borderDy = border.Dy();
+            WIDE numerator = -( borderDy * ( WIDE( aStart.x ) - border.a.x )
+                                - borderDx * ( WIDE( aStart.y ) - border.a.y ) );
+            WIDE denominator = borderDy * stepX - borderDx * stepY;
+            if( denominator == 0 )
+                continue;
+            if( denominator < 0 )
+            {
+                numerator = -numerator;
+                denominator = -denominator;
+            }
+            const WIDE lower = floorDivide( numerator, denominator );
+            const WIDE upper = ceilDivide( numerator, denominator );
+            for( const WIDE& base : { lower, upper } )
+            {
+                for( int offset = -1; offset <= 1; ++offset )
+                {
+                    const WIDE candidate = base + offset;
+                    if( candidate >= 0 && candidate <= divisor )
+                        indices.insert( candidate );
+                }
+            }
+        }
     }
 
     std::vector<ROUTER_POINT> result;
