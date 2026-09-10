@@ -102,8 +102,36 @@ void DIALOG_AUTOROUTER_PROGRESS::updateProgress( wxTimerEvent& )
         m_reviewButton->Enable();
         m_reviewButton->SetLabel( _( "Review proposal" ) );
         const auto result = m_job.GetResult();
-        m_stage->SetLabel( result && result->complete && result->hostValidated
-                                  ? _( "Proposal validated" ) : _( "Routing stopped; review result" ) );
+
+        if( result && result->complete && result->hostValidated )
+        {
+            m_stage->SetLabel( _( "Proposal validated" ) );
+        }
+        else if( result && result->cancelled )
+        {
+            m_stage->SetLabel( _( "Autorouter cancelled" ) );
+        }
+        else if( result && !result->message.empty()
+                 && ( !result->hostValidated
+                      || ( result->segments.empty() && result->vias.empty() ) ) )
+        {
+            // The old generic stop message concealed synchronous failures
+            // (notably input/DRC setup failures) and made an empty proposal
+            // indistinguishable from an incomplete route.  Show the worker's
+            // concrete reason here; the review dialog still contains the
+            // complete metrics and validation details.
+            m_stage->SetLabel( wxString::FromUTF8( result->message.c_str() ) );
+        }
+        else if( result && result->hostValidated )
+        {
+            m_stage->SetLabel( wxString::Format(
+                    _( "Routing finished with %d unconnected nets and %d new DRC violations; review result" ),
+                    result->hostUnconnected, result->hostNewDrcViolations ) );
+        }
+        else
+        {
+            m_stage->SetLabel( _( "Routing stopped; review result" ) );
+        }
     }
 }
 

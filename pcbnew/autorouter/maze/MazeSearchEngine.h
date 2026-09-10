@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -78,6 +79,15 @@ public:
     ROUTING_BOARD* Board() const { return m_board.get(); }
 
     void Add( const ROUTING_CONNECTION& aConnection );
+    /**
+     * Add retained host copper to the transient collision/congestion model
+     * without turning it into electrical worker copper.  Whole-net reroute
+     * tasks must still route every requested ratsnest edge; treating source
+     * tracks as connected here would let the proposal delete copper it never
+     * regenerated.  A later checked shove removes this static record and
+     * inserts its replacement with Add().
+     */
+    void AddStatic( const ROUTING_CONNECTION& aConnection );
     void Remove( const ROUTING_CONNECTION& aConnection );
     void Clear();
     int  Usage( const ROUTER_CELL_KEY& aCell, int aNetCode ) const;
@@ -117,8 +127,29 @@ private:
 class MAZE_SEARCH_ENGINE
 {
 public:
+    /** Layer-local pad information needed by FoundConnectionInserter's
+     * source-derived neckdown fallback.  The worker never dereferences a
+     * live PAD while routing. */
+    struct PIN_ENTRY_STYLE
+    {
+        ROUTING_EDGE_STYLE style;
+        std::int64_t       maxPadWidth = 0;
+        std::int64_t       clearance = 0;
+    };
+
+    /**
+     * Build a search engine for an immutable board snapshot.  Fanout can
+     * select a different legal ViaRule entry for each SMD pin of one net;
+     * aViaOverride is deliberately scoped to one net and one engine so that
+     * the search, conflict predicate, and strict insertion all see the same
+     * padstack.  Ordinary batch routing leaves both optional arguments at
+     * their defaults.
+     */
     MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
-                        ROUTING_OCCUPANCY& aOccupancy );
+                        ROUTING_OCCUPANCY& aOccupancy, int aViaOverrideNetCode = 0,
+                        std::optional<ROUTING_VIA_DIMENSION> aViaOverride = std::nullopt,
+                        int aTrackWidthOverrideNetCode = 0,
+                        std::optional<std::int64_t> aTrackWidthOverride = std::nullopt );
 
     std::optional<ROUTING_CONNECTION> FindConnection( const ROUTING_PAD& aStart,
                                                        const ROUTING_PAD& aTarget,
@@ -136,21 +167,73 @@ public:
             const ROUTING_CONNECTION& aCandidate ) const;
 
     bool CanUseSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
-                        bool aForVia = false ) const;
+                        bool aForVia = false,
+                        const ROUTING_EDGE_STYLE* aStyle = nullptr ) const;
     /** Strict insertion check: never inherits a negotiated-search ripup flag.
      * Endpoint copper is the new trace width, not the already-existing pad size.
      */
-    bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd ) const;
+    bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
+                           const ROUTING_EDGE_STYLE* aStyle = nullptr ) const;
+    std::int64_t ResolveTrackWidth( int aNetCode,
+                                    const ROUTING_EDGE_STYLE& aStyle ) const;
+    std::optional<PIN_ENTRY_STYLE> PinEntryStyle( std::size_t aPadIndex,
+                                                  const ROUTER_NODE& aNode,
+                                                  int aNetCode,
+                                                  std::int64_t aNormalTrackWidth ) const;
     /** Fixed rectangular obstacle/orthogonal spring-over adapter. Unsupported
      * geometry returns no proposal; all returned edges need strict preflight.
      */
     std::optional<ROUTING_CONNECTION> SpringOverConnection(
             const ROUTING_CONNECTION& aConnection, const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+    /**
+     * Spring a generated connection over transient worker copper.  This is
+     * used by checked forced insertion to move a mutable generated trace
+     * around the incoming path without turning that copper into a permanent
+     * board-snapshot obstacle.  It intentionally fails closed for unsupported
+     * geometry and does not make original host copper movable.
+     */
+    std::optional<ROUTING_CONNECTION> SpringOverConnection(
+            const ROUTING_CONNECTION& aConnection,
+            const std::vector<ROUTING_CONNECTION>& aTransientObstacles,
+            const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+    /**
+     * Relocate one mutable via away from transient worker copper.  A complete
+     * isolated source via can be translated directly; generated worker
+     * trace-via-trace chains also rebuild their two adjacent legs.  Static
+     * source contacts are retained separately by ShoveViaConnectionPlan.
+     * This is a
+     * checked forced-insertion primitive, not a claim that arbitrary host
+     * vias or every source DrillItemMover contact graph are movable.
+     */
+    std::optional<ROUTING_CONNECTION> ShoveViaConnection(
+            const ROUTING_CONNECTION& aConnection,
+            const std::vector<ROUTING_CONNECTION>& aTransientObstacles,
+            const ROUTER_CANCEL_CALLBACK& aCancel,
+            const std::vector<ROUTING_CONNECTION>& aStaticDrillObstacles = {},
+            const std::function<bool( const ROUTING_CONNECTION& )>& aPlacementFilter = {} ) const;
+    /** Build the atomic worker equivalent of DrillItem.moveBy().  In addition
+     * to the moved drill it preserves every supported static trace contact by
+     * materialising that trace and adding one old-centre-to-new-centre bridge
+     * per contacted layer.  aContactCandidates is an explicit live/static
+     * route view because collision-only source copper is intentionally absent
+     * from ROUTING_BOARD's electrical item graph. */
+    std::optional<ROUTING_VIA_SHOVE_PLAN> ShoveViaConnectionPlan(
+            const ROUTING_CONNECTION& aConnection,
+            const std::vector<ROUTING_CONNECTION>& aTransientObstacles,
+            const std::vector<ROUTING_CONNECTION>& aContactCandidates,
+            const ROUTER_CANCEL_CALLBACK& aCancel ) const;
     const ROOM_SEARCH_METRICS& LastRoomSearchMetrics() const { return m_roomMetrics; }
 
 private:
     std::vector<SHAPE_TREE_ENTRY> roomObstacles( int aNet, int aLayer, bool aForVia,
+                                               bool aSkipGeneralConvex,
                                                const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+    /** The rectangular room/frontier cannot faithfully represent an arbitrary
+     * convex contour. A layer which contains one stays on the exact visibility
+     * fallback; other physical layers may still use rooms.  Drill candidates
+     * on that mixed-stack path are checked against the real convex contour
+     * before they are accepted. */
+    bool hasGeneralConvexRoomGeometry( int aNet, int aLayer ) const;
     std::optional<ROUTING_CONNECTION> findMultilayerRoomConnection(
             const std::vector<ROUTING_TERMINAL>& aStarts,
             const std::vector<ROUTING_TERMINAL>& aTargets, int aRetry, int& aExpanded,
@@ -191,21 +274,43 @@ private:
     int  layerOrdinal( int aLayer ) const;
     bool isOnPadLayer( const ROUTING_PAD& aPad, int aLayer ) const;
     bool isPointAllowed( const ROUTER_POINT& aPoint, int aLayer, int aNetCode,
-                         bool aForVia, std::int64_t aEndpointRadius = -1 ) const;
+                         bool aForVia, std::int64_t aEndpointRadius = -1,
+                         std::int64_t aDrillRadius = -1,
+                         std::int64_t aEdgeClearance = 0 ) const;
     bool isSegmentAllowed( const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd, int aLayer,
                            int aNetCode, bool aForVia, std::int64_t aStartRadius = -1,
-                           std::int64_t aEndRadius = -1 ) const;
+                           std::int64_t aEndRadius = -1,
+                           std::int64_t aSegmentRadius = -1,
+                           std::int64_t aEdgeClearance = 0 ) const;
     // A frontier node has already passed the point legality check when it is
     // expanded.  Avoid rechecking that same point for every outgoing edge;
     // the destination is still checked with the complete endpoint radius.
     bool isSegmentAllowedFromKnownStart( const ROUTER_POINT& aStart,
                                          const ROUTER_POINT& aEnd, int aLayer, int aNetCode,
-                                         bool aForVia, std::int64_t aEndRadius = -1 ) const;
+                                         bool aForVia, std::int64_t aEndRadius = -1,
+                                         std::int64_t aSegmentRadius = -1,
+                                         std::int64_t aEdgeClearance = 0 ) const;
     bool isInsideBoard( const ROUTER_POINT& aPoint, std::int64_t aMargin ) const;
     bool isInsideOutline( const ROUTER_POINT& aPoint ) const;
     bool isInsidePolygon( const ROUTER_POINT& aPoint,
                           const std::vector<ROUTER_POINT>& aPolygon ) const;
     bool isNearBoardEdge( const ROUTER_POINT& aPoint, std::int64_t aMargin ) const;
+    /** Static collision-only source copper is deliberately absent from the
+     * worker board's electrical graph.  Normal occupancy checks still cover
+     * static drill items that remain live, but a forced-insertion transaction
+     * temporarily removes every initial victim.  Retain the same-net
+     * hole-to-hole rule for those removed source vias while selecting a new
+     * via location. */
+    bool hasStaticViaDrillClearance(
+            const ROUTING_CONNECTION& aCandidate,
+            const std::vector<ROUTING_CONNECTION>& aStaticDrillObstacles ) const;
+    /** DrillItemMover permits trace *and* ConductionArea normal contacts. A
+     * source via may therefore move while touching a filled same-net area,
+     * but the immutable native proposal must keep its translated annulus in
+     * every area it originally contacted; otherwise the worker could claim a
+     * routed connection that the host refill disconnects. */
+    bool preservesConductionAreaContacts( const ROUTING_CONNECTION& aOriginal,
+                                          const ROUTING_CONNECTION& aReplacement ) const;
     std::int64_t netTrackRadius( int aNetCode ) const;
     std::int64_t netViaRadius( int aNetCode ) const;
     std::int64_t netViaDrillRadius( int aNetCode ) const;
@@ -213,9 +318,23 @@ private:
     std::int64_t endpointRadius( int aNetCode, const ROUTER_POINT& aPoint ) const;
     std::int64_t pairClearance( int aFirstNetCode, int aSecondNetCode,
                                 int aLayer = -1 ) const;
+    std::int64_t edgePairClearance( int aFirstNetCode, int aSecondNetCode, int aLayer,
+                                    std::int64_t aFirstEdgeClearance = 0,
+                                    std::int64_t aSecondEdgeClearance = 0 ) const;
+    /**
+     * Exact worker-route collision predicate shared by normal occupancy
+     * conflict discovery and speculative forced-via placement.  A via mover
+     * cannot rely on CanInsertSegment() alone: its candidate route may be
+     * clear of immutable board geometry while still landing on the incoming
+     * transient trace that is about to be committed.
+     */
+    bool connectionsConflict( const ROUTING_CONNECTION& aCandidate,
+                             const ROUTING_CONNECTION& aExisting ) const;
     std::int64_t obstacleExpansionRadius( const ROUTING_OBSTACLE& aObstacle, int aNetCode,
                                           int aLayer, bool aForVia,
-                                          std::int64_t aCandidateRadius = -1 ) const;
+                                          std::int64_t aCandidateRadius = -1,
+                                          std::int64_t aCandidateDrillRadius = -1,
+                                          std::int64_t aCandidateEdgeClearance = 0 ) const;
     const std::vector<std::size_t>& obstacleIndices( int aLayer ) const;
     void collectObstacleIndices( int aLayer, const ROUTER_BOX& aQuery,
                                  std::vector<std::size_t>& aResult ) const;

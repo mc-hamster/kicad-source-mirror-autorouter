@@ -28,8 +28,17 @@ class ROUTING_OCCUPANCY;
 class AUTOROUTE_ENGINE
 {
 public:
+    /**
+     * aViaOverride models one selected ViaRule candidate for an isolated
+     * fanout task.  It is intentionally not a global settings mutation:
+     * separate SMD pins on the same net may escape with different valid
+     * profiles from the source rule's ordered alternatives.
+     */
     AUTOROUTE_ENGINE( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
-                      ROUTING_OCCUPANCY& aOccupancy );
+                      ROUTING_OCCUPANCY& aOccupancy, int aViaOverrideNetCode = 0,
+                      std::optional<ROUTING_VIA_DIMENSION> aViaOverride = std::nullopt,
+                      int aTrackWidthOverrideNetCode = 0,
+                      std::optional<std::int64_t> aTrackWidthOverride = std::nullopt );
 
     std::optional<ROUTING_CONNECTION>
     AutorouteConnection( const ROUTING_PAD& aStart, const ROUTING_PAD& aTarget, int aRetry,
@@ -43,13 +52,17 @@ public:
 
     FOUND_CONNECTION_INSERTER::RESULT InsertConnection(
             const ROUTING_CONNECTION& aConnection, const std::vector<ROUTING_CONNECTION>& aRipups,
-            ROUTING_OCCUPANCY& aOccupancy, const ROUTER_CANCEL_CALLBACK& aCancel = {} ) const
+            ROUTING_OCCUPANCY& aOccupancy, const ROUTER_CANCEL_CALLBACK& aCancel = {},
+            bool aAllowRipupFallback = true ) const
     {
-        return FOUND_CONNECTION_INSERTER::Insert( aConnection, aRipups, aOccupancy, m_search, aCancel );
+        return FOUND_CONNECTION_INSERTER::Insert( aConnection, aRipups, aOccupancy, m_search,
+                                                  aCancel, aAllowRipupFallback );
     }
 
 private:
     MAZE_SEARCH_ENGINE         m_search;
+    int                        m_trackWidthOverrideNetCode = 0;
+    std::optional<std::int64_t> m_trackWidthOverride;
 };
 
 } // namespace KICAD_AUTOROUTER

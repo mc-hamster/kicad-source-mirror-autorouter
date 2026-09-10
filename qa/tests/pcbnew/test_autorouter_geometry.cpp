@@ -35,6 +35,21 @@ BOOST_AUTO_TEST_CASE( ExactRationalGeometryRejectsRoundingAndInvalidShapes )
     BOOST_CHECK( POINT( huge * 6, huge, huge * 2 ) == p );
     BOOST_CHECK_EQUAL( p.CompareX( POINT( 3, 9 ) ), 0 );
     BOOST_CHECK_EQUAL( p.CompareY( POINT( 3, 1 ) ), -1 );
+    // Rational support intersections are not rounded into a single arbitrary
+    // grid point.  The router must enumerate the exact floor/ceil envelope
+    // and prove each candidate legal against the real convex obstacle.
+    const auto pBounds = p.SurroundingBox();
+    BOOST_REQUIRE( pBounds );
+    BOOST_CHECK_EQUAL( pBounds->minX, 3 );
+    BOOST_CHECK_EQUAL( pBounds->maxX, 3 );
+    BOOST_CHECK_EQUAL( pBounds->minY, 0 );
+    BOOST_CHECK_EQUAL( pBounds->maxY, 1 );
+    const auto negativeBounds = POINT( -1, -3, 2 ).SurroundingBox();
+    BOOST_REQUIRE( negativeBounds );
+    BOOST_CHECK_EQUAL( negativeBounds->minX, -1 );
+    BOOST_CHECK_EQUAL( negativeBounds->maxX, 0 );
+    BOOST_CHECK_EQUAL( negativeBounds->minY, -2 );
+    BOOST_CHECK_EQUAL( negativeBounds->maxY, -1 );
     BOOST_CHECK_THROW( POINT( 1, 1, 0 ), std::domain_error );
     LINE a( { INT64_MIN, INT64_MIN }, { INT64_MAX, INT64_MAX } );
     LINE b( { INT64_MIN, INT64_MAX }, { INT64_MAX, INT64_MIN } );
@@ -47,6 +62,27 @@ BOOST_AUTO_TEST_CASE( ExactRationalGeometryRejectsRoundingAndInvalidShapes )
     BOOST_CHECK_THROW( SIMPLEX( { { { 0, 0 }, { 1, 0 } }, { { 0, 1 }, { 1, 1 } },
                                    { { 1, 0 }, { 0, 1 } } } ), std::invalid_argument );
 }
+
+BOOST_AUTO_TEST_CASE( ExpandedTraceSegmentKeepsDiagonalFreeSpaceWedges )
+{
+    // A swept diagonal trace is a convex hexagon under the worker's
+    // Chebyshev clearance model.  Its axis-aligned bounding box would close
+    // the upper-left and lower-right wedges, changing source TraceShover's
+    // obstacle ordering and rejecting valid generated-trace moves.
+    const auto sweep = SIMPLEX::FromExpandedSegment(
+            { 2000000, 2000000 }, { 4000000, 4000000 }, 100000 );
+    BOOST_REQUIRE( sweep );
+    BOOST_CHECK( sweep->Contains( POINT( 3000000, 3000000 ) ) );
+    BOOST_CHECK( !sweep->Contains( POINT( 1900000, 4100000 ) ) );
+    BOOST_CHECK( !SIMPLEX::FromExpandedSegment(
+                           { 2000000, 2000000 }, { 2000000, 2000000 }, 100000 ) );
+
+    const auto cornerPass = POLYLINE::FromPoints(
+            { { 1800000, 4000000 }, { 2000000, 4200000 } } );
+    BOOST_REQUIRE( !cornerPass.Empty() );
+    BOOST_CHECK( !sweep->IntersectsSegment( cornerPass, 1 ) );
+}
+
 BOOST_AUTO_TEST_CASE( SpringOverHonorsRecursionCancellationAndFixedObstacles )
 {
     const auto path = POLYLINE::FromPoints( { { -100, 0 }, { 100, 0 } } );

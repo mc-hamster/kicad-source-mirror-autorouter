@@ -31,6 +31,7 @@ namespace KICAD_AUTOROUTER
 namespace
 {
 using CLOCK = std::chrono::steady_clock;
+constexpr int AUTOROUTER_DRC_ERROR_LIMIT = 10000;
 
 class CANCEL_REPORTER : public PROGRESS_REPORTER
 {
@@ -81,6 +82,16 @@ void initDrc( BOARD& board, CANCEL_REPORTER& reporter )
     wxFileName rules( board.GetFileName() );
     rules.SetExt( "kicad_dru" );
     engine->InitEngine( rules.Exists() ? rules : wxFileName() );
+    // The standard DRC output cap is deliberately small for an interactive
+    // report.  A private autorouter session instead needs the complete
+    // pre-route baseline so existing board errors cannot make validation fail
+    // before it has routed a single task.  Keep the unconnected-item cap: the
+    // host connectivity graph supplies that count independently.
+    for( int code = DRCE_FIRST; code <= DRCE_LAST; ++code )
+    {
+        if( code != DRCE_UNCONNECTED_ITEMS )
+            engine->SetErrorLimitOverride( code, AUTOROUTER_DRC_ERROR_LIMIT );
+    }
     engine->SetProgressReporter( &reporter );
     board.GetDesignSettings().m_DRCEngine = std::move( engine );
 }
@@ -226,12 +237,30 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
     refill( *work, reporter );
     const auto baseline = violations( *work );
     auto snapshot = KICAD_BOARD_ADAPTER( work.get() ).CreateSnapshot( settings );
+    if( !snapshot )
+        throw std::runtime_error( "Could not create an autorouter snapshot from the board" );
+
+    std::size_t snapshotConnections = 0;
+
+    for( const ROUTING_NET& net : snapshot->nets )
+        snapshotConnections += net.connections.size();
+
+    autorouterDebugLog( "Host snapshot: pads=" + std::to_string( snapshot->pads.size() )
+                        + " nets=" + std::to_string( snapshot->nets.size() )
+                        + " connections=" + std::to_string( snapshotConnections )
+                        + " obstacles=" + std::to_string( snapshot->obstacles.size() ) );
     const auto routingStarted = CLOCK::now();
     auto result = ROUTING_PIPELINE().Run( *snapshot, settings, cancel, recordProgress );
     std::int64_t routingMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             CLOCK::now() - routingStarted ).count();
     if( result.cancelled || reporter.IsCancelled() )
     { result.cancelled = true; result.complete = false; return result; }
+    autorouterDebugLog( "Pipeline result: routed=" + std::to_string( result.metrics.routedConnections )
+                        + "/" + std::to_string( result.metrics.totalConnections )
+                        + " segments=" + std::to_string( result.segments.size() )
+                        + " vias=" + std::to_string( result.vias.size() )
+                        + " complete=" + std::to_string( result.complete )
+                        + " message=" + result.message );
     apply( *work, result );
     stage( "Refilling and validating the proposal" );
     refill( *work, reporter );

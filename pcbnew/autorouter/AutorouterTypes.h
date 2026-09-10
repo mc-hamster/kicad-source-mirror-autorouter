@@ -30,6 +30,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -115,6 +116,10 @@ struct AUTOROUTER_SETTINGS
     int  traceLengthCost = 1;
     int  congestionCost = 100;
     int  bendCost = 10;
+    // Optional whole-connection retry width.  Zero disables it.  This is
+    // distinct from a pin-local neckdown: Freerouting retries an otherwise
+    // failed connection with this width before giving up the routing item.
+    std::int64_t neckWidthIU = 0;
     // Base cost for the first rip-up/reroute pass.  The batch loop scales it
     // by the pass number, matching BatchAutorouter.startRipupCosts.
     int  startRipupCost = 100;
@@ -124,7 +129,27 @@ struct AUTOROUTER_SETTINGS
     int  maxOptimizationItems = 0;     // 0 = no item limit
     int  maxRipups = 128;
     int  maxExpandedNodes = 250000;
-    int  maxFanoutPasses = 20;
+    // Fanout is a pre-pass, not the whole job.  The original unbounded
+    // Java-style defaults multiply a 10-second search by every SMD pin and
+    // every pass, so a modest board can spend tens of minutes before ordinary
+    // routing gets a chance to run.  Keep the complete fanout algorithm
+    // available through these settings, but use an interactive default that
+    // makes a short, bounded attempt and then falls back to the batch router.
+    int  maxFanoutPasses = 1;
+    int  maxFanoutItems = 0;
+    std::int64_t maxFanoutMillisecondsPerPin = 250;
+    std::int64_t fanoutTimeoutMilliseconds = 10000;
+    bool fanoutRipupAllowed = true;
+    // These are KiCad IU equivalents of Freerouting's default 2.5 mm and
+    // 4.5 mm fanout escape envelope.  The geometric pad exit requirement is
+    // still enforced as a stricter lower bound where necessary.
+    std::int64_t fanoutMinEscapeLengthIU = 2500000;
+    std::int64_t fanoutMaxEscapeLengthIU = 4500000;
+    // RoutingBoard.fanout combines the net's via rule with the board rule
+    // when this policy is enabled.  The worker has an explicit captured list
+    // of board via dimensions so it can make the same fallback without
+    // consulting a live BOARD from its background thread.
+    bool fanoutFallbackToBoardVias = true;
     // Landing sampling is still a native adapter, NOT a count of routing passes.
     int  fanoutLandingSearchSteps = 20;
     FANOUT_PIN_ORDER fanoutPinOrder = FANOUT_PIN_ORDER::OUTER_FIRST;
@@ -185,6 +210,42 @@ struct ROUTING_PAD
     // -1 identifies data-only input without host package metadata.
     int                      componentId = -1;
     int                      pinIndex = -1;
+    // The source router asks a Padstack for its geometry on the active layer
+    // when deciding whether a trace must neck down at a pin.  A single
+    // maximum radius is insufficient for asymmetric or multi-layer pads, so
+    // keep that layer-local information in the worker snapshot.
+    struct LAYER_GEOMETRY
+    {
+        int          layer = -1;
+        std::int64_t minWidth = 0;
+        std::int64_t maxWidth = 0;
+        std::int64_t clearance = 0;
+
+        bool operator==( const LAYER_GEOMETRY& aOther ) const
+        {
+            return layer == aOther.layer && minWidth == aOther.minWidth
+                   && maxWidth == aOther.maxWidth && clearance == aOther.clearance;
+        }
+    };
+
+    std::vector<LAYER_GEOMETRY> layerGeometry;
+    // Synthetic fanout-only metadata.  The real board's net rule remains
+    // untouched for the ordinary batch stage; a selected board-via fallback
+    // is attached to the synthetic landing and applied only to the fanout
+    // connection that terminates there.
+    std::int64_t fanoutViaDiameter = 0;
+    std::int64_t fanoutViaDrill = 0;
+    std::int64_t fanoutMinEscapeLength = 0;
+    std::int64_t fanoutMaxEscapeLength = 0;
+    // The synthetic landing is only electrically meaningful when its source
+    // SMD pad can actually reach it on the source layer.  BatchFanout keeps a
+    // bounded, preflighted local escape here (including the real pad centre
+    // and the landing point) when a straight stub is blocked.  The maze
+    // consumes this exact path before it considers a board-wide fallback, so
+    // an arbitrary free via point never becomes a dangling synthetic target.
+    // It is deliberately connection-local metadata, not a replacement for
+    // Freerouting's item-set fanout search.
+    std::vector<ROUTER_POINT> fanoutEscapePath;
 };
 
 
@@ -229,6 +290,22 @@ struct ROUTING_OBSTACLE
     // not replace the copper obstacle for the same item: tracks use the
     // copper-to-hole rule while vias also have to satisfy hole-to-hole.
     bool                    isHole = false;
+    // True only for a straight, unlocked existing BOARD_ITEM that the adapter
+    // captured with enough geometry to use as a *candidate* for the bounded
+    // forced-shove path.  This is deliberately not an assertion that every
+    // contact of the item is movable: the batch layer reconstructs a
+    // fail-closed trace/via neighbourhood before it permits a mutation.
+    bool                    isMovable = false;
+    // A whole-net reroute may retain unsupported source copper solely as a
+    // collision surface.  Such a copy must block maze/fanout/DRC geometry,
+    // but it must never become a ROUTING_BOARD item or satisfy an electrical
+    // ratsnest connection before the host item is explicitly regenerated.
+    bool                    isCollisionOnly = false;
+    // True on the canonical removable-source record when a collision-only
+    // copy was appended to BOARD_SNAPSHOT::obstacles.  It prevents the
+    // internal proposal DRC from counting the same physical BOARD_ITEM twice;
+    // the record remains available for exact UUID removal on acceptance.
+    bool                    isMirroredToObstacleModel = false;
 };
 
 
@@ -261,6 +338,19 @@ struct ROUTING_NET
 };
 
 
+/** A manufacturable through-via dimension captured from the KiCad board. */
+struct ROUTING_VIA_DIMENSION
+{
+    std::int64_t diameter = 0;
+    std::int64_t drill = 0;
+
+    bool operator==( const ROUTING_VIA_DIMENSION& aOther ) const
+    {
+        return diameter == aOther.diameter && drill == aOther.drill;
+    }
+};
+
+
 /** A layer-aware pair clearance captured from KiCad's DRC rule resolver. */
 struct ROUTING_CLEARANCE_RULE
 {
@@ -285,12 +375,20 @@ struct BOARD_SNAPSHOT
     // proposal can remove exactly the original BOARD_ITEMs on acceptance.
     std::vector<ROUTING_OBSTACLE> removableExistingRoutes;
     std::vector<ROUTING_NET> nets;
+    // The host's board-wide via presets.  A net normally uses its resolved
+    // netclass profile; fanout may additionally use these profiles when its
+    // explicit Freerouting-compatible fallback policy is enabled.
+    std::vector<ROUTING_VIA_DIMENSION> boardViaDimensions;
     std::vector<ROUTING_CLEARANCE_RULE> clearanceRules;
     // Manufacturing clearances are distinct from copper-to-copper netclass
     // clearances.  They are captured on the editor thread so the worker can
     // reject via/drill collisions without consulting a live DRC engine.
     std::int64_t holeClearance = 0;
     std::int64_t holeToHoleClearance = 0;
+    // The board-wide lower bound is captured explicitly because a pin's
+    // geometric neckdown width is not automatically a legal KiCad track
+    // width. More-specific DRC constraints remain an acceptance-time gate.
+    std::int64_t minimumTrackWidth = 0;
     // KiCad's modification counter captured on the editor thread.  It is not
     // used by the worker algorithm; the tool uses it to refuse acceptance if
     // the live board changed while a proposal was being reviewed.
@@ -314,6 +412,37 @@ struct ROUTER_NODE
 };
 
 
+/**
+ * Manufacturing style for one edge of a routed connection.
+ *
+ * A zero value means "inherit the net's resolved default".  Existing tests
+ * and routes which predate per-edge styles therefore retain their exact
+ * behaviour, while a forced insertion can represent the short narrow part of
+ * a neckdown (or a via with a non-default mask) without changing every other
+ * edge of the net.
+ */
+struct ROUTING_EDGE_STYLE
+{
+    std::int64_t     trackWidth = 0;
+    std::int64_t     clearance = 0;
+    std::int64_t     viaDiameter = 0;
+    std::int64_t     viaDrill = 0;
+    std::vector<int> viaLayers;
+
+    bool operator==( const ROUTING_EDGE_STYLE& aOther ) const
+    {
+        return trackWidth == aOther.trackWidth && clearance == aOther.clearance
+               && viaDiameter == aOther.viaDiameter && viaDrill == aOther.viaDrill
+               && viaLayers == aOther.viaLayers;
+    }
+
+    bool operator!=( const ROUTING_EDGE_STYLE& aOther ) const
+    {
+        return !( *this == aOther );
+    }
+};
+
+
 /** A route produced for one electrical connection. */
 struct ROUTING_CONNECTION
 {
@@ -327,7 +456,183 @@ struct ROUTING_CONNECTION
     std::size_t toPadIndex = std::numeric_limits<std::size_t>::max();
     bool        isPlaneConnection = false;
     bool        isFanoutConnection = false;
+    // Existing BOARD_ITEM copper can be present in the worker occupancy as a
+    // static collision participant while a full-net reroute is planned.  It
+    // must not become electrical worker copper or be emitted a second time
+    // unless a checked forced shove actually replaces it.  The source UUIDs
+    // remain attached to a replacement so proposal acceptance can atomically
+    // delete the exact original BOARD_ITEMs.
+    bool                    isExistingBoardRoute = false;
+    bool                    isShoveMovable = true;
+    std::vector<std::string> sourceBoardItemIds;
+    // Empty means every edge inherits the resolved net defaults.  Otherwise
+    // there is precisely one style for each pair of consecutive nodes.
+    std::vector<ROUTING_EDGE_STYLE> edgeStyles;
 };
+
+
+/** One static worker route promoted into proposal copper without changing its
+ * centreline.  A source via move uses this for each contacted source trace:
+ * KiCad acceptance removes the old BOARD_ITEM and re-emits the exact trace
+ * together with the short bridge to the moved via. */
+struct ROUTING_CONNECTION_REPLACEMENT
+{
+    ROUTING_CONNECTION original;
+    ROUTING_CONNECTION replacement;
+};
+
+
+/** Atomic result of moving a drill item with its source-style trace contacts.
+ *
+ * Freerouting's DrillItem.moveBy() moves the via and inserts one bridge trace
+ * for each unique contacted-trace style.  The native worker cannot mutate
+ * host BOARD_ITEMs in place, so the unchanged contacted traces are promoted
+ * from static occupancy records and emitted as proposal geometry instead.
+ */
+struct ROUTING_VIA_SHOVE_PLAN
+{
+    ROUTING_CONNECTION replacement;
+    std::vector<ROUTING_CONNECTION_REPLACEMENT> materializedContacts;
+    std::vector<ROUTING_CONNECTION> bridges;
+};
+
+
+inline bool HasValidEdgeStyles( const ROUTING_CONNECTION& aConnection )
+{
+    return aConnection.edgeStyles.empty()
+           || aConnection.edgeStyles.size() + 1 == aConnection.nodes.size();
+}
+
+
+inline const ROUTING_EDGE_STYLE& EdgeStyle( const ROUTING_CONNECTION& aConnection,
+                                            std::size_t aEdgeIndex )
+{
+    static const ROUTING_EDGE_STYLE inherited;
+
+    if( aConnection.edgeStyles.empty() )
+        return inherited;
+
+    return aConnection.edgeStyles.at( aEdgeIndex );
+}
+
+
+inline void EnsureEdgeStyles( ROUTING_CONNECTION& aConnection )
+{
+    const std::size_t edgeCount = aConnection.nodes.empty() ? 0 : aConnection.nodes.size() - 1;
+
+    if( aConnection.edgeStyles.empty() )
+    {
+        aConnection.edgeStyles.resize( edgeCount );
+        return;
+    }
+
+    if( aConnection.edgeStyles.size() != edgeCount )
+        aConnection.edgeStyles.resize( edgeCount );
+}
+
+
+inline bool SameRouteGeometry( const ROUTING_CONNECTION& aLeft,
+                               const ROUTING_CONNECTION& aRight )
+{
+    if( aLeft.netCode != aRight.netCode || aLeft.nodes != aRight.nodes
+        || aLeft.edgeStyles != aRight.edgeStyles )
+    {
+        return false;
+    }
+
+    // Normal worker routes historically have no physical identity, so retain
+    // their geometry-only comparison.  Static source BOARD_ITEM routes do:
+    // two coincident tracks/vias must not be treated as one victim merely
+    // because their copper geometry is identical.
+    if( aLeft.sourceBoardItemIds.empty() && aRight.sourceBoardItemIds.empty() )
+        return true;
+
+    return aLeft.sourceBoardItemIds == aRight.sourceBoardItemIds;
+}
+
+
+/** True when replacing the given contiguous edge run by one edge cannot lose
+ * a width, clearance, or via-mask decision. */
+inline bool CanCollapseRouteEdges( const ROUTING_CONNECTION& aConnection,
+                                   std::size_t aFirstEdge, std::size_t aLastEdge )
+{
+    if( aFirstEdge > aLastEdge || aLastEdge + 1 >= aConnection.nodes.size()
+        || !HasValidEdgeStyles( aConnection ) )
+    {
+        return false;
+    }
+
+    const ROUTING_EDGE_STYLE& first = EdgeStyle( aConnection, aFirstEdge );
+
+    for( std::size_t edge = aFirstEdge + 1; edge <= aLastEdge; ++edge )
+        if( EdgeStyle( aConnection, edge ) != first )
+            return false;
+
+    return true;
+}
+
+
+/** Replace nodes (firstNode, lastNode) by one direct edge. Callers must first
+ * prove the replacement geometry is legal. */
+inline bool CollapseRouteNodes( ROUTING_CONNECTION& aConnection, std::size_t aFirstNode,
+                                std::size_t aLastNode )
+{
+    if( aFirstNode >= aLastNode || aLastNode >= aConnection.nodes.size()
+        || !CanCollapseRouteEdges( aConnection, aFirstNode, aLastNode - 1 ) )
+    {
+        return false;
+    }
+
+    if( !aConnection.edgeStyles.empty() && aLastNode > aFirstNode + 1 )
+    {
+        aConnection.edgeStyles.erase(
+                aConnection.edgeStyles.begin()
+                        + static_cast<std::ptrdiff_t>( aFirstNode + 1 ),
+                aConnection.edgeStyles.begin() + static_cast<std::ptrdiff_t>( aLastNode ) );
+    }
+
+    aConnection.nodes.erase( aConnection.nodes.begin()
+                                     + static_cast<std::ptrdiff_t>( aFirstNode + 1 ),
+                             aConnection.nodes.begin()
+                                     + static_cast<std::ptrdiff_t>( aLastNode ) );
+    return true;
+}
+
+
+inline bool RemoveRouteEndpoint( ROUTING_CONNECTION& aConnection, bool aFront )
+{
+    if( aConnection.nodes.empty() || !HasValidEdgeStyles( aConnection ) )
+        return false;
+
+    if( aConnection.nodes.size() == 1 )
+    {
+        aConnection.nodes.clear();
+        aConnection.edgeStyles.clear();
+        return true;
+    }
+
+    if( !aConnection.edgeStyles.empty() )
+    {
+        if( aFront )
+            aConnection.edgeStyles.erase( aConnection.edgeStyles.begin() );
+        else
+            aConnection.edgeStyles.pop_back();
+    }
+
+    if( aFront )
+        aConnection.nodes.erase( aConnection.nodes.begin() );
+    else
+        aConnection.nodes.pop_back();
+
+    return true;
+}
+
+
+inline void ClearRouteGeometry( ROUTING_CONNECTION& aConnection )
+{
+    aConnection.nodes.clear();
+    aConnection.edgeStyles.clear();
+}
 
 
 struct ROUTING_SEGMENT
@@ -337,6 +642,11 @@ struct ROUTING_SEGMENT
     ROUTER_POINT           start;
     ROUTER_POINT           end;
     std::int64_t           width = 0;
+    // Per-edge clearance is routing metadata, not a KiCad track property.
+    // It preserves the clearance class resolved by a forced/neckdown edge so
+    // worker-side conflict checks and final proposal DRC use the same rule
+    // that admitted the connection.
+    std::int64_t           clearance = 0;
 };
 
 
@@ -351,6 +661,9 @@ struct ROUTING_VIA
     // Explicit layers touched by the via.  This is needed for inner-layer
     // spans because KiCad's layer enum values are not a physical ordering.
     std::vector<int> layers;
+    // See ROUTING_SEGMENT::clearance.  This applies to the via's copper
+    // annulus; hole-to-hole clearance remains a distinct board rule.
+    std::int64_t           clearance = 0;
 };
 
 
@@ -399,6 +712,10 @@ struct ROUTING_RESULT
     ROUTER_METRICS metrics;
     bool complete = false;
     bool cancelled = false;
+    // A fanout timeout is not a job cancellation.  The main batch stage is
+    // still allowed to finish the board, and the UI can report that the
+    // fallback path was used instead of implying a hung worker.
+    bool fanoutTimedOut = false;
     std::string message;
     bool hostValidated = false;
     int hostUnconnected = -1;

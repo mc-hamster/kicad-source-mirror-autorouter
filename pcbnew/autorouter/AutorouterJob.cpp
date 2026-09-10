@@ -22,6 +22,7 @@
  */
 
 #include "AutorouterJob.h"
+#include "AutorouterDebug.h"
 #include "board/KicadRoutingSession.h"
 
 #include <algorithm>
@@ -106,6 +107,7 @@ std::optional<ROUTING_RESULT> AUTOROUTER_JOB::GetResult() const
 
 void AUTOROUTER_JOB::run()
 {
+    AUTOROUTER_DEBUG_SCOPE debugScope( "AUTOROUTER_JOB::run" );
     ROUTING_RESULT result;
 
     if( !m_snapshot )
@@ -116,6 +118,15 @@ void AUTOROUTER_JOB::run()
     {
         try
         {
+            std::size_t connectionCount = 0;
+
+            for( const ROUTING_NET& net : m_snapshot->nets )
+                connectionCount += net.connections.size();
+
+            autorouterDebugLog( "Job input: pads=" + std::to_string( m_snapshot->pads.size() )
+                                + " nets=" + std::to_string( m_snapshot->nets.size() )
+                                + " connections=" + std::to_string( connectionCount )
+                                + " host-session=" + ( m_hostSession ? "yes" : "no" ) );
             const ROUTER_CANCEL_CALLBACK cancel = [this] { return m_cancel.load(); };
             const ROUTER_PROGRESS_CALLBACK progress = [this]( const ROUTER_PROGRESS& state )
             {
@@ -134,6 +145,15 @@ void AUTOROUTER_JOB::run()
             result.message = "Autorouter failed with an unknown exception";
         }
     }
+
+    autorouterDebugLog( "Job result: complete=" + std::to_string( result.complete )
+                        + " cancelled=" + std::to_string( result.cancelled )
+                        + " host-validated=" + std::to_string( result.hostValidated )
+                        + " routed=" + std::to_string( result.metrics.routedConnections ) + "/"
+                        + std::to_string( result.metrics.totalConnections )
+                        + " segments=" + std::to_string( result.segments.size() )
+                        + " vias=" + std::to_string( result.vias.size() )
+                        + " message=" + result.message );
 
     if( m_cancel.load() )
     {

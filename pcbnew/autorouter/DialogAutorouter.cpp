@@ -147,6 +147,14 @@ DIALOG_AUTOROUTER_SETTINGS::DIALOG_AUTOROUTER_SETTINGS(
     m_gridStep->SetDigits( 3 );
     costGrid->Add( m_gridStep, 0, wxEXPAND );
 
+    costGrid->Add( new wxStaticText( content, wxID_ANY, _( "Retry neck width (mm)" ) ), 0,
+                   wxALIGN_CENTER_VERTICAL );
+    m_neckWidth = new wxSpinCtrlDouble( content, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                        wxDefaultSize, wxSP_ARROW_KEYS, 0.0, 10.0,
+                                        pcbIUScale.IUTomm( m_settings.neckWidthIU ), 0.001 );
+    m_neckWidth->SetDigits( 3 );
+    costGrid->Add( m_neckWidth, 0, wxEXPAND );
+
     m_viaCost = addIntegerControl( content, costGrid, _( "Via cost" ), m_settings.viaCost, 0,
                                    1000000 );
     m_planeViaCost = addIntegerControl( content, costGrid, _( "Plane via cost" ),
@@ -300,6 +308,8 @@ AUTOROUTER_SETTINGS DIALOG_AUTOROUTER_SETTINGS::GetSettings() const
     }
 
     result.gridStepIU = std::max( 1, pcbIUScale.mmToIU( m_gridStep->GetValue() ) );
+    result.neckWidthIU = std::max<std::int64_t>(
+            0, pcbIUScale.mmToIU( m_neckWidth->GetValue() ) );
     result.viaCost = m_viaCost->GetValue();
     result.planeViaCost = m_planeViaCost->GetValue();
     result.traceLengthCost = m_traceLengthCost->GetValue();

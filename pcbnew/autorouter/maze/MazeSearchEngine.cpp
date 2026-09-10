@@ -23,19 +23,25 @@
 
 #include "MazeSearchEngine.h"
 #include "../board/optimize/TraceShover.h"
+#include "../geometry/planar/ContactGeometry.h"
+#include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
 
 #include "../AutorouterDebug.h"
 #include "../expansion/ExpansionGraph.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <queue>
+#include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -82,6 +88,24 @@ double distance( const ROUTER_POINT& aLeft, const ROUTER_POINT& aRight )
 }
 
 
+std::optional<PLANAR::SIMPLEX> exactConvexClearanceShape(
+        const ROUTING_OBSTACLE& aObstacle, std::int64_t aRadius )
+{
+    // Source TileShape routing works directly on convex support lines.  Keep
+    // the rational representation for a non-rounded, hole-free snapshot
+    // contour rather than falling back to floating samples or its enclosing
+    // rectangle. Rounded and holed contours retain their dedicated generic
+    // geometry paths until their arc/decomposition semantics are ported.
+    if( aObstacle.kind != ROUTER_OBSTACLE_KIND::POLYGON || aObstacle.radius != 0
+        || !aObstacle.polygonHoles.empty() )
+    {
+        return {};
+    }
+
+    return PLANAR::SIMPLEX::FromConvexPolygon( aObstacle.polygon, aRadius );
+}
+
+
 bool rangesOverlap( std::int64_t aMinA, std::int64_t aMaxA, std::int64_t aMinB,
                     std::int64_t aMaxB )
 {
@@ -97,8 +121,13 @@ bool rangesOverlap( std::int64_t aMinA, std::int64_t aMaxA, std::int64_t aMinB,
 
 int orientation( const ROUTER_POINT& a, const ROUTER_POINT& b, const ROUTER_POINT& c )
 {
-    const long double value = static_cast<long double>( b.x - a.x ) * ( c.y - a.y )
-                              - static_cast<long double>( b.y - a.y ) * ( c.x - a.x );
+    // Cast before subtracting.  Board coordinates are signed 64-bit IU, so
+    // subtracting in the integral domain can overflow before the otherwise
+    // exact long-double orientation predicate sees the operands.
+    const long double value = ( static_cast<long double>( b.x ) - a.x )
+                              * ( static_cast<long double>( c.y ) - a.y )
+                              - ( static_cast<long double>( b.y ) - a.y )
+                                        * ( static_cast<long double>( c.x ) - a.x );
 
     if( value > 0 )
         return 1;
@@ -171,9 +200,9 @@ bool pointInOrOnPolygon( const ROUTER_POINT& aPoint, const std::vector<ROUTER_PO
             return true;
 
         const bool intersects = ( ( a.y > aPoint.y ) != ( b.y > aPoint.y ) )
-                                 && ( static_cast<long double>( b.x - a.x )
-                                              * ( aPoint.y - a.y )
-                                      / static_cast<long double>( b.y - a.y )
+                                 && ( ( static_cast<long double>( b.x ) - a.x )
+                                              * ( static_cast<long double>( aPoint.y ) - a.y )
+                                      / ( static_cast<long double>( b.y ) - a.y )
                                       + a.x
                                       > aPoint.x );
 
@@ -335,6 +364,50 @@ bool segmentsWithinClearance( const ROUTER_POINT& aFirstStart,
 }
 
 
+bool segmentIntersectsPolygonWithHoles( const ROUTER_POINT& aStart,
+                                        const ROUTER_POINT& aEnd,
+                                        const ROUTING_OBSTACLE& aObstacle,
+                                        std::int64_t aRadius )
+{
+    // A generic polygon is not safe to validate by sampling along the
+    // candidate trace.  In particular, a chord joining two arms of a concave
+    // *hole* can pass through solid material while both sampled endpoints
+    // remain legal.  The minimum distance of two finite line segments occurs
+    // at an intersection or at one of their endpoints, so test every outer
+    // and hole boundary exactly enough for the worker's integer geometry.
+    // Together with solid-area endpoint classification this covers every
+    // possible transition between outside, copper, and a hole without a
+    // grid-dependent blind spot.
+    if( pointInPolygonWithHoles( aStart, aObstacle.polygon, aObstacle.polygonHoles )
+        || pointInPolygonWithHoles( aEnd, aObstacle.polygon, aObstacle.polygonHoles ) )
+    {
+        return true;
+    }
+
+    const double clearance = static_cast<double>( std::max<std::int64_t>( 0, aRadius ) );
+    const auto hitsBoundary = [&]( const std::vector<ROUTER_POINT>& aContour )
+    {
+        if( aContour.size() < 2 )
+            return false;
+
+        for( std::size_t index = 0; index < aContour.size(); ++index )
+            if( segmentsWithinClearance( aStart, aEnd, aContour[index],
+                                         aContour[( index + 1 ) % aContour.size()], clearance ) )
+            {
+                return true;
+            }
+
+        return false;
+    };
+
+    if( hitsBoundary( aObstacle.polygon ) )
+        return true;
+
+    return std::any_of( aObstacle.polygonHoles.begin(), aObstacle.polygonHoles.end(),
+                        hitsBoundary );
+}
+
+
 } // namespace
 
 
@@ -384,7 +457,8 @@ void ROUTING_OCCUPANCY::InitializeBoard( const BOARD_SNAPSHOT& aBoard,
 {
     auto board = std::make_unique<ROUTING_BOARD>( aBoard, aSettings );
     for( const auto& connection : m_connections )
-        board->AddRoute( connection );
+        if( !connection.isExistingBoardRoute )
+            board->AddRoute( connection );
     m_board = std::move( board );
 }
 
@@ -448,14 +522,44 @@ void ROUTING_OCCUPANCY::Add( const ROUTING_CONNECTION& aConnection )
 }
 
 
+void ROUTING_OCCUPANCY::AddStatic( const ROUTING_CONNECTION& aConnection )
+{
+    if( !aConnection.complete || !aConnection.isExistingBoardRoute
+        || !HasValidEdgeStyles( aConnection ) )
+    {
+        throw std::invalid_argument( "Cannot insert an invalid static board routing connection" );
+    }
+
+    // This deliberately mirrors Add's congestion accounting but does not
+    // call ROUTING_BOARD::AddRoute.  Static source copper must block a
+    // proposed trace and participate in conflict discovery, yet a full-net
+    // reroute may not use it to satisfy CountMissing() before that source
+    // copper is regenerated (or explicitly preserved) in the proposal.
+    TRANSACTION transaction( *this );
+    m_connections.push_back( aConnection );
+
+    for( std::size_t i = 1; i < aConnection.nodes.size(); ++i )
+    {
+        if( aConnection.nodes[i - 1].layer != aConnection.nodes[i].layer )
+            continue;
+
+        for( const ROUTER_CELL_KEY& cell : CellsForSegment( aConnection.nodes[i - 1],
+                                                             aConnection.nodes[i] ) )
+        {
+            ++m_usage[cell][aConnection.netCode];
+        }
+    }
+    transaction.Commit();
+}
+
+
 void ROUTING_OCCUPANCY::Remove( const ROUTING_CONNECTION& aConnection )
 {
     auto connectionIt = std::find_if(
             m_connections.begin(), m_connections.end(),
             [&]( const ROUTING_CONNECTION& aExisting )
             {
-                return aExisting.netCode == aConnection.netCode
-                       && aExisting.nodes == aConnection.nodes;
+                return SameRouteGeometry( aExisting, aConnection );
             } );
 
     if( connectionIt == m_connections.end() )
@@ -463,7 +567,7 @@ void ROUTING_OCCUPANCY::Remove( const ROUTING_CONNECTION& aConnection )
 
     // Copy first: callers may pass a reference into Connections().
     const ROUTING_CONNECTION removed = *connectionIt;
-    if( m_board )
+    if( m_board && !removed.isExistingBoardRoute )
         m_board->RemoveRoute( removed );
     m_connections.erase( connectionIt );
 
@@ -634,7 +738,11 @@ std::size_t MAZE_SEARCH_ENGINE::NODE_KEY_HASH::operator()( const ROUTER_NODE& aN
 
 MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
                                         const AUTOROUTER_SETTINGS& aSettings,
-                                        ROUTING_OCCUPANCY& aOccupancy ) :
+                                        ROUTING_OCCUPANCY& aOccupancy,
+                                        int aViaOverrideNetCode,
+                                        std::optional<ROUTING_VIA_DIMENSION> aViaOverride,
+                                        int aTrackWidthOverrideNetCode,
+                                        std::optional<std::int64_t> aTrackWidthOverride ) :
         m_board( aBoard ),
         m_settings( aSettings ),
         m_occupancy( aOccupancy ),
@@ -676,6 +784,35 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
             if( !inserted )
                 radiusIt->second = std::max( radiusIt->second, radius );
         }
+    }
+
+    // RoutingBoard.fanout() can select a different entry from its combined
+    // net/board ViaRule for each pin.  A single net-wide mutation makes the
+    // first pin's profile leak into every later fanout task: search then
+    // rejects a narrow landing using the earlier large annulus, or explores
+    // it at the wrong cost before the final per-edge style corrects it.
+    // Keep this override local to the fanout task's engine.  All resulting
+    // probes, conflict checks, and strict insertion therefore use exactly
+    // the profile carried by that synthetic landing.
+    if( aViaOverride && aViaOverrideNetCode > 0 && aViaOverride->diameter > 0
+        && aViaOverride->drill > 0 )
+    {
+        m_viaRadii[aViaOverrideNetCode] = std::max<std::int64_t>(
+                1, aViaOverride->diameter / 2 );
+        m_viaDrillRadii[aViaOverrideNetCode] = std::max<std::int64_t>(
+                1, aViaOverride->drill / 2 );
+    }
+
+    // AutorouteConnectionRouter's optional necked retry owns a separate
+    // immutable engine.  Narrow its local track radius before any spatial
+    // index padding or clearance test is derived.  The caller makes output
+    // trace styles explicit, so this changes neither other nets nor the final
+    // KiCad width of an unrelated ordinary route.
+    if( aTrackWidthOverride && aTrackWidthOverrideNetCode > 0
+        && *aTrackWidthOverride > 0 )
+    {
+        m_trackRadii[aTrackWidthOverrideNetCode] = std::max<std::int64_t>(
+                1, *aTrackWidthOverride / 2 );
     }
 
     // The old implementation walked every obstacle on a layer for every
@@ -994,6 +1131,58 @@ std::int64_t MAZE_SEARCH_ENGINE::netClearance( int aNetCode ) const
 }
 
 
+std::int64_t MAZE_SEARCH_ENGINE::ResolveTrackWidth( int aNetCode,
+                                                     const ROUTING_EDGE_STYLE& aStyle ) const
+{
+    return aStyle.trackWidth > 0 ? aStyle.trackWidth : 2 * netTrackRadius( aNetCode );
+}
+
+
+std::optional<MAZE_SEARCH_ENGINE::PIN_ENTRY_STYLE> MAZE_SEARCH_ENGINE::PinEntryStyle(
+        std::size_t aPadIndex, const ROUTER_NODE& aNode, int aNetCode,
+        std::int64_t aNormalTrackWidth ) const
+{
+    if( aPadIndex >= m_board.pads.size() || aNormalTrackWidth <= 0 )
+        return {};
+
+    const ROUTING_PAD& pad = m_board.pads[aPadIndex];
+
+    if( pad.netCode != aNetCode || pad.position != aNode.point
+        || std::find( pad.layers.begin(), pad.layers.end(), aNode.layer ) == pad.layers.end() )
+    {
+        return {};
+    }
+
+    const auto geometry = std::find_if( pad.layerGeometry.begin(), pad.layerGeometry.end(),
+                                        [&]( const ROUTING_PAD::LAYER_GEOMETRY& aGeometry )
+                                        {
+                                            return aGeometry.layer == aNode.layer;
+                                        } );
+
+    if( geometry == pad.layerGeometry.end() || geometry->minWidth <= 0
+        || geometry->maxWidth <= 0 )
+    {
+        return {};
+    }
+
+    // Pin.getTraceNeckdownHalfwidth() in the pinned Java source is exactly
+    // floor(max(minWidth / 2 - 1, 1)); preserve that integer behavior before
+    // applying KiCad's global manufacturing lower bound.
+    const std::int64_t halfWidth = std::max<std::int64_t>( geometry->minWidth / 2 - 1, 1 );
+    const std::int64_t neckdownWidth = std::max<std::int64_t>(
+            2 * halfWidth, m_board.minimumTrackWidth );
+
+    PIN_ENTRY_STYLE result;
+    result.style.trackWidth = neckdownWidth;
+    result.maxPadWidth = geometry->maxWidth;
+    // The source uses the trace/pin clearance matrix at this point.  The
+    // adapter preserves the pad-side resolved clearance; the net value is a
+    // conservative fallback when an input did not carry per-pad metadata.
+    result.clearance = std::max( geometry->clearance, netClearance( aNetCode ) );
+    return result;
+}
+
+
 std::int64_t MAZE_SEARCH_ENGINE::endpointRadius( int aNetCode,
                                                  const ROUTER_POINT& aPoint ) const
 {
@@ -1036,9 +1225,29 @@ std::int64_t MAZE_SEARCH_ENGINE::pairClearance( int aFirstNetCode,
 }
 
 
+std::int64_t MAZE_SEARCH_ENGINE::edgePairClearance(
+        int aFirstNetCode, int aSecondNetCode, int aLayer,
+        std::int64_t aFirstEdgeClearance, std::int64_t aSecondEdgeClearance ) const
+{
+    // The source stores a clearance *class* on every routed trace/via.  The
+    // immutable native snapshot has already resolved that class to a
+    // distance, so it is an additional minimum on the normal net-pair rule,
+    // not a second copy of both netclass values.  Same-net copper remains an
+    // electrical connection surface and deliberately has no copper spacing
+    // requirement here (drill spacing is checked separately).
+    if( aFirstNetCode == aSecondNetCode )
+        return 0;
+
+    return std::max( { pairClearance( aFirstNetCode, aSecondNetCode, aLayer ),
+                       std::max<std::int64_t>( 0, aFirstEdgeClearance ),
+                       std::max<std::int64_t>( 0, aSecondEdgeClearance ) } );
+}
+
+
 std::int64_t MAZE_SEARCH_ENGINE::obstacleExpansionRadius(
         const ROUTING_OBSTACLE& aObstacle, int aNetCode, int aLayer, bool aForVia,
-        std::int64_t aCandidateRadius ) const
+        std::int64_t aCandidateRadius, std::int64_t aCandidateDrillRadius,
+        std::int64_t aCandidateEdgeClearance ) const
 {
     if( !aObstacle.isHole )
     {
@@ -1046,13 +1255,17 @@ std::int64_t MAZE_SEARCH_ENGINE::obstacleExpansionRadius(
                                                       ? aCandidateRadius
                                                       : aForVia ? netViaRadius( aNetCode )
                                                                 : netTrackRadius( aNetCode );
+        const std::int64_t styleClearance = std::max<std::int64_t>( 0,
+                                                                     aCandidateEdgeClearance );
         const std::int64_t clearance = aObstacle.netCode != 0
                                                 && aObstacle.netCode != aNetCode
-                                        ? std::max( pairClearance( aNetCode, aObstacle.netCode,
-                                                                   aLayer ),
+                                        ? std::max( edgePairClearance( aNetCode,
+                                                                      aObstacle.netCode, aLayer,
+                                                                      styleClearance ),
                                                     aObstacle.clearance )
-                                        : std::max( netClearance( aNetCode ),
-                                                    aObstacle.clearance );
+                                        : std::max( { netClearance( aNetCode ),
+                                                      aObstacle.clearance,
+                                                      styleClearance } );
         return aObstacle.radius + candidateRadius + clearance;
     }
 
@@ -1066,7 +1279,9 @@ std::int64_t MAZE_SEARCH_ENGINE::obstacleExpansionRadius(
                                               : netViaRadius( aNetCode );
     const std::int64_t copperExpansion = copperRadius + m_board.holeClearance;
     const std::int64_t drillExpansion = aForVia
-                                                ? netViaDrillRadius( aNetCode )
+                                                ? ( aCandidateDrillRadius >= 0
+                                                            ? aCandidateDrillRadius
+                                                            : netViaDrillRadius( aNetCode ) )
                                                           + m_board.holeToHoleClearance
                                                 : ( aCandidateRadius >= 0
                                                             ? aCandidateRadius
@@ -1168,7 +1383,9 @@ void MAZE_SEARCH_ENGINE::collectObstacleIndices( int aLayer, const ROUTER_BOX& a
 
 bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer, int aNetCode,
                                          bool aForVia,
-                                         std::int64_t aEndpointRadius ) const
+                                         std::int64_t aEndpointRadius,
+                                         std::int64_t aDrillRadius,
+                                         std::int64_t aEdgeClearance ) const
 {
     if( autorouterDebugEnabled() )
         ++m_debugPointChecks;
@@ -1198,6 +1415,8 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                                                 ? aEndpointRadius
                                                 : ( aForVia ? netViaRadius( aNetCode )
                                                             : netTrackRadius( aNetCode ) );
+    const std::int64_t drillRadius = aForVia
+            ? ( aDrillRadius >= 0 ? aDrillRadius : netViaDrillRadius( aNetCode ) ) : 0;
     const std::int64_t margin = m_board.edgeClearance + geometryRadius;
 
     if( !isInsideBoard( aPoint, margin ) )
@@ -1232,7 +1451,8 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
             continue;
 
         const std::int64_t radius = obstacleExpansionRadius(
-                obstacle, aNetCode, aLayer, aForVia, geometryRadius );
+                obstacle, aNetCode, aLayer, aForVia, geometryRadius, drillRadius,
+                aEdgeClearance );
 
         // Visibility expansion probes many obstacles that are far away from
         // the candidate point.  Reject those with an integer bounding-box
@@ -1257,6 +1477,11 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
         else if( obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
         {
             if( pointToSegmentDistance( aPoint, obstacle.start, obstacle.end ) <= radius )
+                return false;
+        }
+        else if( const auto simplex = exactConvexClearanceShape( obstacle, radius ); simplex )
+        {
+            if( simplex->Contains( PLANAR::POINT( aPoint ) ) )
                 return false;
         }
         else if( pointInPolygonWithHoles( aPoint, obstacle.polygon, obstacle.polygonHoles )
@@ -1289,7 +1514,15 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                 const ROUTER_NODE& second = connection.nodes[index];
                 if( first.layer == second.layer || first.point == aPoint )
                     continue;
-                if( distance( aPoint, first.point ) < 2 * netViaDrillRadius( aNetCode )
+                const ROUTING_EDGE_STYLE& otherStyle = EdgeStyle( connection, index - 1 );
+                if( !VIA_RULE::SpansLayer( m_settings, first.layer, second.layer, otherStyle,
+                                           aLayer ) )
+                {
+                    continue;
+                }
+                const std::int64_t otherDrillRadius = otherStyle.viaDrill > 0
+                        ? otherStyle.viaDrill / 2 : netViaDrillRadius( connection.netCode );
+                if( distance( aPoint, first.point ) < drillRadius + otherDrillRadius
                                                         + m_board.holeToHoleClearance )
                     return false;
             }
@@ -1303,13 +1536,19 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
             if( connection.netCode == aNetCode )
                 continue;
 
-            const std::int64_t currentRadius = aForVia ? netViaRadius( aNetCode )
-                                                        : netTrackRadius( aNetCode );
+            const std::int64_t currentRadius = geometryRadius;
 
             for( std::size_t i = 1; i < connection.nodes.size(); ++i )
             {
                 const ROUTER_NODE& previous = connection.nodes[i - 1];
                 const ROUTER_NODE& current = connection.nodes[i];
+                const ROUTING_EDGE_STYLE& otherStyle = EdgeStyle( connection, i - 1 );
+                const std::int64_t otherTrackRadius = otherStyle.trackWidth > 0
+                        ? otherStyle.trackWidth / 2 : netTrackRadius( connection.netCode );
+                const std::int64_t otherViaRadius = otherStyle.viaDiameter > 0
+                        ? otherStyle.viaDiameter / 2 : netViaRadius( connection.netCode );
+                const std::int64_t otherViaDrillRadius = otherStyle.viaDrill > 0
+                        ? otherStyle.viaDrill / 2 : netViaDrillRadius( connection.netCode );
 
                 if( previous.layer == current.layer )
                 {
@@ -1317,24 +1556,22 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                         continue;
 
                     if( pointToSegmentDistance( aPoint, previous.point, current.point )
-                        <= currentRadius + netTrackRadius( connection.netCode )
-                                   + pairClearance( aNetCode, connection.netCode, aLayer ) )
+                        <= currentRadius + otherTrackRadius
+                                   + edgePairClearance( aNetCode, connection.netCode, aLayer,
+                                                        aEdgeClearance, otherStyle.clearance ) )
                     {
                         return false;
                     }
                 }
                 else if( distance( aPoint, previous.point )
-                         <= ( aForVia
-                                      ? std::max( currentRadius + netViaRadius( connection.netCode )
-                                                          + pairClearance( aNetCode,
-                                                                           connection.netCode,
-                                                                           aLayer ),
-                                                  netViaDrillRadius( aNetCode )
-                                                          + netViaDrillRadius( connection.netCode )
-                                                          + m_board.holeToHoleClearance )
-                                      : currentRadius + netViaRadius( connection.netCode )
-                                                + pairClearance( aNetCode, connection.netCode,
-                                                                 aLayer ) ) )
+                         <= std::max( currentRadius + otherViaRadius
+                                              + edgePairClearance( aNetCode, connection.netCode,
+                                                                   aLayer, aEdgeClearance,
+                                                                   otherStyle.clearance ),
+                                      drillRadius + otherViaDrillRadius
+                                              + m_board.holeToHoleClearance )
+                    && VIA_RULE::SpansLayer( m_settings, previous.layer, current.layer,
+                                              otherStyle, aLayer ) )
                 {
                     return false;
                 }
@@ -1349,28 +1586,34 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
 bool MAZE_SEARCH_ENGINE::isSegmentAllowed( const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
                                             int aLayer, int aNetCode, bool aForVia,
                                             std::int64_t aStartRadius,
-                                            std::int64_t aEndRadius ) const
+                                            std::int64_t aEndRadius,
+                                            std::int64_t aSegmentRadius,
+                                            std::int64_t aEdgeClearance ) const
 {
-    if( !isPointAllowed( aStart, aLayer, aNetCode, aForVia, aStartRadius ) )
+    if( !isPointAllowed( aStart, aLayer, aNetCode, aForVia, aStartRadius, -1,
+                         aEdgeClearance ) )
         return false;
 
     return isSegmentAllowedFromKnownStart( aStart, aEnd, aLayer, aNetCode, aForVia,
-                                           aEndRadius );
+                                           aEndRadius, aSegmentRadius, aEdgeClearance );
 }
 
 
 bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
         const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd, int aLayer, int aNetCode,
-        bool aForVia, std::int64_t aEndRadius ) const
+        bool aForVia, std::int64_t aEndRadius, std::int64_t aSegmentRadius,
+        std::int64_t aEdgeClearance ) const
 {
     if( autorouterDebugEnabled() )
         ++m_debugSegmentChecks;
 
-    if( !isPointAllowed( aEnd, aLayer, aNetCode, aForVia, aEndRadius ) )
+    if( !isPointAllowed( aEnd, aLayer, aNetCode, aForVia, aEndRadius, -1,
+                         aEdgeClearance ) )
         return false;
 
     const std::int64_t defaultRadius = aForVia ? netViaRadius( aNetCode )
                                                 : netTrackRadius( aNetCode );
+    const std::int64_t segmentRadius = aSegmentRadius >= 0 ? aSegmentRadius : defaultRadius;
 
     // Endpoints are checked above.  For the segment itself, a straight line
     // can leave a concave outline (or graze a board hole) between legal
@@ -1378,7 +1621,7 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
     // substantially cheaper than sampling every half-grid cell of a long
     // visibility edge.
     const double boundaryClearance = static_cast<double>( m_board.edgeClearance
-                                                          + defaultRadius );
+                                                          + segmentRadius );
     const auto nearBoundary = [&]( const std::vector<ROUTER_POINT>& aPolygon )
     {
         for( std::size_t i = 0; i < aPolygon.size(); ++i )
@@ -1430,8 +1673,9 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
         if( aForVia ? !obstacle.blocksVias : !obstacle.blocksTracks )
             continue;
 
-        const std::int64_t radius =
-                obstacleExpansionRadius( obstacle, aNetCode, aLayer, aForVia );
+        const std::int64_t radius = obstacleExpansionRadius( obstacle, aNetCode, aLayer, aForVia,
+                                                               segmentRadius, -1,
+                                                               aEdgeClearance );
 
         if( !boxesOverlap( routeBounds, m_obstacleBounds[obstacleIndex], radius ) )
             continue;
@@ -1475,79 +1719,41 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
         }
         else
         {
-            if( pointInPolygonWithHoles( aStart, obstacle.polygon, obstacle.polygonHoles )
-                || pointInPolygonWithHoles( aEnd, obstacle.polygon, obstacle.polygonHoles ) )
+            if( const auto simplex = exactConvexClearanceShape( obstacle, radius ); simplex )
             {
-                return false;
-            }
-
-            // A polygon hole is legal free space.  Testing its boundary as a
-            // solid obstacle prevents a route whose endpoints are both inside
-            // a pad/keepout opening from traversing that opening.  The outer
-            // contour remains a hard boundary; samples below detect a segment
-            // that crosses solid material between two holes.
-            const auto intersectsOuterPolygon =
-                    [&]( const std::vector<ROUTER_POINT>& aPolygon )
-            {
-                for( std::size_t i = 0; i < aPolygon.size(); ++i )
+                try
                 {
-                    const ROUTER_POINT& start = aPolygon[i];
-                    const ROUTER_POINT& end = aPolygon[( i + 1 ) % aPolygon.size()];
-
-                    if( segmentsIntersect( aStart, aEnd, start, end )
-                        || pointToSegmentDistance( aStart, start, end ) <= radius
-                        || pointToSegmentDistance( aEnd, start, end ) <= radius
-                        || pointToSegmentDistance( start, aStart, aEnd ) <= radius
-                        || pointToSegmentDistance( end, aStart, aEnd ) <= radius )
-                    {
-                        return true;
-                    }
+                    const PLANAR::POLYLINE path = PLANAR::POLYLINE::FromPoints(
+                            { aStart, aEnd } );
+                    if( !path.Empty() && simplex->IntersectsSegment( path, 1 ) )
+                        return false;
+                    if( path.Empty() && simplex->Contains( PLANAR::POINT( aStart ) ) )
+                        return false;
+                    continue;
                 }
-
-                return false;
-            };
-
-            if( intersectsOuterPolygon( obstacle.polygon ) )
-            {
-                return false;
-            }
-
-            const std::int64_t sampleStep = std::max<std::int64_t>( 1, m_activeGridStep / 2 );
-            const int polygonSampleCount = std::min(
-                    10000,
-                    std::max( 1, static_cast<int>( std::ceil(
-                                             distance( aStart, aEnd ) / sampleStep ) ) ) );
-
-            for( int index = 0; index <= polygonSampleCount; ++index )
-            {
-                const double ratio = static_cast<double>( index ) / polygonSampleCount;
-                const ROUTER_POINT sample{
-                    static_cast<std::int64_t>(
-                            std::llround( aStart.x + ( aEnd.x - aStart.x ) * ratio ) ),
-                    static_cast<std::int64_t>(
-                            std::llround( aStart.y + ( aEnd.y - aStart.y ) * ratio ) ) };
-
-                if( pointInPolygonWithHoles( sample, obstacle.polygon, obstacle.polygonHoles )
-                    || pointNearPolygonWithHoles( sample, obstacle.polygon,
-                                                   obstacle.polygonHoles, radius ) )
+                catch( const std::exception& )
                 {
-                    return false;
+                    // A degenerate/overflowing support line must not be
+                    // rounded into a legal route. Fall back to the existing
+                    // conservative polygon predicate below.
                 }
             }
+
+            if( segmentIntersectsPolygonWithHoles( aStart, aEnd, obstacle, radius ) )
+                return false;
         }
     }
 
     if( !m_allowRipupOccupancy )
     {
-        for( const ROUTER_CELL_KEY& cell : m_occupancy.CellsForSegment( { aStart, aLayer },
-                                                                          { aEnd, aLayer } ) )
-        {
-            if( m_occupancy.Usage( cell, aNetCode ) > 0 )
-                return false;
-        }
-
-        const std::int64_t currentRadius = aForVia ? netViaRadius( aNetCode )
-                                                    : netTrackRadius( aNetCode );
+        // Occupancy cells are deliberately coarse (one routing-grid sample
+        // per segment) and feed negotiated-congestion cost only.  They are
+        // not a clearance representation: two correctly separated tracks
+        // can occupy the same cell.  In particular, treating them as a hard
+        // legality veto made a transactionally shoved trace impossible to
+        // reinsert beside the incoming route.  The exact copper/via scan
+        // below is the authoritative foreign-net collision check.
+        const std::int64_t currentRadius = segmentRadius;
 
         for( const ROUTING_CONNECTION& connection : m_occupancy.Connections() )
         {
@@ -1559,16 +1765,24 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
                 const ROUTER_NODE& previous = connection.nodes[i - 1];
                 const ROUTER_NODE& current = connection.nodes[i];
                 const bool otherIsVia = previous.layer != current.layer;
+                const ROUTING_EDGE_STYLE& otherStyle = EdgeStyle( connection, i - 1 );
+                const std::int64_t otherCopperRadius = otherIsVia
+                        ? ( otherStyle.viaDiameter > 0 ? otherStyle.viaDiameter / 2
+                                                       : netViaRadius( connection.netCode ) )
+                        : ( otherStyle.trackWidth > 0 ? otherStyle.trackWidth / 2
+                                                       : netTrackRadius( connection.netCode ) );
+                const std::int64_t otherDrillRadius = otherStyle.viaDrill > 0
+                        ? otherStyle.viaDrill / 2 : netViaDrillRadius( connection.netCode );
                 const std::int64_t copperClearance =
                         currentRadius
-                        + ( otherIsVia ? netViaRadius( connection.netCode )
-                                       : netTrackRadius( connection.netCode ) )
-                        + pairClearance( aNetCode, connection.netCode, aLayer );
+                        + otherCopperRadius
+                        + edgePairClearance( aNetCode, connection.netCode, aLayer,
+                                             aEdgeClearance, otherStyle.clearance );
                 const std::int64_t clearance =
                         aForVia && otherIsVia
                                 ? std::max( copperClearance,
                                             netViaDrillRadius( aNetCode )
-                                                    + netViaDrillRadius( connection.netCode )
+                                                    + otherDrillRadius
                                                     + m_board.holeToHoleClearance )
                                 : copperClearance;
 
@@ -1601,21 +1815,41 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
 
 
 bool MAZE_SEARCH_ENGINE::CanUseSegment( int aNetCode, const ROUTER_NODE& aStart,
-                                        const ROUTER_NODE& aEnd, bool aForVia ) const
+                                        const ROUTER_NODE& aEnd, bool aForVia,
+                                        const ROUTING_EDGE_STYLE* aStyle ) const
 {
+    const std::int64_t styleRadius = aForVia
+            ? ( aStyle && aStyle->viaDiameter > 0 ? aStyle->viaDiameter / 2
+                                                   : netViaRadius( aNetCode ) )
+            : ( aStyle && aStyle->trackWidth > 0 ? aStyle->trackWidth / 2
+                                                  : netTrackRadius( aNetCode ) );
+    const std::int64_t styleClearance =
+            aStyle ? std::max<std::int64_t>( 0, aStyle->clearance ) : 0;
+
     if( aStart.layer != aEnd.layer )
     {
         if( aStart.point != aEnd.point
-            || !VIA_RULE::AllowsTransition( m_settings, aStart.layer, aEnd.layer ) )
+            || !VIA_RULE::AllowsTransition( m_settings, aStart.layer, aEnd.layer, aStyle ) )
             return false;
 
-        for( const auto& layer : m_settings.layers )
+        const std::vector<int> viaLayers = VIA_RULE::LayersFor( m_settings, aStart.layer,
+                                                                 aEnd.layer, aStyle );
+        const std::int64_t drillRadius = aStyle && aStyle->viaDrill > 0
+                ? aStyle->viaDrill / 2 : netViaDrillRadius( aNetCode );
+        for( int layer : viaLayers )
         {
-            if( !isPointAllowed( aStart.point, layer.layerId, aNetCode, true ) )
+            if( !isPointAllowed( aStart.point, layer, aNetCode, true, styleRadius, drillRadius,
+                                 styleClearance ) )
                 return false;
         }
 
         return true;
+    }
+
+    if( aStyle )
+    {
+        return isSegmentAllowed( aStart.point, aEnd.point, aStart.layer, aNetCode, aForVia,
+                                 styleRadius, styleRadius, styleRadius, styleClearance );
     }
 
     return isSegmentAllowed( aStart.point, aEnd.point, aStart.layer, aNetCode, aForVia,
@@ -1625,7 +1859,8 @@ bool MAZE_SEARCH_ENGINE::CanUseSegment( int aNetCode, const ROUTER_NODE& aStart,
 
 
 bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
-                                            const ROUTER_NODE& end ) const
+                                            const ROUTER_NODE& end,
+                                            const ROUTING_EDGE_STYLE* style ) const
 {
     struct RESTORE
     {
@@ -1635,90 +1870,1255 @@ bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
     } restore{ m_allowRipupOccupancy, m_allowRipupOccupancy };
     m_allowRipupOccupancy = false;
     if( start.layer != end.layer )
-        return CanUseSegment( net, start, end );
-    const auto radius = netTrackRadius( net );
-    return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius );
+        return CanUseSegment( net, start, end, true, style );
+    const auto radius = style && style->trackWidth > 0 ? style->trackWidth / 2
+                                                        : netTrackRadius( net );
+    const auto clearance = style ? std::max<std::int64_t>( 0, style->clearance ) : 0;
+    return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius,
+                             radius, clearance );
+}
+
+
+bool MAZE_SEARCH_ENGINE::hasStaticViaDrillClearance(
+        const ROUTING_CONNECTION& aCandidate,
+        const std::vector<ROUTING_CONNECTION>& aStaticDrillObstacles ) const
+{
+    // ROUTING_OCCUPANCY::AddStatic intentionally keeps source copper out of
+    // the worker board's connectivity graph.  `isPointAllowed` nevertheless
+    // sees every static route that is still resident in occupancy.  A forced
+    // insertion removes its full initial conflict set before asking this
+    // helper to choose a shove location, however, so a same-net source via
+    // in that removed set would otherwise escape the regular hole-to-hole
+    // check.  Compare only via drill geometry here: same-net copper sharing
+    // is electrical connectivity, while two distinct drills still require
+    // manufacturing spacing.
+    if( !HasValidEdgeStyles( aCandidate ) )
+        return false;
+
+    const auto viaDrillRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.viaDrill > 0 ? aStyle.viaDrill / 2
+                                   : netViaDrillRadius( aNetCode );
+    };
+    const auto replacesSameSourceItem = [&]( const ROUTING_CONNECTION& aStaticRoute )
+    {
+        // The moved route retains its source UUID solely so proposal
+        // acceptance removes the old BOARD_ITEM.  That old drill is the one
+        // item whose former centre must not veto its own replacement.
+        return !aCandidate.sourceBoardItemIds.empty()
+               && aCandidate.sourceBoardItemIds == aStaticRoute.sourceBoardItemIds;
+    };
+
+    for( std::size_t candidateEdge = 1; candidateEdge < aCandidate.nodes.size();
+         ++candidateEdge )
+    {
+        const ROUTER_NODE& candidateStart = aCandidate.nodes[candidateEdge - 1];
+        const ROUTER_NODE& candidateEnd = aCandidate.nodes[candidateEdge];
+        if( candidateStart.layer == candidateEnd.layer
+            || candidateStart.point != candidateEnd.point )
+        {
+            continue;
+        }
+
+        const ROUTING_EDGE_STYLE& candidateStyle = EdgeStyle( aCandidate, candidateEdge - 1 );
+        const std::vector<int> candidateLayers = VIA_RULE::LayersFor(
+                m_settings, candidateStart.layer, candidateEnd.layer, &candidateStyle );
+        if( candidateLayers.empty() )
+            return false;
+
+        const std::int64_t candidateDrill = viaDrillRadius( aCandidate.netCode,
+                                                             candidateStyle );
+        for( const ROUTING_CONNECTION& staticRoute : aStaticDrillObstacles )
+        {
+            if( !staticRoute.isExistingBoardRoute || staticRoute.netCode != aCandidate.netCode
+                || !HasValidEdgeStyles( staticRoute ) || replacesSameSourceItem( staticRoute ) )
+            {
+                continue;
+            }
+
+            for( std::size_t staticEdge = 1; staticEdge < staticRoute.nodes.size(); ++staticEdge )
+            {
+                const ROUTER_NODE& staticStart = staticRoute.nodes[staticEdge - 1];
+                const ROUTER_NODE& staticEnd = staticRoute.nodes[staticEdge];
+                if( staticStart.layer == staticEnd.layer || staticStart.point != staticEnd.point )
+                    continue;
+
+                const ROUTING_EDGE_STYLE& staticStyle = EdgeStyle( staticRoute, staticEdge - 1 );
+                const bool sharedCopperLayer = std::any_of(
+                        candidateLayers.begin(), candidateLayers.end(), [&]( int aLayer )
+                        {
+                            return VIA_RULE::SpansLayer( m_settings, staticStart.layer,
+                                                        staticEnd.layer, staticStyle, aLayer );
+                        } );
+                if( !sharedCopperLayer )
+                    continue;
+
+                const std::int64_t requiredClearance =
+                        candidateDrill + viaDrillRadius( staticRoute.netCode, staticStyle )
+                        + m_board.holeToHoleClearance;
+                if( distance( candidateStart.point, staticStart.point )
+                    < static_cast<double>( requiredClearance ) )
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+
+bool MAZE_SEARCH_ENGINE::preservesConductionAreaContacts(
+        const ROUTING_CONNECTION& aOriginal,
+        const ROUTING_CONNECTION& aReplacement ) const
+{
+    if( !HasValidEdgeStyles( aOriginal ) || !HasValidEdgeStyles( aReplacement ) )
+        return false;
+
+    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.viaDiameter > 0 ? aStyle.viaDiameter / 2 : netViaRadius( aNetCode );
+    };
+    const auto appliesOnLayer = []( const ROUTING_OBSTACLE& aArea, int aLayer )
+    {
+        return aArea.layers.empty()
+               || std::find( aArea.layers.begin(), aArea.layers.end(), aLayer )
+                          != aArea.layers.end();
+    };
+    const auto annulusTouchesArea = [&]( const ROUTING_OBSTACLE& aArea,
+                                         const ROUTER_POINT& aCentre,
+                                         std::int64_t aRadius )
+    {
+        if( aArea.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+        {
+            ROUTER_BOX expanded = aArea.box;
+            expanded.minX = saturatedAdd( expanded.minX, -aRadius );
+            expanded.minY = saturatedAdd( expanded.minY, -aRadius );
+            expanded.maxX = saturatedAdd( expanded.maxX, aRadius );
+            expanded.maxY = saturatedAdd( expanded.maxY, aRadius );
+            return expanded.Contains( aCentre );
+        }
+
+        if( aArea.kind != ROUTER_OBSTACLE_KIND::POLYGON )
+            return false;
+
+        // A via whose centre is inside a filled region clearly contacts it.
+        // If its centre is just outside a boundary (or in a thermal void),
+        // its annulus can still be a normal contact; retain that exact
+        // straight-contour case as well.  This matches the worker's polygon
+        // clearance predicates without pretending curved zone outlines have
+        // been reconstructed here.
+        return CONTACT_GEOMETRY::ContainsArea( aArea, aCentre )
+               || pointNearPolygonWithHoles( aCentre, aArea.polygon,
+                                             aArea.polygonHoles, aRadius );
+    };
+
+    const auto replacementTouchesArea = [&]( const ROUTING_OBSTACLE& aArea, int aLayer )
+    {
+        for( std::size_t edge = 1; edge < aReplacement.nodes.size(); ++edge )
+        {
+            const ROUTER_NODE& first = aReplacement.nodes[edge - 1];
+            const ROUTER_NODE& second = aReplacement.nodes[edge];
+            if( first.layer == second.layer || first.point != second.point )
+                continue;
+
+            const ROUTING_EDGE_STYLE& style = EdgeStyle( aReplacement, edge - 1 );
+            if( !VIA_RULE::SpansLayer( m_settings, first.layer, second.layer, style, aLayer ) )
+                continue;
+
+            if( annulusTouchesArea( aArea, first.point,
+                                    viaRadius( aReplacement.netCode, style ) ) )
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    for( std::size_t edge = 1; edge < aOriginal.nodes.size(); ++edge )
+    {
+        const ROUTER_NODE& first = aOriginal.nodes[edge - 1];
+        const ROUTER_NODE& second = aOriginal.nodes[edge];
+        if( first.layer == second.layer || first.point != second.point )
+            continue;
+
+        const ROUTING_EDGE_STYLE& style = EdgeStyle( aOriginal, edge - 1 );
+        const std::vector<int> layers = VIA_RULE::LayersFor(
+                m_settings, first.layer, second.layer, &style );
+        if( layers.empty() )
+            return false;
+
+        for( int layer : layers )
+        {
+            for( const ROUTING_OBSTACLE& area : m_board.conductionAreas )
+            {
+                if( area.netCode != aOriginal.netCode || !appliesOnLayer( area, layer )
+                    || !annulusTouchesArea( area, first.point,
+                                            viaRadius( aOriginal.netCode, style ) ) )
+                {
+                    continue;
+                }
+
+                if( !replacementTouchesArea( area, layer ) )
+                    return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 
 std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
         const ROUTING_CONNECTION& connection, const ROUTER_CANCEL_CALLBACK& cancel ) const
 {
-    if( connection.nodes.size() < 2 ) return {};
+    return SpringOverConnection( connection, {}, cancel );
+}
+
+
+std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
+        const ROUTING_CONNECTION& connection,
+        const std::vector<ROUTING_CONNECTION>& transientObstacles,
+        const ROUTER_CANCEL_CALLBACK& cancel ) const
+{
+    if( connection.nodes.size() < 2 || !HasValidEdgeStyles( connection ) ) return {};
     ROUTING_CONNECTION result = connection;
     result.nodes.clear();
-    std::size_t begin = 0;
-    while( begin < connection.nodes.size() )
+    result.edgeStyles.clear();
+
+    const auto appendNode = [&]( const ROUTER_NODE& aNode,
+                                 const ROUTING_EDGE_STYLE* aStyle ) -> bool
+    {
+        if( result.nodes.empty() )
+        {
+            result.nodes.push_back( aNode );
+            return true;
+        }
+
+        if( !aStyle )
+            return false;
+
+        result.nodes.push_back( aNode );
+        if( !connection.edgeStyles.empty() )
+            result.edgeStyles.push_back( *aStyle );
+        return true;
+    };
+
+    // A `ROUTING_CONNECTION` may contain a short terminal neckdown followed
+    // by normal-width copper on the same layer.  TraceShover operates on one
+    // trace style at a time; treating that entire layer run as an all-or-
+    // nothing polyline rejected a legal spring-over of the ordinary-width
+    // middle merely because an untouched terminal edge had a different
+    // width.  Iterate edges, splitting only at a via or a style boundary,
+    // while retaining the shared node between adjacent runs.
+    if( !appendNode( connection.nodes.front(), nullptr ) )
+        return {};
+
+    std::size_t edge = 0;
+    while( edge + 1 < connection.nodes.size() )
     {
         if( cancel && cancel() ) return {};
-        std::size_t end = begin;
-        const int layer = connection.nodes[begin].layer;
-        std::vector<ROUTER_POINT> points{ connection.nodes[begin].point };
-        while( end + 1 < connection.nodes.size() && connection.nodes[end + 1].layer == layer )
+
+        // A via is already a single style-preserving edge. It is not a
+        // TraceShover contour, so carry it verbatim and resume on its exit
+        // layer.
+        if( connection.nodes[edge].layer != connection.nodes[edge + 1].layer )
         {
-            const auto a = connection.nodes[end].point, b = connection.nodes[end + 1].point;
-            // General-angle swept offsets and convex obstacle compensation are
-            // not yet mapped from the host. Do not substitute a bounding box.
-            if( a.x != b.x && a.y != b.y ) return {};
-            points.push_back( b ); ++end;
+            if( !appendNode( connection.nodes[edge + 1], &EdgeStyle( connection, edge ) ) )
+                return {};
+            ++edge;
+            continue;
         }
-        if( points.size() > 1 )
+
+        const int layer = connection.nodes[edge].layer;
+        const ROUTING_EDGE_STYLE& style = EdgeStyle( connection, edge );
+        std::size_t lastEdge = edge;
+        std::vector<ROUTER_POINT> points{ connection.nodes[edge].point };
+        while( lastEdge + 1 < connection.nodes.size()
+               && connection.nodes[lastEdge].layer == connection.nodes[lastEdge + 1].layer
+               && EdgeStyle( connection, lastEdge ) == style )
         {
-            std::vector<TRACE_SHOVER::OBSTACLE> obstacles;
-            for( std::size_t i = m_board.obstacles.size(); i > 0; --i )
+            // POLYLINE preserves arbitrary support lines exactly. A later
+            // IntegralCorners check rejects any non-integral contour result;
+            // never round a general-angle forced route into a false contact.
+            points.push_back( connection.nodes[lastEdge + 1].point );
+            ++lastEdge;
+        }
+
+        std::vector<TRACE_SHOVER::OBSTACLE> obstacles;
+        for( std::size_t i = m_board.obstacles.size(); i > 0; --i )
+        {
+            if( cancel && cancel() ) return {};
+            const auto& obstacle = m_board.obstacles[i - 1];
+            if( !obstacle.blocksTracks || obstacle.isHole
+                || ( obstacle.netCode == connection.netCode && !obstacle.isKeepout )
+                || ( !obstacle.layers.empty()
+                     && std::find( obstacle.layers.begin(), obstacle.layers.end(), layer )
+                                == obstacle.layers.end() )
+                || !obstacle.polygonHoles.empty() )
+            {
+                continue;
+            }
+            const auto radius = obstacleExpansionRadius(
+                    obstacle, connection.netCode, layer, false,
+                    style.trackWidth > 0 ? style.trackWidth / 2
+                                         : netTrackRadius( connection.netCode ),
+                    -1, style.clearance );
+            // Host rule evaluation already supplies clearance. No Java
+            // class-0 broad-phase omission or hardcoded source-unit margin.
+            if( obstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+            {
+                // A rounded rectangle is not an exact box. Keep it for
+                // the general shape path below once an offset model for
+                // its arcs exists; do not silently square its corners.
+                if( obstacle.radius != 0 )
+                    continue;
+                const ROUTER_BOX box = obstacle.box;
+                if( box.minX >= box.maxX || box.minY >= box.maxY )
+                    continue;
+                const auto expanded = [&]( std::int64_t aExtra )
+                {
+                    return PLANAR::SIMPLEX::Box(
+                            { box.minX - radius - aExtra, box.minY - radius - aExtra,
+                              box.maxX + radius + aExtra, box.maxY + radius + aExtra } );
+                };
+                obstacles.push_back( { i, box, expanded( 0 ), expanded( 1 ) } );
+            }
+            else if( obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
+            {
+                // KiCad represents circular and oval pads, vias and straight
+                // copper as a centre segment swept by its physical radius.
+                // The source TraceShover receives their compensated TileShape
+                // from the search tree, so excluding native SEGMENT snapshots
+                // made forced insertion give up on the most common fixed
+                // obstacles even though CanInsertSegment() could see them.
+                //
+                // Construct the same kind of convex support contour here: the
+                // L-infinity sweep contains the circular clearance envelope,
+                // retains exact integer/rational support intersections, and is
+                // checked again against KiCad's real capsule geometry before
+                // publication. A point segment (circle/via) needs a Box because
+                // FromExpandedSegment intentionally rejects zero-length input.
+                if( radius <= 0 || radius == std::numeric_limits<std::int64_t>::max() )
+                    continue;
+
+                const auto expandedSegment = [&]( std::int64_t aRadius )
+                        -> std::optional<PLANAR::SIMPLEX>
+                {
+                    if( aRadius <= 0 || aRadius == std::numeric_limits<std::int64_t>::max() )
+                        return {};
+
+                    if( obstacle.start != obstacle.end )
+                    {
+                        return PLANAR::SIMPLEX::FromExpandedSegment(
+                                obstacle.start, obstacle.end, aRadius );
+                    }
+
+                    const ROUTER_BOX box{
+                            saturatedAdd( obstacle.start.x, -aRadius ),
+                            saturatedAdd( obstacle.start.y, -aRadius ),
+                            saturatedAdd( obstacle.start.x, aRadius ),
+                            saturatedAdd( obstacle.start.y, aRadius ) };
+                    if( box.minX >= box.maxX || box.minY >= box.maxY )
+                        return {};
+
+                    try
+                    {
+                        return PLANAR::SIMPLEX::Box( box );
+                    }
+                    catch( const std::exception& )
+                    {
+                        // A malformed/overflowing support contour must never
+                        // be rounded into a plausible forced route.
+                        return {};
+                    }
+                };
+
+                const auto check = expandedSegment( radius );
+                const auto offset = expandedSegment( saturatedAdd( radius, 1 ) );
+                if( !check || !offset )
+                    continue;
+
+                const std::int64_t physicalRadius = std::max<std::int64_t>( 0, obstacle.radius );
+                const ROUTER_BOX physicalBounds{
+                        saturatedAdd( std::min( obstacle.start.x, obstacle.end.x ), -physicalRadius ),
+                        saturatedAdd( std::min( obstacle.start.y, obstacle.end.y ), -physicalRadius ),
+                        saturatedAdd( std::max( obstacle.start.x, obstacle.end.x ), physicalRadius ),
+                        saturatedAdd( std::max( obstacle.start.y, obstacle.end.y ), physicalRadius ) };
+                obstacles.push_back( { i, physicalBounds, *check, *offset } );
+            }
+            else if( obstacle.kind == ROUTER_OBSTACLE_KIND::POLYGON )
+            {
+                // A source TileShape is convex at this operation. Accept
+                // only an explicitly convex snapshot contour and use an
+                // L-infinity offset, which conservatively contains the
+                // circular copper-clearance offset. Concave/holed shapes
+                // stay fail-closed until their decomposition is ported.
+                const auto check = PLANAR::SIMPLEX::FromConvexPolygon( obstacle.polygon,
+                                                                         radius );
+                const auto offset = radius == std::numeric_limits<std::int64_t>::max()
+                        ? std::optional<PLANAR::SIMPLEX>{}
+                        : PLANAR::SIMPLEX::FromConvexPolygon( obstacle.polygon,
+                                                               radius + 1 );
+                if( !check || !offset )
+                    continue;
+                obstacles.push_back( { i, m_obstacleBounds[i - 1], *check, *offset } );
+            }
+        }
+
+        // Generated routes are mutable worker objects, not immutable
+        // snapshot obstacles.  During forced insertion they are supplied
+        // here explicitly so the same recursive contour logic can move a
+        // trace around the incoming copper before it is committed.  Keep
+        // this representation intentionally conservative: arbitrary
+        // swept/curved shapes return no proposal elsewhere rather than a
+        // bounding-box route that could violate clearance.
+        const std::int64_t movingRadius = style.trackWidth > 0
+                ? style.trackWidth / 2 : netTrackRadius( connection.netCode );
+        for( std::size_t routeIndex = 0; routeIndex < transientObstacles.size(); ++routeIndex )
+        {
+            const ROUTING_CONNECTION& transient = transientObstacles[routeIndex];
+            if( transient.netCode == connection.netCode
+                || !HasValidEdgeStyles( transient ) )
+            {
+                continue;
+            }
+
+            for( std::size_t transientEdge = 1; transientEdge < transient.nodes.size();
+                 ++transientEdge )
             {
                 if( cancel && cancel() ) return {};
-                const auto& obstacle = m_board.obstacles[i - 1];
-                if( !obstacle.blocksTracks || obstacle.isHole
-                    || ( obstacle.netCode == connection.netCode && !obstacle.isKeepout )
-                    || std::find( obstacle.layers.begin(), obstacle.layers.end(), layer ) == obstacle.layers.end()
-                    || obstacle.kind != ROUTER_OBSTACLE_KIND::RECTANGLE || obstacle.radius != 0
-                    || !obstacle.polygonHoles.empty() ) continue;
-                const auto b = obstacle.box;
-                if( b.minX >= b.maxX || b.minY >= b.maxY ) continue;
-                const auto radius = obstacleExpansionRadius( obstacle, connection.netCode, layer, false );
-                // Host rule evaluation already supplies clearance. No Java
-                // class-0 broad-phase omission or hardcoded source-unit margin.
-                const auto expanded = [&]( std::int64_t extra )
+                const ROUTER_NODE& first = transient.nodes[transientEdge - 1];
+                const ROUTER_NODE& second = transient.nodes[transientEdge];
+                const ROUTING_EDGE_STYLE& transientStyle =
+                        EdgeStyle( transient, transientEdge - 1 );
+                const bool via = first.layer != second.layer;
+                const std::uint64_t id = ( std::uint64_t{ 1 } << 63 )
+                                         + ( routeIndex << 20 ) + transientEdge;
+                ROUTER_BOX raw;
+                std::int64_t expansion = 0;
+
+                if( !via )
                 {
-                    return PLANAR::SIMPLEX::Box( { b.minX - radius - extra, b.minY - radius - extra,
-                                                   b.maxX + radius + extra, b.maxY + radius + extra } );
-                };
-                obstacles.push_back( { i, b, expanded( 0 ), expanded( 1 ) } );
+                    if( first.layer != layer )
+                        continue;
+
+                    const std::int64_t transientRadius = transientStyle.trackWidth > 0
+                            ? transientStyle.trackWidth / 2
+                            : netTrackRadius( transient.netCode );
+                    expansion = movingRadius + transientRadius
+                                + edgePairClearance( connection.netCode, transient.netCode,
+                                                     layer, style.clearance,
+                                                     transientStyle.clearance );
+                    raw = { std::min( first.point.x, second.point.x ),
+                            std::min( first.point.y, second.point.y ),
+                            std::max( first.point.x, second.point.x ),
+                            std::max( first.point.y, second.point.y ) };
+                }
+                else
+                {
+                    if( !VIA_RULE::SpansLayer( m_settings, first.layer, second.layer,
+                                               transientStyle, layer ) )
+                    {
+                        continue;
+                    }
+
+                    const std::int64_t transientRadius = transientStyle.viaDiameter > 0
+                            ? transientStyle.viaDiameter / 2
+                            : netViaRadius( transient.netCode );
+                    expansion = movingRadius + transientRadius
+                                + edgePairClearance( connection.netCode, transient.netCode,
+                                                     layer, style.clearance,
+                                                     transientStyle.clearance );
+                    raw = { first.point.x, first.point.y, first.point.x, first.point.y };
+                }
+
+                // Both width radii are non-negative and the source's
+                // closed collision semantics require a nonzero wrapped
+                // shape even for a point via.
+                expansion = std::max<std::int64_t>( 1, expansion );
+                if( via )
+                {
+                    const ROUTER_BOX check{ raw.minX - expansion, raw.minY - expansion,
+                                            raw.maxX + expansion, raw.maxY + expansion };
+                    const ROUTER_BOX offset{ check.minX - 1, check.minY - 1,
+                                             check.maxX + 1, check.maxY + 1 };
+                    obstacles.push_back( { id, raw, PLANAR::SIMPLEX::Box( check ),
+                                           PLANAR::SIMPLEX::Box( offset ) } );
+                }
+                else
+                {
+                    // A trace is a swept segment, not the rectangle that
+                    // encloses its two endpoints.  Using that enclosing
+                    // box made a forced shove treat the empty diagonal
+                    // wedges beside a trace as copper and could reject a
+                    // legal recursive move before strict insertion had a
+                    // chance to prove it.  The convex L-infinity sweep
+                    // keeps integer input vertices and source-style exact
+                    // support intersections; malformed/overflowing input
+                    // fails closed by declining this spring-over move.
+                    const auto check = PLANAR::SIMPLEX::FromExpandedSegment(
+                            first.point, second.point, expansion );
+                    const auto offset = PLANAR::SIMPLEX::FromExpandedSegment(
+                            first.point, second.point, saturatedAdd( expansion, 1 ) );
+                    if( !check || !offset )
+                        continue;
+                    obstacles.push_back( { id, raw, *check, *offset } );
+                }
             }
-            const auto path = PLANAR::POLYLINE::FromPoints( points );
-            if( path.Empty() ) return {};
-            auto wrapped = TRACE_SHOVER::SpringOverObstacles( path, obstacles, cancel );
-            if( wrapped.cancelled || !wrapped.polyline ) return {};
-            // The pinned spring-over method can lose an endpoint on a looping
-            // input. Preserve its oracle output, but NEVER accept that mutation.
-            if( !wrapped.polyline->HasSameEndpoints( path ) ) return {};
-            const auto corners = wrapped.polyline->IntegralCorners();
-            if( !corners ) return {};
-            for( const auto& point : *corners ) result.nodes.push_back( { point, layer } );
         }
-        else result.nodes.push_back( connection.nodes[begin] );
-        begin = end + 1;
+
+        const auto path = PLANAR::POLYLINE::FromPoints( points );
+        if( path.Empty() )
+            return {};
+        auto wrapped = TRACE_SHOVER::SpringOverObstacles( path, obstacles, cancel );
+        if( wrapped.cancelled || !wrapped.polyline ) return {};
+        // The pinned spring-over method can lose an endpoint on a looping
+        // input. Preserve its oracle output, but NEVER accept that mutation.
+        if( !wrapped.polyline->HasSameEndpoints( path ) ) return {};
+        const auto corners = wrapped.polyline->IntegralCorners();
+        if( !corners ) return {};
+
+        for( std::size_t corner = 1; corner < corners->size(); ++corner )
+            if( !appendNode( { corners->at( corner ), layer }, &style ) )
+                return {};
+        edge = lastEdge;
     }
-    if( result.nodes == connection.nodes ) return {};
+    if( SameRouteGeometry( result, connection ) ) return {};
     // Preserve endpoint identities, via transitions and metadata. Cost belongs
     // to the original search; geometric quality is evaluated from actual nodes.
     return result;
 }
 
 
-std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
-        const ROUTING_CONNECTION& aCandidate ) const
+std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::ShoveViaConnection(
+        const ROUTING_CONNECTION& aConnection,
+        const std::vector<ROUTING_CONNECTION>& aTransientObstacles,
+        const ROUTER_CANCEL_CALLBACK& aCancel,
+        const std::vector<ROUTING_CONNECTION>& aStaticDrillObstacles,
+        const std::function<bool( const ROUTING_CONNECTION& )>& aPlacementFilter ) const
 {
-    std::vector<ROUTING_CONNECTION> result;
+    // DrillItemMover can translate an unfixed drill item together with every
+    // trace that contacts it.  The worker has no mutable item graph, so retain
+    // the subsets whose replacement copper can be reconstructed exactly:
+    //
+    // - an isolated via is simply translated; and
+    // - a via with one trace tail (or a generated terminal) on each side has
+    //   those two legs rebuilt as direct/orthogonal doglegs.
+    //
+    // The static-host reconstruction marks only genuinely isolated source
+    // vias eligible for the first case.  A branch, host pad contact, plane
+    // contact, synthetic fanout terminal, or unsupported contact graph still
+    // fails closed until it has the source item's complete normal-contact
+    // mutation semantics.  Every returned edge is subsequently validated
+    // against the transactional occupancy.
+    if( aConnection.nodes.size() < 2 || aTransientObstacles.empty()
+        || !HasValidEdgeStyles( aConnection ) )
+    {
+        return {};
+    }
+
+    const auto traceRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.trackWidth > 0 ? aStyle.trackWidth / 2 : netTrackRadius( aNetCode );
+    };
+    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.viaDiameter > 0 ? aStyle.viaDiameter / 2 : netViaRadius( aNetCode );
+    };
+    const auto viaDrillRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.viaDrill > 0 ? aStyle.viaDrill / 2
+                                   : netViaDrillRadius( aNetCode );
+    };
+    const auto doglegs = []( const ROUTER_NODE& aFrom, const ROUTER_POINT& aTo, int aLayer )
+    {
+        std::vector<std::vector<ROUTER_NODE>> result;
+
+        if( aFrom.point == aTo )
+        {
+            result.emplace_back();
+            return result;
+        }
+
+        // A moved DrillItem keeps the exact shape of each attached trace
+        // whenever that straight leg remains legal.  Restricting every
+        // non-axis-aligned relocation to two Manhattan doglegs discards a
+        // valid general-angle shove merely because both artificial bend
+        // corners touch nearby copper.  Try the direct leg first; strict
+        // insertion below remains the authority for clearance, layer, and
+        // board-edge legality.  The orthogonal alternatives are retained for
+        // 90-degree routing modes and for obstacles that block the diagonal.
+        result.push_back( { { aTo, aLayer } } );
+
+        if( aFrom.point.x == aTo.x || aFrom.point.y == aTo.y )
+            return result;
+
+        result.push_back( { { { aTo.x, aFrom.point.y }, aLayer }, { aTo, aLayer } } );
+        result.push_back( { { { aFrom.point.x, aTo.y }, aLayer }, { aTo, aLayer } } );
+        return result;
+    };
+
+    const auto closestPointOnSegment = []( const ROUTER_POINT& aPoint,
+                                           const ROUTER_POINT& aStart,
+                                           const ROUTER_POINT& aEnd )
+    {
+        const long double dx = static_cast<long double>( aEnd.x ) - aStart.x;
+        const long double dy = static_cast<long double>( aEnd.y ) - aStart.y;
+        const long double lengthSquared = dx * dx + dy * dy;
+        const long double factor = lengthSquared <= 0.0L
+                ? 0.0L
+                : std::clamp(
+                          ( ( static_cast<long double>( aPoint.x ) - aStart.x ) * dx
+                            + ( static_cast<long double>( aPoint.y ) - aStart.y ) * dy )
+                                  / lengthSquared,
+                          0.0L, 1.0L );
+        return std::pair{ static_cast<long double>( aStart.x ) + factor * dx,
+                          static_cast<long double>( aStart.y ) + factor * dy };
+    };
+
+    const auto roundedPoint = []( long double aX, long double aY )
+            -> std::optional<ROUTER_POINT>
+    {
+        constexpr long double minimum = static_cast<long double>(
+                std::numeric_limits<std::int64_t>::min() );
+        constexpr long double maximum = static_cast<long double>(
+                std::numeric_limits<std::int64_t>::max() );
+        if( !std::isfinite( aX ) || !std::isfinite( aY ) || aX <= minimum || aX >= maximum
+            || aY <= minimum || aY >= maximum )
+        {
+            return {};
+        }
+
+        return ROUTER_POINT{ static_cast<std::int64_t>( std::llround( aX ) ),
+                             static_cast<std::int64_t>( std::llround( aY ) ) };
+    };
+
+    ROUTING_CONNECTION source = aConnection;
+    EnsureEdgeStyles( source );
+
+    const auto clearsTransientCopper = [&]( const ROUTING_CONNECTION& aCandidate )
+    {
+        // The source DrillItemMover checks the translated drill against the
+        // complete temporary search-tree state before it commits the move.
+        // In the immutable worker the incoming route is held separately from
+        // board obstacles, so CanInsertSegment() cannot see it.  Reject a
+        // locally legal via candidate if any transient foreign route still
+        // overlaps it; otherwise the first nearest projection can poison the
+        // whole shove even though a later projection is clear.
+        return std::none_of( aTransientObstacles.begin(), aTransientObstacles.end(),
+                             [&]( const ROUTING_CONNECTION& aObstacle )
+                             { return connectionsConflict( aCandidate, aObstacle ); } );
+    };
+
+    const auto terminalAnchor = [&]( std::size_t aPadIndex, const ROUTER_NODE& aEndpoint )
+            -> std::optional<ROUTER_NODE>
+    {
+        if( aPadIndex >= m_board.pads.size() )
+            return {};
+
+        const ROUTING_PAD& pad = m_board.pads[aPadIndex];
+        // DrillItemMover only moves a via when every normal contact is a
+        // trace or a conduction area.  A KiCad PAD is a fixed host item even
+        // when its centre happens to coincide with the generated via, so it
+        // must not become a movable terminal anchor just because the worker
+        // snapshot represents both with ROUTING_PAD coordinates.  Data-only
+        // generated terminals intentionally have no sourceId and remain the
+        // limited testable subset supported by this reconstruction.
+        if( pad.netCode != source.netCode || !pad.sourceId.empty() || pad.isFanoutTarget
+            || pad.isPlaneTarget || !isOnPadLayer( pad, aEndpoint.layer )
+            || pad.position != aEndpoint.point )
+        {
+            return {};
+        }
+
+        return ROUTER_NODE{ pad.position, aEndpoint.layer };
+    };
+
+    for( std::size_t viaIndex = 1; viaIndex < source.nodes.size(); ++viaIndex )
+    {
+        if( aCancel && aCancel() )
+            return {};
+
+        const ROUTER_NODE& viaStart = source.nodes[viaIndex - 1];
+        const ROUTER_NODE& viaEnd = source.nodes[viaIndex];
+
+        if( viaStart.layer == viaEnd.layer || viaStart.point != viaEnd.point )
+        {
+            continue;
+        }
+
+        // A source via with no normal contacts is a legal DrillItemMover
+        // case: moveBy() translates the drill and adds no bridge traces.  It
+        // is deliberately recognized before the two-sided reconstruction
+        // below, which needs endpoints for both attachment legs.
+        const bool standaloneVia = viaIndex == 1 && source.nodes.size() == 2;
+        const bool hasBeforeTrace = viaIndex >= 2
+                                    && source.nodes[viaIndex - 2].layer == viaStart.layer;
+        const bool hasAfterTrace = viaIndex + 1 < source.nodes.size()
+                                   && source.nodes[viaIndex + 1].layer == viaEnd.layer;
+
+        std::optional<ROUTER_NODE> before;
+        std::optional<ROUTER_NODE> after;
+        ROUTING_EDGE_STYLE beforeStyle;
+        ROUTING_EDGE_STYLE afterStyle;
+
+        if( hasBeforeTrace )
+        {
+            before = source.nodes[viaIndex - 2];
+            beforeStyle = source.edgeStyles[viaIndex - 2];
+        }
+        else if( viaIndex == 1 )
+        {
+            before = terminalAnchor( source.fromPadIndex, viaStart );
+        }
+
+        if( hasAfterTrace )
+        {
+            after = source.nodes[viaIndex + 1];
+            afterStyle = source.edgeStyles[viaIndex];
+        }
+        else if( viaIndex + 1 == source.nodes.size() )
+        {
+            after = terminalAnchor( source.toPadIndex, viaEnd );
+        }
+
+        if( !standaloneVia
+            && ( !before || !after || before->layer != viaStart.layer
+                 || after->layer != viaEnd.layer ) )
+            continue;
+
+        const ROUTING_EDGE_STYLE& viaStyle = source.edgeStyles[viaIndex - 1];
+        const std::vector<int> viaLayers = VIA_RULE::LayersFor(
+                m_settings, viaStart.layer, viaEnd.layer, &viaStyle );
+        if( viaLayers.empty() )
+            continue;
+
+        std::vector<ROUTER_POINT> candidates;
+        const auto addCandidate = [&]( const ROUTER_POINT& aPoint )
+        {
+            if( aPoint != viaStart.point
+                && std::find( candidates.begin(), candidates.end(), aPoint ) == candidates.end() )
+            {
+                candidates.push_back( aPoint );
+            }
+        };
+
+        const auto addOffsetCandidate = [&]( long double aOriginX, long double aOriginY,
+                                             long double aDirectionX, long double aDirectionY,
+                                             std::int64_t aDistance )
+        {
+            const long double length = std::hypotl( aDirectionX, aDirectionY );
+            if( length <= 0.0L || aDistance <= 0 )
+                return;
+
+            if( const auto point = roundedPoint(
+                        aOriginX + aDirectionX * aDistance / length,
+                        aOriginY + aDirectionY * aDistance / length ) )
+            {
+                addCandidate( *point );
+            }
+        };
+
+        for( const ROUTING_CONNECTION& obstacleRoute : aTransientObstacles )
+        {
+            if( aCancel && aCancel() )
+                return {};
+            if( obstacleRoute.netCode == source.netCode || !HasValidEdgeStyles( obstacleRoute ) )
+                continue;
+
+            for( std::size_t edge = 1; edge < obstacleRoute.nodes.size(); ++edge )
+            {
+                const ROUTER_NODE& first = obstacleRoute.nodes[edge - 1];
+                const ROUTER_NODE& second = obstacleRoute.nodes[edge];
+                const ROUTING_EDGE_STYLE& obstacleStyle =
+                        EdgeStyle( obstacleRoute, edge - 1 );
+                const bool obstacleVia = first.layer != second.layer;
+                std::int64_t clearance = 0;
+                ROUTER_BOX bounds;
+
+                if( obstacleVia )
+                {
+                    bool sharesLayer = false;
+                    std::int64_t pair = 0;
+                    for( int layer : viaLayers )
+                    {
+                        if( !VIA_RULE::SpansLayer( m_settings, first.layer, second.layer,
+                                                   obstacleStyle, layer ) )
+                        {
+                            continue;
+                        }
+
+                        sharesLayer = true;
+                        pair = std::max(
+                                pair, edgePairClearance( source.netCode,
+                                                         obstacleRoute.netCode, layer,
+                                                         viaStyle.clearance,
+                                                         obstacleStyle.clearance ) );
+                    }
+
+                    if( !sharesLayer )
+                        continue;
+
+                    clearance = std::max(
+                            viaRadius( source.netCode, viaStyle )
+                                    + viaRadius( obstacleRoute.netCode, obstacleStyle ) + pair,
+                            viaDrillRadius( source.netCode, viaStyle )
+                                    + viaDrillRadius( obstacleRoute.netCode, obstacleStyle )
+                                    + m_board.holeToHoleClearance );
+                    bounds = { first.point.x, first.point.y, first.point.x, first.point.y };
+
+                    if( distance( viaStart.point, first.point ) > clearance )
+                        continue;
+
+                    // DrillItemMover asks its exact shape for the nearest
+                    // outside locations.  A via is circular in the worker
+                    // model, so its radial escape is exact; when the two
+                    // centres coincide try the compass and diagonal choices
+                    // rather than arbitrarily biasing the move to a box side.
+                    const std::int64_t margin = std::max<std::int64_t>(
+                            1, saturatedAdd( clearance, 2 ) );
+                    const long double deltaX = static_cast<long double>( viaStart.point.x )
+                                               - first.point.x;
+                    const long double deltaY = static_cast<long double>( viaStart.point.y )
+                                               - first.point.y;
+                    if( std::hypotl( deltaX, deltaY ) > 0.0L )
+                    {
+                        addOffsetCandidate( first.point.x, first.point.y, deltaX, deltaY,
+                                            margin );
+                    }
+                    else
+                    {
+                        for( const auto& direction :
+                             std::array<std::array<int, 2>, 8>{
+                                     std::array<int, 2>{ 1, 0 },
+                                     std::array<int, 2>{ -1, 0 },
+                                     std::array<int, 2>{ 0, 1 },
+                                     std::array<int, 2>{ 0, -1 },
+                                     std::array<int, 2>{ 1, 1 },
+                                     std::array<int, 2>{ 1, -1 },
+                                     std::array<int, 2>{ -1, 1 },
+                                     std::array<int, 2>{ -1, -1 } } )
+                        {
+                            addOffsetCandidate( first.point.x, first.point.y, direction[0],
+                                                direction[1], margin );
+                        }
+                    }
+                }
+                else
+                {
+                    if( !VIA_RULE::SpansLayer( m_settings, viaStart.layer, viaEnd.layer,
+                                               viaStyle, first.layer ) )
+                    {
+                        continue;
+                    }
+
+                    clearance = viaRadius( source.netCode, viaStyle )
+                                + traceRadius( obstacleRoute.netCode, obstacleStyle )
+                                + edgePairClearance( source.netCode,
+                                                     obstacleRoute.netCode, first.layer,
+                                                     viaStyle.clearance,
+                                                     obstacleStyle.clearance );
+                    bounds = { std::min( first.point.x, second.point.x ),
+                               std::min( first.point.y, second.point.y ),
+                               std::max( first.point.x, second.point.x ),
+                               std::max( first.point.y, second.point.y ) };
+
+                    if( pointToSegmentDistance( viaStart.point, first.point, second.point )
+                        > clearance )
+                    {
+                        continue;
+                    }
+
+                    // Box-edge candidates alone are not equivalent to
+                    // DrillItemMover.tryShoveViaPoints for a diagonal trace:
+                    // its nearest legal via location lies on the normal of
+                    // the compensated segment.  Preserve that geometric
+                    // candidate before adding broad box projections below.
+                    const std::int64_t margin = std::max<std::int64_t>(
+                            1, saturatedAdd( clearance, 2 ) );
+                    const auto [closestX, closestY] =
+                            closestPointOnSegment( viaStart.point, first.point, second.point );
+                    const long double deltaX = static_cast<long double>( viaStart.point.x )
+                                               - closestX;
+                    const long double deltaY = static_cast<long double>( viaStart.point.y )
+                                               - closestY;
+                    const long double tangentX = static_cast<long double>( second.point.x )
+                                                - first.point.x;
+                    const long double tangentY = static_cast<long double>( second.point.y )
+                                                - first.point.y;
+
+                    if( std::hypotl( deltaX, deltaY ) > 0.0L )
+                        addOffsetCandidate( closestX, closestY, deltaX, deltaY, margin );
+
+                    // At a centre-line intersection the radial direction is
+                    // undefined.  The two compensated trace normals are the
+                    // source's nearest relative outside locations; retain
+                    // both so a fixed item on one side does not force a
+                    // needless rip-up.
+                    addOffsetCandidate( closestX, closestY, -tangentY, tangentX, margin );
+                    addOffsetCandidate( closestX, closestY, tangentY, -tangentX, margin );
+                }
+
+                const ROUTER_POINT projected{
+                        std::clamp( viaStart.point.x, bounds.minX, bounds.maxX ),
+                        std::clamp( viaStart.point.y, bounds.minY, bounds.maxY ) };
+                const std::int64_t margin = std::max<std::int64_t>( 1, clearance + 1 );
+                addCandidate( { saturatedAdd( bounds.minX, -margin ), projected.y } );
+                addCandidate( { saturatedAdd( bounds.maxX, margin ), projected.y } );
+                addCandidate( { projected.x, saturatedAdd( bounds.minY, -margin ) } );
+                addCandidate( { projected.x, saturatedAdd( bounds.maxY, margin ) } );
+            }
+        }
+
+        std::sort( candidates.begin(), candidates.end(), [&]( const ROUTER_POINT& aLeft,
+                                                               const ROUTER_POINT& aRight )
+        {
+            const std::int64_t leftDistance = squaredDistance( viaStart.point, aLeft );
+            const std::int64_t rightDistance = squaredDistance( viaStart.point, aRight );
+            if( leftDistance != rightDistance )
+                return leftDistance < rightDistance;
+            if( aLeft.x != aRight.x )
+                return aLeft.x < aRight.x;
+            return aLeft.y < aRight.y;
+        } );
+
+        // DrillItemMover tries a bounded set of nearest projections. Keeping
+        // the worker bound explicit prevents a large conflict fan-out from
+        // turning one forced insertion into unbounded dogleg enumeration.
+        constexpr std::size_t maxViaCandidates = 20;
+        if( candidates.size() > maxViaCandidates )
+            candidates.resize( maxViaCandidates );
+
+        for( const ROUTER_POINT& candidate : candidates )
+        {
+            if( aCancel && aCancel() )
+                return {};
+
+            if( standaloneVia )
+            {
+                ROUTING_CONNECTION moved = source;
+                moved.nodes = { { candidate, viaStart.layer }, { candidate, viaEnd.layer } };
+                moved.edgeStyles = { viaStyle };
+
+                if( CanInsertSegment( moved.netCode, moved.nodes.front(), moved.nodes.back(),
+                                      &moved.edgeStyles.front() )
+                    && clearsTransientCopper( moved )
+                    && hasStaticViaDrillClearance( moved, aStaticDrillObstacles )
+                    && preservesConductionAreaContacts( source, moved )
+                    && ( !aPlacementFilter || aPlacementFilter( moved ) ) )
+                {
+                    return moved;
+                }
+
+                continue;
+            }
+
+            const auto beforeOptions = doglegs( *before, candidate, viaStart.layer );
+            const auto afterOptions = doglegs( { candidate, viaEnd.layer }, after->point,
+                                               viaEnd.layer );
+
+            for( const auto& beforePath : beforeOptions )
+            {
+                for( const auto& afterPath : afterOptions )
+                {
+                    ROUTING_CONNECTION moved = source;
+                    moved.nodes.clear();
+                    moved.edgeStyles.clear();
+                    const auto append = [&]( const ROUTER_NODE& aNode,
+                                             const ROUTING_EDGE_STYLE* aStyle )
+                    {
+                        if( moved.nodes.empty() )
+                        {
+                            moved.nodes.push_back( aNode );
+                            return true;
+                        }
+
+                        if( moved.nodes.back() == aNode )
+                            return true;
+                        if( !aStyle )
+                            return false;
+                        moved.nodes.push_back( aNode );
+                        moved.edgeStyles.push_back( *aStyle );
+                        return true;
+                    };
+
+                    if( !append( source.nodes.front(), nullptr ) )
+                        continue;
+                    bool valid = true;
+                    const std::size_t prefixEnd = hasBeforeTrace ? viaIndex - 2 : viaIndex - 1;
+                    for( std::size_t node = 1; node <= prefixEnd && valid; ++node )
+                        valid = append( source.nodes[node], &source.edgeStyles[node - 1] );
+                    for( const ROUTER_NODE& node : beforePath )
+                        valid = valid && append( node, &beforeStyle );
+                    valid = valid && append( { candidate, viaEnd.layer }, &viaStyle );
+                    for( const ROUTER_NODE& node : afterPath )
+                        valid = valid && append( node, &afterStyle );
+                    const std::size_t suffixBegin = hasAfterTrace ? viaIndex + 2 : viaIndex + 1;
+                    for( std::size_t node = suffixBegin; node < source.nodes.size() && valid;
+                         ++node )
+                    {
+                        valid = append( source.nodes[node], &source.edgeStyles[node - 1] );
+                    }
+
+                    if( !valid || !HasValidEdgeStyles( moved ) || SameRouteGeometry( moved, source ) )
+                        continue;
+
+                    for( std::size_t edge = 1; edge < moved.nodes.size() && valid; ++edge )
+                    {
+                        valid = CanInsertSegment( moved.netCode, moved.nodes[edge - 1],
+                                                  moved.nodes[edge], &moved.edgeStyles[edge - 1] );
+                    }
+
+                    if( valid && clearsTransientCopper( moved )
+                        && hasStaticViaDrillClearance( moved, aStaticDrillObstacles )
+                        && preservesConductionAreaContacts( source, moved )
+                        && ( !aPlacementFilter || aPlacementFilter( moved ) ) )
+                        return moved;
+                }
+            }
+        }
+    }
+
+    return {};
+}
 
 
+std::optional<ROUTING_VIA_SHOVE_PLAN> MAZE_SEARCH_ENGINE::ShoveViaConnectionPlan(
+        const ROUTING_CONNECTION& aConnection,
+        const std::vector<ROUTING_CONNECTION>& aTransientObstacles,
+        const std::vector<ROUTING_CONNECTION>& aContactCandidates,
+        const ROUTER_CANCEL_CALLBACK& aCancel ) const
+{
+    // DrillItem.moveBy() preserves every normal trace contact by adding a
+    // short old-centre-to-new-centre trace on that trace's layer/style.  The
+    // path-only worker has to make the equivalent edit explicit: a retained
+    // source trace is materialised into proposal copper, then a bridge joins
+    // it to the translated via.
+    //
+    // Placement and contact mutation cannot be separated. DrillItemMover.check
+    // validates the *translated drill plus its temporary board state* before
+    // it accepts a candidate. In this worker a bridge is not implicit inside
+    // the board item graph; returning the first via position and only later
+    // discovering that its bridge crosses the incoming trace discarded an
+    // otherwise legal later projection. Build and validate the complete plan
+    // while ShoveViaConnection still enumerates ordered candidate centres.
+    const auto isDirectStaticVia = []( const ROUTING_CONNECTION& aRoute )
+    {
+        return aRoute.isExistingBoardRoute && aRoute.sourceBoardItemIds.size() == 1
+               && aRoute.nodes.size() == 2
+               && aRoute.nodes.front().point == aRoute.nodes.back().point
+               && aRoute.nodes.front().layer != aRoute.nodes.back().layer
+               && HasValidEdgeStyles( aRoute ) && aRoute.edgeStyles.size() == 1;
+    };
+
+    // Generated drills and reconstructed trace-via-trace worker routes carry
+    // every replacement edge in one connection, so their normal candidate
+    // validation in ShoveViaConnection is already complete. Only an isolated
+    // static board via has independent source-contact bridges to account for.
+    if( !isDirectStaticVia( aConnection ) )
+    {
+        auto replacement = ShoveViaConnection( aConnection, aTransientObstacles, aCancel,
+                                               aContactCandidates );
+        if( !replacement )
+            return {};
+
+        ROUTING_VIA_SHOVE_PLAN result;
+        result.replacement = std::move( *replacement );
+        return result;
+    }
+
+    const ROUTING_EDGE_STYLE& viaStyle = aConnection.edgeStyles.front();
+    const std::vector<int> viaLayers = VIA_RULE::LayersFor(
+            m_settings, aConnection.nodes.front().layer, aConnection.nodes.back().layer,
+            &viaStyle );
+    if( viaLayers.empty() )
+        return {};
+
+    const ROUTER_POINT oldCenter = aConnection.nodes.front().point;
+    const auto isViaLayer = [&]( int aLayer )
+    {
+        return std::find( viaLayers.begin(), viaLayers.end(), aLayer ) != viaLayers.end();
+    };
+    const auto hasNormalTraceEndpoint = [&]( const ROUTER_POINT& aStart,
+                                              const ROUTER_POINT& aEnd )
+    {
+        // DrillItem.getNormalContacts() accepts a Trace only when the drill
+        // centre equals its first or last corner. A through trace has no
+        // TraceInfo and must not receive an invented bridge.
+        return oldCenter == aStart || oldCenter == aEnd;
+    };
+
+    struct NORMAL_CONTACT
+    {
+        ROUTING_CONNECTION_REPLACEMENT materialization;
+        int                            layer = -1;
+        ROUTING_EDGE_STYLE             bridgeStyle;
+    };
+
+    std::vector<NORMAL_CONTACT> contacts;
+    for( const ROUTING_CONNECTION& contact : aContactCandidates )
+    {
+        if( aCancel && aCancel() )
+            return {};
+        if( SameRouteGeometry( contact, aConnection ) || !contact.isExistingBoardRoute
+            || contact.sourceBoardItemIds.empty() || contact.netCode != aConnection.netCode
+            || contact.nodes.size() != 2
+            || contact.nodes.front().layer != contact.nodes.back().layer
+            || !HasValidEdgeStyles( contact ) || contact.edgeStyles.size() != 1 )
+        {
+            continue;
+        }
+
+        const int layer = contact.nodes.front().layer;
+        if( !isViaLayer( layer )
+            || !hasNormalTraceEndpoint( contact.nodes.front().point,
+                                        contact.nodes.back().point ) )
+        {
+            continue;
+        }
+
+        // The caller combines live occupancy and its removed initial victims.
+        // Materialize a source BOARD_ITEM just once even when it appears in
+        // both views.
+        if( std::any_of( contacts.begin(), contacts.end(),
+                         [&]( const NORMAL_CONTACT& aExisting )
+                         {
+                             return SameRouteGeometry( aExisting.materialization.original,
+                                                       contact );
+                         } ) )
+        {
+            continue;
+        }
+
+        ROUTING_CONNECTION materialized = contact;
+        materialized.isExistingBoardRoute = false;
+        materialized.isShoveMovable = true;
+        ROUTING_EDGE_STYLE bridgeStyle = contact.edgeStyles.front();
+        bridgeStyle.trackWidth = ResolveTrackWidth( contact.netCode, bridgeStyle );
+        contacts.push_back( { { contact, std::move( materialized ) }, layer,
+                              std::move( bridgeStyle ) } );
+    }
+
+    const auto makePlan = [&]( const ROUTING_CONNECTION& aReplacement )
+            -> std::optional<ROUTING_VIA_SHOVE_PLAN>
+    {
+        if( !isDirectStaticVia( aReplacement )
+            || aReplacement.nodes.front().layer != aConnection.nodes.front().layer
+            || aReplacement.nodes.back().layer != aConnection.nodes.back().layer
+            || aReplacement.nodes.front().point != aReplacement.nodes.back().point
+            || aReplacement.nodes.front().point == oldCenter )
+        {
+            return {};
+        }
+
+        ROUTING_VIA_SHOVE_PLAN result;
+        result.replacement = aReplacement;
+        const ROUTER_POINT newCenter = aReplacement.nodes.front().point;
+
+        // DrillItem.TraceInfo.compareTo() keys its TreeSet by layer, not by
+        // width or clearance class. Each contact stays materialized, but the
+        // first stable trace style on a layer creates the sole bridge.
+        std::set<int> bridgedLayers;
+        for( const NORMAL_CONTACT& contact : contacts )
+        {
+            result.materializedContacts.push_back( contact.materialization );
+            if( !bridgedLayers.insert( contact.layer ).second )
+                continue;
+
+            ROUTING_CONNECTION bridge;
+            bridge.netCode = aConnection.netCode;
+            bridge.complete = true;
+            bridge.isShoveMovable = true;
+            bridge.nodes = { { oldCenter, contact.layer }, { newCenter, contact.layer } };
+            bridge.edgeStyles = { contact.bridgeStyle };
+            result.bridges.push_back( std::move( bridge ) );
+        }
+
+        return result;
+    };
+
+    const auto routeFitsTemporaryBoard = [&]( const ROUTING_CONNECTION& aRoute )
+    {
+        if( !aRoute.complete || !HasValidEdgeStyles( aRoute ) )
+            return false;
+
+        for( std::size_t edge = 1; edge < aRoute.nodes.size(); ++edge )
+        {
+            if( !CanInsertSegment( aRoute.netCode, aRoute.nodes[edge - 1],
+                                   aRoute.nodes[edge], &aRoute.edgeStyles[edge - 1] ) )
+            {
+                return false;
+            }
+        }
+
+        return std::none_of( aTransientObstacles.begin(), aTransientObstacles.end(),
+                             [&]( const ROUTING_CONNECTION& aObstacle )
+                             { return connectionsConflict( aRoute, aObstacle ); } );
+    };
+
+    const auto planFitsTemporaryBoard = [&]( const ROUTING_CONNECTION& aReplacement )
+    {
+        if( aCancel && aCancel() )
+            return false;
+
+        const auto plan = makePlan( aReplacement );
+        if( !plan || !routeFitsTemporaryBoard( plan->replacement ) )
+            return false;
+
+        for( const ROUTING_CONNECTION_REPLACEMENT& contact : plan->materializedContacts )
+            if( !routeFitsTemporaryBoard( contact.replacement ) )
+                return false;
+        for( const ROUTING_CONNECTION& bridge : plan->bridges )
+            if( !routeFitsTemporaryBoard( bridge ) )
+                return false;
+        return true;
+    };
+
+    auto replacement = ShoveViaConnection( aConnection, aTransientObstacles, aCancel,
+                                           aContactCandidates, planFitsTemporaryBoard );
+    if( !replacement )
+        return {};
+
+    return makePlan( *replacement );
+}
+
+bool MAZE_SEARCH_ENGINE::connectionsConflict( const ROUTING_CONNECTION& aCandidate,
+                                              const ROUTING_CONNECTION& aExisting ) const
+{
+    if( aCandidate.netCode == aExisting.netCode || !HasValidEdgeStyles( aCandidate )
+        || !HasValidEdgeStyles( aExisting ) )
+    {
+        return false;
+    }
+
+    const auto trackRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.trackWidth > 0 ? aStyle.trackWidth / 2 : netTrackRadius( aNetCode );
+    };
+    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.viaDiameter > 0 ? aStyle.viaDiameter / 2 : netViaRadius( aNetCode );
+    };
+    const auto viaDrillRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    {
+        return aStyle.viaDrill > 0 ? aStyle.viaDrill / 2 : netViaDrillRadius( aNetCode );
+    };
+    const auto viaSpans = [&]( const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
+                               const ROUTING_EDGE_STYLE& aStyle, int aLayer )
+    {
+        return VIA_RULE::SpansLayer( m_settings, aStart.layer, aEnd.layer, aStyle, aLayer );
+    };
     const auto edgeConflicts = [&]( const ROUTER_NODE& aLeftStart,
                                     const ROUTER_NODE& aLeftEnd,
                                     int aLeftNetCode,
+                                    const ROUTING_EDGE_STYLE& aLeftStyle,
                                     const ROUTER_NODE& aRightStart,
                                     const ROUTER_NODE& aRightEnd,
-                                    int aRightNetCode )
+                                    int aRightNetCode,
+                                    const ROUTING_EDGE_STYLE& aRightStyle )
     {
         const bool leftVia = aLeftStart.layer != aLeftEnd.layer;
         const bool rightVia = aRightStart.layer != aRightEnd.layer;
@@ -1728,10 +3128,12 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
             if( aLeftStart.layer != aRightStart.layer )
                 return false;
 
-            const std::int64_t clearance = netTrackRadius( aLeftNetCode )
-                                           + netTrackRadius( aRightNetCode )
-                                           + pairClearance( aLeftNetCode, aRightNetCode,
-                                                            aLeftStart.layer );
+            const std::int64_t clearance = trackRadius( aLeftNetCode, aLeftStyle )
+                                           + trackRadius( aRightNetCode, aRightStyle )
+                                           + edgePairClearance( aLeftNetCode, aRightNetCode,
+                                                                 aLeftStart.layer,
+                                                                 aLeftStyle.clearance,
+                                                                 aRightStyle.clearance );
             return segmentsWithinClearance( aLeftStart.point, aLeftEnd.point,
                                             aRightStart.point, aRightEnd.point,
                                             static_cast<double>( clearance ) );
@@ -1739,11 +3141,30 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
 
         if( leftVia && rightVia )
         {
-            const std::int64_t copperClearance = netViaRadius( aLeftNetCode )
-                                                 + netViaRadius( aRightNetCode )
-                                                 + pairClearance( aLeftNetCode, aRightNetCode );
-            const std::int64_t drillClearance = netViaDrillRadius( aLeftNetCode )
-                                                + netViaDrillRadius( aRightNetCode )
+            std::int64_t pair = 0;
+            bool sharesLayer = false;
+            for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
+            {
+                if( !viaSpans( aLeftStart, aLeftEnd, aLeftStyle, layer.layerId )
+                    || !viaSpans( aRightStart, aRightEnd, aRightStyle, layer.layerId ) )
+                {
+                    continue;
+                }
+
+                sharesLayer = true;
+                pair = std::max( pair, edgePairClearance( aLeftNetCode, aRightNetCode,
+                                                           layer.layerId,
+                                                           aLeftStyle.clearance,
+                                                           aRightStyle.clearance ) );
+            }
+
+            if( !sharesLayer )
+                return false;
+
+            const std::int64_t copperClearance = viaRadius( aLeftNetCode, aLeftStyle )
+                                                 + viaRadius( aRightNetCode, aRightStyle ) + pair;
+            const std::int64_t drillClearance = viaDrillRadius( aLeftNetCode, aLeftStyle )
+                                                + viaDrillRadius( aRightNetCode, aRightStyle )
                                                 + m_board.holeToHoleClearance;
             return distance( aLeftStart.point, aRightStart.point )
                    <= static_cast<double>( std::max( copperClearance, drillClearance ) );
@@ -1751,39 +3172,54 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
 
         const ROUTER_NODE& viaStart = leftVia ? aLeftStart : aRightStart;
         const int viaNetCode = leftVia ? aLeftNetCode : aRightNetCode;
+        const ROUTING_EDGE_STYLE& viaStyle = leftVia ? aLeftStyle : aRightStyle;
         const ROUTER_NODE& trackStart = leftVia ? aRightStart : aLeftStart;
         const ROUTER_NODE& trackEnd = leftVia ? aRightEnd : aLeftEnd;
         const int trackNetCode = leftVia ? aRightNetCode : aLeftNetCode;
+        const ROUTING_EDGE_STYLE& trackStyle = leftVia ? aRightStyle : aLeftStyle;
 
-        const std::int64_t clearance = netViaRadius( viaNetCode )
-                                       + netTrackRadius( trackNetCode )
-                                       + pairClearance( viaNetCode, trackNetCode,
-                                                        trackStart.layer );
+        if( !viaSpans( viaStart, leftVia ? aLeftEnd : aRightEnd, viaStyle,
+                        trackStart.layer ) )
+        {
+            return false;
+        }
+
+        const std::int64_t clearance = viaRadius( viaNetCode, viaStyle )
+                                       + trackRadius( trackNetCode, trackStyle )
+                                       + edgePairClearance( viaNetCode, trackNetCode,
+                                                             trackStart.layer,
+                                                             viaStyle.clearance,
+                                                             trackStyle.clearance );
         return pointToSegmentDistance( viaStart.point, trackStart.point, trackEnd.point )
                <= static_cast<double>( clearance );
     };
 
-    for( const ROUTING_CONNECTION& existing : m_occupancy.Connections() )
+    for( std::size_t left = 1; left < aCandidate.nodes.size(); ++left )
     {
-        if( existing.netCode == aCandidate.netCode )
-            continue;
-
-        bool conflicts = false;
-        for( std::size_t left = 1; left < aCandidate.nodes.size() && !conflicts; ++left )
+        for( std::size_t right = 1; right < aExisting.nodes.size(); ++right )
         {
-            for( std::size_t right = 1; right < existing.nodes.size(); ++right )
+            if( edgeConflicts( aCandidate.nodes[left - 1], aCandidate.nodes[left],
+                               aCandidate.netCode, EdgeStyle( aCandidate, left - 1 ),
+                               aExisting.nodes[right - 1], aExisting.nodes[right],
+                               aExisting.netCode, EdgeStyle( aExisting, right - 1 ) ) )
             {
-                if( edgeConflicts( aCandidate.nodes[left - 1], aCandidate.nodes[left],
-                                   aCandidate.netCode, existing.nodes[right - 1],
-                                   existing.nodes[right], existing.netCode ) )
-                {
-                    conflicts = true;
-                    break;
-                }
+                return true;
             }
         }
+    }
 
-        if( conflicts )
+    return false;
+}
+
+
+std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
+        const ROUTING_CONNECTION& aCandidate ) const
+{
+    std::vector<ROUTING_CONNECTION> result;
+
+    for( const ROUTING_CONNECTION& existing : m_occupancy.Connections() )
+    {
+        if( connectionsConflict( aCandidate, existing ) )
             result.push_back( existing );
     }
 
@@ -1803,7 +3239,7 @@ std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::buildLandmarks( const ROUTING_PAD& 
                                                              int aNetCode ) const
 {
     std::vector<ROUTER_NODE> result;
-    result.reserve( m_baseLandmarks.size() + aStart.layers.size() + aTarget.layers.size() );
+    result.reserve( aStart.layers.size() + aTarget.layers.size() + 512 );
 
     auto add = [&]( const ROUTER_POINT& aPoint, int aLayer )
     {
@@ -1831,21 +3267,171 @@ std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::buildLandmarks( const ROUTING_PAD& 
     if( aTarget.isFanoutTarget && aTarget.fanoutSourceLayer >= 0 )
         add( aTarget.position, aTarget.fanoutSourceLayer );
 
-    // Keep the room/door visibility set large enough for a full board while
-    // leaving the per-frontier visibility cap below as the runtime bound.
-    // Freerouting's expansion graph is board-wide; a 768-entry prefix is too
-    // spatially biased on dense boards with many pads and copper fragments.
-    constexpr std::size_t maxLandmarks = 2048;
-    for( const ROUTER_NODE& landmark : m_baseLandmarks )
+    // The immutable board-wide graph is indexed separately below. Add only
+    // connection-local exact convex corners here; otherwise copying the
+    // whole graph into this vector obscures the small set of per-net features
+    // from adaptiveNeighbours and makes every frontier expansion rescan it.
+    // A rectangle has an exact room representation already. For a strict
+    // convex contour, however, its L-infinity offset preserves free wedges
+    // that its axis-aligned bounding box would erase. A one-IU guard keeps
+    // an integral support intersection outside the host's closed collision
+    // boundary; rational intersections are deliberately not rounded.
+    //
+    // Do not stop at the first 512 corners in snapshot order. KiCad writes
+    // zones/tracks in board-item order, not in relation to this connection;
+    // on a dense board that made a late convex blocker invisible while an
+    // unrelated footprint monopolized every dynamic landmark slot. Retain a
+    // bounded reservoir ranked by distance to this connection's direct
+    // corridor, then validate/support the best integral siblings below.
+    constexpr std::size_t maxDynamicLandmarks = 512;
+    constexpr std::size_t maxRawConvexLandmarks = 4096;
+    constexpr std::size_t retainedRawConvexLandmarks = 2048;
+    struct CONVEX_LANDMARK_CANDIDATE
     {
-        if( result.size() >= maxLandmarks )
-            break;
+        long double corridorDistanceSquared = 0.0L;
+        long double endpointDistanceSquared = 0.0L;
+        ROUTER_NODE node;
+    };
+    std::vector<CONVEX_LANDMARK_CANDIDATE> convexCandidates;
+    convexCandidates.reserve( retainedRawConvexLandmarks );
+    const auto scoreConvexCandidate = [&]( const ROUTER_POINT& aPoint )
+    {
+        const long double startX = static_cast<long double>( aStart.position.x );
+        const long double startY = static_cast<long double>( aStart.position.y );
+        const long double endX = static_cast<long double>( aTarget.position.x );
+        const long double endY = static_cast<long double>( aTarget.position.y );
+        const long double pointX = static_cast<long double>( aPoint.x );
+        const long double pointY = static_cast<long double>( aPoint.y );
+        const long double directionX = endX - startX;
+        const long double directionY = endY - startY;
+        const long double lengthSquared = directionX * directionX + directionY * directionY;
+        const long double startDistanceSquared = ( pointX - startX ) * ( pointX - startX )
+                                               + ( pointY - startY ) * ( pointY - startY );
+        const long double endDistanceSquared = ( pointX - endX ) * ( pointX - endX )
+                                             + ( pointY - endY ) * ( pointY - endY );
+        if( lengthSquared <= 0.0L )
+            return std::pair{ startDistanceSquared, startDistanceSquared };
 
-        if( std::find( result.begin(), result.end(), landmark ) == result.end() )
-            result.push_back( landmark );
+        const long double projection = std::clamp(
+                ( ( pointX - startX ) * directionX + ( pointY - startY ) * directionY )
+                        / lengthSquared,
+                0.0L, 1.0L );
+        const long double closestX = startX + projection * directionX;
+        const long double closestY = startY + projection * directionY;
+        const long double corridorDistanceSquared = ( pointX - closestX ) * ( pointX - closestX )
+                                                   + ( pointY - closestY )
+                                                             * ( pointY - closestY );
+        return std::pair{ corridorDistanceSquared,
+                          std::min( startDistanceSquared, endDistanceSquared ) };
+    };
+    const auto compareConvexCandidates = []( const CONVEX_LANDMARK_CANDIDATE& aLeft,
+                                             const CONVEX_LANDMARK_CANDIDATE& aRight )
+    {
+        if( aLeft.corridorDistanceSquared != aRight.corridorDistanceSquared )
+            return aLeft.corridorDistanceSquared < aRight.corridorDistanceSquared;
+        if( aLeft.endpointDistanceSquared != aRight.endpointDistanceSquared )
+            return aLeft.endpointDistanceSquared < aRight.endpointDistanceSquared;
+        if( aLeft.node.point.x != aRight.node.point.x )
+            return aLeft.node.point.x < aRight.node.point.x;
+        if( aLeft.node.point.y != aRight.node.point.y )
+            return aLeft.node.point.y < aRight.node.point.y;
+        return aLeft.node.layer < aRight.node.layer;
+    };
+    const auto addConvexCandidate = [&]( const ROUTER_POINT& aPoint, int aLayer )
+    {
+        if( aLayer < 0 )
+            return;
+
+        const auto [corridorDistanceSquared, endpointDistanceSquared] =
+                scoreConvexCandidate( aPoint );
+        convexCandidates.push_back( { corridorDistanceSquared, endpointDistanceSquared,
+                                      { aPoint, aLayer } } );
+        if( convexCandidates.size() > maxRawConvexLandmarks )
+        {
+            std::nth_element( convexCandidates.begin(),
+                              convexCandidates.begin()
+                                      + static_cast<std::ptrdiff_t>( retainedRawConvexLandmarks ),
+                              convexCandidates.end(), compareConvexCandidates );
+            convexCandidates.resize( retainedRawConvexLandmarks );
+        }
+    };
+
+    for( const ROUTING_OBSTACLE& obstacle : m_board.obstacles )
+    {
+        if( obstacle.kind != ROUTER_OBSTACLE_KIND::POLYGON || obstacle.isHole
+            || !obstacle.blocksTracks || !obstacle.polygonHoles.empty()
+            || obstacle.radius != 0
+            || ( obstacle.netCode == aNetCode && !obstacle.isKeepout ) )
+        {
+            continue;
+        }
+
+        for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
+        {
+            if( !layer.enabled
+                || ( !obstacle.layers.empty()
+                     && std::find( obstacle.layers.begin(), obstacle.layers.end(), layer.layerId )
+                                == obstacle.layers.end() ) )
+            {
+                continue;
+            }
+
+            const std::int64_t radius = obstacleExpansionRadius(
+                    obstacle, aNetCode, layer.layerId, false,
+                    netTrackRadius( aNetCode ) );
+            if( radius == std::numeric_limits<std::int64_t>::max() )
+                continue;
+
+            const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon(
+                    obstacle.polygon, radius + 1 );
+            if( !simplex )
+                continue;
+
+            for( std::size_t index = 0; index < simplex->Borders().size(); ++index )
+            {
+                // A source support-line intersection may be rational. KiCad
+                // cannot emit fractional IU coordinates, but dropping the
+                // corner altogether forces an otherwise exact convex route
+                // back onto the coarse grid. Enumerate the at-most four
+                // surrounding integer points and retain only candidates that
+                // pass the full compensated point predicate. This keeps the
+                // exact support geometry as the oracle and never rounds a
+                // corner through copper merely to make it integral.
+                const auto bounds = simplex->Corner( index ).SurroundingBox();
+                if( !bounds )
+                    continue;
+
+                for( const std::int64_t x : { bounds->minX, bounds->maxX } )
+                {
+                    for( const std::int64_t y : { bounds->minY, bounds->maxY } )
+                    {
+                        const ROUTER_POINT candidate{ x, y };
+                        addConvexCandidate( candidate, layer.layerId );
+                    }
+                }
+            }
+        }
     }
 
-    (void) aNetCode;
+    std::stable_sort( convexCandidates.begin(), convexCandidates.end(), compareConvexCandidates );
+    convexCandidates.erase(
+            std::unique( convexCandidates.begin(), convexCandidates.end(),
+                         []( const CONVEX_LANDMARK_CANDIDATE& aLeft,
+                             const CONVEX_LANDMARK_CANDIDATE& aRight )
+                         { return aLeft.node == aRight.node; } ),
+            convexCandidates.end() );
+    for( const CONVEX_LANDMARK_CANDIDATE& candidate : convexCandidates )
+    {
+        if( result.size() >= maxDynamicLandmarks )
+            break;
+
+        if( isPointAllowed( candidate.node.point, candidate.node.layer, aNetCode, false,
+                            netTrackRadius( aNetCode ) ) )
+        {
+            add( candidate.node.point, candidate.node.layer );
+        }
+    }
+
     return result;
 }
 
@@ -1854,8 +3440,10 @@ std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::adaptiveNeighbours(
         const std::vector<ROUTER_NODE>& aLandmarks, int aNetCode ) const
 {
     std::vector<ROUTER_NODE> result = neighbours( aNode );
-    std::vector<std::pair<long double, ROUTER_NODE>> candidates;
-    candidates.reserve( std::min<std::size_t>( aLandmarks.size(), 128 ) );
+    std::vector<std::pair<long double, ROUTER_NODE>> nearbyCandidates;
+    std::vector<std::pair<long double, ROUTER_NODE>> localCandidates;
+    nearbyCandidates.reserve( 128 );
+    localCandidates.reserve( std::min<std::size_t>( aLandmarks.size(), 128 ) );
 
     auto collectNearbyLandmarks = [&]( int aCellRadius )
     {
@@ -1888,7 +3476,7 @@ std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::adaptiveNeighbours(
                     const long double distanceSquared = dx * dx + dy * dy;
 
                     if( distanceSquared != 0.0L )
-                        candidates.emplace_back( distanceSquared, landmark );
+                        nearbyCandidates.emplace_back( distanceSquared, landmark );
                 }
             }
         }
@@ -1900,8 +3488,27 @@ std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::adaptiveNeighbours(
     // still considered below, so long clear-board routes do not depend on
     // the bucket radius.
     collectNearbyLandmarks( 2 );
-    if( candidates.size() < 8 )
+    if( nearbyCandidates.size() < 8 )
         collectNearbyLandmarks( 8 );
+
+    // buildLandmarks intentionally contains only connection-local terminals
+    // and exact convex support corners. Keep them in a distinct reserve until
+    // the dense-board cap is applied below: a convex support corner is a
+    // faithful escape door, not optional board-wide decoration. Letting
+    // thousands of nearby pad/zone landmarks consume the cap first forces a
+    // general-convex connection back onto the coarse grid even though its
+    // exact support corner was already available.
+    for( const ROUTER_NODE& landmark : aLandmarks )
+    {
+        if( landmark.layer != aNode.layer || landmark == aNode )
+            continue;
+
+        const long double dx = static_cast<long double>( landmark.point.x ) - aNode.point.x;
+        const long double dy = static_cast<long double>( landmark.point.y ) - aNode.point.y;
+        const long double distanceSquared = dx * dx + dy * dy;
+        if( distanceSquared != 0.0L )
+            localCandidates.emplace_back( distanceSquared, landmark );
+    }
 
     auto compareCandidates = []( const auto& aLeft, const auto& aRight )
     {
@@ -1926,20 +3533,50 @@ std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::adaptiveNeighbours(
     // the orthogonal grid already supplies the local fallback.  Keep the
     // richer set for ordinary boards and use a bounded dense-board set so a
     // difficult connection remains cancellable in the editor.
-    const bool denseBoard = m_board.obstacles.size() > 2000 || m_board.pads.size() > 300;
-    const std::size_t maxVisibilityCandidates = denseBoard ? 16 : 128;
-    if( candidates.size() > maxVisibilityCandidates )
+    const auto sortAndUnique = [&]( auto& aCandidates )
     {
-        std::nth_element( candidates.begin(),
-                          candidates.begin()
-                                  + static_cast<std::ptrdiff_t>( maxVisibilityCandidates ),
-                          candidates.end(), compareCandidates );
-        candidates.resize( maxVisibilityCandidates );
-    }
+        std::stable_sort( aCandidates.begin(), aCandidates.end(), compareCandidates );
+        aCandidates.erase( std::unique( aCandidates.begin(), aCandidates.end(),
+                                        []( const auto& aLeft, const auto& aRight )
+                                        { return aLeft.second == aRight.second; } ),
+                           aCandidates.end() );
+    };
+    const auto trimNearest = [&]( auto& aCandidates, std::size_t aMaximum )
+    {
+        if( aCandidates.size() <= aMaximum )
+            return;
 
-    std::stable_sort( candidates.begin(), candidates.end(), compareCandidates );
+        std::nth_element( aCandidates.begin(),
+                          aCandidates.begin() + static_cast<std::ptrdiff_t>( aMaximum ),
+                          aCandidates.end(), compareCandidates );
+        aCandidates.resize( aMaximum );
+        std::stable_sort( aCandidates.begin(), aCandidates.end(), compareCandidates );
+    };
 
-    const std::size_t maxVisibleLandmarks = denseBoard ? 2 : 24;
+    const bool denseBoard = m_board.obstacles.size() > 2000 || m_board.pads.size() > 300;
+    sortAndUnique( localCandidates );
+    const bool hasExtraLocalDoors = localCandidates.size() > 1;
+
+    // The ordinary visibility graph stays deliberately small on dense
+    // boards. Reserve a handful of slots for per-connection landmarks,
+    // however; these include the exact offset corners of a non-rectangular
+    // convex obstacle and are the only geometrically faithful door choices
+    // when the rectangular room engine declines that layer.
+    const std::size_t localReserve = denseBoard && hasExtraLocalDoors ? 24 : 0;
+    const std::size_t maxVisibilityCandidates = denseBoard ? 24 : 128;
+    trimNearest( localCandidates,
+                 localReserve == 0 ? maxVisibilityCandidates : localReserve );
+
+    trimNearest( nearbyCandidates, maxVisibilityCandidates - localCandidates.size() );
+
+    std::vector<std::pair<long double, ROUTER_NODE>> candidates;
+    candidates.reserve( localCandidates.size() + nearbyCandidates.size() );
+    candidates.insert( candidates.end(), localCandidates.begin(), localCandidates.end() );
+    candidates.insert( candidates.end(), nearbyCandidates.begin(), nearbyCandidates.end() );
+    sortAndUnique( candidates );
+
+    const std::size_t maxVisibleLandmarks = denseBoard
+            ? ( hasExtraLocalDoors ? 24 : 2 ) : 24;
     std::size_t visible = 0;
 
     for( const auto& [unusedDistance, candidate] : candidates )
@@ -2025,10 +3662,14 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
 {
     aExpandedNodes = 0;
     m_roomMetrics = {};
+    ROUTING_TERMINAL defaultStart;
+    defaultStart.pad = aStart;
+    ROUTING_TERMINAL defaultTarget;
+    defaultTarget.pad = aTarget;
     const std::vector<ROUTING_TERMINAL> starts = aStarts.empty()
-            ? std::vector<ROUTING_TERMINAL>{ { aStart } } : aStarts;
+            ? std::vector<ROUTING_TERMINAL>{ defaultStart } : aStarts;
     const std::vector<ROUTING_TERMINAL> targets = aTargets.empty()
-            ? std::vector<ROUTING_TERMINAL>{ { aTarget } } : aTargets;
+            ? std::vector<ROUTING_TERMINAL>{ defaultTarget } : aTargets;
     for( const auto& terminal : starts )
         if( terminal.pad.netCode != aStart.netCode )
             return std::nullopt;
@@ -2073,6 +3714,115 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     }
     AUTOROUTE_CONTROL control( m_settings, aStart.netCode, aRetry,
                                aTarget.isPlaneTarget );
+
+    // A constrained SMD breakout can require one or more local bends before
+    // its selected via. BatchFanout preflights that bounded escape rather
+    // than reserving a merely free via coordinate. Consume the exact
+    // source-layer route before invoking the room/grid search: the latter is
+    // board-wide and may otherwise spend its entire node budget rediscovering
+    // a short path that was already certified during fanout planning.
+    //
+    // Keep the old direct construction below for snapshots created by older
+    // callers (or data-only tests) that do not carry this optional metadata.
+    if( aStarts.empty() && aTargets.empty()
+        && aTarget.isFanoutTarget && aTarget.fanoutSourceLayer >= 0
+        && aTarget.fanoutTargetLayer >= 0 && aTarget.fanoutEscapePath.size() >= 2
+        && aTarget.fanoutEscapePath.front() == aStart.position
+        && aTarget.fanoutEscapePath.back() == aTarget.position
+        && isOnPadLayer( aStart, aTarget.fanoutSourceLayer )
+        && isOnPadLayer( aTarget, aTarget.fanoutTargetLayer ) )
+    {
+        ROUTING_CONNECTION planned;
+        planned.netCode = aStart.netCode;
+        planned.complete = true;
+        planned.nodes.reserve( aTarget.fanoutEscapePath.size() + 1 );
+        for( const ROUTER_POINT& point : aTarget.fanoutEscapePath )
+            planned.nodes.push_back( { point, aTarget.fanoutSourceLayer } );
+        planned.nodes.push_back( { aTarget.position, aTarget.fanoutTargetLayer } );
+
+        bool allowed = true;
+        for( std::size_t index = 1; index < planned.nodes.size(); ++index )
+        {
+            if( aCancel && aCancel() )
+                return std::nullopt;
+
+            const ROUTER_NODE& first = planned.nodes[index - 1];
+            const ROUTER_NODE& second = planned.nodes[index];
+            const bool via = first.layer != second.layer;
+            if( !CanUseSegment( planned.netCode, first, second, via ) )
+            {
+                allowed = false;
+                break;
+            }
+
+            planned.cost += control.TraceCost( distance( first.point, second.point ) );
+            if( via )
+                planned.cost += control.ViaCost();
+        }
+
+        if( allowed )
+        {
+            if( debug )
+                autorouterDebugLog( "END search via planned local fanout path" );
+            return planned;
+        }
+    }
+
+    // The connection scheduler is allowed to orient an edge from an already
+    // escaped landing back toward its source SMD pad.  The forward case above
+    // consumes a bounded bent path verbatim, but the former reverse shortcut
+    // below reconstructed only a straight stub.  That sent a perfectly
+    // preflighted bent breakout back through the board-wide maze (or failed
+    // outright under a tight node budget).  Reverse the exact same local
+    // geometry instead.  This is still a connection-local adapter, not a
+    // replacement for RoutingBoard.fanout's item-set maze search.
+    if( aStarts.empty() && aTargets.empty()
+        && aStart.isFanoutTarget && aStart.fanoutSourceLayer >= 0
+        && aStart.fanoutTargetLayer >= 0 && aStart.fanoutEscapePath.size() >= 2
+        && aStart.fanoutEscapePath.back() == aStart.position
+        && aStart.fanoutEscapePath.front() == aTarget.position
+        && isOnPadLayer( aStart, aStart.fanoutTargetLayer )
+        && isOnPadLayer( aTarget, aStart.fanoutSourceLayer ) )
+    {
+        ROUTING_CONNECTION planned;
+        planned.netCode = aStart.netCode;
+        planned.complete = true;
+        planned.nodes.reserve( aStart.fanoutEscapePath.size() + 1 );
+        planned.nodes.push_back( { aStart.position, aStart.fanoutTargetLayer } );
+        planned.nodes.push_back( { aStart.position, aStart.fanoutSourceLayer } );
+        for( auto point = std::next( aStart.fanoutEscapePath.rbegin() );
+             point != aStart.fanoutEscapePath.rend(); ++point )
+        {
+            planned.nodes.push_back( { *point, aStart.fanoutSourceLayer } );
+        }
+
+        bool allowed = true;
+        for( std::size_t index = 1; index < planned.nodes.size(); ++index )
+        {
+            if( aCancel && aCancel() )
+                return std::nullopt;
+
+            const ROUTER_NODE& first = planned.nodes[index - 1];
+            const ROUTER_NODE& second = planned.nodes[index];
+            const bool via = first.layer != second.layer;
+            if( !CanUseSegment( planned.netCode, first, second, via ) )
+            {
+                allowed = false;
+                break;
+            }
+
+            planned.cost += control.TraceCost( distance( first.point, second.point ) );
+            if( via )
+                planned.cost += control.ViaCost();
+        }
+
+        if( allowed )
+        {
+            if( debug )
+                autorouterDebugLog( "END search via reversed planned local fanout path" );
+            return planned;
+        }
+    }
 
     // Plane fanout has an intentionally simple first-stage topology: a short
     // source-layer stub ending at the synthetic landing point, followed by a

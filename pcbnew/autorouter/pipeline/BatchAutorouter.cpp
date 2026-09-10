@@ -30,6 +30,7 @@
 #include <limits>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -63,6 +64,858 @@ double distance( const ROUTER_POINT& a, const ROUTER_POINT& b )
 std::int64_t viaValue( const ROUTING_NET& aNet, std::int64_t aFallback )
 {
     return aNet.viaDiameter > 0 ? aNet.viaDiameter : aFallback;
+}
+
+
+std::int64_t routeWidth( const BOARD_SNAPSHOT& aBoard, const ROUTING_NET& aNet )
+{
+    std::int64_t width = 0;
+
+    for( std::size_t padIndex : aNet.padIndices )
+    {
+        if( padIndex < aBoard.pads.size() )
+            width = std::max( width, aBoard.pads[padIndex].trackWidth );
+    }
+
+    return width > 0 ? width : 150000;
+}
+
+
+bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
+                               const ROUTING_PAD& aSource,
+                               const ROUTING_PAD& aLanding )
+{
+    if( !aLanding.isFanoutTarget || aLanding.fanoutSourceLayer < 0
+        || aLanding.fanoutTargetLayer < 0 || aConnection.nodes.size() < 2 )
+    {
+        return true;
+    }
+
+    const std::int64_t minimum = std::max<std::int64_t>( 0,
+                                                           aLanding.fanoutMinEscapeLength );
+    const std::int64_t maximum = aLanding.fanoutMaxEscapeLength > 0
+            ? aLanding.fanoutMaxEscapeLength
+            : std::numeric_limits<std::int64_t>::max();
+    // A malformed or contradictory synthetic target must not turn an
+    // impossible source envelope into a wider one.  This matches the
+    // independent min-drill and max-start-room filters in Freerouting's
+    // MazeSearchEngine.
+    if( maximum < minimum )
+        return false;
+    bool sawTransition = false;
+
+    for( std::size_t index = 0; index < aConnection.nodes.size(); ++index )
+    {
+        const ROUTER_NODE& node = aConnection.nodes[index];
+        if( !sawTransition && node.layer == aLanding.fanoutSourceLayer
+            && distance( node.point, aSource.position ) > static_cast<double>( maximum ) )
+        {
+            return false;
+        }
+
+        if( index == 0 || aConnection.nodes[index - 1].layer == node.layer )
+            continue;
+
+        if( !sawTransition )
+        {
+            const ROUTER_NODE& prior = aConnection.nodes[index - 1];
+            if( prior.point != node.point
+                || prior.layer != aLanding.fanoutSourceLayer )
+            {
+                return false;
+            }
+
+            const double drillDistance = distance( prior.point, aSource.position );
+            if( drillDistance < static_cast<double>( minimum )
+                || drillDistance > static_cast<double>( maximum ) )
+            {
+                return false;
+            }
+            sawTransition = true;
+        }
+    }
+
+    // A synthetic landing on a different layer must be reached through its
+    // fanout via.  Returning a same-layer path would make the later graph
+    // rewrite look connected while it has no physical layer transition.
+    return sawTransition || aLanding.fanoutSourceLayer == aLanding.fanoutTargetLayer;
+}
+
+
+void applyFanoutViaStyle( ROUTING_CONNECTION& aConnection, const ROUTING_PAD& aLanding )
+{
+    if( !aLanding.isFanoutTarget || aLanding.fanoutViaDiameter <= 0
+        || aConnection.nodes.size() < 2 )
+    {
+        return;
+    }
+
+    EnsureEdgeStyles( aConnection );
+    for( std::size_t index = 1; index < aConnection.nodes.size(); ++index )
+    {
+        if( aConnection.nodes[index - 1].layer == aConnection.nodes[index].layer )
+            continue;
+
+        ROUTING_EDGE_STYLE& style = aConnection.edgeStyles[index - 1];
+        style.viaDiameter = aLanding.fanoutViaDiameter;
+        style.viaDrill = aLanding.fanoutViaDrill;
+    }
+}
+
+
+/**
+ * Reconstruct the deliberately small, safe subset of pre-existing KiCad
+ * copper that can participate in a source-style forced shove.
+ *
+ * `allowRipupExisting` makes the adapter omit routable source copper from the
+ * immutable obstacle list so a complete proposal can replace it.  That must
+ * not make the copper invisible while the batch search is in progress: it is
+ * still a real collision surface and, in Freerouting, an unlocked trace/via
+ * may be moved rather than deleted.  The snapshot records direct trace/via
+ * pieces by UUID.  Here we rebuild:
+ *
+ * - a single straight trace as a static route whose endpoints stay fixed;
+ * - each uniform drilled via as its own static route.  Its normal endpoint
+ *   trace contacts remain separate source items so a later
+ *   `ShoveViaConnectionPlan` can reproduce `DrillItem.moveBy()`: retain
+ *   each trace and add one bridge per contacted layer.
+ *
+ * Anything with an interior/non-normal contact, pad-attached drill, arc,
+ * non-uniform padstack, or unsupported shape remains a static obstacle and is
+ * never destructively ripped up by forced insertion.  This maps the source's
+ * `DrillItemMover` normal-contact guard instead of pretending a UUID alone is
+ * enough to mutate arbitrary host topology.
+ */
+std::vector<ROUTING_CONNECTION> existingMovableConnections(
+        const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings )
+{
+    struct EXISTING_ATOM
+    {
+        enum class KIND { TRACE, VIA };
+
+        KIND               kind = KIND::TRACE;
+        ROUTING_CONNECTION connection;
+    };
+
+    std::map<std::string, std::vector<const ROUTING_OBSTACLE*>> byItem;
+    for( const ROUTING_OBSTACLE& obstacle : aBoard.removableExistingRoutes )
+    {
+        if( obstacle.isExistingRoute && obstacle.isMovable && !obstacle.boardItemId.empty() )
+            byItem[obstacle.boardItemId].push_back( &obstacle );
+    }
+
+    const auto layerOrder = [&]( int aLayer )
+    {
+        const auto found = std::find_if(
+                aSettings.layers.begin(), aSettings.layers.end(),
+                [&]( const ROUTER_LAYER_SETTINGS& aLayerSetting )
+                { return aLayerSetting.layerId == aLayer; } );
+        if( found == aSettings.layers.end() )
+            return std::pair{ std::numeric_limits<int>::max(), aLayer };
+        const int index = static_cast<int>( std::distance( aSettings.layers.begin(), found ) );
+        return std::pair{ found->layerOrdinal >= 0 ? found->layerOrdinal : index, aLayer };
+    };
+
+    std::vector<EXISTING_ATOM> atoms;
+    atoms.reserve( byItem.size() );
+    for( const auto& [id, pieces] : byItem )
+    {
+        std::vector<const ROUTING_OBSTACLE*> copper;
+        const ROUTING_OBSTACLE* hole = nullptr;
+        bool valid = true;
+
+        for( const ROUTING_OBSTACLE* piece : pieces )
+        {
+            if( piece->kind != ROUTER_OBSTACLE_KIND::SEGMENT )
+            {
+                valid = false;
+                break;
+            }
+            if( piece->isHole )
+            {
+                if( hole || piece->radius <= 0 )
+                {
+                    valid = false;
+                    break;
+                }
+                hole = piece;
+            }
+            else
+            {
+                copper.push_back( piece );
+            }
+        }
+
+        if( !valid || copper.empty() )
+            continue;
+
+        ROUTING_CONNECTION connection;
+        connection.complete = true;
+        connection.isExistingBoardRoute = true;
+        connection.isShoveMovable = false;
+        connection.sourceBoardItemIds = { id };
+        connection.netCode = copper.front()->netCode;
+
+        // A direct PCB_TRACK is represented by exactly one capsule.  Do not
+        // turn a tessellated arc or a compound shape into a chord.
+        if( copper.size() == 1 && !hole && copper.front()->start != copper.front()->end
+            && copper.front()->layers.size() == 1 && copper.front()->radius > 0 )
+        {
+            const ROUTING_OBSTACLE& trace = *copper.front();
+            connection.nodes = { { trace.start, trace.layers.front() },
+                                 { trace.end, trace.layers.front() } };
+            ROUTING_EDGE_STYLE traceStyle;
+            traceStyle.trackWidth = 2 * trace.radius;
+            traceStyle.clearance = std::max<std::int64_t>( 0, trace.clearance );
+            connection.edgeStyles = { std::move( traceStyle ) };
+            atoms.push_back( { EXISTING_ATOM::KIND::TRACE, std::move( connection ) } );
+            continue;
+        }
+
+        // A uniform drilled via becomes one layer transition.  The adapter
+        // marks non-uniform padstacks as non-movable, but revalidate the
+        // captured pieces here because this function is also used by
+        // data-only regression tests.
+        const ROUTER_POINT position = copper.front()->start;
+        std::vector<int> layers;
+        std::int64_t diameter = 0;
+        std::int64_t clearance = 0;
+        bool via = hole != nullptr && copper.size() >= 2;
+        for( const ROUTING_OBSTACLE* piece : copper )
+        {
+            if( piece->start != position || piece->end != position
+                || piece->layers.size() != 1 || piece->radius <= 0
+                || piece->netCode != connection.netCode )
+            {
+                via = false;
+                break;
+            }
+            const std::int64_t currentDiameter = 2 * piece->radius;
+            if( diameter != 0 && diameter != currentDiameter )
+            {
+                via = false;
+                break;
+            }
+            diameter = currentDiameter;
+            clearance = std::max( clearance, std::max<std::int64_t>( 0, piece->clearance ) );
+            layers.push_back( piece->layers.front() );
+        }
+
+        std::sort( layers.begin(), layers.end(), [&]( int aLeft, int aRight )
+        { return layerOrder( aLeft ) < layerOrder( aRight ); } );
+        layers.erase( std::unique( layers.begin(), layers.end() ), layers.end() );
+        if( !via || !hole || hole->start != position || hole->end != position
+            || hole->radius <= 0 || layers.size() < 2 )
+        {
+            continue;
+        }
+
+        ROUTING_EDGE_STYLE viaStyle;
+        viaStyle.viaDiameter = diameter;
+        viaStyle.viaDrill = 2 * hole->radius;
+        viaStyle.viaLayers = layers;
+        viaStyle.clearance = clearance;
+        connection.nodes = { { position, layers.front() }, { position, layers.back() } };
+        connection.edgeStyles = { std::move( viaStyle ) };
+        atoms.push_back( { EXISTING_ATOM::KIND::VIA, std::move( connection ) } );
+    }
+
+    const auto onInterior = []( const ROUTER_POINT& aPoint, const ROUTER_POINT& aStart,
+                                const ROUTER_POINT& aEnd )
+    {
+        if( aPoint == aStart || aPoint == aEnd || aStart == aEnd )
+            return false;
+        const long double dx = static_cast<long double>( aEnd.x ) - aStart.x;
+        const long double dy = static_cast<long double>( aEnd.y ) - aStart.y;
+        const long double px = static_cast<long double>( aPoint.x ) - aStart.x;
+        const long double py = static_cast<long double>( aPoint.y ) - aStart.y;
+        const long double cross = dx * py - dy * px;
+        if( std::fabs( cross ) > 0.5L )
+            return false;
+        const long double dot = px * dx + py * dy;
+        const long double lengthSquared = dx * dx + dy * dy;
+        return dot > 0.0L && dot < lengthSquared;
+    };
+
+    const auto hasNormalTraceEndpoint = []( const ROUTER_POINT& aPoint,
+                                             const ROUTER_POINT& aStart,
+                                             const ROUTER_POINT& aEnd )
+    {
+        // DrillItem.getNormalContacts() deliberately does not turn an
+        // arbitrary through-trace crossing into a normal contact.  A moved
+        // DrillItem only creates a bridge for a Trace whose first or last
+        // corner is exactly its old centre.  Treating every centreline
+        // crossing as a contact here used to manufacture a bridge to copper
+        // that Java leaves untouched, and made a host via appear movable in
+        // a topology that DrillItemMover rejects.
+        return aPoint == aStart || aPoint == aEnd;
+    };
+
+    const auto isOnLayer = []( const std::vector<int>& aLayers, int aLayer )
+    {
+        return std::find( aLayers.begin(), aLayers.end(), aLayer ) != aLayers.end();
+    };
+
+    const auto hasAreaOnLayer = [&]( int aNetCode, int aLayer )
+    {
+        // We have not yet ported the full mutable ConductionArea contact
+        // update from DrillItemMover.  Never move an existing trace/via on a
+        // plane layer rather than risking disconnecting an island.
+        return std::any_of( aBoard.conductionAreas.begin(), aBoard.conductionAreas.end(),
+                            [&]( const ROUTING_OBSTACLE& aArea )
+                            {
+                                return aArea.netCode == aNetCode
+                                       && isOnLayer( aArea.layers, aLayer );
+                            } );
+    };
+
+    const auto padTouchesTraceInterior = [&]( const ROUTING_PAD& aPad,
+                                               const ROUTING_CONNECTION& aTrace )
+    {
+        if( aTrace.nodes.size() != 2 || aTrace.nodes.front().layer != aTrace.nodes.back().layer
+            || aPad.position == aTrace.nodes.front().point
+            || aPad.position == aTrace.nodes.back().point )
+        {
+            return false;
+        }
+
+        const ROUTER_POINT& start = aTrace.nodes.front().point;
+        const ROUTER_POINT& end = aTrace.nodes.back().point;
+        const long double dx = static_cast<long double>( end.x ) - start.x;
+        const long double dy = static_cast<long double>( end.y ) - start.y;
+        const long double lengthSquared = dx * dx + dy * dy;
+        if( lengthSquared <= 0.0L )
+            return false;
+
+        const long double px = static_cast<long double>( aPad.position.x ) - start.x;
+        const long double py = static_cast<long double>( aPad.position.y ) - start.y;
+        const long double factor = ( px * dx + py * dy ) / lengthSquared;
+        if( factor <= 0.0L || factor >= 1.0L )
+            return false;
+
+        const long double nearestX = static_cast<long double>( start.x ) + factor * dx;
+        const long double nearestY = static_cast<long double>( start.y ) + factor * dy;
+        const long double deltaX = static_cast<long double>( aPad.position.x ) - nearestX;
+        const long double deltaY = static_cast<long double>( aPad.position.y ) - nearestY;
+        const ROUTING_EDGE_STYLE& style = aTrace.edgeStyles.front();
+        const std::int64_t traceRadius = std::max<std::int64_t>( 0, style.trackWidth / 2 );
+        const std::int64_t contactRadius = traceRadius + std::max<std::int64_t>( 0, aPad.radius );
+        return deltaX * deltaX + deltaY * deltaY
+               <= static_cast<long double>( contactRadius ) * contactRadius;
+    };
+
+    const auto sourceGeometryTouchesTraceInterior =
+            [&]( const ROUTING_OBSTACLE& aObstacle, const ROUTING_CONNECTION& aTrace )
+    {
+        // A source trace is reconstructed as one independently movable
+        // worker capsule.  That is only sound when all of its electrical
+        // topology is represented by its two retained endpoints.  KiCad does
+        // not require a track to be split at a via or another track contact,
+        // however, and a locked/unsupported source item is deliberately not
+        // turned into an EXISTING_ATOM above.  If it touches the open interior
+        // of this trace, springing the trace would retain neither the contact
+        // nor an equivalent bridge.  Keep the trace fixed instead.
+        //
+        // This is intentionally about copper geometry, rather than the
+        // source's `getNormalContacts()` graph.  The latter expects imported
+        // routes to have already been normalized at every contact; the KiCad
+        // snapshot can contain legitimate unsplit host geometry.  Exact
+        // endpoint contacts remain allowed below because their endpoint stays
+        // in place when a trace is springed.
+        if( !aObstacle.isExistingRoute || aObstacle.isHole || aObstacle.isKeepout
+            || aTrace.nodes.size() != 2
+            || aTrace.nodes.front().layer != aTrace.nodes.back().layer
+            || aTrace.edgeStyles.empty()
+            || aObstacle.netCode != aTrace.netCode
+            || !isOnLayer( aObstacle.layers, aTrace.nodes.front().layer )
+            || ( !aTrace.sourceBoardItemIds.empty()
+                 && aObstacle.boardItemId == aTrace.sourceBoardItemIds.front() ) )
+        {
+            return false;
+        }
+
+        const ROUTER_POINT& traceStart = aTrace.nodes.front().point;
+        const ROUTER_POINT& traceEnd = aTrace.nodes.back().point;
+        const long double traceDx = static_cast<long double>( traceEnd.x ) - traceStart.x;
+        const long double traceDy = static_cast<long double>( traceEnd.y ) - traceStart.y;
+        const long double traceLengthSquared = traceDx * traceDx + traceDy * traceDy;
+        if( traceLengthSquared <= 0.0L )
+            return true;
+
+        const std::int64_t traceRadius = std::max<std::int64_t>(
+                0, aTrace.edgeStyles.front().trackWidth / 2 );
+
+        const auto pointTouchesOpenInterior = [&]( const ROUTER_POINT& aPoint,
+                                                    std::int64_t aOtherRadius )
+        {
+            if( aPoint == traceStart || aPoint == traceEnd )
+                return false;
+
+            const long double pointDx = static_cast<long double>( aPoint.x ) - traceStart.x;
+            const long double pointDy = static_cast<long double>( aPoint.y ) - traceStart.y;
+            const long double factor = ( pointDx * traceDx + pointDy * traceDy )
+                                       / traceLengthSquared;
+            if( factor <= 0.0L || factor >= 1.0L )
+                return false;
+
+            const long double nearestX = static_cast<long double>( traceStart.x )
+                                         + factor * traceDx;
+            const long double nearestY = static_cast<long double>( traceStart.y )
+                                         + factor * traceDy;
+            const long double deltaX = static_cast<long double>( aPoint.x ) - nearestX;
+            const long double deltaY = static_cast<long double>( aPoint.y ) - nearestY;
+            const long double contactRadius = static_cast<long double>( traceRadius )
+                                              + std::max<std::int64_t>( 0, aOtherRadius );
+            return deltaX * deltaX + deltaY * deltaY <= contactRadius * contactRadius;
+        };
+
+        if( aObstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
+        {
+            const std::int64_t obstacleRadius = std::max<std::int64_t>( 0,
+                                                                          aObstacle.radius );
+            if( pointTouchesOpenInterior( aObstacle.start, obstacleRadius )
+                || pointTouchesOpenInterior( aObstacle.end, obstacleRadius ) )
+            {
+                return true;
+            }
+
+            const long double obstacleDx = static_cast<long double>( aObstacle.end.x )
+                                           - aObstacle.start.x;
+            const long double obstacleDy = static_cast<long double>( aObstacle.end.y )
+                                           - aObstacle.start.y;
+            const long double relativeX = static_cast<long double>( aObstacle.start.x )
+                                          - traceStart.x;
+            const long double relativeY = static_cast<long double>( aObstacle.start.y )
+                                          - traceStart.y;
+            const long double denominator = traceDx * obstacleDy - traceDy * obstacleDx;
+            constexpr long double epsilon = 0.5L;
+
+            if( std::fabs( denominator ) > epsilon )
+            {
+                const long double traceFactor = ( relativeX * obstacleDy
+                                                  - relativeY * obstacleDx )
+                                                 / denominator;
+                const long double obstacleFactor = ( relativeX * traceDy
+                                                     - relativeY * traceDx )
+                                                    / denominator;
+                // The source trace normal-contact topology already retains a
+                // shared endpoint.  A proper/through intersection of the
+                // centre lines is an interior attachment that cannot be
+                // reconstructed by moving this one capsule.
+                if( traceFactor > 0.0L && traceFactor < 1.0L
+                    && obstacleFactor >= 0.0L && obstacleFactor <= 1.0L )
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                // Parallel overlapping copper is not caught by a line-line
+                // intersection.  Project the obstacle onto the host trace;
+                // an interval through its open interior is a real attachment
+                // whenever the two swept centre lines are close enough.
+                const long double collinear = relativeX * traceDy - relativeY * traceDx;
+                const long double startProjection = ( relativeX * traceDx
+                                                      + relativeY * traceDy )
+                                                     / traceLengthSquared;
+                const long double endProjection =
+                        ( ( static_cast<long double>( aObstacle.end.x ) - traceStart.x )
+                                  * traceDx
+                          + ( static_cast<long double>( aObstacle.end.y ) - traceStart.y )
+                                    * traceDy )
+                        / traceLengthSquared;
+                const long double overlapStart = std::max(
+                        0.0L, std::min( startProjection, endProjection ) );
+                const long double overlapEnd = std::min(
+                        1.0L, std::max( startProjection, endProjection ) );
+                const long double contactRadius = static_cast<long double>( traceRadius )
+                                                  + obstacleRadius;
+
+                if( overlapStart < overlapEnd
+                    && std::fabs( collinear ) / std::sqrt( traceLengthSquared )
+                               <= contactRadius )
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Existing source routes currently arrive as capsule primitives.  If
+        // a future adapter supplies an arbitrary source shape, do not claim
+        // its contact topology is movable just because its UUID is different.
+        // Restrict that fail-closed choice to a coarse overlap with the trace
+        // envelope so an unrelated same-net item elsewhere on the layer does
+        // not suppress every possible source trace shove.
+        ROUTER_BOX obstacleBounds = aObstacle.box;
+        bool      haveBounds = aObstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE;
+        const auto includePoint = [&]( const ROUTER_POINT& aPoint )
+        {
+            if( !haveBounds )
+            {
+                obstacleBounds = { aPoint.x, aPoint.y, aPoint.x, aPoint.y };
+                haveBounds = true;
+                return;
+            }
+            obstacleBounds.minX = std::min( obstacleBounds.minX, aPoint.x );
+            obstacleBounds.minY = std::min( obstacleBounds.minY, aPoint.y );
+            obstacleBounds.maxX = std::max( obstacleBounds.maxX, aPoint.x );
+            obstacleBounds.maxY = std::max( obstacleBounds.maxY, aPoint.y );
+        };
+        for( const ROUTER_POINT& point : aObstacle.polygon )
+            includePoint( point );
+        if( !haveBounds )
+            return true;
+
+        const long double obstacleRadius = std::max<std::int64_t>( 0, aObstacle.radius );
+        const long double traceMinX = static_cast<long double>(
+                std::min( traceStart.x, traceEnd.x ) ) - traceRadius;
+        const long double traceMinY = static_cast<long double>(
+                std::min( traceStart.y, traceEnd.y ) ) - traceRadius;
+        const long double traceMaxX = static_cast<long double>(
+                std::max( traceStart.x, traceEnd.x ) ) + traceRadius;
+        const long double traceMaxY = static_cast<long double>(
+                std::max( traceStart.y, traceEnd.y ) ) + traceRadius;
+        return static_cast<long double>( obstacleBounds.minX ) - obstacleRadius <= traceMaxX
+               && static_cast<long double>( obstacleBounds.maxX ) + obstacleRadius >= traceMinX
+               && static_cast<long double>( obstacleBounds.minY ) - obstacleRadius <= traceMaxY
+               && static_cast<long double>( obstacleBounds.maxY ) + obstacleRadius >= traceMinY;
+    };
+
+    const auto viaHasSupportedNormalContacts = [&]( std::size_t aViaIndex )
+    {
+        if( aViaIndex >= atoms.size() || atoms[aViaIndex].kind != EXISTING_ATOM::KIND::VIA )
+            return false;
+
+        const ROUTING_CONNECTION& via = atoms[aViaIndex].connection;
+        if( via.nodes.size() != 2 || via.nodes.front().point != via.nodes.back().point
+            || via.nodes.front().layer == via.nodes.back().layer
+            || via.edgeStyles.size() != 1 || via.sourceBoardItemIds.size() != 1 )
+        {
+            return false;
+        }
+
+        const ROUTER_POINT position = via.nodes.front().point;
+        const ROUTING_EDGE_STYLE& style = via.edgeStyles.front();
+        const std::int64_t viaRadius = std::max<std::int64_t>( 1, style.viaDiameter / 2 );
+        const std::vector<int>& layers = style.viaLayers;
+        if( layers.empty() )
+            return false;
+
+        // DrillItemMover rejects a drill item with a normal PAD contact.  A
+        // point-only test misses the ordinary KiCad case where the via lands
+        // inside a pad away from its centre, so use the captured conservative
+        // pad radius.  False positives are intentionally fail-closed.
+        for( const ROUTING_PAD& pad : aBoard.pads )
+        {
+            if( pad.isFanoutTarget || pad.isPlaneTarget || pad.netCode != via.netCode
+                || !std::any_of( layers.begin(), layers.end(), [&]( int aLayer )
+                   { return isOnLayer( pad.layers, aLayer ); } ) )
+            {
+                continue;
+            }
+
+            const long double dx = static_cast<long double>( position.x ) - pad.position.x;
+            const long double dy = static_cast<long double>( position.y ) - pad.position.y;
+            const long double radius = static_cast<long double>( viaRadius )
+                                       + std::max<std::int64_t>( 0, pad.radius );
+            if( dx * dx + dy * dy <= radius * radius )
+                return false;
+        }
+
+        const auto pointToSegmentDistanceSquared = [&]( const ROUTER_POINT& aStart,
+                                                         const ROUTER_POINT& aEnd )
+        {
+            const long double dx = static_cast<long double>( aEnd.x ) - aStart.x;
+            const long double dy = static_cast<long double>( aEnd.y ) - aStart.y;
+            const long double lengthSquared = dx * dx + dy * dy;
+            const long double factor = lengthSquared <= 0.0L
+                    ? 0.0L
+                    : std::clamp(
+                              ( ( static_cast<long double>( position.x ) - aStart.x ) * dx
+                                + ( static_cast<long double>( position.y ) - aStart.y ) * dy )
+                                      / lengthSquared,
+                              0.0L, 1.0L );
+            const long double nearestX = static_cast<long double>( aStart.x ) + factor * dx;
+            const long double nearestY = static_cast<long double>( aStart.y ) + factor * dy;
+            const long double deltaX = static_cast<long double>( position.x ) - nearestX;
+            const long double deltaY = static_cast<long double>( position.y ) - nearestY;
+            return deltaX * deltaX + deltaY * deltaY;
+        };
+
+        // DrillItem.moveBy() remembers a TraceInfo for every *normal* trace
+        // contact, moves the via, and creates a bridge for that layer.
+        // DrillItem.getNormalContacts() defines a trace contact as an exact
+        // endpoint match, not an annulus overlap or a trace centreline
+        // crossing. Admit exactly the source subset that can reproduce that
+        // operation. A tangential or through-trace contact remains fixed
+        // rather than becoming a dangling proposal stub.
+        std::set<std::string> supportedTraceIds;
+        for( const EXISTING_ATOM& atom : atoms )
+        {
+            if( atom.kind != EXISTING_ATOM::KIND::TRACE
+                || atom.connection.netCode != via.netCode
+                || atom.connection.nodes.size() != 2
+                || atom.connection.nodes.front().layer != atom.connection.nodes.back().layer
+                || atom.connection.edgeStyles.size() != 1
+                || atom.connection.sourceBoardItemIds.size() != 1
+                || !isOnLayer( layers, atom.connection.nodes.front().layer )
+                || !hasNormalTraceEndpoint( position, atom.connection.nodes.front().point,
+                                             atom.connection.nodes.back().point ) )
+            {
+                continue;
+            }
+            supportedTraceIds.insert( atom.connection.sourceBoardItemIds.front() );
+        }
+
+        const auto inspectSourceGeometry = [&]( const std::vector<ROUTING_OBSTACLE>& aObstacles )
+        {
+            for( const ROUTING_OBSTACLE& obstacle : aObstacles )
+            {
+                if( obstacle.boardItemId == via.sourceBoardItemIds.front()
+                    || obstacle.netCode != via.netCode
+                    || !std::any_of( layers.begin(), layers.end(), [&]( int aLayer )
+                       { return isOnLayer( obstacle.layers, aLayer ); } ) )
+                {
+                    continue;
+                }
+
+                // An unsupported source shape on a physical via layer might
+                // be a normal contact. Without its exact mutation/bridge
+                // semantics the only safe answer is to keep the via fixed.
+                if( obstacle.kind != ROUTER_OBSTACLE_KIND::SEGMENT )
+                    return false;
+
+                const long double radius = static_cast<long double>( viaRadius )
+                                           + std::max<std::int64_t>( 0, obstacle.radius );
+                if( pointToSegmentDistanceSquared( obstacle.start, obstacle.end )
+                    > radius * radius )
+                {
+                    continue;
+                }
+
+                if( !obstacle.isHole && supportedTraceIds.contains( obstacle.boardItemId )
+                    && hasNormalTraceEndpoint( position, obstacle.start, obstacle.end ) )
+                {
+                    continue;
+                }
+
+                // A second via/pad/hole, an arc tessellation, a locked trace,
+                // or a direct trace that ends somewhere inside the annulus is
+                // not represented by the source-style old-centre bridge.
+                return false;
+            }
+            return true;
+        };
+
+        if( !inspectSourceGeometry( aBoard.removableExistingRoutes )
+            || !inspectSourceGeometry( aBoard.obstacles ) )
+        {
+            return false;
+        }
+
+        return true;
+    };
+
+    const auto traceHasInteriorContact = [&]( std::size_t aTrace )
+    {
+        const ROUTING_CONNECTION& trace = atoms[aTrace].connection;
+        if( trace.nodes.size() != 2 || trace.nodes.front().layer != trace.nodes.back().layer )
+            return true;
+        const int layer = trace.nodes.front().layer;
+        if( hasAreaOnLayer( trace.netCode, layer ) )
+            return true;
+
+        for( std::size_t other = 0; other < atoms.size(); ++other )
+        {
+            if( other == aTrace || atoms[other].connection.netCode != trace.netCode )
+                continue;
+            for( const ROUTER_NODE& node : atoms[other].connection.nodes )
+                if( node.layer == layer
+                    && onInterior( node.point, trace.nodes.front().point, trace.nodes.back().point ) )
+                {
+                    return true;
+                }
+        }
+        for( const ROUTING_PAD& pad : aBoard.pads )
+        {
+            if( pad.isFanoutTarget || pad.isPlaneTarget || pad.netCode != trace.netCode
+                || !isOnLayer( pad.layers, layer ) )
+            {
+                continue;
+            }
+            // A KiCad track can enter a pad away from its centre.  The old
+            // centreline-only probe marked that as movable, then a spring-over
+            // detached an interior pad contact that Java's item topology keeps
+            // fixed.  The snapshot carries a conservative pad radius, so use
+            // the actual copper contact envelope while still allowing an
+            // ordinary trace endpoint to remain anchored at a pad centre.
+            if( padTouchesTraceInterior( pad, trace ) )
+                return true;
+        }
+
+        const auto hasSourceGeometryContact = [&]( const std::vector<ROUTING_OBSTACLE>& aObstacles )
+        {
+            return std::any_of( aObstacles.begin(), aObstacles.end(),
+                                [&]( const ROUTING_OBSTACLE& aObstacle )
+                                {
+                                    return sourceGeometryTouchesTraceInterior( aObstacle, trace );
+                                } );
+        };
+
+        // Movable atoms cover the source subset we can reconstruct.  Inspect
+        // the complete snapshot as well: a locked via/arc or an unsupported
+        // source item is intentionally absent from atoms, but can still make
+        // a physical same-net attachment in the interior of this trace.
+        if( hasSourceGeometryContact( aBoard.removableExistingRoutes )
+            || hasSourceGeometryContact( aBoard.obstacles ) )
+        {
+            return true;
+        }
+        return false;
+    };
+
+    std::vector<ROUTING_CONNECTION> result;
+    result.reserve( atoms.size() );
+
+    for( std::size_t index = 0; index < atoms.size(); ++index )
+    {
+        ROUTING_CONNECTION route = atoms[index].connection;
+
+        // Do not collapse a source trace-via-trace chain into a synthetic
+        // mutable polyline. DrillItem.moveBy() moves the Via, retains every
+        // contacted Trace in place, and emits old-centre -> new-centre bridge
+        // copper for its normal endpoint contacts. Keeping each host item as
+        // its own static route lets ShoveViaConnectionPlan reproduce that
+        // mutation and preserves branches/multiple same-layer contacts that
+        // a two-legged composite silently discarded.
+        route.isShoveMovable = ( atoms[index].kind == EXISTING_ATOM::KIND::TRACE
+                                 && !traceHasInteriorContact( index ) )
+                                || viaHasSupportedNormalContacts( index );
+        result.push_back( std::move( route ) );
+    }
+
+    return result;
+}
+
+
+/**
+ * Return the physical source item identities represented completely by a
+ * static occupancy route.
+ *
+ * `removableExistingRoutes` is deliberately a collection of primitive
+ * snapshot shapes: a through via has one annulus per copper layer plus a
+ * drill, and an arc can have several tessellated capsules.  A static
+ * ROUTING_CONNECTION may replace *all* of those shapes in the live
+ * occupancy model, but only when it owns every shape for the corresponding
+ * BOARD_ITEM UUID.  Every other source item must remain in the immutable
+ * search obstacle set.  Otherwise an unsupported arc, a non-uniform via, or
+ * a trace whose topology failed the fail-closed reconstruction becomes
+ * invisible during a whole-net reroute.
+ */
+std::set<std::string> representedExistingItemIds(
+        const std::vector<ROUTING_CONNECTION>& aConnections )
+{
+    std::set<std::string> result;
+
+    for( const ROUTING_CONNECTION& connection : aConnections )
+    {
+        if( !connection.isExistingBoardRoute )
+            continue;
+
+        result.insert( connection.sourceBoardItemIds.begin(),
+                       connection.sourceBoardItemIds.end() );
+    }
+
+    return result;
+}
+
+
+/**
+ * Add source copper that has no live static-route representation back to the
+ * immutable obstacle model.
+ *
+ * This helper is used twice with different scopes:
+ *
+ * - the fanout pre-pass sees every removable source item as fixed copper;
+ *   current native fanout planning has no host-item shove transaction;
+ * - the ordinary batch stage sees only items that could not be represented
+ *   by a complete static connection.  Represented items instead participate
+ *   in occupancy conflict discovery and can be promoted to proposal copper
+ *   only after a checked shove.
+ *
+ * Existing routes in `aSnapshot.obstacles` are never removed here.  Their
+ * UUID cannot also occur in `removableExistingRoutes`, because the adapter
+ * places each BOARD_ITEM in exactly one collection.
+ */
+void appendUnrepresentedExistingObstacles( BOARD_SNAPSHOT& aSnapshot,
+                                           const std::set<std::string>& aRepresentedIds )
+{
+    for( ROUTING_OBSTACLE& obstacle : aSnapshot.removableExistingRoutes )
+    {
+        if( !obstacle.isExistingRoute || obstacle.boardItemId.empty()
+            || aRepresentedIds.contains( obstacle.boardItemId ) )
+        {
+            continue;
+        }
+
+        // Keep the canonical removable record for output ownership, but make
+        // the immutable-search copy collision-only so ROUTING_BOARD cannot
+        // accidentally use old copper to satisfy a full-reroute task.
+        ROUTING_OBSTACLE collisionOnly = obstacle;
+        collisionOnly.isCollisionOnly = true;
+        aSnapshot.obstacles.push_back( std::move( collisionOnly ) );
+        obstacle.isMirroredToObstacleModel = true;
+    }
+}
+
+
+/** Add every removable source shape to a planning-only immutable snapshot. */
+void appendAllRemovableExistingObstacles( BOARD_SNAPSHOT& aSnapshot )
+{
+    // This input is planning-only, so avoid setting the DRC mirror bit on
+    // its canonical source records.  BatchFanout itself never constructs a
+    // ROUTING_BOARD, but marking copies collision-only documents and
+    // preserves the invariant should that change later.
+    for( const ROUTING_OBSTACLE& obstacle : aSnapshot.removableExistingRoutes )
+    {
+        if( !obstacle.isExistingRoute || obstacle.boardItemId.empty() )
+            continue;
+
+        ROUTING_OBSTACLE collisionOnly = obstacle;
+        collisionOnly.isCollisionOnly = true;
+        aSnapshot.obstacles.push_back( std::move( collisionOnly ) );
+    }
+}
+
+
+/**
+ * Remove planning-only copies of source copper after BatchFanout has chosen
+ * its local escapes.  The returned fanout snapshot must not retain these
+ * copies: represented source items are subsequently supplied by live
+ * occupancy so a forced insertion can shove them; unrepresented items are
+ * appended once by appendUnrepresentedExistingObstacles().
+ */
+void removePlanningOnlyExistingObstacles( BOARD_SNAPSHOT& aSnapshot,
+                                          const BOARD_SNAPSHOT& aOriginal )
+{
+    std::set<std::string> removableIds;
+    for( const ROUTING_OBSTACLE& obstacle : aOriginal.removableExistingRoutes )
+    {
+        if( obstacle.isExistingRoute && !obstacle.boardItemId.empty() )
+            removableIds.insert( obstacle.boardItemId );
+    }
+
+    aSnapshot.obstacles.erase(
+            std::remove_if( aSnapshot.obstacles.begin(), aSnapshot.obstacles.end(),
+                            [&]( const ROUTING_OBSTACLE& obstacle )
+                            {
+                                return obstacle.isExistingRoute
+                                       && !obstacle.boardItemId.empty()
+                                       && removableIds.contains( obstacle.boardItemId );
+                            } ),
+            aSnapshot.obstacles.end() );
 }
 
 
@@ -162,6 +1015,19 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         return true;
 
     std::vector<ROUTING_CONNECTION> newConnections;
+    std::size_t                     newConnectionCount = 0;
+    bool                            newConnectionsFlushed = false;
+    const auto flushNewConnections = [&]()
+    {
+        if( newConnectionsFlushed )
+            return;
+
+        newConnectionCount = newConnections.size();
+        aConnections.insert( aConnections.end(),
+                             std::make_move_iterator( newConnections.begin() ),
+                             std::make_move_iterator( newConnections.end() ) );
+        newConnectionsFlushed = true;
+    };
     if( aNet.connections.empty() )
         return true;
 
@@ -250,7 +1116,14 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
     while( !pendingConnections.empty() )
     {
         if( aCancel && aCancel() )
+        {
+            // Per-pin fanout budgets use the regular cancellation plumbing.
+            // Keep all previously committed worker routes visible to the
+            // caller before returning so occupancy, emitted geometry and the
+            // subsequent ordinary batch stage never diverge.
+            flushNewConnections();
             return false;
+        }
 
         std::size_t selected = 0;
         int          selectedClass = std::numeric_limits<int>::max();
@@ -294,7 +1167,10 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                                   + static_cast<std::ptrdiff_t>( selected ) );
 
         if( sourceIndex >= aBoard.pads.size() || targetIndex >= aBoard.pads.size() )
+        {
+            flushNewConnections();
             return false;
+        }
 
         if( aOccupancy.Board()->Connected( sourceIndex, targetIndex ) )
             continue;
@@ -394,7 +1270,10 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             for( int iteration = 0; iteration < attemptsThisPass; ++iteration )
             {
                 if( aCancel && aCancel() )
+                {
+                    flushNewConnections();
                     return false;
+                }
 
                 int expanded = 0;
                 const int expandedBeforeSearch = aExpandedNodes;
@@ -410,6 +1289,37 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                                                            starts, destinations );
                 aExpandedNodes += expanded;
 
+                // This is distinct from a pin-entry neckdown.  Freerouting's
+                // AutorouteConnectionRouter retries a complete failed search
+                // at the configured neck width, so a narrow corridor can be
+                // discovered by the maze itself rather than only after a
+                // normal-width path reaches a terminal pad.  The retry owns a
+                // separate immutable engine: its spatial padding, room
+                // clearance predicates, output edge styles, and strict
+                // insertion all agree on the selected width.
+                int neckExpanded = 0;
+                const std::int64_t normalWidth = routeWidth( aBoard, aNet );
+                const std::int64_t neckWidth = std::max<std::int64_t>(
+                        0, aSettings.neckWidthIU );
+                if( !connection && neckWidth > 0 && neckWidth < normalWidth
+                    && !( aCancel && aCancel() ) )
+                {
+                    const int expandedBeforeNeckSearch = aExpandedNodes;
+                    const ROUTER_SEARCH_PROGRESS_CALLBACK neckSearchProgress =
+                            [&]( int aSearchExpanded )
+                    {
+                        if( aSearchProgress )
+                            aSearchProgress( expandedBeforeNeckSearch + neckExpanded
+                                             + aSearchExpanded );
+                    };
+                    AUTOROUTE_ENGINE neckEngine( aBoard, aSettings, aOccupancy, 0,
+                                                  std::nullopt, aNet.netCode, neckWidth );
+                    connection = neckEngine.AutorouteConnection(
+                            source, target, aRetry + iteration, neckExpanded, aCancel,
+                            neckSearchProgress, starts, destinations );
+                    aExpandedNodes += neckExpanded;
+                }
+
                 if( autorouterDebugEnabled() )
                 {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -420,7 +1330,8 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                     message << "search result net=" << aNet.netCode << " sourcePad="
                             << routeSourceIndex << " targetPad=" << candidate
                             << " iteration=" << iteration << " found=" << connection.has_value()
-                            << " expanded=" << expanded << " elapsed=" << elapsed << " ms";
+                            << " expanded=" << expanded << " neckExpanded=" << neckExpanded
+                            << " neckWidth=" << neckWidth << " elapsed=" << elapsed << " ms";
                     autorouterDebugLog( message.str() );
                 }
 
@@ -454,18 +1365,54 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         connection->fromPadIndex = routeSourceIndex;
         connection->toPadIndex = routeTargetIndex;
         connection->isPlaneConnection = target.isPlaneTarget;
-        connection->isFanoutConnection = target.isFanoutTarget
-                                        && target.fanoutSourcePadIndex == routeSourceIndex;
+        const ROUTING_PAD* fanoutSource = nullptr;
+        const ROUTING_PAD* fanoutLanding = nullptr;
+        if( target.isFanoutTarget && target.fanoutSourcePadIndex == routeSourceIndex )
+        {
+            fanoutSource = &source;
+            fanoutLanding = &target;
+        }
+        else if( source.isFanoutTarget && source.fanoutSourcePadIndex == routeTargetIndex )
+        {
+            // The connected-component walk may legally choose the synthetic
+            // landing as its source. A fanout bridge is directional only in
+            // its local geometry; its selected via profile and envelope are
+            // still properties of the same source-pad/landing pair.
+            fanoutSource = &target;
+            fanoutLanding = &source;
+        }
+        connection->isFanoutConnection = fanoutSource != nullptr;
+
+        if( connection->isFanoutConnection )
+        {
+            if( !fanoutEscapeFitsEnvelope( *connection, *fanoutSource, *fanoutLanding ) )
+            {
+                if( autorouterDebugEnabled() )
+                    autorouterDebugLog( "fanout escape rejected outside configured envelope" );
+                continue;
+            }
+
+            // A board-via fallback is selected only for this synthetic
+            // fanout edge.  Carry it as per-edge style before both conflict
+            // discovery and strict insertion so search, DRC and emitted
+            // KiCad geometry see exactly the same padstack.
+            applyFanoutViaStyle( *connection, *fanoutLanding );
+        }
 
         // Ripup and insertion are ONE speculative edit. A late blocked edge,
         // invalid via, cancellation or exception must not lose earlier routes.
         const auto conflicts = aSettings.allowRipupRouted
                 ? aEngine.FindConflictingConnections( *connection )
                 : std::vector<ROUTING_CONNECTION>{};
-        if( conflicts.size() > static_cast<std::size_t>( std::max( 0, aSettings.maxRipups - aRipups ) ) )
-            continue;
+        const std::size_t remainingRipups = static_cast<std::size_t>(
+                std::max( 0, aSettings.maxRipups - aRipups ) );
+        // A source-style forced shove preserves every victim instead of
+        // consuming a negotiated-congestion rip-up. Let insertion attempt
+        // that transactional move even when ordinary deletions are exhausted;
+        // only the fallback that would discard a victim remains forbidden.
+        const bool allowRipupFallback = conflicts.size() <= remainingRipups;
         const auto inserted = aEngine.InsertConnection(
-                *connection, conflicts, aOccupancy, aCancel );
+                *connection, conflicts, aOccupancy, aCancel, allowRipupFallback );
         if( inserted.state != FOUND_CONNECTION_INSERTER::STATE::INSERTED )
         {
             if( autorouterDebugEnabled() )
@@ -481,10 +1428,67 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         if( inserted.connection )
             *connection = *inserted.connection;
 
+        // Recursive forced insertion may relocate a generated route that was
+        // not in the candidate's original conflict set.  Publish *every*
+        // transactional replacement before accounting for ordinary rip-ups;
+        // otherwise the worker occupancy and the emitted proposal diverge.
+        for( const auto& shove : inserted.shoved )
+        {
+            const auto replace = [&]( auto& aRoutes )
+            {
+                for( auto& route : aRoutes )
+                    if( SameRouteGeometry( route, shove.original ) )
+                        route = shove.replacement;
+            };
+            replace( aConnections );
+            replace( newConnections );
+
+            // DrillItem.moveBy() leaves its contacted traces in place and
+            // adds a bridge to the moved via. In a proposal worker those
+            // source BOARD_ITEMs must instead be re-emitted explicitly: swap
+            // each static collision record for its materialised equivalent,
+            // then retain every newly generated bridge in the global route
+            // set. Do not put bridges in newConnections: their source net can
+            // differ from the currently routed net, while aConnections owns
+            // all cross-net proposal geometry.
+            for( const ROUTING_CONNECTION_REPLACEMENT& contact : shove.materializedContacts )
+            {
+                const auto materialize = [&]( auto& aRoutes )
+                {
+                    for( auto& route : aRoutes )
+                        if( SameRouteGeometry( route, contact.original ) )
+                            route = contact.replacement;
+                };
+                materialize( aConnections );
+                materialize( newConnections );
+            }
+            for( const ROUTING_CONNECTION& bridge : shove.bridges )
+            {
+                const bool alreadyPublished = std::any_of(
+                        aConnections.begin(), aConnections.end(),
+                        [&]( const ROUTING_CONNECTION& aRoute )
+                        { return SameRouteGeometry( aRoute, bridge ); } )
+                                              || std::any_of(
+                                                      newConnections.begin(), newConnections.end(),
+                                                      [&]( const ROUTING_CONNECTION& aRoute )
+                                                      { return SameRouteGeometry( aRoute, bridge ); } );
+                if( !alreadyPublished )
+                    aConnections.push_back( bridge );
+            }
+        }
+
         for( const auto& conflict : conflicts )
         {
+            const auto shoved = std::find_if(
+                    inserted.shoved.begin(), inserted.shoved.end(),
+                    [&]( const FOUND_CONNECTION_INSERTER::RESULT::SHOVED_CONNECTION& aShove )
+                    { return SameRouteGeometry( aShove.original, conflict ); } );
+
+            if( shoved != inserted.shoved.end() )
+                continue;
+
             auto matches = [&]( const auto& route )
-            { return route.netCode == conflict.netCode && route.nodes == conflict.nodes; };
+            { return SameRouteGeometry( route, conflict ); };
             std::erase_if( aConnections, matches );
             std::erase_if( newConnections, matches );
             ++aRipups;
@@ -495,10 +1499,7 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
         refreshContacts();
     }
 
-    const std::size_t newConnectionCount = newConnections.size();
-    aConnections.insert( aConnections.end(),
-                         std::make_move_iterator( newConnections.begin() ),
-                         std::make_move_iterator( newConnections.end() ) );
+    flushNewConnections();
 
     const bool allConnectionsRouted =
             aOccupancy.Board()->CountMissing( aNet ) == 0;
@@ -546,32 +1547,24 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
             continue;
 
         aResult.connections.push_back( connection );
+        // A static host route is retained only for occupancy/history while a
+        // full-net reroute is planned.  It has neither been moved nor
+        // regenerated, so emitting it would duplicate source copper in the
+        // proposal.  Its UUID is preserved on the route for a later checked
+        // replacement; unchanged static copper is deliberately not output.
+        if( connection.isExistingBoardRoute )
+            continue;
         if( connection.isFanoutConnection )
             ++aResult.metrics.fanoutConnections;
 
         // The path layer owns route-to-geometry materialization.  KiCad board
         // objects are still not created here; the editor adapter does that
-        // only after the proposal is accepted.
-        for( std::size_t i = 1; i < connection.nodes.size(); ++i )
-        {
-            const ROUTER_NODE& previous = connection.nodes[i - 1];
-            const ROUTER_NODE& current = connection.nodes[i];
-
-            if( previous.layer == current.layer )
-            {
-                FOUND_CONNECTION_INSERTER::AppendEdge(
-                        connection.netCode, previous, current, netWidths[connection.netCode],
-                        netViaDiameters[connection.netCode], netViaDrills[connection.netCode], {},
-                        aResult );
-            }
-            else
-            {
-                FOUND_CONNECTION_INSERTER::AppendEdge(
-                        connection.netCode, previous, current, netWidths[connection.netCode],
-                        netViaDiameters[connection.netCode], netViaDrills[connection.netCode],
-                        VIA_RULE::ThroughLayers( aSettings ), aResult );
-            }
-        }
+        // only after the proposal is accepted.  Keep individual edge styles
+        // intact here: a terminal neckdown's width/clearance and a selected
+        // blind-via stack must reach both the proposal DRC and the adapter.
+        FOUND_CONNECTION_INSERTER::Append(
+                connection, netWidths[connection.netCode], netViaDiameters[connection.netCode],
+                netViaDrills[connection.netCode], VIA_RULE::ThroughLayers( aSettings ), aResult );
     }
 
     // A plane fanout is represented by two logical connections that meet at
@@ -584,7 +1577,7 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
     uniqueVias.reserve( aResult.vias.size() );
     for( ROUTING_VIA& via : aResult.vias )
     {
-        const bool duplicate = std::any_of(
+        const auto duplicate = std::find_if(
                 uniqueVias.begin(), uniqueVias.end(),
                 [&]( const ROUTING_VIA& existing )
                 {
@@ -594,8 +1587,10 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
                            && existing.diameter == via.diameter && existing.drill == via.drill
                            && existing.layers == via.layers;
                 } );
-        if( !duplicate )
+        if( duplicate == uniqueVias.end() )
             uniqueVias.push_back( std::move( via ) );
+        else
+            duplicate->clearance = std::max( duplicate->clearance, via.clearance );
     }
     aResult.vias = std::move( uniqueVias );
 
@@ -603,7 +1598,8 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
     std::set<int> completeNets;
     ROUTING_BOARD copper( aBoard, aSettings );
     for( const auto& connection : aConnections )
-        copper.AddRoute( connection );
+        if( !connection.isExistingBoardRoute )
+            copper.AddRoute( connection );
     for( const ROUTING_NET& net : aBoard.nets )
     {
         if( !net.connections.empty()
@@ -611,6 +1607,26 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
         {
             completeNets.insert( net.netCode );
         }
+    }
+
+    // A checked forced shove can safely replace a source item even when the
+    // rest of that source net is still incomplete.  Removing source UUIDs
+    // only after a whole net completed used to emit the moved via/trace while
+    // retaining its original BOARD_ITEM, producing duplicate copper in a
+    // partial-but-otherwise-valid proposal.  Limit this early removal to
+    // UUIDs known to come from the removable snapshot and only when the route
+    // carrying that provenance was materialised as new proposal copper.
+    std::set<std::string> removableSourceIds;
+    for( const ROUTING_OBSTACLE& obstacle : aBoard.removableExistingRoutes )
+        if( obstacle.isExistingRoute && !obstacle.boardItemId.empty() )
+            removableSourceIds.insert( obstacle.boardItemId );
+    for( const ROUTING_CONNECTION& connection : aConnections )
+    {
+        if( connection.isExistingBoardRoute || !connection.complete )
+            continue;
+        for( const std::string& id : connection.sourceBoardItemIds )
+            if( removableSourceIds.contains( id ) )
+                removed.insert( id );
     }
 
     if( aSettings.allowRipupExisting )
@@ -637,8 +1653,13 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
     for( const ROUTING_SEGMENT& segment : aResult.segments )
         aResult.metrics.routedLengthIU += distance( segment.start, segment.end );
 
+    std::vector<ROUTING_CONNECTION> emittedConnections;
+    emittedConnections.reserve( aResult.connections.size() );
+    for( const ROUTING_CONNECTION& connection : aResult.connections )
+        if( !connection.isExistingBoardRoute )
+            emittedConnections.push_back( connection );
     aResult.metrics.airlineLengthIU = AUTOROUTE_AIRLINE_CALCULATOR::TotalLength(
-            aBoard, aResult.connections );
+            aBoard, emittedConnections );
 }
 
 
@@ -692,9 +1713,58 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     }
 
     // BatchFanout only changes the immutable worker snapshot.  The caller's
-    // KiCad board remains untouched until the proposal is accepted.
+    // KiCad board remains untouched until the proposal is accepted.  Keep a
+    // stage-local deadline separate from user cancellation: Freerouting
+    // stops fanout at its deadline and continues ordinary autorouting, while
+    // a user cancellation must still discard the complete proposal.
     const auto fanoutStarted = std::chrono::steady_clock::now();
-    const BOARD_SNAPSHOT routedBoard = BATCH_FANOUT::PrepareSnapshot( aBoard, aSettings, aCancel );
+    const std::optional<std::chrono::steady_clock::time_point> fanoutDeadline =
+            aSettings.fanoutTimeoutMilliseconds > 0
+                    ? std::optional{ fanoutStarted
+                                     + std::chrono::milliseconds(
+                                             aSettings.fanoutTimeoutMilliseconds ) }
+                    : std::nullopt;
+    bool fanoutTimedOut = false;
+    const ROUTER_CANCEL_CALLBACK fanoutStageCancel = [&]()
+    {
+        if( aCancel && aCancel() )
+            return true;
+
+        if( fanoutDeadline && std::chrono::steady_clock::now() >= *fanoutDeadline )
+        {
+            fanoutTimedOut = true;
+            return true;
+        }
+
+        return false;
+    };
+
+    // Fanout does not yet own a host-item shove transaction.  Give its
+    // planning snapshot every removable source shape as a fixed collision
+    // surface, rather than allowing a local escape to be selected through an
+    // unlocked arc, custom via, or trace branch that the later batch stage
+    // correctly refuses to move.  The planning-only copies are stripped
+    // immediately after the pre-pass; represented source items then enter
+    // live occupancy and unsupported ones are appended exactly once below.
+    BOARD_SNAPSHOT fanoutInput = aBoard;
+    appendAllRemovableExistingObstacles( fanoutInput );
+    BOARD_SNAPSHOT routedBoard = BATCH_FANOUT::PrepareSnapshot( fanoutInput, aSettings,
+                                                                  fanoutStageCancel );
+
+    if( !fanoutTimedOut && fanoutDeadline
+        && std::chrono::steady_clock::now() >= *fanoutDeadline )
+    {
+        fanoutTimedOut = true;
+    }
+
+    // Preparation only plans synthetic terminals.  If it timed out partway
+    // through, discard that partial graph and route the original snapshot;
+    // keeping half-created landings would allow the ordinary stage to start
+    // from a point without an electrical escape back to its SMD pad.
+    if( fanoutTimedOut )
+        routedBoard = aBoard;
+    else
+        removePlanningOnlyExistingObstacles( routedBoard, aBoard );
 
     if( autorouterDebugEnabled() )
     {
@@ -702,8 +1772,9 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                                       std::chrono::steady_clock::now() - fanoutStarted )
                                       .count();
         std::ostringstream message;
-        message << "fanout complete elapsed=" << elapsed << " ms pads="
-                << routedBoard.pads.size() << " obstacles=" << routedBoard.obstacles.size();
+        message << "fanout preparation elapsed=" << elapsed << " ms pads="
+                << routedBoard.pads.size() << " obstacles=" << routedBoard.obstacles.size()
+                << " timedOut=" << fanoutTimedOut;
         autorouterDebugLog( message.str() );
     }
 
@@ -714,6 +1785,12 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         return result;
     }
 
+    if( fanoutTimedOut )
+    {
+        result.fanoutTimedOut = true;
+        result.message = "SMD fanout preparation timed out; continuing with ordinary routing.";
+    }
+
     // Keep the fanout-expanded snapshot mutable until the fanout pre-pass has
     // decided which synthetic landings are actually usable.  A failed
     // synthetic escape must be removed from the graph and its ordinary
@@ -721,6 +1798,16 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     // can route successfully from an electrically disconnected landing.
     BOARD_SNAPSHOT        workingBoard = routedBoard;
     BOARD_SNAPSHOT&       board = workingBoard;
+    // Existing, unlocked host copper omitted from the immutable obstacle set
+    // during a whole-net reroute still has to block the first search.  Keep a
+    // fully reconstructed item static in occupancy until forced insertion
+    // proves an atomic shove; anything not reconstructed remains an immutable
+    // collision-only obstacle rather than silently disappearing.
+    const std::vector<ROUTING_CONNECTION> staticExistingRoutes =
+            existingMovableConnections( board, aSettings );
+    appendUnrepresentedExistingObstacles( board,
+                                          representedExistingItemIds( staticExistingRoutes ) );
+
     const std::vector<NET_ORDER_ENTRY> orderedNets = orderNets( board );
     int totalConnections = std::accumulate(
             orderedNets.begin(), orderedNets.end(), 0,
@@ -732,13 +1819,18 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     result.metrics.totalConnections = totalConnections;
     ROUTING_OCCUPANCY occupancy( aSettings.gridStepIU );
     occupancy.InitializeBoard( board, aSettings );
+    // AddStatic intentionally does not make source copper satisfy electrical
+    // tasks.  It does, however, expose represented host routes to forced
+    // insertion conflict discovery.
+    for( const ROUTING_CONNECTION& route : staticExistingRoutes )
+        occupancy.AddStatic( route );
     // The search engine builds the immutable obstacle/spatial index once per
     // engine.  Reuse it for every connection in a pass; reconstructing it for
     // each net makes large boards spend most of their runtime re-indexing the
     // same pads and keepouts rather than expanding paths.
     AUTOROUTE_ENGINE routeEngine( board, aSettings, occupancy );
     autorouterDebugLog( "route engine constructed" );
-    std::vector<ROUTING_CONNECTION> connections;
+    std::vector<ROUTING_CONNECTION> connections = staticExistingRoutes;
     std::set<int> failedNets;
     int totalExpandedNodes = 0;
     int retries = 0;
@@ -789,47 +1881,194 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         fanoutConnectionTotal += static_cast<int>( net.connections.size() );
     }
 
-    if( fanoutConnectionTotal > 0 )
+    if( fanoutConnectionTotal > 0 && !fanoutTimedOut )
     {
-        const auto orderedPins = BATCH_FANOUT::OrderedPins( fanoutBoard, aSettings.fanoutPinOrder, aCancel );
+        // Fanout has its own rip-up policy.  Build a separate immutable
+        // search engine for this stage so a disabled fanout rip-up cannot
+        // accidentally inherit the ordinary batch's negotiated-congestion
+        // permission through MAZE_SEARCH_ENGINE::m_settings.
+        AUTOROUTER_SETTINGS fanoutSettings = aSettings;
+        fanoutSettings.allowRipupRouted = aSettings.fanoutRipupAllowed;
+
+        AUTOROUTE_ENGINE fanoutRouteEngine( fanoutBoard, fanoutSettings, occupancy );
+        struct FANOUT_ENGINE
+        {
+            int                                  netCode = 0;
+            ROUTING_VIA_DIMENSION                via;
+            std::unique_ptr<AUTOROUTE_ENGINE>    engine;
+        };
+        // Re-indexing a large board for every SMD pin would undo the batch
+        // router's persistent-index performance work.  Cache one immutable
+        // engine per (net, selected ViaRule profile); those engines share the
+        // occupancy transaction but have their own net-local via radii.
+        std::vector<FANOUT_ENGINE> fanoutEngines;
+        const auto fanoutEngineFor = [&]( int aNetCode, const ROUTING_PAD& aLanding )
+                -> const AUTOROUTE_ENGINE&
+        {
+            if( !aLanding.isFanoutTarget || aLanding.fanoutViaDiameter <= 0
+                || aLanding.fanoutViaDrill <= 0 )
+            {
+                return fanoutRouteEngine;
+            }
+
+            const ROUTING_VIA_DIMENSION via{ aLanding.fanoutViaDiameter,
+                                              aLanding.fanoutViaDrill };
+            const auto found = std::find_if(
+                    fanoutEngines.begin(), fanoutEngines.end(),
+                    [&]( const FANOUT_ENGINE& aEntry )
+                    { return aEntry.netCode == aNetCode && aEntry.via == via; } );
+            if( found != fanoutEngines.end() )
+                return *found->engine;
+
+            FANOUT_ENGINE entry;
+            entry.netCode = aNetCode;
+            entry.via = via;
+            entry.engine = std::make_unique<AUTOROUTE_ENGINE>(
+                    fanoutBoard, fanoutSettings, occupancy, aNetCode, via );
+            fanoutEngines.push_back( std::move( entry ) );
+            return *fanoutEngines.back().engine;
+        };
+        const auto orderedPins = BATCH_FANOUT::OrderedPins( fanoutBoard,
+                                                             aSettings.fanoutPinOrder,
+                                                             fanoutStageCancel );
         std::map<std::size_t, std::pair<const ROUTING_NET*, std::size_t>> tasks;
         for( const auto& net : fanoutBoard.nets )
             for( const auto& [source, target] : net.connections )
                 tasks.emplace( source, std::pair{ &net, target } );
         std::optional<std::pair<int, std::size_t>> previousOutcome;
         int identicalPasses = 0;
+        int totalItemsFanouted = 0;
+        bool maxItemLimitReached = false;
+
+        // A deadline is a normal fallback, not a partially successful
+        // fanout.  Retaining only the early escapes poisons the ordinary
+        // batch search with provisional vias/traces and can create hundreds
+        // of DRC errors.  Keep the shared occupancy and emitted connection
+        // list transactional until the complete fanout stage is known to fit
+        // its budget.
+        const std::vector<ROUTING_CONNECTION> connectionsBeforeFanout = connections;
+        const std::set<int> failedNetsBeforeFanout = failedNets;
+        const int ripupsBeforeFanout = ripups;
+        const int expandedBeforeFanout = totalExpandedNodes;
+        ROUTING_OCCUPANCY::TRANSACTION fanoutTransaction( occupancy );
+
         for( int pass = 0; pass < aSettings.maxFanoutPasses; ++pass )
         {
+            if( fanoutStageCancel() )
+            {
+                if( aCancel && aCancel() )
+                {
+                    result.cancelled = true;
+                    result.message = "Autorouter cancelled";
+                }
+                break;
+            }
+
+            if( aSettings.maxFanoutItems > 0
+                && totalItemsFanouted >= aSettings.maxFanoutItems )
+            {
+                maxItemLimitReached = true;
+                break;
+            }
+
             int routedPins = 0;
             const auto before = occupancy.Connections();
             for( auto pin : orderedPins )
             {
+                if( fanoutStageCancel() )
+                {
+                    if( aCancel && aCancel() )
+                    {
+                        result.cancelled = true;
+                        result.message = "Autorouter cancelled";
+                    }
+                    break;
+                }
+
+                if( aSettings.maxFanoutItems > 0
+                    && totalItemsFanouted >= aSettings.maxFanoutItems )
+                {
+                    maxItemLimitReached = true;
+                    break;
+                }
+
+                const auto task = tasks.find( pin );
+                if( task == tasks.end() || occupancy.Board()->Connected( pin, task->second.second ) )
+                    continue;
+
+                ROUTING_NET net = *task->second.first;
+                net.connections = { { pin, task->second.second } };
+                const auto pinStarted = std::chrono::steady_clock::now();
+                // This is a per-pin *maximum*, not a value that grows on
+                // each fanout pass.  Multiplying it by the pass number makes
+                // later retries arbitrarily slower and defeats the global
+                // stage deadline on boards with many SMD pins.
+                const std::int64_t pinBudget = std::max<std::int64_t>(
+                        0, aSettings.maxFanoutMillisecondsPerPin );
+                bool pinTimedOut = false;
+                const ROUTER_CANCEL_CALLBACK pinCancel = [&]()
+                {
+                    if( fanoutStageCancel() )
+                        return true;
+
+                    if( std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - pinStarted )
+                                .count()
+                        >= pinBudget )
+                    {
+                        pinTimedOut = true;
+                        return true;
+                    }
+
+                    return false;
+                };
+
+                ++totalItemsFanouted;
+                const ROUTING_PAD& landing = fanoutBoard.pads[task->second.second];
+                const AUTOROUTE_ENGINE& pinRouteEngine = fanoutEngineFor( net.netCode, landing );
+                int expanded = 0;
+                const bool routed = routeNet(
+                        fanoutBoard, fanoutSettings, net, pass, occupancy, pinRouteEngine,
+                        connections, expanded, ripups, pinCancel,
+                        [&]( int aSearchExpanded )
+                        {
+                            if( !aProgress )
+                                return;
+
+                            ROUTER_PROGRESS progress;
+                            progress.pass = pass + 1;
+                            progress.maxPasses = aSettings.maxFanoutPasses;
+                            progress.totalConnections = fanoutConnectionTotal;
+                            progress.routedConnections = routedPins;
+                            progress.ripups = ripups;
+                            progress.expandedNodes = totalExpandedNodes + aSearchExpanded;
+                            progress.elapsedMilliseconds = elapsedMilliseconds();
+                            progress.stage = "Searching SMD fanout escape";
+                            aProgress( progress );
+                        } );
+                totalExpandedNodes += expanded;
+
                 if( aCancel && aCancel() )
                 {
                     result.cancelled = true;
                     result.message = "Autorouter cancelled";
                     break;
                 }
-                const auto task = tasks.find( pin );
-                if( task == tasks.end() || occupancy.Board()->Connected( pin, task->second.second ) )
-                    continue;
-                ROUTING_NET net = *task->second.first;
-                net.connections = { { pin, task->second.second } };
-                int expanded = 0;
-                const bool routed = routeNet( fanoutBoard, aSettings, net, pass, occupancy,
-                                              routeEngine, connections, expanded, ripups, aCancel, nullptr );
-                totalExpandedNodes += expanded;
+
                 if( routed )
                     ++routedPins;
                 else
                     failedNets.insert( net.netCode );
+
                 result.metrics.routedConnections = routedConnectionCount();
                 if( autorouterDebugEnabled() )
                 {
                     std::ostringstream message;
                     const auto& pad = fanoutBoard.pads[pin];
                     message << "FANOUT_PIN pass=" << pass + 1 << " component=" << pad.componentId
-                            << " pin=" << pad.pinIndex << " net=" << net.netCode << " routed=" << routed;
+                            << " pin=" << pad.pinIndex << " net=" << net.netCode
+                            << " routed=" << routed << " pinTimedOut=" << pinTimedOut
+                            << " stageTimedOut=" << fanoutTimedOut;
                     autorouterDebugLog( message.str() );
                 }
                 if( aProgress )
@@ -839,15 +2078,24 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     progress.maxPasses = aSettings.maxFanoutPasses;
                     progress.totalConnections = fanoutConnectionTotal;
                     progress.routedConnections = routedPins;
+                    progress.ripups = ripups;
                     progress.expandedNodes = totalExpandedNodes;
                     progress.elapsedMilliseconds = elapsedMilliseconds();
-                    progress.stage = "Routing SMD fanout";
+                    progress.stage = pinTimedOut ? "SMD fanout pin timed out"
+                                                 : "Routing SMD fanout";
                     aProgress( progress );
                 }
+
+                if( fanoutTimedOut || result.cancelled )
+                    break;
             }
+
             // Pinned fanout loop: zero routed pins, three repeated (routed,
-            // via-count) outcomes, unchanged geometry, or cancellation stops.
-            if( result.cancelled || routedPins == 0 )
+            // via-count) outcomes, unchanged geometry, item cap, deadline,
+            // or cancellation stops.  A timeout is intentionally not a job
+            // cancellation; the fallback graph below restores failed SMD
+            // pads and ordinary routing continues.
+            if( result.cancelled || fanoutTimedOut || maxItemLimitReached || routedPins == 0 )
                 break;
             std::set<std::pair<std::int64_t, std::int64_t>> vias;
             for( const auto& route : occupancy.Connections() )
@@ -867,8 +2115,22 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             }
             const auto& after = occupancy.Connections();
             if( before.size() == after.size() && std::equal( before.begin(), before.end(), after.begin(),
-                    []( const auto& a, const auto& b ) { return a.netCode == b.netCode && a.nodes == b.nodes; } ) )
+                    []( const auto& a, const auto& b ) { return SameRouteGeometry( a, b ); } ) )
                 break;
+        }
+
+        if( fanoutTimedOut )
+        {
+            connections = connectionsBeforeFanout;
+            failedNets = failedNetsBeforeFanout;
+            ripups = ripupsBeforeFanout;
+            totalExpandedNodes = expandedBeforeFanout;
+            result.fanoutTimedOut = true;
+            result.message = "SMD fanout stage timed out; continuing with ordinary routing.";
+        }
+        else
+        {
+            fanoutTransaction.Commit();
         }
     }
 
@@ -983,7 +2245,12 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         for( const ROUTING_CONNECTION& connection : connections )
         {
             if( connection.complete )
-                occupancy.Add( connection );
+            {
+                if( connection.isExistingBoardRoute )
+                    occupancy.AddStatic( connection );
+                else
+                    occupancy.Add( connection );
+            }
         }
         result.metrics.routedConnections = routedConnectionCount();
     };
@@ -1033,7 +2300,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             std::map<int, std::size_t> routedBefore;
             for( const ROUTING_CONNECTION& connection : connections )
             {
-                if( connection.complete )
+                if( connection.complete && !connection.isExistingBoardRoute )
                     ++routedBefore[connection.netCode];
             }
 
@@ -1105,7 +2372,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             std::map<int, std::size_t> routedAfter;
             for( const ROUTING_CONNECTION& connection : connections )
             {
-                if( connection.complete )
+                if( connection.complete && !connection.isExistingBoardRoute )
                     ++routedAfter[connection.netCode];
             }
 

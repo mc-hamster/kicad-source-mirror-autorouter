@@ -426,7 +426,13 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
     }
     for( const auto& copper : snapshot.obstacles )
     {
-        if( copper.netCode <= 0 || copper.isHole || copper.isKeepout )
+        // During a whole-net reroute, unsupported original copper is copied
+        // into the immutable obstacle list only to keep it physically
+        // blocking.  It is intentionally not electrical worker copper: if
+        // it made a component here, CountMissing() could declare a task done
+        // before the proposal regenerated (or safely shoved) that BOARD_ITEM.
+        if( copper.netCode <= 0 || copper.isHole || copper.isKeepout
+            || copper.isCollisionOnly )
             continue;
         ITEM_ID id;
         if( !copper.boardItemId.empty() && hostItems.contains( copper.boardItemId ) )
@@ -479,31 +485,57 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
 {
     if( !route.complete )
         return;
+
+    if( !HasValidEdgeStyles( route ) )
+        throw std::invalid_argument( "Invalid routing-board edge-style count" );
+
     auto& state = *m_impl;
     IMPL::ROUTE record{ route, {} };
-    std::int64_t width = 0, diameter = 600000;
+    std::int64_t width = 0, diameter = 600000, drill = 300000;
     for( const auto& net : state.snapshot.nets )
         if( net.netCode == route.netCode )
+        {
             for( auto index : net.padIndices )
                 width = std::max( width, state.snapshot.pads.at( index ).trackWidth );
+            if( net.viaDiameter > 0 )
+                diameter = net.viaDiameter;
+            if( net.viaDrill > 0 )
+                drill = net.viaDrill;
+        }
+
     if( width <= 0 )
         width = 150000;
-    for( const auto& net : state.snapshot.nets )
-        if( net.netCode == route.netCode && net.viaDiameter > 0 )
-        { diameter = net.viaDiameter; break; }
+
     // Reject all invalid coordinates/dimensions before changing any copper,
     // including a malformed later edge after otherwise valid first edges.
     coordinate( width );
     coordinate( diameter );
+    coordinate( drill );
     for( const auto& node : route.nodes )
         point( node.point );
+
     // Reject malformed layer transitions before changing any copper.
     for( std::size_t i = 1; i < route.nodes.size(); ++i )
+    {
+        const ROUTING_EDGE_STYLE& style = EdgeStyle( route, i - 1 );
+        coordinate( style.trackWidth > 0 ? style.trackWidth : width );
+        coordinate( style.viaDiameter > 0 ? style.viaDiameter : diameter );
+        coordinate( style.viaDrill > 0 ? style.viaDrill : drill );
+
         if( route.nodes[i - 1].layer != route.nodes[i].layer
             && ( route.nodes[i - 1].point != route.nodes[i].point
                  || !VIA_RULE::AllowsTransition( state.settings, route.nodes[i - 1].layer,
-                                                 route.nodes[i].layer ) ) )
+                                                 route.nodes[i].layer, &style ) ) )
             throw std::invalid_argument( "Invalid routing-board via transition" );
+
+        if( route.nodes[i - 1].layer != route.nodes[i].layer
+            && VIA_RULE::LayersFor( state.settings, route.nodes[i - 1].layer,
+                                    route.nodes[i].layer, &style ).empty() )
+        {
+            throw std::invalid_argument( "Invalid routing-board via layer mask" );
+        }
+    }
+
     TRANSACTION transaction( *this );
     for( std::size_t i = 1; i < route.nodes.size(); ++i )
     {
@@ -512,13 +544,20 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         if( from == to )
             continue;
         const bool via = from.layer != to.layer;
+        const ROUTING_EDGE_STYLE& style = EdgeStyle( route, i - 1 );
+        const std::int64_t edgeWidth = style.trackWidth > 0 ? style.trackWidth : width;
+        const std::int64_t edgeDiameter = style.viaDiameter > 0 ? style.viaDiameter : diameter;
+        const std::vector<int> edgeLayers = via
+                ? VIA_RULE::LayersFor( state.settings, from.layer, to.layer, &style )
+                : std::vector<int>{ from.layer };
         auto& item = state.newItem( route.netCode, true );
         ROUTING_OBSTACLE copper;
         copper.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
         copper.start = from.point;
         copper.end = to.point;
-        copper.radius = ( via ? diameter : width ) / 2;
-        copper.layers = via ? VIA_RULE::ThroughLayers( state.settings )
+        copper.radius = ( via ? edgeDiameter : edgeWidth ) / 2;
+        copper.clearance = std::max<std::int64_t>( 0, style.clearance );
+        copper.layers = via ? edgeLayers
                             : std::vector<int>{ from.layer };
         item.normal.kind = via ? NORMAL_CONTACT_ITEM::KIND::DRILL
                                : NORMAL_CONTACT_ITEM::KIND::TRACE;
@@ -533,7 +572,7 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
             terminal.netCode = route.netCode;
             terminal.position = from.point;
             terminal.layers = { layer };
-            terminal.trackWidth = width;
+            terminal.trackWidth = edgeWidth;
             item.terminals.push_back( { terminal, NO_PAD, via ? std::nullopt
                                                               : std::optional( to.point ) } );
         }
@@ -551,7 +590,7 @@ void ROUTING_BOARD::RemoveRoute( const ROUTING_CONNECTION& route )
 {
     auto& state = *m_impl;
     const auto it = std::find_if( state.routes.begin(), state.routes.end(), [&]( const auto& existing )
-    { return existing.connection.netCode == route.netCode && existing.connection.nodes == route.nodes; } );
+    { return SameRouteGeometry( existing.connection, route ); } );
     if( it == state.routes.end() )
         return;
     for( ITEM_ID id : it->items )
@@ -668,7 +707,7 @@ std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::NormalConnectedSet( ITEM_ID id )
 std::vector<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::RouteItems( const ROUTING_CONNECTION& route ) const
 {
     for( const auto& record : m_impl->routes )
-        if( record.connection.netCode == route.netCode && record.connection.nodes == route.nodes )
+        if( SameRouteGeometry( record.connection, route ) )
             return record.items;
     return {};
 }

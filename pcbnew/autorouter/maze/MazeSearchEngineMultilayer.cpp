@@ -81,6 +81,38 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     for( const auto& layer : layers )
         spaces.push_back( std::make_unique<ROOM_SEARCH>( layer.bounds, layer.obstacles,
                 layer.id, net, sectionOffset, maxExpanded, expanded, metrics, cancel, progress, &nextRoomId ) );
+
+    // `active` controls whether a layer can carry a trace-room state; it
+    // must not make that physical copper layer transparent to a manufactured
+    // through via.  Production callers provide `via.obstacles` as the exact
+    // all-layer drill preflight set.  Retain any inactive ROOM_LAYER entries
+    // as well so this lower-level frontier cannot accidentally accept a via
+    // through an inactive inner-layer plane when the caller's broad drill
+    // list is incomplete.  The exact canDrill callback is still the final
+    // authority for non-rectangular geometry.
+    std::vector<SHAPE_TREE_ENTRY> drillObstacles = via.obstacles;
+    const auto appendDrillObstacle = [&]( const SHAPE_TREE_ENTRY& aEntry )
+    {
+        const auto duplicate = [&]( const SHAPE_TREE_ENTRY& aKnown )
+        {
+            return aKnown.shape.minX == aEntry.shape.minX
+                   && aKnown.shape.minY == aEntry.shape.minY
+                   && aKnown.shape.maxX == aEntry.shape.maxX
+                   && aKnown.shape.maxY == aEntry.shape.maxY
+                   && aKnown.objectId == aEntry.objectId
+                   && aKnown.shapeIndex == aEntry.shapeIndex && aKnown.layer == aEntry.layer
+                   && aKnown.net == aEntry.net && aKnown.isRoom == aEntry.isRoom
+                   && aKnown.obstacle == aEntry.obstacle;
+        };
+
+        if( std::none_of( drillObstacles.begin(), drillObstacles.end(), duplicate ) )
+            drillObstacles.push_back( aEntry );
+    };
+    for( const ROOM_LAYER& layer : layers )
+        if( !layer.active )
+            for( const SHAPE_TREE_ENTRY& obstacle : layer.obstacles )
+                appendDrillObstacle( obstacle );
+
     auto stopped = [&]() { return expanded >= maxExpanded || ( cancel && cancel() ); };
     auto step = [&]() { return spaces.front()->step(); };
     auto nearestTerminal = []( const ROOM_TERMINAL& terminal, FLOAT_POINT point )
@@ -184,7 +216,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         {
             ++metrics.drillPages;
             const bool wasCached = current.page->IsValid();
-            auto* drills = current.page->GetDrills( via.obstacles, net, layers.size(), via.attachSmd, via.pins,
+            auto* drills = current.page->GetDrills( drillObstacles, net, layers.size(), via.attachSmd, via.pins,
                     cancel, static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
             if( !drills )
                 continue;
@@ -195,12 +227,21 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     return std::nullopt;
                 if( !drill.valid || drill.occupied[current.layer] )
                     continue;
-                if( !drill.rooms.front() )
+                bool roomsReady = true;
+                for( std::size_t i = 0; i < layers.size(); ++i )
+                    if( layers[i].active && !drill.rooms[i] )
+                    {
+                        roomsReady = false;
+                        break;
+                    }
+                if( !roomsReady )
                 {
                     if( !via.canDrill( drill.location ) )
                     { drill.valid = false; continue; }
                     for( std::size_t i = 0; i < layers.size(); ++i )
                     {
+                        if( !layers[i].active )
+                            continue;
                         ROOM* room = roomAt( i, drill.location );
                         if( !room ) { drill.valid = false; break; }
                         drill.rooms[i] = room->shape.get();

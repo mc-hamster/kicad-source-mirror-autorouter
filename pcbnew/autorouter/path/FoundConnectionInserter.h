@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 
 #include "../AutorouterTypes.h"
 
@@ -29,9 +30,11 @@ namespace KICAD_AUTOROUTER
 class MAZE_SEARCH_ENGINE;
 class ROUTING_OCCUPANCY;
 
-/** Checked, atomic insertion of the current straight-segment/through-via
- * subset, plus result emission. Recursive fixed-obstacle spring-over is supported for the mapped orthogonal
- * slice. Movable-copper shove and neckdown are NOT implemented by this API.
+/** Checked, atomic insertion plus result emission. It supports terminal
+ * neckdown, fixed-obstacle spring-over, and bounded recursive displacement of
+ * generated trace/via (including generated fanout) copper plus supported
+ * source-via trace contacts. Full host-board contact-graph mutation and
+ * partial-progress insertion remain deliberately outside this data-only API.
  */
 class FOUND_CONNECTION_INSERTER
 {
@@ -39,16 +42,42 @@ public:
     enum class STATE { INSERTED, BLOCKED, CANCELLED, INVALID };
     struct RESULT
     {
+        struct SHOVED_CONNECTION
+        {
+            ROUTING_CONNECTION original;
+            ROUTING_CONNECTION replacement;
+            // Static trace contacts of a moved source via. Their centreline
+            // is unchanged, but they must be emitted as proposal copper when
+            // the source BOARD_ITEM is removed.
+            std::vector<ROUTING_CONNECTION_REPLACEMENT> materializedContacts;
+            // DrillItem.moveBy() bridge traces from the old via centre to its
+            // accepted location, one per unique contacted trace style.
+            std::vector<ROUTING_CONNECTION> bridges;
+        };
+
         STATE state;
         std::size_t edge = 0; // failed edge's end index; 0 for whole-input failure
         // Present only when insertion changed the path. Batch/result ownership
         // must publish this route, not the search proposal it replaced.
         std::optional<ROUTING_CONNECTION> connection = std::nullopt;
+        // Existing generated routes relocated transactionally around this
+        // connection. Batch storage replaces these records instead of treating
+        // them as conventional rip-up victims.
+        std::vector<SHOVED_CONNECTION> shoved;
+
+        RESULT( STATE aState, std::size_t aEdge = 0,
+                std::optional<ROUTING_CONNECTION> aConnection = std::nullopt ) :
+                state( aState ),
+                edge( aEdge ),
+                connection( std::move( aConnection ) )
+        {
+        }
     };
     static RESULT Insert( const ROUTING_CONNECTION& aConnection,
                           const std::vector<ROUTING_CONNECTION>& aRipups,
                           ROUTING_OCCUPANCY& aOccupancy, const MAZE_SEARCH_ENGINE& aEngine,
-                          const ROUTER_CANCEL_CALLBACK& aCancel = {} );
+                          const ROUTER_CANCEL_CALLBACK& aCancel = {},
+                          bool aAllowRipupFallback = true );
 
     static void Append( const ROUTING_CONNECTION& aConnection,
                         std::int64_t aTrackWidth,
@@ -60,7 +89,8 @@ public:
     static void AppendEdge( int aNetCode, const ROUTER_NODE& aPrevious,
                             const ROUTER_NODE& aCurrent, std::int64_t aTrackWidth,
                             std::int64_t aViaDiameter, std::int64_t aViaDrill,
-                            const std::vector<int>& aViaLayers, ROUTING_RESULT& aResult );
+                            const std::vector<int>& aViaLayers, ROUTING_RESULT& aResult,
+                            std::int64_t aClearance = 0 );
 };
 
 } // namespace KICAD_AUTOROUTER

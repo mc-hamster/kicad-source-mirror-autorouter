@@ -65,6 +65,7 @@ private:
     std::vector<LAYER_CONTROLS> m_layerControls;
 
     wxSpinCtrlDouble* m_gridStep = nullptr;
+    wxSpinCtrlDouble* m_neckWidth = nullptr;
     wxSpinCtrl*       m_viaCost = nullptr;
     wxSpinCtrl*       m_planeViaCost = nullptr;
     wxSpinCtrl*       m_traceLengthCost = nullptr;

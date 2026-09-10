@@ -162,4 +162,51 @@ golden data to make a failed comparison pass.
   disabled; this is not a whole-application sanitizer or peak-memory result.
 - Python harness: **21 tests passed**.
 
-Full-suite and fresh three-board A/B results are recorded below when completed.
+
+
+### Full suite and real-board A/B
+
+The full PCB suite finished: **2,411 of 2,412 cases passed**, including 18
+warning-bearing cases; 537,829/537,831 assertions passed. The two failures are
+`MatchProperties/KeysAreCanonicalAndLabelsAreFriendly` (the same Tracks and Arcs /
+Width labels reported by the preceding pass). That case passes in the focused
+selection. The full suite is **not green**; its 21 failed warnings and all raw
+diagnostics are retained, not filtered out.
+
+Each of the three saved online boards was stripped identically for both routers
+and tested in default and no-via modes. Both engines used four passes; native
+used eight iterations, a 250,000-node search bound and a 180-second process
+limit. The reference ran single-threaded with optimization and automatic
+neckdown disabled, matching the preceding benchmark protocol. These are
+single final-build measurements, not statistical performance claims.
+
+| Mode / board | Missing native / Java | New DRC native / Java | Vias native / Java | Length mm native / Java | Core ms native / Java | Gate |
+|---|---:|---:|---:|---:|---:|---|
+| default / regulated-5v | 0 / 0 | 0 / 0 | 0 / 0 | 323.211 / 319.203 | 2266 / 460 | PASS |
+| default / 555-astable | 0 / 0 | 0 / 10 | 11 / 7 | 96.1797 / 184.248 | 68 / 2370 | **FAIL** |
+| default / bjt-astable | 0 / 0 | 0 / 0 | 0 / 0 | 145.458 / 152.435 | 38 / 330 | PASS |
+| no-vias / regulated-5v | 0 / 0 | 0 / 0 | 0 / 0 | 357.391 / 319.203 | 438 / 460 | **FAIL** |
+| no-vias / 555-astable | timeout / 0 | — / 1 | — / 0 | — / 193.479 | timeout / 1030 | **FAIL** |
+| no-vias / bjt-astable | 0 / 0 | 0 / 0 | 0 / 0 | 147.318 / 152.435 | 31 / 310 | PASS |
+
+All completed native outputs have zero missing connections and zero introduced
+KiCad DRC errors. **Quality parity has not improved on these fixtures:** the
+555 still uses four more vias than Java, the no-via regulator remains over the
+10% length threshold, and the no-via 555 still times out without an output.
+All completed physical metrics match the preceding final-build archive. The
+new spring-over method is not a replacement for full movable-copper shove or
+for retaining job-owned copper across plane refill.
+
+All **11 saved completed outputs** were independently reloaded into KiCad's
+headless validator. Missing connections, full DRC counts/by-code, via counts and
+length matched the original measurements. No new geometry was generated during
+reload and no saved board bytes changed.
+
+Evidence is saved under
+`autorouter-test-assets/online-simple/convex-spring-over-2026-09-08/` with the
+unrouted/native/reference PCBs, DSN/SES, logs, oracle sources and fixtures,
+reconstructible native source delta, build/source hashes, result JSON and a
+SHA-256 manifest. Earlier archives and the original test assets were verified
+against their existing manifests without changes. The Java reference remains
+at its pinned commit with unchanged tracked files/index (pre-existing `en/`
+is still untracked).

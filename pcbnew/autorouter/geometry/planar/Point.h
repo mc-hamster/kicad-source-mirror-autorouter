@@ -6,6 +6,7 @@
 #pragma once
 #include "../../AutorouterTypes.h"
 #include <boost/multiprecision/cpp_int.hpp>
+#include <limits>
 #include <stdexcept>
 
 namespace KICAD_AUTOROUTER::PLANAR
@@ -45,6 +46,49 @@ public:
         if( z != 1 || x < INT64_MIN || x > INT64_MAX || y < INT64_MIN || y > INT64_MAX )
             return {};
         return ROUTER_POINT{ x.convert_to<std::int64_t>(), y.convert_to<std::int64_t>() };
+    }
+
+    /** Smallest integer coordinate box containing this exact finite point.
+     *
+     * Freerouting keeps rational support intersections until its board-item
+     * insertion layer chooses an integral realization.  KiCad geometry is
+     * integral, so callers must enumerate the surrounding integer candidates
+     * and then prove them legal; silently rounding a support corner can move
+     * it through the compensated obstacle boundary.
+     */
+    std::optional<ROUTER_BOX> SurroundingBox() const
+    {
+        const auto floorDivide = []( const INTEGER& aNumerator, const INTEGER& aDenominator )
+        {
+            INTEGER quotient = aNumerator / aDenominator;
+            const INTEGER remainder = aNumerator % aDenominator;
+            if( remainder != 0 && aNumerator < 0 )
+                --quotient;
+            return quotient;
+        };
+        const auto ceilDivide = []( const INTEGER& aNumerator, const INTEGER& aDenominator )
+        {
+            INTEGER quotient = aNumerator / aDenominator;
+            const INTEGER remainder = aNumerator % aDenominator;
+            if( remainder != 0 && aNumerator > 0 )
+                ++quotient;
+            return quotient;
+        };
+        const INTEGER minX = floorDivide( x, z );
+        const INTEGER minY = floorDivide( y, z );
+        const INTEGER maxX = ceilDivide( x, z );
+        const INTEGER maxY = ceilDivide( y, z );
+        const INTEGER minimum = std::numeric_limits<std::int64_t>::min();
+        const INTEGER maximum = std::numeric_limits<std::int64_t>::max();
+
+        if( minX < minimum || minX > maximum || minY < minimum || minY > maximum
+            || maxX < minimum || maxX > maximum || maxY < minimum || maxY > maximum )
+        {
+            return {};
+        }
+
+        return ROUTER_BOX{ minX.convert_to<std::int64_t>(), minY.convert_to<std::int64_t>(),
+                           maxX.convert_to<std::int64_t>(), maxY.convert_to<std::int64_t>() };
     }
 };
 } // namespace KICAD_AUTOROUTER::PLANAR

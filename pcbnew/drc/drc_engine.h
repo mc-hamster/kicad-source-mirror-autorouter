@@ -204,6 +204,16 @@ public:
     bool IsErrorLimitExceeded( int error_code );
 
     /**
+     * Override the per-run reported-error limit for one error code.
+     *
+     * A negative value restores the normal UI limit.  This is intended for
+     * non-interactive callers which need a complete baseline before comparing
+     * a proposed board change; the interactive DRC still uses its bounded
+     * default output.
+     */
+    void SetErrorLimitOverride( int aErrorCode, int aLimit );
+
+    /**
      * Return the number of violations of \a error_code that may still be reported.
      *
      * Providers which collect candidates before reporting them can use this to bound the
@@ -379,6 +389,7 @@ protected:
 
     bool                      m_testsCompleted = false;
     std::vector<int>           m_errorLimits;
+    std::vector<int>           m_errorLimitOverrides;
     mutable std::mutex         m_errorLimitsMutex;
     bool                       m_reportAllTrackErrors;
     bool                       m_testFootprints;

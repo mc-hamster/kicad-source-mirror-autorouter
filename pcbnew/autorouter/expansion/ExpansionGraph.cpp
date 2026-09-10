@@ -27,12 +27,44 @@
 #include <unordered_map>
 
 #include "../drill/DrillPageArray.h"
+#include "../geometry/planar/Simplex.h"
 
 namespace KICAD_AUTOROUTER
 {
 
 namespace
 {
+
+bool isAxisAlignedRectangle( const std::vector<ROUTER_POINT>& aPolygon )
+{
+    if( aPolygon.size() != 4 )
+        return false;
+
+    std::vector<std::int64_t> x;
+    std::vector<std::int64_t> y;
+    x.reserve( aPolygon.size() );
+    y.reserve( aPolygon.size() );
+
+    for( const ROUTER_POINT& point : aPolygon )
+    {
+        x.push_back( point.x );
+        y.push_back( point.y );
+    }
+
+    std::sort( x.begin(), x.end() );
+    std::sort( y.begin(), y.end() );
+    x.erase( std::unique( x.begin(), x.end() ), x.end() );
+    y.erase( std::unique( y.begin(), y.end() ), y.end() );
+
+    if( x.size() != 2 || y.size() != 2 )
+        return false;
+
+    return std::all_of( aPolygon.begin(), aPolygon.end(), [&]( const ROUTER_POINT& point )
+    {
+        return ( point.x == x.front() || point.x == x.back() )
+               && ( point.y == y.front() || point.y == y.back() );
+    } );
+}
 
 } // namespace
 
@@ -47,6 +79,13 @@ std::vector<ROUTER_NODE> EXPANSION_GRAPH::BuildLandmarks(
     result.reserve( 96 );
     std::vector<ROUTER_NODE> obstacleLandmarks;
     obstacleLandmarks.reserve( std::min<std::size_t>( aBoard.obstacles.size() * 4, 32768 ) );
+    // General convex support corners cannot share the broad phase's
+    // one-feature-per-room sampling: for a rational corner, the first
+    // floor/ceil realization may lie inside the offset shape while a sibling
+    // realization is legal. Keep those candidates independently until they
+    // are admitted below.
+    std::vector<ROUTER_NODE> exactConvexLandmarks;
+    exactConvexLandmarks.reserve( std::min<std::size_t>( aBoard.obstacles.size() * 8, 32768 ) );
 
     auto add = [&]( const ROUTER_POINT& aPoint, int aLayer )
     {
@@ -74,6 +113,13 @@ std::vector<ROUTER_NODE> EXPANSION_GRAPH::BuildLandmarks(
     {
         for( int layer : aLayers )
             obstacleLandmarks.push_back( { aPoint, layer } );
+    };
+
+    auto addExactConvexForLayers = [&]( const ROUTER_POINT& aPoint,
+                                        const std::vector<int>& aLayers )
+    {
+        for( int layer : aLayers )
+            exactConvexLandmarks.push_back( { aPoint, layer } );
     };
 
     auto addPad = [&]( const ROUTING_PAD& aPad )
@@ -191,6 +237,47 @@ std::vector<ROUTER_NODE> EXPANSION_GRAPH::BuildLandmarks(
         }
         else if( !obstacle.polygon.empty() )
         {
+            // The rectangular room graph cannot represent a rotated or
+            // general convex obstacle without closing real free space around
+            // its corners.  Keep its broad-phase box landmarks for the
+            // rectangular fallback, but also expose exact L-infinity-offset
+            // support corners to the general visibility search.  The offset
+            // is deliberately one IU wider than the exact copper clearance,
+            // so every integral landmark remains strictly legal when the
+            // route's exact predicate validates it.
+            if( obstacle.polygonHoles.empty() && obstacle.radius == 0
+                && !isAxisAlignedRectangle( obstacle.polygon ) )
+            {
+                const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon(
+                        obstacle.polygon, margin );
+
+                if( simplex )
+                {
+                    for( std::size_t index = 0; index < simplex->Borders().size(); ++index )
+                    {
+                        // Convex support intersections are frequently
+                        // rational (for example a 45-degree offset corner).
+                        // Dropping those vertices from the board-wide
+                        // visibility graph makes dense-board searches fall
+                        // back to the coarse grid even though the exact
+                        // convex predicates can route around the contour.
+                        // A KiCad route must have integral IU coordinates,
+                        // so retain its at-most-four surrounding candidates;
+                        // MAZE_SEARCH_ENGINE is the sole authority that
+                        // proves a candidate is outside the compensated
+                        // contour before emitting an edge.  Never round one
+                        // corner into a potentially illegal point here.
+                        const auto bounds = simplex->Corner( index ).SurroundingBox();
+                        if( !bounds )
+                            continue;
+
+                        for( const std::int64_t x : { bounds->minX, bounds->maxX } )
+                            for( const std::int64_t y : { bounds->minY, bounds->maxY } )
+                                addExactConvexForLayers( { x, y }, obstacle.layers );
+                    }
+                }
+            }
+
             std::int64_t minX = obstacle.polygon.front().x;
             std::int64_t maxX = minX;
             std::int64_t minY = obstacle.polygon.front().y;
@@ -213,6 +300,43 @@ std::vector<ROUTER_NODE> EXPANSION_GRAPH::BuildLandmarks(
             {
                 addObstacleForLayers( corner, obstacle.layers );
             }
+        }
+    }
+
+    if( !exactConvexLandmarks.empty() && result.size() < maxLandmarks )
+    {
+        std::sort( exactConvexLandmarks.begin(), exactConvexLandmarks.end(),
+                   []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
+                   {
+                       if( aLeft.point.x != aRight.point.x )
+                           return aLeft.point.x < aRight.point.x;
+                       if( aLeft.point.y != aRight.point.y )
+                           return aLeft.point.y < aRight.point.y;
+                       return aLeft.layer < aRight.layer;
+                   } );
+        exactConvexLandmarks.erase(
+                std::unique( exactConvexLandmarks.begin(), exactConvexLandmarks.end() ),
+                exactConvexLandmarks.end() );
+
+        // Keep a bounded but meaningful exact-geometry reserve even on a
+        // board with thousands of pads.  The older vector filled with pad
+        // centres first, so every general-angle obstacle vanished from the
+        // base graph precisely on the dense boards that need it most.
+        constexpr std::size_t maxExactConvexLandmarks = 512;
+        const std::size_t selected = std::min( { exactConvexLandmarks.size(),
+                                                 maxExactConvexLandmarks,
+                                                 maxLandmarks } );
+        const std::size_t ordinaryCapacity = maxLandmarks - selected;
+        if( result.size() > ordinaryCapacity )
+            result.resize( ordinaryCapacity );
+
+        for( std::size_t index = 0; index < selected; ++index )
+        {
+            const std::size_t sourceIndex = selected == exactConvexLandmarks.size()
+                                                    ? index
+                                                    : index * exactConvexLandmarks.size() / selected;
+            add( exactConvexLandmarks[sourceIndex].point,
+                 exactConvexLandmarks[sourceIndex].layer );
         }
     }
 

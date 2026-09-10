@@ -46,6 +46,11 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
 
     for( auto& connection : aConnections )
     {
+        // A source BOARD_ITEM held in static occupancy has no worker copper
+        // record to trim.  It is either retained unchanged or first promoted
+        // to a proposal route by the checked forced-shove path.
+        if( connection.isExistingBoardRoute )
+            continue;
         // Terminal via transitions may become redundant after a later trace
         // attaches on the source layer. Remove only if every real-pad/plane
         // contact component survives; synthetic fanout requests are not copper.
@@ -65,7 +70,7 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
                         preservesContacts = false;
             if( preservesContacts )
             {
-                connection.nodes.clear();
+                ClearRouteGeometry( connection );
                 continue;
             }
             m_occupancy.Add( connection );
@@ -83,7 +88,12 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
                 continue;
             const ROUTING_CONNECTION original = connection;
             m_occupancy.Remove( original );
-            connection.nodes.erase( front ? connection.nodes.begin() : connection.nodes.end() - 1 );
+            if( !RemoveRouteEndpoint( connection, front ) )
+            {
+                connection = original;
+                m_occupancy.Add( original );
+                continue;
+            }
             m_occupancy.Add( connection );
             bool preservesContacts = true;
             for( const auto& group : groups )
@@ -117,6 +127,8 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
         changed = false;
         for( auto& connection : connections )
         {
+            if( connection.isExistingBoardRoute )
+                continue;
             if( cancel && cancel() )
                 return;
             auto groups = m_occupancy.Board()->ConnectedPadGroups( connection.netCode );
@@ -153,7 +165,7 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
                     if( next == from.point )
                     { m_occupancy.Add( original ); break; }
                     if( next == to.point )
-                        connection.nodes.erase( front ? connection.nodes.begin() : connection.nodes.end() - 1 );
+                        RemoveRouteEndpoint( connection, front );
                     else
                         ( front ? connection.nodes.front() : connection.nodes.back() ).point = next;
                     m_occupancy.Add( connection );
@@ -174,7 +186,7 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
             if( connection.nodes.size() == 1 )
             {
                 m_occupancy.Remove( connection );
-                connection.nodes.clear();
+                ClearRouteGeometry( connection );
             }
         }
     } while( changed ); // Strictly removes vertices/length; never grows copper.
@@ -198,6 +210,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
 
         for( ROUTING_CONNECTION& connection : aConnections )
         {
+            if( connection.isExistingBoardRoute )
+                continue;
             if( aCancel && aCancel() )
                 break;
 

@@ -100,6 +100,7 @@ DRC_ENGINE::DRC_ENGINE( BOARD* aBoard, BOARD_DESIGN_SETTINGS *aSettings ) :
         m_progressReporter( nullptr )
 {
     m_errorLimits.resize( DRCE_LAST + 1 );
+    m_errorLimitOverrides.resize( DRCE_LAST + 1, -1 );
 
     for( int ii = DRCE_FIRST; ii <= DRCE_LAST; ++ii )
         m_errorLimits[ii] = ERROR_LIMIT;
@@ -938,14 +939,20 @@ void DRC_ENGINE::RunTests( EDA_UNITS aUnits, bool aReportAllTrackErrors, bool aT
     m_reportAllTrackErrors = aReportAllTrackErrors;
     m_testFootprints = aTestFootprints;
 
-    for( int ii = DRCE_FIRST; ii <= DRCE_LAST; ++ii )
     {
-        if( m_designSettings->Ignore( ii ) )
-            m_errorLimits[ ii ] = 0;
-        else if( ii == DRCE_CLEARANCE || ii == DRCE_UNCONNECTED_ITEMS )
-            m_errorLimits[ ii ] = EXTENDED_ERROR_LIMIT;
-        else
-            m_errorLimits[ ii ] = ERROR_LIMIT;
+        std::lock_guard<std::mutex> errorLimitsLock( m_errorLimitsMutex );
+
+        for( int ii = DRCE_FIRST; ii <= DRCE_LAST; ++ii )
+        {
+            if( m_designSettings->Ignore( ii ) )
+                m_errorLimits[ ii ] = 0;
+            else if( m_errorLimitOverrides[ ii ] >= 0 )
+                m_errorLimits[ ii ] = m_errorLimitOverrides[ ii ];
+            else if( ii == DRCE_CLEARANCE || ii == DRCE_UNCONNECTED_ITEMS )
+                m_errorLimits[ ii ] = EXTENDED_ERROR_LIMIT;
+            else
+                m_errorLimits[ ii ] = ERROR_LIMIT;
+        }
     }
 
     DRC_TEST_PROVIDER::Init();
@@ -2309,6 +2316,14 @@ bool DRC_ENGINE::IsErrorLimitExceeded( int error_code )
     assert( error_code >= 0 && error_code <= DRCE_LAST );
     std::lock_guard<std::mutex> lock( m_errorLimitsMutex );
     return m_errorLimits[ error_code ] <= 0;
+}
+
+
+void DRC_ENGINE::SetErrorLimitOverride( int aErrorCode, int aLimit )
+{
+    assert( aErrorCode >= 0 && aErrorCode <= DRCE_LAST );
+    std::lock_guard<std::mutex> lock( m_errorLimitsMutex );
+    m_errorLimitOverrides[ aErrorCode ] = aLimit < 0 ? -1 : aLimit;
 }
 
 

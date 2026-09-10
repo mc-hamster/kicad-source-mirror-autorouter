@@ -38,6 +38,8 @@
 #include <autorouter/maze/AutorouteEngine.h>
 #include <autorouter/board/model/items/NormalContacts.h>
 #include <autorouter/geometry/planar/ContactGeometry.h>
+#include <autorouter/geometry/planar/Simplex.h>
+#include <autorouter/board/optimize/TraceShover.h>
 #include <autorouter/path/FoundConnectionInserter.h>
 #include <autorouter/maze/MazeSearchEngine90Degree.h>
 #include <autorouter/maze/MazeExpansionEngine.h>
@@ -45,6 +47,7 @@
 #include <autorouter/geometry/planar/PolylineArea.h>
 #include <autorouter/maze/MazeListElement.h>
 #include <autorouter/path/FoundConnectionLocator45Degree.h>
+#include <autorouter/expansion/ExpansionGraph.h>
 #include <autorouter/expansion/ExpansionDoor.h>
 #include <autorouter/expansion/CompleteFreeSpaceExpansionRoom.h>
 #include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
@@ -66,7 +69,9 @@
 #include <pcbnew_utils/board_file_utils.h>
 
 #include <boost/test/unit_test.hpp>
+#include <array>
 #include <bit>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <random>
@@ -518,6 +523,55 @@ BOOST_AUTO_TEST_CASE( PairClearanceIsAppliedOnce )
 }
 
 
+BOOST_AUTO_TEST_CASE( PerEdgeClearanceIsPreservedByInsertionAndProposalDrc )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads.push_back( { 2, { 1000000, 1000000 }, { 0 }, "Default", 0, 100000, 0,
+                            100000 } );
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    foreign.padIndices = { 2 };
+    board.nets.push_back( foreign );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.allowVias = false;
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    ROUTING_CONNECTION committed;
+    committed.netCode = 2;
+    committed.complete = true;
+    committed.nodes = { { { 1000000, 1000000 }, 0 },
+                        { { 5000000, 1000000 }, 0 } };
+    occupancy.Add( committed );
+
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    const ROUTER_NODE start{ { 1000000, 1350000 }, 0 };
+    const ROUTER_NODE end{ { 5000000, 1350000 }, 0 };
+    ROUTING_EDGE_STYLE styled;
+    styled.trackWidth = 100000;
+    styled.clearance = 300000;
+
+    // Copper alone needs 100000 IU centre spacing, so the ordinary net style
+    // may pass. The source clearance-class value on this one edge requires
+    // 400000 IU and must be carried through the strict insertion predicate.
+    BOOST_CHECK( search.CanInsertSegment( 1, start, end ) );
+    BOOST_CHECK( !search.CanInsertSegment( 1, start, end, &styled ) );
+
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.nodes = { start, end };
+    route.edgeStyles = { styled };
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( route, 100000, 300000, 150000, { 0, 1 }, emitted );
+    BOOST_REQUIRE_EQUAL( emitted.segments.size(), 1U );
+    BOOST_CHECK_EQUAL( emitted.segments.front().clearance, styled.clearance );
+
+    emitted.segments.push_back( { 2, 0, { 1000000, 1000000 }, { 5000000, 1000000 },
+                                  100000 } );
+    BOOST_CHECK_GT( DESIGN_RULES_CHECKER::CountViolations( board, settings, emitted ), 0 );
+}
+
+
 BOOST_AUTO_TEST_CASE( ForeignObstacleLocalClearanceIsApplied )
 {
     BOARD_SNAPSHOT board = makeBoard();
@@ -635,6 +689,11 @@ BOOST_AUTO_TEST_CASE( PlaneSmdPadsFanoutBeforeChangingLayers )
     net.netCode = 1;
     net.name = "GND";
     net.netClass = "Default";
+    // Data-only snapshots do not inherit KiCad's resolved netclass via
+    // rule. Model the real adapter input explicitly: a fanout needs either
+    // its net rule or an explicitly captured board-via fallback.
+    net.viaDiameter = 600000;
+    net.viaDrill = 300000;
     net.padIndices = { 0 };
     net.planeTargetIndices = { 1 };
     net.connections = { { 0, 1 } };
@@ -712,6 +771,8 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
     net.netCode = 1;
     net.name = "SMD_NET";
     net.netClass = "Default";
+    net.viaDiameter = 300000;
+    net.viaDrill = 150000;
     net.padIndices = { 0, 1 };
     net.connections = { { 0, 1 } };
     board.nets.push_back( net );
@@ -752,6 +813,561 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
         BOOST_CHECK( via.position != board.pads[0].position );
         BOOST_CHECK( via.position != board.pads[1].position );
     }
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutUsesBoardViaFallbackAndHonorsItsEscapeEnvelope )
+{
+    // The real KiCad adapter captures the resolved netclass via rule.  This
+    // deliberately omits it so the test exercises Freerouting's independent
+    // fallback-to-board-vias policy rather than the ordinary net rule.
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 8000000, 3000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].position = { 7000000, 1500000 };
+    board.pads[1].layers = { 1 };
+    board.nets[0].viaDiameter = 0;
+    board.nets[0].viaDrill = 0;
+    board.boardViaDimensions = { { 400000, 200000 } };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1000000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDiameter, 400000 );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDrill, 200000 );
+    BOOST_CHECK_EQUAL( landing.fanoutMinEscapeLength, 1000000 );
+    BOOST_CHECK_EQUAL( landing.fanoutMaxEscapeLength, 1000000 );
+    BOOST_CHECK_EQUAL( landing.position.y, board.pads[0].position.y );
+    BOOST_CHECK_EQUAL( std::llabs( landing.position.x - board.pads[0].position.x ), 1000000 );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1U );
+    BOOST_CHECK_EQUAL( result.vias.front().diameter, 400000 );
+    BOOST_CHECK_EQUAL( result.vias.front().drill, 200000 );
+    const ROUTER_POINT viaDelta{ result.vias.front().position.x - board.pads[0].position.x,
+                                 result.vias.front().position.y - board.pads[0].position.y };
+    BOOST_CHECK_EQUAL( viaDelta.x * viaDelta.x + viaDelta.y * viaDelta.y,
+                       1000000LL * 1000000LL );
+
+    // Falling back is opt-in: a net without a via rule must retain its
+    // ordinary graph when board-via fallback is disabled.
+    AUTOROUTER_SETTINGS noFallback = settings;
+    noFallback.fanoutFallbackToBoardVias = false;
+    BOOST_CHECK_EQUAL( BATCH_FANOUT::PrepareSnapshot( board, noFallback ).pads.size(),
+                       board.pads.size() );
+
+    // Java applies max-start-room and min-drill checks separately. An
+    // inverted interval has no legal escape; the native planner must not
+    // silently widen the requested maximum to its minimum.
+    AUTOROUTER_SETTINGS impossibleEnvelope = settings;
+    impossibleEnvelope.fanoutMinEscapeLengthIU = 2000000;
+    impossibleEnvelope.fanoutMaxEscapeLengthIU = 1000000;
+    BOOST_CHECK_EQUAL( BATCH_FANOUT::PrepareSnapshot( board, impossibleEnvelope ).pads.size(),
+                       board.pads.size() );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutNormalizesNonCardinalEscapeDirections )
+{
+    // A real fanout maze evaluates physical distances in all legal outgoing
+    // directions.  Block the four cardinal exits but leave a 45-degree
+    // channel.  The synthetic planner must treat its diagonal probe as a
+    // one-millimetre physical escape, not as a sqrt(2)-millimetre vector that
+    // falls outside the configured envelope before it is checked.
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 10000000, 10000000 };
+    board.pads[0].position = { 5000000, 5000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[0].radius = 100000;
+    board.pads[0].clearance = 0;
+    board.pads[0].trackWidth = 100000;
+    board.pads[1].position = { 8000000, 5000000 };
+    board.pads[1].layers = { 1 };
+
+    for( const ROUTER_POINT& offset : { ROUTER_POINT{ 1000000, 0 },
+                                        ROUTER_POINT{ -1000000, 0 },
+                                        ROUTER_POINT{ 0, 1000000 },
+                                        ROUTER_POINT{ 0, -1000000 } } )
+    {
+        ROUTING_OBSTACLE blocker;
+        blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        blocker.netCode = 2;
+        blocker.layers = { 0, 1 };
+        blocker.start = blocker.end = { board.pads[0].position.x + offset.x,
+                                        board.pads[0].position.y + offset.y };
+        blocker.radius = 100000;
+        blocker.blocksTracks = true;
+        blocker.blocksVias = true;
+        board.obstacles.push_back( blocker );
+    }
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1200000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    const std::int64_t dx = landing.position.x - board.pads[0].position.x;
+    const std::int64_t dy = landing.position.y - board.pads[0].position.y;
+    BOOST_CHECK_NE( dx, 0 );
+    BOOST_CHECK_NE( dy, 0 );
+    const long double escape = std::sqrt( static_cast<long double>( dx ) * dx
+                                          + static_cast<long double>( dy ) * dy );
+    BOOST_CHECK_GE( escape, 1000000.0L );
+    BOOST_CHECK_LE( escape, 1200000.0L );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutRefinesBeyondItsLegacyDirectionSet )
+{
+    // RoutingBoard.fanout() searches maze doors, rather than being limited to
+    // the native adapter's original cardinal, diagonal and 1:2 probes. Block
+    // all sixteen legacy directions and leave the bounded angular refinement
+    // clear. Before the refinement this board had no synthetic landing.
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 10000000, 10000000 };
+    board.pads[0].position = { 5000000, 5000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[0].radius = 1;
+    board.pads[0].clearance = 0;
+    board.pads[0].trackWidth = 2;
+    board.pads[1].position = { 8000000, 5000000 };
+    board.pads[1].layers = { 1 };
+    board.nets[0].viaDiameter = 2;
+    board.nets[0].viaDrill = 1;
+
+    const std::array<std::array<int, 2>, 16> legacyDirections = {
+            std::array<int, 2>{ 1, 0 },   std::array<int, 2>{ -1, 0 },
+            std::array<int, 2>{ 0, 1 },   std::array<int, 2>{ 0, -1 },
+            std::array<int, 2>{ 1, 1 },   std::array<int, 2>{ -1, 1 },
+            std::array<int, 2>{ -1, -1 }, std::array<int, 2>{ 1, -1 },
+            std::array<int, 2>{ 2, 1 },   std::array<int, 2>{ 2, -1 },
+            std::array<int, 2>{ -2, 1 },  std::array<int, 2>{ -2, -1 },
+            std::array<int, 2>{ 1, 2 },   std::array<int, 2>{ -1, 2 },
+            std::array<int, 2>{ 1, -2 },  std::array<int, 2>{ -1, -2 } };
+
+    for( const auto& direction : legacyDirections )
+    {
+        const long double length = std::hypotl( static_cast<long double>( direction[0] ),
+                                                static_cast<long double>( direction[1] ) );
+        ROUTING_OBSTACLE blocker;
+        blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        blocker.netCode = 2;
+        blocker.layers = { 0, 1 };
+        blocker.start = blocker.end = {
+                board.pads[0].position.x + static_cast<std::int64_t>( std::llround(
+                                                   1000000.0L * direction[0] / length ) ),
+                board.pads[0].position.y + static_cast<std::int64_t>( std::llround(
+                                                   1000000.0L * direction[1] / length ) ) };
+        blocker.radius = 1;
+        blocker.blocksTracks = true;
+        blocker.blocksVias = true;
+        board.obstacles.push_back( blocker );
+    }
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1000000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    const std::int64_t dx = landing.position.x - board.pads[0].position.x;
+    const std::int64_t dy = landing.position.y - board.pads[0].position.y;
+    BOOST_REQUIRE( dx != 0 && dy != 0 );
+
+    // Rounding an angular escape to integral IU leaves a sub-IU error. The
+    // selected direction must nevertheless be meaningfully distinct from
+    // every legacy support direction; otherwise one of the deliberately
+    // blocked probes leaked through instead of the refinement being used.
+    const bool isLegacyDirection = std::any_of(
+            legacyDirections.begin(), legacyDirections.end(), [&]( const auto& direction )
+            {
+                const long double cross = std::abs(
+                        static_cast<long double>( dx ) * direction[1]
+                        - static_cast<long double>( dy ) * direction[0] );
+                return cross / std::hypotl( static_cast<long double>( direction[0] ),
+                                             static_cast<long double>( direction[1] ) ) < 10.0L;
+            } );
+    BOOST_CHECK( !isLegacyDirection );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutRejectsAStubCrossingSolidBetweenConcaveHoleArms )
+{
+    // Both endpoints of the preferred eastward escape are inside different
+    // arms of one concave hole, so they are individually legal. Its direct
+    // chord crosses the solid U-shaped region between them. An outer-contour
+    // only check incorrectly accepts that first (roomiest) eastward landing;
+    // a legal northward escape remains available so the planner must choose
+    // it instead of falling back to a bent route through the blocked chord.
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 500000, 500000, 5000000, 4500000 };
+    board.pads[0].position = { 1000000, 1500000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[0].radius = 1;
+    board.pads[0].clearance = 0;
+    board.pads[0].trackWidth = 2;
+    board.pads[1].position = { 3000000, 1500000 };
+    board.pads[1].layers = { 1 };
+    board.pads[1].isSmd = false;
+    board.nets[0].viaDiameter = 2;
+    board.nets[0].viaDrill = 1;
+
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    obstacle.netCode = 2;
+    obstacle.layers = { 0, 1 };
+    obstacle.polygon = { { 600000, 900000 }, { 3400000, 900000 },
+                         { 3400000, 4100000 }, { 600000, 4100000 } };
+    obstacle.polygonHoles = { { { 800000, 1100000 }, { 1400000, 1100000 },
+                                { 1400000, 3400000 }, { 2600000, 3400000 },
+                                { 2600000, 1100000 }, { 3200000, 1100000 },
+                                { 3200000, 4000000 }, { 800000, 4000000 } } };
+    obstacle.blocksTracks = true;
+    obstacle.blocksVias = true;
+    board.obstacles.push_back( std::move( obstacle ) );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 2000000;
+    settings.fanoutMaxEscapeLengthIU = 2000000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 1 );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    BOOST_CHECK_EQUAL( landing.position.x, board.pads[0].position.x );
+    BOOST_CHECK_GT( landing.position.y, board.pads[0].position.y );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutUsesBoundedPreflightedBentEscapeBeforeGlobalSearch )
+{
+    // The direct fanout probes are deliberately blocked at every sampled
+    // radius. A source-layer wall still leaves a short bent escape: travel
+    // above the wall, then place the via on its far side. The old planner
+    // accepted an arbitrary free via point and made the global maze rediscover
+    // this local path. The bounded local search must retain the actual escape
+    // and the maze must consume it without expanding a board-wide frontier.
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 7000000, 7000000 };
+    board.pads[0].position = { 1000000, 1000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[0].radius = 1;
+    board.pads[0].clearance = 0;
+    board.pads[0].trackWidth = 2;
+    board.pads[1].position = { 5000000, 1000000 };
+    board.pads[1].layers = { 1 };
+    board.pads[1].isSmd = false;
+    board.nets[0].viaDiameter = 2;
+    board.nets[0].viaDrill = 1;
+
+    ROUTING_OBSTACLE wall;
+    wall.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    wall.netCode = 2;
+    wall.layers = { 0 };
+    wall.box = { 1250000, 0, 2000000, 2250000 };
+    wall.blocksTracks = true;
+    wall.blocksVias = true;
+    board.obstacles.push_back( wall );
+
+    // The source can travel through this region on its top layer, but may not
+    // stop a via there. It forces the accepted landing to be on the far side
+    // of the source-layer wall instead of a trivial left-hand escape.
+    ROUTING_OBSTACLE viaKeepout;
+    viaKeepout.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    viaKeepout.netCode = 2;
+    viaKeepout.layers = { 1 };
+    viaKeepout.box = { 0, 0, 2000000, 7000000 };
+    viaKeepout.blocksTracks = false;
+    viaKeepout.blocksVias = true;
+    board.obstacles.push_back( viaKeepout );
+
+    // Mirror the bounded direct probe set used by BatchFanout and block each
+    // sampled endpoint. A non-probe local grid point remains available only
+    // through the bent source-layer path around the wall.
+    std::vector<std::array<int, 2>> directions = {
+            { 1, 0 },   { -1, 0 }, { 0, 1 },   { 0, -1 }, { 1, 1 },  { -1, 1 },
+            { -1, -1 }, { 1, -1 }, { 2, 1 },   { 2, -1 }, { -2, 1 }, { -2, -1 },
+            { 1, 2 },   { -1, 2 }, { 1, -2 },  { -1, -2 } };
+    for( int x = -4; x <= 4; ++x )
+    {
+        for( int y = -4; y <= 4; ++y )
+        {
+            if( ( x != 0 || y != 0 ) && std::gcd( std::abs( x ), std::abs( y ) ) == 1
+                && std::max( std::abs( x ), std::abs( y ) ) > 2 )
+            {
+                directions.push_back( { x, y } );
+            }
+        }
+    }
+
+    for( std::int64_t distance : { 2000000, 2500000, 3000000, 3500000 } )
+    {
+        for( const auto& direction : directions )
+        {
+            const long double length = std::hypotl( static_cast<long double>( direction[0] ),
+                                                    static_cast<long double>( direction[1] ) );
+            ROUTING_OBSTACLE blocker;
+            blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+            blocker.netCode = 2;
+            blocker.layers = { 0, 1 };
+            blocker.start = blocker.end = {
+                    board.pads[0].position.x + static_cast<std::int64_t>( std::llround(
+                                                       distance * direction[0] / length ) ),
+                    board.pads[0].position.y + static_cast<std::int64_t>( std::llround(
+                                                       distance * direction[1] / length ) ) };
+            blocker.radius = 1;
+            blocker.blocksTracks = true;
+            blocker.blocksVias = true;
+            board.obstacles.push_back( blocker );
+        }
+    }
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 2000000;
+    settings.fanoutMaxEscapeLengthIU = 3500000;
+    settings.fanoutLandingSearchSteps = 20;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 1 );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    BOOST_REQUIRE_GT( landing.fanoutEscapePath.size(), 2U );
+    BOOST_CHECK( landing.fanoutEscapePath.front() == board.pads[0].position );
+    BOOST_CHECK( landing.fanoutEscapePath.back() == landing.position );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( prepared, settings );
+    MAZE_SEARCH_ENGINE engine( prepared, settings, occupancy );
+    int expanded = -1;
+    const auto route = engine.FindConnection( prepared.pads[0], landing, 0, expanded, {} );
+    BOOST_REQUIRE( route );
+    BOOST_CHECK_EQUAL( expanded, 0 );
+    BOOST_REQUIRE_EQUAL( route->nodes.size(), landing.fanoutEscapePath.size() + 1 );
+    for( std::size_t index = 1; index < landing.fanoutEscapePath.size(); ++index )
+        BOOST_CHECK( route->nodes[index].point == landing.fanoutEscapePath[index] );
+    BOOST_CHECK_NE( route->nodes[route->nodes.size() - 2].layer,
+                    route->nodes.back().layer );
+
+    // The connected-set scheduler can also visit the synthetic landing
+    // first. Its reverse fanout edge must consume the same certified bent
+    // escape rather than falling through to a board-wide search that assumes
+    // the two endpoints have a direct source-layer stub.
+    int reverseExpanded = -1;
+    const auto reverse = engine.FindConnection( landing, prepared.pads[0], 0, reverseExpanded,
+                                                {} );
+    BOOST_REQUIRE( reverse );
+    BOOST_CHECK_EQUAL( reverseExpanded, 0 );
+    BOOST_REQUIRE_EQUAL( reverse->nodes.size(), landing.fanoutEscapePath.size() + 1 );
+    BOOST_CHECK( reverse->nodes.front().point == landing.position );
+    BOOST_CHECK_EQUAL( reverse->nodes.front().layer, landing.fanoutTargetLayer );
+    BOOST_CHECK_EQUAL( reverse->nodes[1].layer, landing.fanoutSourceLayer );
+    for( std::size_t index = 2; index < reverse->nodes.size(); ++index )
+    {
+        const std::size_t pathIndex = landing.fanoutEscapePath.size() - index;
+        BOOST_CHECK( reverse->nodes[index].point == landing.fanoutEscapePath[pathIndex] );
+        BOOST_CHECK_EQUAL( reverse->nodes[index].layer, landing.fanoutSourceLayer );
+    }
+    BOOST_CHECK( reverse->nodes.back().point == board.pads[0].position );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutTriesLaterBoardViaProfileWhenEarlierProfileCannotEscape )
+{
+    // RoutingBoard.fanout appends every board ViaRule alternative to the
+    // netclass rule.  The first board profile is intentionally too large to
+    // land in this channel; the second profile must be considered rather
+    // than discarding the SMD escape after the first rejection.
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 8000000, 3000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].position = { 7000000, 1500000 };
+    board.pads[1].layers = { 1 };
+    board.nets[0].viaDiameter = 0;
+    board.nets[0].viaDrill = 0;
+    board.boardViaDimensions = { { 2000000, 100000 }, { 300000, 100000 } };
+
+    // With a fixed 1 mm escape, the 2 mm via only has one in-board landing
+    // at (2 mm, 1.5 mm).  This small foreign-net obstacle blocks its annulus
+    // but remains clear of the 0.3 mm fallback profile.
+    ROUTING_OBSTACLE blocker;
+    blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    blocker.netCode = 2;
+    blocker.layers = { 0, 1 };
+    blocker.start = { 2800000, 1500000 };
+    blocker.end = blocker.start;
+    blocker.radius = 100000;
+    blocker.blocksTracks = true;
+    blocker.blocksVias = true;
+    board.obstacles.push_back( blocker );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = true;
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1000000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDiameter, 300000 );
+    BOOST_CHECK_EQUAL( landing.fanoutViaDrill, 100000 );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1U );
+    BOOST_CHECK_EQUAL( result.vias.front().diameter, 300000 );
+    BOOST_CHECK_EQUAL( result.vias.front().drill, 100000 );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutKeepsEachSelectedViaProfileScopedToItsPin )
+{
+    // Freerouting's combined ViaRule is evaluated separately for every SMD
+    // pin.  Here the first pin can use the large first profile, while the
+    // second pin's only legal landing requires the later small profile.  A
+    // net-wide profile mutation makes the second fanout search test its via
+    // against the first pin's large annulus and reject a legal escape.
+    BOARD_SNAPSHOT board = makeBoard();
+    // Make the usable vertical margin around the large annulus smaller than
+    // the shallowest non-cardinal 1 mm escape. A fanout can consequently
+    // leave this horizontal channel only in either cardinal horizontal
+    // direction; every angular landing puts the large annulus beyond the
+    // board edge. This keeps the test about ViaRule ownership rather than
+    // accidentally relying on the old finite probe list now that fanout also
+    // searches non-cardinal doors.
+    board.bounds = { 0, 0, 12000000, 1400000 };
+    board.pads[0].position = { 2000000, 700000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[0].componentId = 1;
+    board.pads[0].pinIndex = 1;
+    board.pads[1].position = { 8000000, 700000 };
+    board.pads[1].layers = { 0 };
+    board.pads[1].isSmd = true;
+    board.pads[1].componentId = 2;
+    board.pads[1].pinIndex = 1;
+
+    ROUTING_PAD destination = board.pads[1];
+    destination.position = { 11000000, 700000 };
+    destination.layers = { 1 };
+    destination.isSmd = false;
+    destination.componentId = 3;
+    board.pads.push_back( destination );
+
+    board.nets[0].viaDiameter = 0;
+    board.nets[0].viaDrill = 0;
+    board.nets[0].padIndices = { 0, 1, 2 };
+    board.nets[0].connections = { { 0, 2 }, { 1, 2 } };
+    board.boardViaDimensions = { { 1200000, 100000 }, { 300000, 100000 } };
+
+    // The second pin is ordered after the first and escapes left to (7 mm,
+    // 0.7 mm).  This point is clear for the 0.3 mm alternative but not the
+    // 1.2 mm first alternative.  The only other in-board large-via landing
+    // is blocked, so a large-profile search cannot quietly use a different
+    // transition and mask a profile leak.
+    const auto addLayerZeroBlocker = [&]( ROUTER_POINT aPoint )
+    {
+        ROUTING_OBSTACLE blocker;
+        blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        blocker.netCode = 2;
+        blocker.layers = { 0 };
+        blocker.start = aPoint;
+        blocker.end = aPoint;
+        blocker.radius = 100000;
+        blocker.blocksTracks = true;
+        blocker.blocksVias = true;
+        board.obstacles.push_back( blocker );
+    };
+    addLayerZeroBlocker( { 7000000, 1450000 } );
+    addLayerZeroBlocker( { 9000000, 700000 } );
+    ROUTING_OBSTACLE sourceLayerWall;
+    sourceLayerWall.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    sourceLayerWall.netCode = 0;
+    sourceLayerWall.layers = { 0 };
+    sourceLayerWall.box = { 5000000, 0, 5100000, 1400000 };
+    sourceLayerWall.blocksTracks = true;
+    sourceLayerWall.blocksVias = false;
+    board.obstacles.push_back( sourceLayerWall );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = true;
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1000000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    std::map<std::size_t, ROUTING_VIA_DIMENSION> landingProfiles;
+    for( const ROUTING_PAD& pad : prepared.pads )
+    {
+        if( pad.isFanoutTarget )
+        {
+            landingProfiles.emplace( pad.fanoutSourcePadIndex,
+                                     ROUTING_VIA_DIMENSION{ pad.fanoutViaDiameter,
+                                                            pad.fanoutViaDrill } );
+        }
+    }
+    BOOST_REQUIRE_EQUAL( landingProfiles.size(), 2U );
+    BOOST_CHECK( ( landingProfiles.at( 0 ) == ROUTING_VIA_DIMENSION{ 1200000, 100000 } ) );
+    BOOST_CHECK( ( landingProfiles.at( 1 ) == ROUTING_VIA_DIMENSION{ 300000, 100000 } ) );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_CHECK_EQUAL( std::count_if( result.vias.begin(), result.vias.end(),
+                                      []( const ROUTING_VIA& aVia )
+                                      { return aVia.diameter == 1200000 && aVia.drill == 100000; } ),
+                       1 );
+    BOOST_CHECK_EQUAL( std::count_if( result.vias.begin(), result.vias.end(),
+                                      []( const ROUTING_VIA& aVia )
+                                      { return aVia.diameter == 300000 && aVia.drill == 100000; } ),
+                       1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutPinTimeoutFallsBackToTheOrdinaryBatchStage )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 8000000, 3000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].position = { 7000000, 1500000 };
+    board.pads[1].layers = { 1 };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.maxFanoutPasses = 1;
+    settings.maxFanoutMillisecondsPerPin = 0;
+
+    // A per-pin fanout budget may expire without cancelling the entire job.
+    // The synthetic landing must be removed and the normal batch router must
+    // restart from the real SMD pad rather than leaving disconnected copper.
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( !result.cancelled );
+    BOOST_REQUIRE( result.complete );
+    BOOST_CHECK( !result.fanoutTimedOut );
+    BOOST_CHECK_EQUAL( result.metrics.fanoutConnections, 0 );
+    BOOST_CHECK_EQUAL( result.metrics.routedConnections, 1 );
+    BOOST_CHECK_EQUAL( result.vias.size(), 1U );
 }
 
 
@@ -1128,6 +1744,44 @@ BOOST_AUTO_TEST_CASE( DirectFanoutChecksTheWholeSelectedViaPadstack )
 }
 
 
+BOOST_AUTO_TEST_CASE( FanoutRejectsLandingThatViolatesDrillToHoleClearance )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.enableFanout = true;
+    board.pads[0].isSmd = true;
+    board.pads[0].layers = { 0 };
+    board.pads[0].radius = 100000;
+    board.pads[0].clearance = 0;
+    board.pads[0].trackWidth = 100000;
+    board.pads[1].layers = { 0, 1 };
+    board.nets[0].viaDiameter = 300000;
+    board.nets[0].viaDrill = 150000;
+
+    // The first deterministic fanout probe is 150000 IU to the right of
+    // the SMD pad. Copper-to-hole spacing would permit that via, but its
+    // 75000-IU drill plus this existing 50000-IU hole must observe the
+    // 200000-IU hole-to-hole rule. This used to select a landing that the
+    // final DRC would reject.
+    board.holeClearance = 0;
+    board.holeToHoleClearance = 200000;
+    ROUTING_OBSTACLE hole;
+    hole.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    hole.layers = { 0, 1 };
+    hole.start = hole.end = { 1400000, 1500000 };
+    hole.radius = 50000;
+    hole.blocksTracks = true;
+    hole.blocksVias = true;
+    hole.isHole = true;
+    board.obstacles.push_back( hole );
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3 );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    BOOST_CHECK( landing.position != ( ROUTER_POINT{ 1150000, 1500000 } ) );
+}
+
 BOOST_AUTO_TEST_CASE( InnerLayerRouteInsertsTheSelectedThroughPadstack )
 {
     auto board = makeBoard();
@@ -1318,8 +1972,10 @@ BOOST_AUTO_TEST_CASE( FanoutLandingPlanningUsesGlobalComponentOrderNotNetOrder )
         pin.componentId = i < 3 ? 1 : 2; pin.pinIndex = i;
         board.pads.push_back( pin );
     }
-    ROUTING_NET a; a.netCode = 1; a.padIndices = { 0, 3 }; a.connections = { { 0, 3 } };
-    ROUTING_NET b; b.netCode = 2; b.padIndices = { 1, 2 }; b.connections = { { 1, 2 } };
+    ROUTING_NET a; a.netCode = 1; a.viaDiameter = 300000; a.viaDrill = 150000;
+    a.padIndices = { 0, 3 }; a.connections = { { 0, 3 } };
+    ROUTING_NET b; b.netCode = 2; b.viaDiameter = 300000; b.viaDrill = 150000;
+    b.padIndices = { 1, 2 }; b.connections = { { 1, 2 } };
     board.nets = { a, b };
     auto settings = makeSettings(); settings.enableFanout = true;
     const auto expected = BATCH_FANOUT::OrderedPins( board, settings.fanoutPinOrder );
@@ -1665,6 +2321,2346 @@ BOOST_AUTO_TEST_CASE( ForcedSpringOverPublishesCheckedReplacementAtomically )
     }
 }
 
+BOOST_AUTO_TEST_CASE( ForcedSpringOverHandlesFixedCircularAndOvalObstacles )
+{
+    // KiCad snapshots circles and ovals as SEGMENT + radius.  These are the
+    // normal representation of round pads, vias and straight copper, so a
+    // forced insert must be able to spring around their clearance contour just
+    // as it can around a rectangular or polygonal TileShape.
+    for( const auto& [start, end] : std::array<std::pair<ROUTER_POINT, ROUTER_POINT>, 2>{
+                 std::pair{ ROUTER_POINT{ 5000000, 2000000 },
+                            ROUTER_POINT{ 5000000, 2000000 } },
+                 std::pair{ ROUTER_POINT{ 4250000, 2000000 },
+                            ROUTER_POINT{ 5750000, 2000000 } } } )
+    {
+        BOOST_TEST_CONTEXT( "fixed " << ( start == end ? "circle" : "oval" ) )
+        {
+            auto board = makeBoard();
+            board.bounds = { 0, 0, 10000000, 4000000 };
+            board.pads[0].position = { 1000000, 2000000 };
+            board.pads[1].position = { 9000000, 2000000 };
+            auto settings = makeSettings();
+            settings.layers = { { 0, true, 1, 20 } };
+            settings.allowVias = false;
+
+            ROUTING_OBSTACLE obstacle;
+            obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+            obstacle.netCode = 2;
+            obstacle.layers = { 0 };
+            obstacle.start = start;
+            obstacle.end = end;
+            obstacle.radius = 400000;
+            obstacle.blocksTracks = true;
+            obstacle.blocksVias = true;
+            board.obstacles.push_back( obstacle );
+
+            ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+            occupancy.InitializeBoard( board, settings );
+            MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+            ROUTING_CONNECTION route;
+            route.netCode = 1;
+            route.complete = true;
+            route.fromPadIndex = 0;
+            route.toPadIndex = 1;
+            route.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+
+            BOOST_REQUIRE( !engine.CanInsertSegment( route.netCode, route.nodes.front(),
+                                                      route.nodes.back() ) );
+            const auto wrapped = engine.SpringOverConnection( route, {} );
+            BOOST_REQUIRE( wrapped );
+            BOOST_CHECK_GT( wrapped->nodes.size(), route.nodes.size() );
+            BOOST_CHECK( wrapped->nodes.front() == route.nodes.front() );
+            BOOST_CHECK( wrapped->nodes.back() == route.nodes.back() );
+            for( std::size_t index = 1; index < wrapped->nodes.size(); ++index )
+            {
+                BOOST_CHECK( engine.CanInsertSegment( wrapped->netCode,
+                                                      wrapped->nodes[index - 1],
+                                                      wrapped->nodes[index] ) );
+            }
+
+            const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+            BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+            BOOST_REQUIRE( inserted.connection );
+            BOOST_CHECK( inserted.connection->nodes == wrapped->nodes );
+            BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1U );
+        }
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( ConfiguredWholeConnectionNeckRetryUsesNarrowOutputCopper )
+{
+    // This is the RouterSettings.neckWidthUm path, not a pad-local
+    // getTraceNeckdownHalfwidth escape.  The pair of board-edge walls leaves
+    // a 80-IU channel: the ordinary 100-IU trace cannot enter it, while a
+    // 50-IU retry can.  The proposed copper must retain the narrow style all
+    // the way through materialization rather than silently reverting to the
+    // net's ordinary width.
+    auto board = makeBoard();
+    board.minimumTrackWidth = 0;
+    board.nets[0].clearance = 0;
+
+    ROUTING_OBSTACLE topWall;
+    topWall.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    topWall.netCode = 2;
+    topWall.layers = { 0 };
+    topWall.box = { 1500000, 0, 4500000, 1460000 };
+    ROUTING_OBSTACLE bottomWall = topWall;
+    bottomWall.box = { 1500000, 1540000, 4500000, 3000000 };
+    board.obstacles = { topWall, bottomWall };
+
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    settings.maxPasses = 1;
+    // The worker may otherwise choose a longer, congestion-avoiding path
+    // around the static via before forced insertion runs. This fixture is an
+    // insertion/provenance test, so select the direct source-valid route.
+    settings.congestionCost = 0;
+    settings.maxIterations = 1;
+    settings.maxExpandedNodes = 50000;
+
+    const ROUTING_RESULT normal = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_CHECK( !normal.complete );
+    BOOST_CHECK_EQUAL( normal.metrics.routedConnections, 0 );
+
+    settings.neckWidthIU = 50000;
+    const ROUTING_RESULT necked = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( necked.complete );
+    BOOST_REQUIRE_EQUAL( necked.metrics.routedConnections, 1 );
+    BOOST_REQUIRE( !necked.segments.empty() );
+    BOOST_CHECK( std::all_of( necked.segments.begin(), necked.segments.end(),
+                              []( const ROUTING_SEGMENT& aSegment )
+                              { return aSegment.width == 50000; } ) );
+    BOOST_CHECK_EQUAL( DESIGN_RULES_CHECKER::CountViolations( board, settings, necked ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedTerminalNeckdownUsesSourcePinWidthAndEmitsPerEdgeCopper )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.minimumTrackWidth = 0;
+    // Pin.getTraceNeckdownHalfwidth(40000) is 19999 source units, hence a
+    // 39998-wide final segment. The ordinary net width is 100000.
+    board.pads[1].layerGeometry.push_back( { 0, 40000, 100000, 0 } );
+    ROUTING_OBSTACLE nearPin;
+    nearPin.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    nearPin.netCode = 2;
+    nearPin.layers = { 0 };
+    // A 100000-wide trace cannot pass beneath this box, while the source
+    // pin-entry width can. Its position makes the normal prefix stop before
+    // the obstacle and exercises the partial-forcing reconstruction.
+    nearPin.box = { 4500000, 1540000, 4750000, 1800000 };
+    board.obstacles.push_back( nearPin );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( inserted.connection );
+    BOOST_REQUIRE_EQUAL( inserted.connection->nodes.size(), 3 );
+    BOOST_REQUIRE_EQUAL( inserted.connection->edgeStyles.size(), 2 );
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[0].trackWidth, 0 );
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[1].trackWidth, 39998 );
+    BOOST_CHECK_LT( inserted.connection->nodes[1].point.x, nearPin.box.minX );
+    BOOST_CHECK_EQUAL( occupancy.Connections().size(), 1 );
+
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( *inserted.connection, 100000, 300000, 150000,
+                                       { 0, 1 }, emitted );
+    BOOST_REQUIRE_EQUAL( emitted.segments.size(), 2 );
+    BOOST_CHECK_EQUAL( emitted.segments[0].width, 100000 );
+    BOOST_CHECK_EQUAL( emitted.segments[1].width, 39998 );
+    const auto items = occupancy.Board()->RouteItems( *inserted.connection );
+    BOOST_REQUIRE_EQUAL( items.size(), 2 );
+    occupancy.Remove( *inserted.connection );
+    BOOST_CHECK( occupancy.Connections().empty() );
+}
+
+BOOST_AUTO_TEST_CASE( ForcedTerminalNeckdownUsesSourceStartPinForLongTerminalEdge )
+{
+    // The source invokes tryNeckDown with a reversed segment at the start
+    // pin.  Its pin-distance check therefore validates the selected pin
+    // endpoint, not the four-millimetre terminal edge.  Keeping the old
+    // native whole-edge guard made this exact mirror of the end-pin case
+    // fall back to an unnecessarily large spring-over.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.minimumTrackWidth = 0;
+    board.pads[0].layerGeometry.push_back( { 0, 40000, 100000, 0 } );
+    ROUTING_OBSTACLE nearPin;
+    nearPin.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    nearPin.netCode = 2;
+    nearPin.layers = { 0 };
+    nearPin.box = { 1250000, 1540000, 1500000, 1800000 };
+    board.obstacles.push_back( nearPin );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( inserted.connection );
+    BOOST_REQUIRE_EQUAL( inserted.connection->nodes.size(), 3U );
+    BOOST_REQUIRE_EQUAL( inserted.connection->edgeStyles.size(), 2U );
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[0].trackWidth, 39998 );
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[1].trackWidth, 0 );
+    BOOST_CHECK_GT( inserted.connection->nodes[1].point.x, nearPin.box.maxX );
+
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( *inserted.connection, 100000, 300000, 150000,
+                                       { 0, 1 }, emitted );
+    BOOST_REQUIRE_EQUAL( emitted.segments.size(), 2U );
+    BOOST_CHECK_EQUAL( emitted.segments[0].width, 39998 );
+    BOOST_CHECK_EQUAL( emitted.segments[1].width, 100000 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedTerminalMicroNeckdownUsesFanoutFallbackWidths )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.minimumTrackWidth = 0;
+    // This pad is not narrower than the ordinary 100000-IU trace, so the
+    // source Pin.getTraceNeckdownHalfwidth path has no usable reduction.
+    // The Freerouting fanout fallback must still try its deterministic
+    // micro-neckdown widths; 3/4 of the normal trace clears this obstacle.
+    board.pads[1].layerGeometry.push_back( { 0, 102000, 102000, 0 } );
+    ROUTING_OBSTACLE nearPin;
+    nearPin.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    nearPin.netCode = 2;
+    nearPin.layers = { 0 };
+    nearPin.box = { 4500000, 1540000, 4750000, 1800000 };
+    board.obstacles.push_back( nearPin );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( route.netCode, route.nodes.front(), route.nodes.back() ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( inserted.connection );
+    BOOST_REQUIRE_EQUAL( inserted.connection->nodes.size(), 3 );
+    BOOST_REQUIRE_EQUAL( inserted.connection->edgeStyles.size(), 2 );
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[0].trackWidth, 0 );
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[1].trackWidth, 75000 );
+    BOOST_CHECK_LT( inserted.connection->nodes[1].point.x, nearPin.box.minX );
+}
+
+BOOST_AUTO_TEST_CASE( SpringOverPreservesTerminalNeckdownStyleBoundaries )
+{
+    // The centre edge needs a forced spring-over, while the two terminal
+    // edges retain a narrower pin-entry style.  Source TraceShover acts on
+    // one homogeneous trace at a time; refusing the whole connection just
+    // because the terminal neckdown has a different style loses this valid
+    // forced insertion.
+    auto board = makeBoard();
+    board.bounds = { 0, 0, 10000000, 4000000 };
+    board.pads[0].position = { 1000000, 2000000 };
+    board.pads[1].position = { 9000000, 2000000 };
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    obstacle.netCode = 2;
+    obstacle.layers = { 0 };
+    obstacle.box = { 4000000, 1500000, 6000000, 2500000 };
+    obstacle.blocksTracks = true;
+    obstacle.blocksVias = true;
+    board.obstacles.push_back( obstacle );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_EDGE_STYLE narrow;
+    narrow.trackWidth = 50000;
+    ROUTING_EDGE_STYLE normal;
+    normal.trackWidth = 100000;
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { { 2000000, 2000000 }, 0 },
+                    { { 8000000, 2000000 }, 0 }, { board.pads[1].position, 0 } };
+    route.edgeStyles = { narrow, normal, narrow };
+    BOOST_CHECK( !engine.CanInsertSegment( route.netCode, route.nodes[1], route.nodes[2],
+                                           &route.edgeStyles[1] ) );
+
+    const auto wrapped = engine.SpringOverConnection( route, {} );
+    BOOST_REQUIRE( wrapped );
+    BOOST_REQUIRE( HasValidEdgeStyles( *wrapped ) );
+    BOOST_CHECK_GT( wrapped->nodes.size(), route.nodes.size() );
+    BOOST_CHECK( wrapped->nodes.front() == route.nodes.front() );
+    BOOST_CHECK( wrapped->nodes.back() == route.nodes.back() );
+    BOOST_CHECK_EQUAL( wrapped->edgeStyles.front().trackWidth, narrow.trackWidth );
+    BOOST_CHECK_EQUAL( wrapped->edgeStyles.back().trackWidth, narrow.trackWidth );
+    BOOST_CHECK_GE( std::count_if( wrapped->edgeStyles.begin(), wrapped->edgeStyles.end(),
+                                   [&]( const ROUTING_EDGE_STYLE& aStyle )
+                                   { return aStyle.trackWidth == normal.trackWidth; } ),
+                    2 );
+    for( std::size_t index = 1; index < wrapped->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( wrapped->netCode, wrapped->nodes[index - 1],
+                                              wrapped->nodes[index],
+                                              &wrapped->edgeStyles[index - 1] ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionShovesStaticHostTraceWithoutBorrowingItsConnectivity )
+{
+    // Whole-net reroute keeps eligible source copper in occupancy as a static
+    // collision participant.  It must not count as worker electrical copper
+    // (otherwise the proposal could delete an old trace it never regenerated),
+    // but a checked forced spring-over may promote it into new proposal
+    // copper rather than deleting it.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_PAD first = board.pads.front();
+    first.netCode = 2;
+    first.position = { 3000000, 500000 };
+    ROUTING_PAD second = first;
+    second.position = { 3000000, 2500000 };
+    const std::size_t firstIndex = board.pads.size();
+    board.pads.push_back( first );
+    const std::size_t secondIndex = board.pads.size();
+    board.pads.push_back( second );
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices = { firstIndex, secondIndex };
+    foreign.connections = { { firstIndex, secondIndex } };
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION hostTrace;
+    hostTrace.netCode = 2;
+    hostTrace.complete = true;
+    hostTrace.isExistingBoardRoute = true;
+    hostTrace.isShoveMovable = true;
+    hostTrace.sourceBoardItemIds = { "host-straight-trace" };
+    hostTrace.nodes = { { first.position, 0 }, { second.position, 0 } };
+    occupancy.AddStatic( hostTrace );
+
+    // Static copper blocks the candidate, but does not make its two pads
+    // electrically connected in the worker routing board.
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.back() ), 1 );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), hostTrace ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, conflicts, occupancy, engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    const ROUTING_CONNECTION& moved = inserted.shoved.front().replacement;
+    BOOST_CHECK( !moved.isExistingBoardRoute );
+    BOOST_CHECK( moved.isShoveMovable );
+    BOOST_CHECK_EQUAL_COLLECTIONS( moved.sourceBoardItemIds.begin(), moved.sourceBoardItemIds.end(),
+                                   hostTrace.sourceBoardItemIds.begin(),
+                                   hostTrace.sourceBoardItemIds.end() );
+    BOOST_CHECK( moved.nodes != hostTrace.nodes );
+    BOOST_CHECK( !occupancy.Board()->RouteItems( moved ).empty() );
+    BOOST_CHECK( std::none_of( occupancy.Connections().begin(), occupancy.Connections().end(),
+                               []( const ROUTING_CONNECTION& aRoute )
+                               { return aRoute.isExistingBoardRoute; } ) );
+
+    // A host route that failed the snapshot/contact eligibility guard may
+    // never fall through to an ordinary rip-up, even if the caller allows
+    // destructive fallback for generated worker routes.
+    ROUTING_OCCUPANCY fixedOccupancy( settings.gridStepIU );
+    fixedOccupancy.InitializeBoard( board, settings );
+    hostTrace.isShoveMovable = false;
+    fixedOccupancy.AddStatic( hostTrace );
+    MAZE_SEARCH_ENGINE fixedEngine( board, settings, fixedOccupancy );
+    const auto fixedConflicts = fixedEngine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( fixedConflicts.size(), 1U );
+    const auto rejected = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, fixedConflicts, fixedOccupancy, fixedEngine, {}, true );
+    BOOST_CHECK( rejected.state == FOUND_CONNECTION_INSERTER::STATE::BLOCKED );
+    BOOST_REQUIRE_EQUAL( fixedOccupancy.Connections().size(), 1U );
+    BOOST_CHECK( fixedOccupancy.Connections().front().isExistingBoardRoute );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionShovesStaticHostViaWithAttachedTraceLegs )
+{
+    // The adapter reconstructs a host via only when it has exactly one
+    // direct trace contact on each layer.  Model that composite here: its
+    // source UUIDs must survive the move so proposal acceptance removes all
+    // three original BOARD_ITEMs before adding the replacement legs/via.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION hostVia;
+    hostVia.netCode = 2;
+    hostVia.complete = true;
+    hostVia.isExistingBoardRoute = true;
+    hostVia.isShoveMovable = true;
+    hostVia.sourceBoardItemIds = { "host-trace-top", "host-via", "host-trace-bottom" };
+    hostVia.nodes = { { { 2500000, 750000 }, 0 }, { { 3000000, 1500000 }, 0 },
+                      { { 3000000, 1500000 }, 1 }, { { 3500000, 2250000 }, 1 } };
+    occupancy.AddStatic( hostVia );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, conflicts, occupancy, engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    const ROUTING_CONNECTION& moved = inserted.shoved.front().replacement;
+    BOOST_CHECK( !moved.isExistingBoardRoute );
+    BOOST_CHECK_EQUAL_COLLECTIONS( moved.sourceBoardItemIds.begin(), moved.sourceBoardItemIds.end(),
+                                   hostVia.sourceBoardItemIds.begin(),
+                                   hostVia.sourceBoardItemIds.end() );
+    BOOST_REQUIRE( HasValidEdgeStyles( moved ) );
+    const auto transition = std::find_if(
+            moved.nodes.begin() + 1, moved.nodes.end(),
+            []( const ROUTER_NODE& aNode ) { return aNode.layer == 1; } );
+    BOOST_REQUIRE( transition != moved.nodes.end() );
+    BOOST_CHECK( ( transition - 1 )->point != hostVia.nodes[1].point );
+
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( moved, 100000, 300000, 150000, { 0, 1 }, emitted );
+    BOOST_CHECK_GE( emitted.segments.size(), 2U );
+    BOOST_REQUIRE_EQUAL( emitted.vias.size(), 1U );
+    BOOST_CHECK( emitted.vias.front().position != hostVia.nodes[1].point );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionMaterializesStaticViaTraceContactsAndBridges )
+{
+    // DrillItem.moveBy() does not drag a contacted trace. It leaves that
+    // source trace in place and creates an old-via-centre -> new-via-centre
+    // bridge on the trace layer. Model one lower-layer source trace here: the
+    // incoming upper-layer route conflicts only with the via, which lets the
+    // test distinguish the new contact-graph plan from the older
+    // trace-via-trace path reconstruction.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION hostTrace;
+    hostTrace.netCode = 2;
+    hostTrace.complete = true;
+    hostTrace.isExistingBoardRoute = true;
+    // The trace itself need not be spring-over movable: source DrillItem.moveBy
+    // retains its exact centreline and only materialises it for proposal output.
+    hostTrace.isShoveMovable = false;
+    hostTrace.sourceBoardItemIds = { "host-bottom-trace" };
+    hostTrace.nodes = { { { 2500000, 500000 }, 1 }, { { 3000000, 1500000 }, 1 } };
+    hostTrace.edgeStyles = { { 100000, 0, 0, 0, {} } };
+    occupancy.AddStatic( hostTrace );
+
+    // A branch is not a two-sided trace-via-trace chain. The source stores
+    // TraceInfo in a set, so both same-style bottom contacts must be
+    // materialised but share exactly one bridge trace.
+    ROUTING_CONNECTION secondHostTrace = hostTrace;
+    secondHostTrace.sourceBoardItemIds = { "host-bottom-trace-branch" };
+    secondHostTrace.nodes = { { { 3500000, 500000 }, 1 },
+                              { { 3000000, 1500000 }, 1 } };
+    occupancy.AddStatic( secondHostTrace );
+
+    ROUTING_CONNECTION hostVia;
+    hostVia.netCode = 2;
+    hostVia.complete = true;
+    hostVia.isExistingBoardRoute = true;
+    hostVia.isShoveMovable = true;
+    hostVia.sourceBoardItemIds = { "host-via" };
+    hostVia.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+    hostVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+    occupancy.AddStatic( hostVia );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), hostVia ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, conflicts, occupancy, engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    const auto& shove = inserted.shoved.front();
+    BOOST_REQUIRE_EQUAL( shove.materializedContacts.size(), 2U );
+    BOOST_REQUIRE_EQUAL( shove.bridges.size(), 1U );
+    BOOST_CHECK( !shove.replacement.isExistingBoardRoute );
+    BOOST_CHECK( shove.replacement.nodes.front().point != hostVia.nodes.front().point );
+    BOOST_CHECK( std::any_of( shove.materializedContacts.begin(), shove.materializedContacts.end(),
+                              [&]( const ROUTING_CONNECTION_REPLACEMENT& aContact )
+                              { return SameRouteGeometry( aContact.original, hostTrace ); } ) );
+    BOOST_CHECK( std::any_of( shove.materializedContacts.begin(), shove.materializedContacts.end(),
+                              [&]( const ROUTING_CONNECTION_REPLACEMENT& aContact )
+                              { return SameRouteGeometry( aContact.original, secondHostTrace ); } ) );
+    BOOST_CHECK( std::all_of( shove.materializedContacts.begin(), shove.materializedContacts.end(),
+                              []( const ROUTING_CONNECTION_REPLACEMENT& aContact )
+                              { return !aContact.replacement.isExistingBoardRoute; } ) );
+
+    const ROUTING_CONNECTION& bridge = shove.bridges.front();
+    BOOST_REQUIRE_EQUAL( bridge.nodes.size(), 2U );
+    BOOST_REQUIRE_EQUAL( bridge.edgeStyles.size(), 1U );
+    BOOST_CHECK_EQUAL( bridge.nodes.front().layer, 1 );
+    BOOST_CHECK_EQUAL( bridge.nodes.back().layer, 1 );
+    BOOST_CHECK( bridge.nodes.front().point == hostVia.nodes.front().point );
+    BOOST_CHECK( bridge.nodes.back().point == shove.replacement.nodes.front().point );
+    BOOST_CHECK_EQUAL( bridge.edgeStyles.front().trackWidth, 100000 );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 5U );
+    BOOST_CHECK( std::none_of( occupancy.Connections().begin(), occupancy.Connections().end(),
+                               []( const ROUTING_CONNECTION& aRoute )
+                               { return aRoute.isExistingBoardRoute; } ) );
+
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( candidate, 100000, 300000, 150000, { 0, 1 }, emitted );
+    FOUND_CONNECTION_INSERTER::Append( shove.replacement, 100000, 300000, 150000, { 0, 1 },
+                                       emitted );
+    for( const ROUTING_CONNECTION_REPLACEMENT& contact : shove.materializedContacts )
+        FOUND_CONNECTION_INSERTER::Append( contact.replacement, 100000, 300000, 150000,
+                                           { 0, 1 }, emitted );
+    FOUND_CONNECTION_INSERTER::Append( bridge, 100000, 300000, 150000, { 0, 1 }, emitted );
+    BOOST_REQUIRE_EQUAL( emitted.vias.size(), 1U );
+    BOOST_REQUIRE_EQUAL( emitted.segments.size(), 4U );
+    BOOST_CHECK_EQUAL( DESIGN_RULES_CHECKER::CountViolations( board, settings, emitted ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( StaticViaShoveUsesOnlyExactNormalTraceEndpoints )
+{
+    // DrillItem.getNormalContacts() intentionally sees a Trace only at one
+    // of its endpoints. A same-net trace whose *interior* crosses the via
+    // centre is not a normal Java contact, so DrillItem.moveBy() moves the
+    // via without materialising that trace or adding a bridge to it. The
+    // worker must not turn that geometric overlap into an invented contact
+    // edge during source-via reconstruction.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( std::move( foreign ) );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION throughTrace;
+    throughTrace.netCode = 2;
+    throughTrace.complete = true;
+    throughTrace.isExistingBoardRoute = true;
+    throughTrace.sourceBoardItemIds = { "through-trace" };
+    throughTrace.nodes = { { { 2500000, 1500000 }, 1 },
+                           { { 3500000, 1500000 }, 1 } };
+    throughTrace.edgeStyles = { { 100000, 0, 0, 0, {} } };
+
+    ROUTING_CONNECTION sourceVia;
+    sourceVia.netCode = 2;
+    sourceVia.complete = true;
+    sourceVia.isExistingBoardRoute = true;
+    sourceVia.isShoveMovable = true;
+    sourceVia.sourceBoardItemIds = { "source-via" };
+    sourceVia.nodes = { { { 3000000, 1500000 }, 0 },
+                        { { 3000000, 1500000 }, 1 } };
+    sourceVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 1000000, 1500000 }, 0 },
+                       { { 5000000, 1500000 }, 0 } };
+    occupancy.Add( incoming );
+
+    const auto plan = engine.ShoveViaConnectionPlan(
+            sourceVia, { incoming }, { throughTrace, sourceVia }, {} );
+    BOOST_REQUIRE( plan );
+    BOOST_CHECK( plan->replacement.nodes.front().point != sourceVia.nodes.front().point );
+    BOOST_CHECK( plan->materializedContacts.empty() );
+    BOOST_CHECK( plan->bridges.empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( StaticViaShoveUsesOneBridgePerNormalContactLayer )
+{
+    // DrillItem.TraceInfo's TreeSet comparator keys only by layer. Two
+    // normal trace contacts on the same layer are both retained as source
+    // copper, but moveBy() creates exactly one old-centre-to-new-centre
+    // bridge, using the first stable contact's style.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( std::move( foreign ) );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    const ROUTER_POINT centre{ 3000000, 1500000 };
+    ROUTING_CONNECTION firstTrace;
+    firstTrace.netCode = 2;
+    firstTrace.complete = true;
+    firstTrace.isExistingBoardRoute = true;
+    firstTrace.sourceBoardItemIds = { "a-first-layer-one-contact" };
+    firstTrace.nodes = { { { 2500000, 500000 }, 1 }, { centre, 1 } };
+    firstTrace.edgeStyles = { { 100000, 0, 0, 0, {} } };
+
+    ROUTING_CONNECTION secondTrace = firstTrace;
+    secondTrace.sourceBoardItemIds = { "b-second-layer-one-contact" };
+    secondTrace.nodes = { { { 3500000, 500000 }, 1 }, { centre, 1 } };
+    secondTrace.edgeStyles = { { 160000, 0, 0, 0, {} } };
+
+    ROUTING_CONNECTION sourceVia;
+    sourceVia.netCode = 2;
+    sourceVia.complete = true;
+    sourceVia.isExistingBoardRoute = true;
+    sourceVia.isShoveMovable = true;
+    sourceVia.sourceBoardItemIds = { "source-via" };
+    sourceVia.nodes = { { centre, 0 }, { centre, 1 } };
+    sourceVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 1000000, 1500000 }, 0 },
+                       { { 5000000, 1500000 }, 0 } };
+    occupancy.Add( incoming );
+
+    const auto plan = engine.ShoveViaConnectionPlan(
+            sourceVia, { incoming }, { firstTrace, secondTrace, sourceVia }, {} );
+    BOOST_REQUIRE( plan );
+    BOOST_REQUIRE_EQUAL( plan->materializedContacts.size(), 2U );
+    BOOST_REQUIRE_EQUAL( plan->bridges.size(), 1U );
+    BOOST_REQUIRE_EQUAL( plan->bridges.front().nodes.front().layer, 1 );
+    BOOST_REQUIRE_EQUAL( plan->bridges.front().edgeStyles.size(), 1U );
+    BOOST_CHECK_EQUAL( plan->bridges.front().edgeStyles.front().trackWidth, 100000 );
+}
+
+
+BOOST_AUTO_TEST_CASE( StaticViaShoveRetriesWhenItsBridgeHitsTransientCopper )
+{
+    // DrillItemMover.check sees the complete temporary item set before it
+    // accepts a via translation. The native representation emits a separate
+    // bridge from the old drill centre to its new centre, so that bridge must
+    // participate in the same candidate check. Otherwise the nearest via
+    // location is returned, then rejected by the outer forced-insertion
+    // transaction without trying the next legal projection.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    for( int netCode : { 2, 3 } )
+    {
+        ROUTING_NET foreign = board.nets.front();
+        foreign.netCode = netCode;
+        foreign.name = "N" + std::to_string( netCode );
+        foreign.padIndices.clear();
+        foreign.connections.clear();
+        board.nets.push_back( std::move( foreign ) );
+    }
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    const ROUTER_POINT oldCentre{ 3000000, 1500000 };
+    ROUTING_CONNECTION contact;
+    contact.netCode = 2;
+    contact.complete = true;
+    contact.isExistingBoardRoute = true;
+    contact.sourceBoardItemIds = { "source-bottom-contact" };
+    contact.nodes = { { { 2500000, 500000 }, 1 }, { oldCentre, 1 } };
+    contact.edgeStyles = { { 100000, 0, 0, 0, {} } };
+
+    ROUTING_CONNECTION sourceVia;
+    sourceVia.netCode = 2;
+    sourceVia.complete = true;
+    sourceVia.isExistingBoardRoute = true;
+    sourceVia.isShoveMovable = true;
+    sourceVia.sourceBoardItemIds = { "source-via" };
+    sourceVia.nodes = { { oldCentre, 0 }, { oldCentre, 1 } };
+    sourceVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 1000000, 1500000 }, 0 }, { { 5000000, 1500000 }, 0 } };
+    // Make the primary collision envelope long enough that a narrow foreign
+    // trace can cross the bridge midpoint while remaining clear of both the
+    // old and translated via annuli.
+    incoming.edgeStyles = { { 1000000, 0, 0, 0, {} } };
+
+    const auto firstPlan = engine.ShoveViaConnectionPlan(
+            sourceVia, { incoming }, { contact, sourceVia }, {} );
+    BOOST_REQUIRE( firstPlan );
+    BOOST_REQUIRE_EQUAL( firstPlan->materializedContacts.size(), 1U );
+    BOOST_REQUIRE_EQUAL( firstPlan->bridges.size(), 1U );
+    const ROUTING_CONNECTION& firstBridge = firstPlan->bridges.front();
+    BOOST_REQUIRE_EQUAL( firstBridge.nodes.size(), 2U );
+    BOOST_REQUIRE( firstBridge.nodes.front().point != firstBridge.nodes.back().point );
+
+    // Put a two-IU foreign trace across the middle of the bridge. It remains
+    // clear of both via centres (so it does not alter the placement candidate
+    // set) but necessarily collides with the 100,000-IU bridge trace.
+    const ROUTER_POINT midpoint{
+            firstBridge.nodes.front().point.x
+                    + ( firstBridge.nodes.back().point.x - firstBridge.nodes.front().point.x )
+                              / 2,
+            firstBridge.nodes.front().point.y
+                    + ( firstBridge.nodes.back().point.y - firstBridge.nodes.front().point.y )
+                              / 2 };
+    const std::int64_t deltaX = firstBridge.nodes.back().point.x
+                                - firstBridge.nodes.front().point.x;
+    const std::int64_t deltaY = firstBridge.nodes.back().point.y
+                                - firstBridge.nodes.front().point.y;
+    ROUTING_CONNECTION lateBlocker;
+    lateBlocker.netCode = 3;
+    lateBlocker.complete = true;
+    if( std::llabs( deltaX ) >= std::llabs( deltaY ) )
+    {
+        lateBlocker.nodes = { { { midpoint.x, midpoint.y - 1000 }, 1 },
+                              { { midpoint.x, midpoint.y + 1000 }, 1 } };
+    }
+    else
+    {
+        lateBlocker.nodes = { { { midpoint.x - 1000, midpoint.y }, 1 },
+                              { { midpoint.x + 1000, midpoint.y }, 1 } };
+    }
+    lateBlocker.edgeStyles = { { 2, 0, 0, 0, {} } };
+
+    occupancy.Add( incoming );
+    occupancy.Add( lateBlocker );
+    const auto originalConflicts = engine.FindConflictingConnections( sourceVia );
+    BOOST_REQUIRE_EQUAL( originalConflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( originalConflicts.front(), incoming ) );
+    BOOST_REQUIRE( !engine.FindConflictingConnections( firstBridge ).empty() );
+
+    const auto secondPlan = engine.ShoveViaConnectionPlan(
+            sourceVia, { incoming, lateBlocker }, { contact, sourceVia }, {} );
+    BOOST_REQUIRE( secondPlan );
+    BOOST_REQUIRE_EQUAL( secondPlan->bridges.size(), 1U );
+    BOOST_CHECK( secondPlan->replacement.nodes.front().point
+                 != firstPlan->replacement.nodes.front().point );
+    BOOST_CHECK( engine.FindConflictingConnections( secondPlan->bridges.front() ).empty() );
+
+    // Exercise the checked forced-insertion transaction as well. The blocker
+    // is immutable host copper: older code returned the first bad bridge, saw
+    // this fixed conflict only after planning, and abandoned the entire shove
+    // instead of trying the alternate via centre above.
+    ROUTING_CONNECTION fixedBlocker = lateBlocker;
+    fixedBlocker.isExistingBoardRoute = true;
+    fixedBlocker.isShoveMovable = false;
+    fixedBlocker.sourceBoardItemIds = { "fixed-bridge-blocker" };
+    ROUTING_OCCUPANCY insertionOccupancy( settings.gridStepIU );
+    insertionOccupancy.InitializeBoard( board, settings );
+    insertionOccupancy.AddStatic( contact );
+    insertionOccupancy.AddStatic( sourceVia );
+    insertionOccupancy.AddStatic( fixedBlocker );
+    MAZE_SEARCH_ENGINE insertionEngine( board, settings, insertionOccupancy );
+    const auto insertionConflicts = insertionEngine.FindConflictingConnections( incoming );
+    BOOST_REQUIRE_EQUAL( insertionConflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( insertionConflicts.front(), sourceVia ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            incoming, insertionConflicts, insertionOccupancy, insertionEngine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.front().bridges.size(), 1U );
+    BOOST_CHECK( inserted.shoved.front().replacement.nodes.front().point
+                 != firstPlan->replacement.nodes.front().point );
+    BOOST_CHECK( insertionEngine.FindConflictingConnections( incoming ).empty() );
+    BOOST_CHECK( insertionEngine.FindConflictingConnections(
+                         inserted.shoved.front().bridges.front() )
+                         .empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( StaticViaShovePreservesConductionAreaContacts )
+{
+    // DrillItemMover explicitly permits ConductionArea normal contacts. The
+    // native snapshot must therefore not freeze every via on a plane layer,
+    // but its immutable proposal also cannot move the annulus off the filled
+    // island and leave a false electrical completion for host refill to
+    // discover later. A broad plane permits the move; the same source via in
+    // a tiny island has no legal translated annulus and fails closed.
+    const auto makeSourceVia = []
+    {
+        ROUTING_CONNECTION via;
+        via.netCode = 2;
+        via.complete = true;
+        via.isExistingBoardRoute = true;
+        via.isShoveMovable = true;
+        via.sourceBoardItemIds = { "plane-contact-via" };
+        via.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+        via.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+        return via;
+    };
+    const auto makeIncoming = []
+    {
+        ROUTING_CONNECTION incoming;
+        incoming.netCode = 1;
+        incoming.complete = true;
+        incoming.nodes = { { { 1000000, 1500000 }, 0 }, { { 5000000, 1500000 }, 0 } };
+        return incoming;
+    };
+    const auto addNet = []( BOARD_SNAPSHOT& aBoard )
+    {
+        ROUTING_NET foreign = aBoard.nets.front();
+        foreign.netCode = 2;
+        foreign.name = "N2";
+        foreign.padIndices.clear();
+        foreign.connections.clear();
+        aBoard.nets.push_back( std::move( foreign ) );
+    };
+    const auto area = []( ROUTER_BOX aBox )
+    {
+        ROUTING_OBSTACLE result;
+        result.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+        result.netCode = 2;
+        result.layers = { 1 };
+        result.box = aBox;
+        return result;
+    };
+
+    {
+        auto board = makeBoard();
+        addNet( board );
+        board.conductionAreas.push_back( area( { 2500000, 500000, 3500000, 2500000 } ) );
+        auto settings = makeSettings();
+        ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+        occupancy.InitializeBoard( board, settings );
+        MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+        const ROUTING_CONNECTION sourceVia = makeSourceVia();
+        const ROUTING_CONNECTION incoming = makeIncoming();
+        occupancy.Add( incoming );
+
+        const auto plan = engine.ShoveViaConnectionPlan( sourceVia, { incoming }, { sourceVia }, {} );
+        BOOST_REQUIRE( plan );
+        BOOST_CHECK( plan->replacement.nodes.front().point != sourceVia.nodes.front().point );
+        BOOST_CHECK( CONTACT_GEOMETRY::ContainsArea( board.conductionAreas.front(),
+                                                     plan->replacement.nodes.front().point ) );
+    }
+
+    {
+        auto board = makeBoard();
+        addNet( board );
+        // Candidate locations are clearance + 2 IU outside the incoming
+        // trace. This small island contains the old annulus but none of the
+        // bounded translated candidates.
+        board.conductionAreas.push_back( area( { 2950000, 1450000, 3050000, 1550000 } ) );
+        auto settings = makeSettings();
+        ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+        occupancy.InitializeBoard( board, settings );
+        MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+        const ROUTING_CONNECTION sourceVia = makeSourceVia();
+        const ROUTING_CONNECTION incoming = makeIncoming();
+        occupancy.Add( incoming );
+
+        BOOST_CHECK( !engine.ShoveViaConnectionPlan( sourceVia, { incoming }, { sourceVia }, {} ) );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( StaticViaShoveRetainsRemovedSameNetVictimDrillClearance )
+{
+    // FOUND_CONNECTION_INSERTER removes its complete initial conflict set
+    // before it asks the via mover for a legal location.  A second source via
+    // of the same net can therefore be absent from live occupancy even though
+    // its drill still exists on the board.  DrillItemMover's forced-pad check
+    // retains that hole-to-hole constraint.  Enumerate every bounded native
+    // candidate as an explicitly removed source victim and ensure the plan
+    // fails closed instead of placing a replacement drill on one of them.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 1000000, 1500000 }, 0 }, { { 5000000, 1500000 }, 0 } };
+    occupancy.Add( incoming );
+
+    ROUTING_CONNECTION sourceVia;
+    sourceVia.netCode = 2;
+    sourceVia.complete = true;
+    sourceVia.isExistingBoardRoute = true;
+    sourceVia.isShoveMovable = true;
+    sourceVia.sourceBoardItemIds = { "source-via" };
+    sourceVia.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+    sourceVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+
+    std::vector<ROUTING_CONNECTION> removedVictims{ sourceVia };
+    bool exhaustedCandidates = false;
+    std::size_t attemptedPlacements = 0;
+    for( ; attemptedPlacements <= 20; ++attemptedPlacements )
+    {
+        const auto plan = engine.ShoveViaConnectionPlan( sourceVia, { incoming },
+                                                          removedVictims, {} );
+        if( !plan )
+        {
+            exhaustedCandidates = true;
+            break;
+        }
+
+        ROUTING_CONNECTION blocker = sourceVia;
+        blocker.sourceBoardItemIds = { "removed-same-net-via-"
+                                       + std::to_string( attemptedPlacements ) };
+        blocker.nodes = { { plan->replacement.nodes.front().point, 0 },
+                          { plan->replacement.nodes.front().point, 1 } };
+        removedVictims.push_back( std::move( blocker ) );
+    }
+
+    BOOST_CHECK_GT( attemptedPlacements, 0U );
+    BOOST_CHECK( exhaustedCandidates );
+}
+
+
+BOOST_AUTO_TEST_CASE( BatchReconstructsSupportedStaticViaTraceContactsForForcedShove )
+{
+    // Exercise the snapshot -> static occupancy reconstruction path. Net 2
+    // deliberately has no ratsnest task, so normal batch routing leaves its
+    // source copper static. The via nevertheless has a supported lower-layer
+    // direct trace contact and must be marked eligible for a later atomic
+    // DrillItem.moveBy-style forced shove rather than being treated as an
+    // isolated-via-only special case.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.allowVias = false;
+    settings.allowRipupExisting = true;
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    settings.maxPasses = 1;
+
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    // The reference permits a DrillItem with a ConductionArea normal contact.
+    // Keep a real filled-region model beside the source via so snapshot
+    // reconstruction proves it remains eligible for the constrained
+    // area-preserving shove plan rather than freezing every plane-layer via.
+    ROUTING_OBSTACLE plane;
+    plane.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    plane.netCode = 2;
+    plane.layers = { 1 };
+    plane.box = { 2500000, 500000, 3500000, 2500000 };
+    board.conductionAreas.push_back( std::move( plane ) );
+
+    const auto appendSource = [&]( const std::string& aId, const ROUTER_POINT& aStart,
+                                   const ROUTER_POINT& aEnd, std::int64_t aRadius,
+                                   std::vector<int> aLayers, bool aHole = false )
+    {
+        ROUTING_OBSTACLE obstacle;
+        obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        obstacle.netCode = 2;
+        obstacle.layers = std::move( aLayers );
+        obstacle.start = aStart;
+        obstacle.end = aEnd;
+        obstacle.radius = aRadius;
+        obstacle.blocksTracks = true;
+        obstacle.blocksVias = true;
+        obstacle.isExistingRoute = true;
+        obstacle.isMovable = true;
+        obstacle.isHole = aHole;
+        obstacle.boardItemId = aId;
+        board.removableExistingRoutes.push_back( std::move( obstacle ) );
+    };
+
+    const ROUTER_POINT viaCenter{ 3000000, 1500000 };
+    appendSource( "host-bottom-trace", { 2500000, 500000 }, viaCenter, 50000, { 1 } );
+    appendSource( "host-via", viaCenter, viaCenter, 150000, { 0 } );
+    appendSource( "host-via", viaCenter, viaCenter, 150000, { 1 } );
+    appendSource( "host-via", viaCenter, viaCenter, 75000, { 0, 1 }, true );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_CHECK_EQUAL( result.metrics.drcViolations, 0 );
+    BOOST_CHECK( result.removedBoardItemIds.empty() );
+
+    const auto staticVia = std::find_if(
+            result.connections.begin(), result.connections.end(),
+            [&]( const ROUTING_CONNECTION& aConnection )
+            {
+                return aConnection.netCode == 2 && aConnection.isExistingBoardRoute
+                       && aConnection.sourceBoardItemIds == std::vector<std::string>{ "host-via" }
+                       && aConnection.nodes.size() == 2
+                       && aConnection.nodes.front().layer != aConnection.nodes.back().layer;
+            } );
+    BOOST_REQUIRE( staticVia != result.connections.end() );
+    BOOST_CHECK( staticVia->isShoveMovable );
+
+    const auto staticTrace = std::find_if(
+            result.connections.begin(), result.connections.end(),
+            [&]( const ROUTING_CONNECTION& aConnection )
+            {
+                return aConnection.netCode == 2 && aConnection.isExistingBoardRoute
+                       && aConnection.sourceBoardItemIds
+                                  == std::vector<std::string>{ "host-bottom-trace" }
+                       && aConnection.nodes.size() == 2
+                       && aConnection.nodes.front().point == ROUTER_POINT{ 2500000, 500000 }
+                        && aConnection.nodes.back().point == viaCenter;
+            } );
+    BOOST_REQUIRE( staticTrace != result.connections.end() );
+    BOOST_CHECK_EQUAL( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( BatchKeepsStaticTraceWithOffCentreInteriorPadContactFixed )
+{
+    // KiCad tracks need not join a pad at its centre.  A pad whose copper
+    // overlaps a trace's interior is a real fixed contact even if its centre
+    // is a little off the trace centreline.  Do not promote that source trace
+    // to a movable forced-shove route: preserving only its two endpoints
+    // would disconnect the pad.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.allowRipupExisting = true;
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    settings.maxPasses = 1;
+
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_PAD interiorPad = board.pads.front();
+    interiorPad.netCode = 2;
+    interiorPad.position = { 3000000, 1550000 };
+    interiorPad.layers = { 0 };
+    interiorPad.sourceId = "interior-pad";
+    board.pads.push_back( interiorPad );
+
+    ROUTING_OBSTACLE trace;
+    trace.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    trace.netCode = 2;
+    trace.layers = { 0 };
+    trace.start = { 2000000, 1500000 };
+    trace.end = { 4000000, 1500000 };
+    trace.radius = 50000;
+    trace.isExistingRoute = true;
+    trace.isMovable = true;
+    trace.boardItemId = "host-trace-with-interior-pad";
+    board.removableExistingRoutes.push_back( trace );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_CHECK( result.removedBoardItemIds.empty() );
+
+    const auto staticTrace = std::find_if(
+            result.connections.begin(), result.connections.end(),
+            []( const ROUTING_CONNECTION& aConnection )
+            {
+                return aConnection.isExistingBoardRoute
+                       && aConnection.sourceBoardItemIds
+                                  == std::vector<std::string>{ "host-trace-with-interior-pad" };
+            } );
+    BOOST_REQUIRE( staticTrace != result.connections.end() );
+    BOOST_CHECK( !staticTrace->isShoveMovable );
+}
+
+
+BOOST_AUTO_TEST_CASE( BatchKeepsStaticTraceWithInteriorLockedViaContactFixed )
+{
+    // KiCad permits an existing via to land in the middle of an unsplit
+    // track.  A locked via is intentionally absent from the movable source
+    // atom set, so the old atom-only contact scan promoted the track to a
+    // spring-over candidate.  Moving that track preserves its endpoints but
+    // disconnects the fixed via.  Source geometry has to participate in the
+    // fail-closed contact classification as well.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.allowRipupExisting = true;
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    settings.maxPasses = 1;
+
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OBSTACLE trace;
+    trace.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    trace.netCode = 2;
+    trace.layers = { 0 };
+    trace.start = { 2000000, 1500000 };
+    trace.end = { 4000000, 1500000 };
+    trace.radius = 50000;
+    trace.isExistingRoute = true;
+    trace.isMovable = true;
+    trace.boardItemId = "host-trace-with-locked-interior-via";
+    board.removableExistingRoutes.push_back( trace );
+
+    // This is the copper on layer 0 of a locked through via.  The layer-1
+    // annulus and drill do not need to be modeled for this classification;
+    // the physical contact on the trace layer is sufficient to make moving
+    // only the trace unsafe.
+    ROUTING_OBSTACLE lockedVia;
+    lockedVia.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    lockedVia.netCode = 2;
+    lockedVia.layers = { 0 };
+    lockedVia.start = { 3000000, 1500000 };
+    lockedVia.end = lockedVia.start;
+    lockedVia.radius = 150000;
+    lockedVia.isExistingRoute = true;
+    lockedVia.isMovable = false;
+    lockedVia.boardItemId = "locked-interior-via";
+    board.obstacles.push_back( lockedVia );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_CHECK( result.removedBoardItemIds.empty() );
+
+    const auto staticTrace = std::find_if(
+            result.connections.begin(), result.connections.end(),
+            []( const ROUTING_CONNECTION& aConnection )
+            {
+                return aConnection.isExistingBoardRoute
+                       && aConnection.sourceBoardItemIds
+                                  == std::vector<std::string>{
+                                          "host-trace-with-locked-interior-via" };
+            } );
+    BOOST_REQUIRE( staticTrace != result.connections.end() );
+    BOOST_CHECK( !staticTrace->isShoveMovable );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionShovesAnIsolatedStaticHostViaWithoutRipup )
+{
+    // DrillItem.moveBy() is also valid for a via with no normal contacts: it
+    // translates the drill and contributes no bridge trace.  The native
+    // static-source reconstruction now admits exactly that subset.  Its UUID
+    // must survive the transactional promotion to proposal copper so the
+    // accepted KiCad proposal replaces (rather than duplicates) the host via.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION hostVia;
+    hostVia.netCode = 2;
+    hostVia.complete = true;
+    hostVia.isExistingBoardRoute = true;
+    hostVia.isShoveMovable = true;
+    hostVia.sourceBoardItemIds = { "host-isolated-via" };
+    hostVia.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+    hostVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+    occupancy.AddStatic( hostVia );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), hostVia ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, conflicts, occupancy, engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    const ROUTING_CONNECTION& moved = inserted.shoved.front().replacement;
+    BOOST_CHECK( !moved.isExistingBoardRoute );
+    BOOST_CHECK( moved.isShoveMovable );
+    BOOST_CHECK_EQUAL_COLLECTIONS( moved.sourceBoardItemIds.begin(), moved.sourceBoardItemIds.end(),
+                                   hostVia.sourceBoardItemIds.begin(),
+                                   hostVia.sourceBoardItemIds.end() );
+    BOOST_REQUIRE_EQUAL( moved.nodes.size(), 2U );
+    BOOST_REQUIRE_EQUAL( moved.edgeStyles.size(), 1U );
+    BOOST_CHECK( moved.nodes.front().point == moved.nodes.back().point );
+    BOOST_CHECK( moved.nodes.front().point != hostVia.nodes.front().point );
+    BOOST_CHECK_EQUAL( moved.edgeStyles.front().viaDiameter, 300000 );
+    BOOST_CHECK_EQUAL( moved.edgeStyles.front().viaDrill, 150000 );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 2U );
+
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( moved, 100000, 300000, 150000, { 0, 1 }, emitted );
+    BOOST_REQUIRE_EQUAL( emitted.vias.size(), 1U );
+    BOOST_CHECK( emitted.vias.front().position == moved.nodes.front().point );
+}
+
+
+BOOST_AUTO_TEST_CASE( WholeNetRerouteKeepsUnrepresentableExistingCopperAsCollisionOnly )
+{
+    // A full-net reroute omits removable host copper from the ordinary
+    // immutable snapshot.  That is only safe if every omitted BOARD_ITEM is
+    // represented by a complete static occupancy route.  Model a
+    // tessellated/compound source item with two capsules under one UUID:
+    // the bounded host-shove reconstruction must fail closed, retain both
+    // collision pieces, and never produce an unsafe proposal through them.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+    settings.enableFanout = false;
+    settings.optimizeAfterComplete = false;
+    settings.maxPasses = 1;
+    settings.maxIterations = 1;
+    settings.maxExpandedNodes = 10000;
+    settings.allowRipupExisting = true;
+
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.netClass = "Default";
+    board.nets.push_back( foreign );
+
+    for( const auto [firstY, lastY] : std::array<std::pair<std::int64_t, std::int64_t>, 2>{
+                 std::pair{ 0, 1500000 }, std::pair{ 1500000, 3000000 } } )
+    {
+        ROUTING_OBSTACLE source;
+        source.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        source.netCode = 2;
+        source.layers = { 0 };
+        source.start = { 3000000, firstY };
+        source.end = { 3000000, lastY };
+        source.radius = 100000;
+        source.isExistingRoute = true;
+        // It is deliberately marked as an adapter-eligible straight piece,
+        // but two pieces with one UUID cannot be reconstructed as one direct
+        // mutable trace. This is the fail-closed item-topology guard.
+        source.isMovable = true;
+        source.boardItemId = "compound-host-copper";
+        board.removableExistingRoutes.push_back( std::move( source ) );
+    }
+
+    ROUTING_PIPELINE pipeline;
+    const ROUTING_RESULT result = pipeline.Run( board, settings, {}, {} );
+
+    BOOST_CHECK( !result.complete );
+    BOOST_CHECK_EQUAL( result.metrics.routedConnections, 0 );
+    BOOST_CHECK_EQUAL( result.metrics.unroutedConnections, 1 );
+    BOOST_CHECK_EQUAL( result.metrics.drcViolations, 0 );
+    BOOST_CHECK( result.segments.empty() );
+    BOOST_CHECK( result.vias.empty() );
+    BOOST_CHECK( result.removedBoardItemIds.empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionRelocatesAMutableGeneratedTraceBeforeRipup )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2;
+    victim.complete = true;
+    victim.nodes = { { { 3000000, 500000 }, 0 }, { { 3000000, 2500000 }, 0 } };
+    occupancy.Add( victim );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1 );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), victim ) );
+    const auto directShove = engine.SpringOverConnection( victim, { candidate }, {} );
+    BOOST_REQUIRE( directShove );
+    BOOST_CHECK( directShove->nodes != victim.nodes );
+    {
+        ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+        occupancy.Remove( victim );
+        occupancy.Add( candidate );
+        for( std::size_t index = 1; index < directShove->nodes.size(); ++index )
+            BOOST_CHECK( engine.CanInsertSegment( directShove->netCode,
+                                                  directShove->nodes[index - 1],
+                                                  directShove->nodes[index] ) );
+    }
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( candidate, conflicts, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1 );
+    BOOST_CHECK( SameRouteGeometry( inserted.shoved.front().original, victim ) );
+    BOOST_CHECK( inserted.shoved.front().replacement.nodes != victim.nodes );
+    BOOST_CHECK( inserted.shoved.front().replacement.nodes.front() == victim.nodes.front() );
+    BOOST_CHECK( inserted.shoved.front().replacement.nodes.back() == victim.nodes.back() );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 2 );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+    BOOST_CHECK( occupancy.Board()->RouteItems( victim ).empty() );
+    BOOST_CHECK( !occupancy.Board()->RouteItems( inserted.shoved.front().replacement ).empty() );
+
+    // BatchAutorouter must still attempt this source-style move after its
+    // ordinary rip-up budget is exhausted. The guarded insertion may move
+    // every generated victim, but it must never fall through to deleting one.
+    ROUTING_OCCUPANCY guardedOccupancy( settings.gridStepIU );
+    guardedOccupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE guardedEngine( board, settings, guardedOccupancy );
+    guardedOccupancy.Add( victim );
+    const auto guardedConflicts = guardedEngine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( guardedConflicts.size(), 1 );
+    const auto guarded = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, guardedConflicts, guardedOccupancy, guardedEngine, {}, false );
+    BOOST_REQUIRE( guarded.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( guarded.shoved.size(), 1 );
+    BOOST_REQUIRE_EQUAL( guardedOccupancy.Connections().size(), 2 );
+}
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionConsidersGeneratedTraceChainBeforeRipup )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    for( int netCode : { 2, 3 } )
+    {
+        ROUTING_NET foreign = board.nets.front();
+        foreign.netCode = netCode;
+        foreign.name = "N" + std::to_string( netCode );
+        foreign.padIndices.clear();
+        foreign.connections.clear();
+        board.nets.push_back( std::move( foreign ) );
+    }
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION primary;
+    primary.netCode = 2;
+    primary.complete = true;
+    primary.nodes = { { { 3000000, 500000 }, 0 }, { { 3000000, 2500000 }, 0 } };
+    occupancy.Add( primary );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+
+    const auto primaryReplacement = engine.SpringOverConnection( primary, { candidate }, {} );
+    BOOST_REQUIRE( primaryReplacement );
+
+    // Construct a second pre-existing generated route that does not collide
+    // with the incoming candidate or the original trace, but does collide
+    // with the replacement contour. This expresses the source TraceShover
+    // recursion rather than relying on a hand-picked corner ordering.
+    ROUTING_CONNECTION secondary;
+    bool               foundSecondary = false;
+    for( std::size_t edge = 1; edge < primaryReplacement->nodes.size() && !foundSecondary;
+         ++edge )
+    {
+        const ROUTER_NODE& first = primaryReplacement->nodes[edge - 1];
+        const ROUTER_NODE& last = primaryReplacement->nodes[edge];
+        if( first.layer != last.layer || first.point.y != last.point.y )
+            continue;
+
+        // A vertical route through the spring-over contour's outermost bend
+        // collides with that replacement without entering the incoming
+        // candidate's clearance envelope. Unlike a tiny endpoint overlap,
+        // both of its tails retain enough room for the child spring-over.
+        const std::int64_t outerX = std::min( first.point.x, last.point.x );
+        const ROUTER_POINT start{ outerX, board.bounds.minY + 250000 };
+        const ROUTER_POINT end{ outerX, board.bounds.maxY - 250000 };
+        if( outerX <= board.bounds.minX || outerX >= board.bounds.maxX )
+            continue;
+
+        ROUTING_CONNECTION probe;
+        probe.netCode = 3;
+        probe.complete = true;
+        probe.nodes = { { start, first.layer }, { end, first.layer } };
+
+        if( !engine.FindConflictingConnections( probe ).empty() )
+            continue;
+        {
+            ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+            occupancy.Add( candidate );
+            if( !engine.FindConflictingConnections( probe ).empty() )
+                continue;
+        }
+        {
+            ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+            occupancy.Remove( primary );
+            occupancy.Add( *primaryReplacement );
+            if( engine.FindConflictingConnections( probe ).empty() )
+                continue;
+        }
+        secondary = std::move( probe );
+        foundSecondary = true;
+    }
+    BOOST_REQUIRE( foundSecondary );
+    occupancy.Add( secondary );
+
+    const auto initialConflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( initialConflicts.size(), 1 );
+    BOOST_CHECK( SameRouteGeometry( initialConflicts.front(), primary ) );
+
+    // No ordinary rip-up is permitted. The mover must include the second
+    // generated trace in its source-style obstacle set rather than deleting
+    // it while forcing the primary route around the incoming candidate.
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+            candidate, initialConflicts, occupancy, engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_GE( inserted.shoved.size(), 1U );
+    BOOST_CHECK( std::any_of( inserted.shoved.begin(), inserted.shoved.end(),
+                              [&]( const auto& shove )
+                              { return SameRouteGeometry( shove.original, primary ); } ) );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 3 );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+}
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionRelocatesAMutableGeneratedViaBeforeRipup )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2;
+    victim.complete = true;
+    // The source DrillItemMover translates an unfixed via and reconnects its
+    // attached traces. Use diagonal original legs so fixed-obstacle
+    // spring-over cannot solve this case; the via-shove fallback must build
+    // its own orthogonal attachment doglegs.
+    victim.nodes = { { { 2500000, 750000 }, 0 }, { { 3000000, 1500000 }, 0 },
+                     { { 3000000, 1500000 }, 1 }, { { 3500000, 2250000 }, 1 } };
+    occupancy.Add( victim );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1 );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), victim ) );
+    BOOST_CHECK( !engine.SpringOverConnection( victim, { candidate }, {} ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( candidate, conflicts, occupancy,
+                                                               engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1 );
+    const ROUTING_CONNECTION& moved = inserted.shoved.front().replacement;
+    BOOST_CHECK( moved.nodes.front() == victim.nodes.front() );
+    BOOST_CHECK( moved.nodes.back() == victim.nodes.back() );
+    std::size_t index = 1;
+    while( index < moved.nodes.size() && moved.nodes[index - 1].layer == moved.nodes[index].layer )
+        ++index;
+    BOOST_REQUIRE_LT( index, moved.nodes.size() );
+    BOOST_CHECK( moved.nodes[index - 1].point != victim.nodes[1].point );
+    BOOST_CHECK( moved.nodes[index - 1].point == moved.nodes[index].point );
+    BOOST_CHECK_NE( moved.nodes[index - 1].layer, moved.nodes[index].layer );
+    BOOST_REQUIRE( HasValidEdgeStyles( moved ) );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 2 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionShovesGeneratedFanoutCopperBeforeRipup )
+{
+    // Fanout vias/traces are inserted as unfixed copper by Freerouting. They
+    // need the same bounded recursive shove opportunity as an ordinary
+    // generated route, but must never be silently discarded if that move
+    // fails. The prior native guard rejected this victim before the shove
+    // engine could inspect it.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION fanout;
+    fanout.netCode = 2;
+    fanout.complete = true;
+    fanout.isFanoutConnection = true;
+    fanout.nodes = { { { 2500000, 750000 }, 0 }, { { 3000000, 1500000 }, 0 },
+                     { { 3000000, 1500000 }, 1 }, { { 3500000, 2250000 }, 1 } };
+    occupancy.Add( fanout );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), fanout ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( candidate, conflicts, occupancy,
+                                                               engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    BOOST_CHECK( inserted.shoved.front().replacement.isFanoutConnection );
+    BOOST_CHECK( inserted.shoved.front().replacement.nodes != fanout.nodes );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 2U );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneratedViaShoveSkipsTransientCollisionAtNearestProjection )
+{
+    // DrillItemMover checks a translated via against every temporary item in
+    // the forced-insertion search tree.  The nearest projection away from the
+    // incoming trace can itself be occupied by a second route that did not
+    // overlap the *original* via.  It therefore contributes no projection of
+    // its own.  The mover must reject that first candidate and continue to a
+    // later legal projection instead of returning a plan which the outer
+    // transaction immediately rejects.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    for( int netCode : { 2, 3 } )
+    {
+        ROUTING_NET foreign = board.nets.front();
+        foreign.netCode = netCode;
+        foreign.name = "N" + std::to_string( netCode );
+        foreign.padIndices.clear();
+        foreign.connections.clear();
+        board.nets.push_back( std::move( foreign ) );
+    }
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION sourceVia;
+    sourceVia.netCode = 2;
+    sourceVia.complete = true;
+    sourceVia.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 1 } };
+    sourceVia.edgeStyles = { { 0, 0, 300000, 150000, { 0, 1 } } };
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 1000000, 1500000 }, 0 }, { { 5000000, 1500000 }, 0 } };
+
+    const auto nearest = engine.ShoveViaConnection( sourceVia, { incoming }, {} );
+    BOOST_REQUIRE( nearest );
+    BOOST_CHECK( nearest->nodes.front().point != sourceVia.nodes.front().point );
+
+    // Place a narrow second trace exactly on the nearest destination.  Its
+    // 50,000-IU radius is clear of the old via by the mover's +2-IU tolerance,
+    // so it cannot generate an alternative by itself; it only validates that
+    // transient-copper collision rechecking is part of candidate selection.
+    ROUTING_CONNECTION lateBlocker;
+    lateBlocker.netCode = 3;
+    lateBlocker.complete = true;
+    lateBlocker.nodes = { { { nearest->nodes.front().point.x - 1000,
+                              nearest->nodes.front().point.y }, 0 },
+                           { { nearest->nodes.front().point.x + 1000,
+                              nearest->nodes.front().point.y }, 0 } };
+    lateBlocker.edgeStyles = { { 100000, 0, 0, 0, {} } };
+
+    occupancy.Add( incoming );
+    occupancy.Add( lateBlocker );
+    const auto oldConflicts = engine.FindConflictingConnections( sourceVia );
+    BOOST_REQUIRE_EQUAL( oldConflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( oldConflicts.front(), incoming ) );
+
+    const auto moved = engine.ShoveViaConnection( sourceVia, { incoming, lateBlocker }, {} );
+    BOOST_REQUIRE( moved );
+    BOOST_CHECK( moved->nodes.front().point != nearest->nodes.front().point );
+    BOOST_CHECK( engine.FindConflictingConnections( *moved ).empty() );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneratedViaShoveUsesDiagonalTraceNormalCandidates )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    // These tiny fixed keepouts make the old bounding-box-side projections
+    // illegal.  The diagonally incoming trace still leaves a legal normal
+    // displacement, as DrillItemMover.tryShoveViaPoints would find from the
+    // compensated segment geometry.
+    for( const ROUTER_POINT point : { ROUTER_POINT{ 799000, 1500000 },
+                                     ROUTER_POINT{ 5201000, 1500000 },
+                                     ROUTER_POINT{ 3000000, 299000 },
+                                     ROUTER_POINT{ 3000000, 2701000 } } )
+    {
+        ROUTING_OBSTACLE blocker;
+        blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        blocker.netCode = 3;
+        blocker.layers = { 0, 1 };
+        blocker.start = blocker.end = point;
+        blocker.radius = 100000;
+        blocker.blocksTracks = true;
+        blocker.blocksVias = true;
+        board.obstacles.push_back( std::move( blocker ) );
+    }
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2;
+    victim.complete = true;
+    victim.nodes = { { { 2500000, 2000000 }, 0 }, { { 3000000, 1500000 }, 0 },
+                     { { 3000000, 1500000 }, 1 }, { { 3500000, 1000000 }, 1 } };
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 1000000, 500000 }, 0 }, { { 5000000, 2500000 }, 0 } };
+    occupancy.Add( incoming );
+
+    const auto moved = engine.ShoveViaConnection( victim, { incoming }, {} );
+    BOOST_REQUIRE( moved );
+    BOOST_REQUIRE( HasValidEdgeStyles( *moved ) );
+
+    const auto transition = std::find_if(
+            moved->nodes.begin() + 1, moved->nodes.end(),
+            []( const ROUTER_NODE& aNode )
+            {
+                // The test's first via is the only layer change; the actual
+                // comparison is performed below using its preceding node.
+                return aNode.layer == 1;
+            } );
+    BOOST_REQUIRE( transition != moved->nodes.end() );
+    const std::size_t viaIndex = static_cast<std::size_t>( transition - moved->nodes.begin() );
+    BOOST_REQUIRE_GT( viaIndex, 0U );
+    const ROUTER_POINT movedVia = moved->nodes[viaIndex - 1].point;
+    BOOST_CHECK_NE( movedVia.x, 3000000 );
+    BOOST_CHECK_NE( movedVia.y, 1500000 );
+
+    for( std::size_t index = 1; index < moved->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( moved->netCode, moved->nodes[index - 1],
+                                              moved->nodes[index], &moved->edgeStyles[index - 1] ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneratedViaShovePreservesLegalDiagonalTraceLegs )
+{
+    // The movable via's two attached traces are diagonal.  Every Manhattan
+    // bend around the nearest legal via centre is blocked, while the direct
+    // diagonal legs are clear.  DrillItemMover preserves a legal attached
+    // trace geometry; making the worker invent only 90-degree doglegs loses
+    // this source-valid shove.
+    auto board = makeBoard();
+    board.bounds = { 500000, 0, 5500000, 6000000 };
+    auto settings = makeSettings();
+    ROUTING_NET foreign = board.nets.front();
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.padIndices.clear();
+    foreign.connections.clear();
+    board.nets.push_back( foreign );
+
+    const auto addBlocker = [&]( ROUTER_POINT aPoint, int aLayer )
+    {
+        ROUTING_OBSTACLE blocker;
+        blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        blocker.netCode = 3;
+        blocker.layers = { aLayer };
+        blocker.start = blocker.end = aPoint;
+        blocker.radius = 100000;
+        blocker.blocksTracks = true;
+        blocker.blocksVias = true;
+        board.obstacles.push_back( std::move( blocker ) );
+    };
+
+    // The incoming horizontal trace makes the nearest legal via centres
+    // (3 mm, 2.8 mm) and (3 mm, 3.2 mm).  These blockers cover the two
+    // synthetic Manhattan corner choices on each attached layer without
+    // touching either direct diagonal leg.
+    addBlocker( { 3000000, 1000000 }, 0 );
+    addBlocker( { 1000000, 2800000 }, 0 );
+    addBlocker( { 1000000, 3200000 }, 0 );
+    addBlocker( { 5000000, 2800000 }, 1 );
+    addBlocker( { 5000000, 3200000 }, 1 );
+    addBlocker( { 3000000, 5000000 }, 1 );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION incoming;
+    incoming.netCode = 1;
+    incoming.complete = true;
+    incoming.nodes = { { { 500000, 3000000 }, 0 }, { { 5500000, 3000000 }, 0 } };
+    occupancy.Add( incoming );
+
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2;
+    victim.complete = true;
+    victim.nodes = { { { 1000000, 1000000 }, 0 }, { { 3000000, 3000000 }, 0 },
+                     { { 3000000, 3000000 }, 1 }, { { 5000000, 5000000 }, 1 } };
+
+    const auto moved = engine.ShoveViaConnection( victim, { incoming }, {} );
+    BOOST_REQUIRE( moved );
+    BOOST_REQUIRE( HasValidEdgeStyles( *moved ) );
+    BOOST_REQUIRE_EQUAL( moved->nodes.size(), 4U );
+    BOOST_CHECK_EQUAL( moved->nodes[1].layer, 0 );
+    BOOST_CHECK_EQUAL( moved->nodes[2].layer, 1 );
+    BOOST_CHECK( moved->nodes[1].point == moved->nodes[2].point );
+    BOOST_CHECK( moved->nodes[1].point != victim.nodes[1].point );
+    for( std::size_t index = 1; index < moved->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( moved->netCode, moved->nodes[index - 1],
+                                              moved->nodes[index], &moved->edgeStyles[index - 1] ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionRelocatesATerminalGeneratedViaBeforeRipup )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads[0].position.y = 1800000;
+    board.pads[1].position.y = 1800000;
+    board.nets[0].clearance = 100000;
+
+    // The source endpoint is a real generated-route terminal rather than a
+    // preceding trace edge. Its tiny pad is deliberately outside the incoming
+    // trace's clearance envelope; only the adjacent via conflicts, so moving
+    // the generated via is electrically meaningful and does not pretend that
+    // a fixed host pad itself can be shoved.
+    ROUTING_PAD terminal;
+    terminal.netCode = 2;
+    terminal.position = { 3000000, 1500000 };
+    terminal.layers = { 0 };
+    terminal.trackWidth = 100000;
+    ROUTING_PAD farTerminal = terminal;
+    farTerminal.position = { 3500000, 2250000 };
+    farTerminal.layers = { 1 };
+    board.pads.push_back( terminal );
+    board.pads.push_back( farTerminal );
+
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.netClass = "Default";
+    foreign.clearance = 100000;
+    foreign.viaDiameter = 300000;
+    foreign.viaDrill = 150000;
+    foreign.padIndices = { 2, 3 };
+    foreign.connections = { { 2, 3 } };
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2;
+    victim.complete = true;
+    victim.fromPadIndex = 2;
+    victim.toPadIndex = 3;
+    victim.nodes = { { terminal.position, 0 }, { terminal.position, 1 },
+                     { farTerminal.position, 1 } };
+    occupancy.Add( victim );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), victim ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( candidate, conflicts, occupancy,
+                                                               engine, {}, false );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE_EQUAL( inserted.shoved.size(), 1U );
+    const ROUTING_CONNECTION& moved = inserted.shoved.front().replacement;
+    BOOST_CHECK( moved.nodes.front() == victim.nodes.front() );
+    BOOST_CHECK( moved.nodes.back() == victim.nodes.back() );
+    BOOST_REQUIRE( HasValidEdgeStyles( moved ) );
+
+    std::size_t transition = 1;
+    while( transition < moved.nodes.size()
+           && moved.nodes[transition - 1].layer == moved.nodes[transition].layer )
+    {
+        ++transition;
+    }
+    BOOST_REQUIRE_LT( transition, moved.nodes.size() );
+    BOOST_CHECK( moved.nodes[transition - 1].point != terminal.position );
+    BOOST_CHECK( moved.nodes[transition - 1].point == moved.nodes[transition].point );
+    // The former direct terminal-via contact is now a real source-layer
+    // trace into the moved via; the endpoint pad identity remains intact.
+    BOOST_REQUIRE_GT( transition, 1U );
+    BOOST_CHECK( moved.nodes.front().point == terminal.position );
+    BOOST_CHECK( engine.FindConflictingConnections( candidate ).empty() );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 2U );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedViaShoveFailsClosedForAHostPadAnchor )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_PAD terminal;
+    terminal.netCode = 2;
+    terminal.position = { 3000000, 1500000 };
+    terminal.layers = { 0 };
+    terminal.trackWidth = 100000;
+    terminal.sourceId = "host-pad-uuid";
+    ROUTING_PAD farTerminal = terminal;
+    farTerminal.position = { 3500000, 2250000 };
+    farTerminal.layers = { 1 };
+    farTerminal.sourceId = "host-pad-uuid-2";
+    board.pads.push_back( terminal );
+    board.pads.push_back( farTerminal );
+
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    foreign.name = "N2";
+    foreign.netClass = "Default";
+    foreign.viaDiameter = 300000;
+    foreign.viaDrill = 150000;
+    foreign.padIndices = { 2, 3 };
+    foreign.connections = { { 2, 3 } };
+    board.nets.push_back( foreign );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION victim;
+    victim.netCode = 2;
+    victim.complete = true;
+    victim.fromPadIndex = 2;
+    victim.toPadIndex = 3;
+    victim.nodes = { { terminal.position, 0 }, { terminal.position, 1 },
+                     { farTerminal.position, 1 } };
+    occupancy.Add( victim );
+
+    ROUTING_CONNECTION candidate;
+    candidate.netCode = 1;
+    candidate.complete = true;
+    candidate.fromPadIndex = 0;
+    candidate.toPadIndex = 1;
+    candidate.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    const auto conflicts = engine.FindConflictingConnections( candidate );
+    BOOST_REQUIRE_EQUAL( conflicts.size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( conflicts.front(), victim ) );
+
+    // DrillItemMover rejects an actual PAD in the moved via's normal-contact
+    // set.  The native worker must not manufacture a dogleg that appears to
+    // move copper off a fixed KiCad pad merely because both centres match.
+    BOOST_CHECK( !engine.ShoveViaConnection( victim, { candidate }, {} ) );
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( candidate, conflicts, occupancy,
+                                                               engine, {}, false );
+    BOOST_CHECK( inserted.state == FOUND_CONNECTION_INSERTER::STATE::BLOCKED );
+    BOOST_REQUIRE_EQUAL( occupancy.Connections().size(), 1U );
+    BOOST_CHECK( SameRouteGeometry( occupancy.Connections().front(), victim ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( StyledBlindViaChecksOnlyItsPhysicalSpanAndPreservesItInOutput )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers.push_back( { 2, true, 1, 20 } );
+    ROUTING_OBSTACLE blockedOuterLayer;
+    blockedOuterLayer.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    blockedOuterLayer.netCode = 2;
+    blockedOuterLayer.layers = { 2 };
+    blockedOuterLayer.start = blockedOuterLayer.end = { 3000000, 1500000 };
+    blockedOuterLayer.radius = 100000;
+    board.obstacles.push_back( blockedOuterLayer );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    const ROUTER_NODE top{ { 3000000, 1500000 }, 0 };
+    const ROUTER_NODE inner{ top.point, 1 };
+    ROUTING_EDGE_STYLE blind;
+    blind.viaDiameter = 300000;
+    blind.viaDrill = 150000;
+    blind.viaLayers = { 0, 1 };
+    BOOST_CHECK( engine.CanInsertSegment( 1, top, inner, &blind ) );
+    BOOST_CHECK( !engine.CanInsertSegment( 1, top, inner ) );
+
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.nodes = { top, inner };
+    route.edgeStyles = { blind };
+    occupancy.Add( route );
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( route, 100000, 300000, 150000, { 0, 1, 2 }, emitted );
+    BOOST_REQUIRE_EQUAL( emitted.vias.size(), 1 );
+    BOOST_CHECK( emitted.vias.front().layers == std::vector<int>( { 0, 1 } ) );
+    BOOST_CHECK_EQUAL( emitted.vias.front().topLayer, 0 );
+    BOOST_CHECK_EQUAL( emitted.vias.front().bottomLayer, 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ConvexPolygonSpringOverKeepsGeneralAngleRoutesExact )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 6000000 };
+    ROUTING_OBSTACLE diamond;
+    diamond.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    diamond.netCode = 2;
+    diamond.layers = { 0 };
+    diamond.polygon = { { 5000000, 2000000 }, { 6000000, 3000000 },
+                        { 5000000, 4000000 }, { 4000000, 3000000 } };
+    board.obstacles.push_back( diamond );
+
+    const auto convex = PLANAR::SIMPLEX::FromConvexPolygon( diamond.polygon, 50000 );
+    BOOST_REQUIRE( convex );
+    const auto directPath = PLANAR::POLYLINE::FromPoints(
+            { { 2000000, 2699994 }, { 8000000, 3300006 } } );
+    BOOST_REQUIRE( !directPath.Empty() );
+    BOOST_CHECK( convex->IntersectsSegment( directPath, 1 ) );
+    const auto offset = PLANAR::SIMPLEX::FromConvexPolygon( diamond.polygon, 50001 );
+    BOOST_REQUIRE( offset );
+    const auto spring = TRACE_SHOVER::SpringOverObstacles(
+            directPath, { { 1, { 4000000, 2000000, 6000000, 4000000 }, *convex, *offset } } );
+    BOOST_REQUIRE( spring.polyline );
+    BOOST_REQUIRE( spring.polyline->IntegralCorners() );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    // This diagonal crosses the convex diamond at integral entrance points;
+    // its replacement must use exact support-line intersections, not an
+    // axis-aligned obstacle box or a rounded vertex.
+    route.nodes = { { { 2000000, 2699994 }, 0 }, { { 8000000, 3300006 }, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
+    const auto wrapped = engine.SpringOverConnection( route, {} );
+    BOOST_REQUIRE( wrapped );
+    BOOST_CHECK( wrapped->nodes.front() == route.nodes.front() );
+    BOOST_CHECK( wrapped->nodes.back() == route.nodes.back() );
+    BOOST_CHECK_GT( wrapped->nodes.size(), route.nodes.size() );
+    for( std::size_t index = 1; index < wrapped->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( wrapped->netCode, wrapped->nodes[index - 1],
+                                              wrapped->nodes[index] ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ConvexPolygonNormalizesCollinearSupportCorners )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 4000000 };
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    obstacle.netCode = 2;
+    obstacle.layers = { 0 };
+    // The middle point along the lower edge is a redundant, forward
+    // collinear support point. Freerouting's Polygon normalization removes
+    // it before TileShape construction; treating the whole contour as
+    // unsupported would drop this common KiCad shape into the sampled path.
+    obstacle.polygon = { { 4000000, 1000000 }, { 5000000, 1000000 },
+                         { 6000000, 1000000 }, { 6000000, 3000000 },
+                         { 4000000, 3000000 } };
+    board.obstacles.push_back( obstacle );
+
+    const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon( obstacle.polygon, 50000 );
+    BOOST_REQUIRE( simplex );
+    const auto path = PLANAR::POLYLINE::FromPoints(
+            { { 1000000, 2000000 }, { 9000000, 2000000 } } );
+    BOOST_REQUIRE( !path.Empty() );
+    BOOST_CHECK( simplex->IntersectsSegment( path, 1 ) );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.nodes = { { { 1000000, 2000000 }, 0 }, { { 9000000, 2000000 }, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
+    const auto wrapped = engine.SpringOverConnection( route, {} );
+    BOOST_REQUIRE( wrapped );
+    BOOST_CHECK_GT( wrapped->nodes.size(), route.nodes.size() );
+    for( std::size_t index = 1; index < wrapped->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( wrapped->netCode, wrapped->nodes[index - 1],
+                                              wrapped->nodes[index] ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralConvexGeometryDoesNotCloseABoundingBoxCornerWedge )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 6000000 };
+    board.pads[0].position = { 1000000, 3400000 };
+    board.pads[1].position = { 9000000, 200000 };
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+
+    ROUTING_OBSTACLE diamond;
+    diamond.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    diamond.netCode = 2;
+    diamond.layers = { 0 };
+    diamond.polygon = { { 5000000, 2000000 }, { 6000000, 3000000 },
+                        { 5000000, 4000000 }, { 4000000, 3000000 } };
+    board.obstacles.push_back( diamond );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    const auto route = engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {}, {} );
+    BOOST_REQUIRE( route );
+    // The line crosses only the diamond's axis-aligned bounding box corner;
+    // it stays outside the real convex contour. A rectangular room model
+    // would manufacture an unnecessary dogleg here.
+    BOOST_REQUIRE_EQUAL( route->nodes.size(), 2 );
+    BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes.front(),
+                                          route->nodes.back() ) );
+    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralConvexGeometryUsesExactOffsetSupportCornersForDetours )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 6000000 };
+    board.pads[0].position = { 1000000, 3000000 };
+    board.pads[1].position = { 9000000, 3000000 };
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+    settings.maxExpandedNodes = 64;
+
+    ROUTING_OBSTACLE diamond;
+    diamond.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    diamond.netCode = 2;
+    diamond.layers = { 0 };
+    diamond.polygon = { { 5000000, 2000000 }, { 6000000, 3000000 },
+                        { 5000000, 4000000 }, { 4000000, 3000000 } };
+    board.obstacles.push_back( diamond );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    const auto route = engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {}, {} );
+    BOOST_REQUIRE( route );
+    BOOST_CHECK_GT( route->nodes.size(), 2 );
+    BOOST_CHECK_LE( expanded, settings.maxExpandedNodes );
+    BOOST_CHECK( std::any_of( route->nodes.begin() + 1, route->nodes.end() - 1,
+                              [&]( const ROUTER_NODE& node )
+                              {
+                                  return node.point.x % settings.gridStepIU != 0
+                                         || node.point.y % settings.gridStepIU != 0;
+                              } ) );
+    for( std::size_t index = 1; index < route->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes[index - 1],
+                                              route->nodes[index] ) );
+    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralConvexOnOtherLayerKeepsSafeLayerRoomSearchActive )
+{
+    // A through-via still needs exact full-stack clearance, but a diagonal
+    // contour on an otherwise unused layer must not disable the bounded room
+    // search on a clear signal layer.  The old all-or-nothing guard skipped
+    // the whole room/drill frontier here and made this simple direct route
+    // fall back to the broad visibility graph.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 6000000 };
+    board.pads[0].position = { 1000000, 3000000 };
+    board.pads[1].position = { 9000000, 3000000 };
+    settings.maxExpandedNodes = 256;
+
+    ROUTING_OBSTACLE diamond;
+    diamond.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    diamond.netCode = 2;
+    diamond.layers = { 1 };
+    diamond.polygon = { { 5000000, 2000000 }, { 6000000, 3000000 },
+                        { 5000000, 4000000 }, { 4000000, 3000000 } };
+    board.obstacles.push_back( diamond );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    const auto route = engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {}, {} );
+
+    BOOST_REQUIRE( route );
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
+    BOOST_REQUIRE_EQUAL( route->nodes.size(), 2U );
+    BOOST_CHECK_EQUAL( route->nodes.front().layer, 0 );
+    BOOST_CHECK_EQUAL( route->nodes.back().layer, 0 );
+    BOOST_CHECK_LE( expanded, settings.maxExpandedNodes );
+    BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes.front(),
+                                          route->nodes.back() ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( DenseConvexSearchReservesConnectionLocalSupportDoors )
+{
+    // A dense board can contribute hundreds of nearby base landmarks before
+    // the exact support corners of the blocking convex contour. The regular
+    // 8 mm grid has no in-board escape here, so dropping those local corners
+    // behind the dense-board visibility cap incorrectly exhausts the maze.
+    // Connection-local exact corners must retain a small reserved fan even
+    // while the broad board graph stays bounded for editor responsiveness.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 6000000 };
+    board.pads[0].position = { 1000000, 3000000 };
+    board.pads[1].position = { 9000000, 3000000 };
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+    settings.gridStepIU = 8000000;
+    settings.maxExpandedNodes = 64;
+
+    // These are deliberately data-only, netless landmark sources. They do
+    // not obstruct the active route; their role is to model the many nearby
+    // ordinary board landmarks seen on a dense MCU layout.
+    for( int index = 0; index < 400; ++index )
+    {
+        ROUTING_PAD dummy;
+        dummy.position = { 1100000 + ( index % 20 ) * 10000,
+                           3100000 + ( index / 20 ) * 10000 };
+        dummy.layers = { 0 };
+        board.pads.push_back( std::move( dummy ) );
+    }
+
+    ROUTING_OBSTACLE diamond;
+    diamond.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    diamond.netCode = 2;
+    diamond.layers = { 0 };
+    diamond.polygon = { { 5000000, 2000000 }, { 6000000, 3000000 },
+                        { 5000000, 4000000 }, { 4000000, 3000000 } };
+    board.obstacles.push_back( diamond );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    const auto route = engine.FindConnection( board.pads[0], board.pads[1], 0, expanded, {}, {} );
+    BOOST_REQUIRE( route );
+    BOOST_CHECK_GT( route->nodes.size(), 2U );
+    BOOST_CHECK_LE( expanded, settings.maxExpandedNodes );
+    BOOST_CHECK( std::any_of( route->nodes.begin() + 1, route->nodes.end() - 1,
+                              [&]( const ROUTER_NODE& node )
+                              {
+                                  return node.point.x % settings.gridStepIU != 0
+                                         || node.point.y % settings.gridStepIU != 0;
+                              } ) );
+    for( std::size_t index = 1; index < route->nodes.size(); ++index )
+        BOOST_CHECK( engine.CanInsertSegment( route->netCode, route->nodes[index - 1],
+                                              route->nodes[index] ) );
+    BOOST_CHECK( !engine.LastRoomSearchMetrics().routed );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralConvexVisibilityGraphRetainsRationalSupportCandidates )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+
+    ROUTING_OBSTACLE triangle;
+    triangle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    triangle.netCode = 2;
+    triangle.layers = { 0 };
+    // Adjacent support lines have determinant 19.  The compensated corner
+    // is therefore rational for this ordinary track radius, rather than a
+    // grid-aligned rectangle corner that the old landmark builder happened
+    // to retain.
+    triangle.polygon = { { 2000000, 1000000 }, { 2004000, 1001000 },
+                         { 2001000, 1005000 } };
+    board.obstacles.push_back( triangle );
+
+    constexpr std::int64_t trackRadius = 50000;
+    const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon( triangle.polygon,
+                                                              trackRadius + 2 );
+    BOOST_REQUIRE( simplex );
+    const auto rational = std::find_if(
+            simplex->Borders().begin(), simplex->Borders().end(),
+            [&]( const PLANAR::LINE& line )
+            {
+                const std::size_t index = static_cast<std::size_t>( &line
+                        - simplex->Borders().data() );
+                return !simplex->Corner( index ).Integral();
+            } );
+    BOOST_REQUIRE( rational != simplex->Borders().end() );
+    const std::size_t rationalIndex = static_cast<std::size_t>( rational
+            - simplex->Borders().begin() );
+    const auto bounds = simplex->Corner( rationalIndex ).SurroundingBox();
+    BOOST_REQUIRE( bounds );
+
+    const auto landmarks = EXPANSION_GRAPH::BuildLandmarks(
+            board, settings, ROUTING_PAD{}, ROUTING_PAD{}, trackRadius, 150000, 1 );
+    const bool foundSibling = std::any_of(
+            landmarks.begin(), landmarks.end(), [&]( const ROUTER_NODE& node )
+            {
+                return node.layer == 0 && node.point.x >= bounds->minX
+                       && node.point.x <= bounds->maxX && node.point.y >= bounds->minY
+                       && node.point.y <= bounds->maxY;
+            } );
+    BOOST_CHECK( foundSibling );
+}
+
+
+BOOST_AUTO_TEST_CASE( ConcaveHoleCannotHideAnInteriorSolidCrossing )
+{
+    // A route may legally use the free space of a polygon hole, but it must
+    // not jump from one arm of a *concave* hole to another through the solid
+    // copper/keepout between them.  The old generic-polygon path sampled at
+    // half the maze grid.  With this deliberately coarse grid it examined
+    // only the endpoints (both in the hole) and missed the interior crossing.
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 10000000, 10000000 };
+    board.pads[0].position = { 3500000, 6000000 };
+    board.pads[1].position = { 6500000, 6000000 };
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+    settings.enableFanout = false;
+    settings.gridStepIU = 10000000;
+
+    ROUTING_OBSTACLE keepout;
+    keepout.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    keepout.layers = { 0 };
+    keepout.blocksTracks = true;
+    keepout.blocksVias = true;
+    keepout.polygon = { { 1000000, 1000000 }, { 9000000, 1000000 },
+                        { 9000000, 9000000 }, { 1000000, 9000000 } };
+    // U-shaped free space: the two pad centres lie in its arms, while the
+    // direct chord passes through the solid centre of the outer polygon.
+    keepout.polygonHoles = { { { 3000000, 3000000 }, { 7000000, 3000000 },
+                               { 7000000, 7000000 }, { 6000000, 7000000 },
+                               { 6000000, 4000000 }, { 4000000, 4000000 },
+                               { 4000000, 7000000 }, { 3000000, 7000000 } } };
+    board.obstacles.push_back( keepout );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    BOOST_CHECK( !engine.CanInsertSegment( 1, { board.pads[0].position, 0 },
+                                           { board.pads[1].position, 0 } ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( SpringOverRejectsUnsupportedShapesAndInvalidVias )
 {
     auto board = makeBoard();
@@ -1996,6 +4992,22 @@ BOOST_AUTO_TEST_CASE( HostSessionValidatesWithoutChangingSourceOrNetCodes )
     drc->ClearViolationHandler();
     BOOST_CHECK( drc->TestsCompleted() );
     BOOST_CHECK_EQUAL( missing, 1 );
+}
+
+BOOST_AUTO_TEST_CASE( DrcErrorLimitOverrideSupportsPrivateProposalValidation )
+{
+    auto board = makeHostRoutingBoard( false );
+    auto drc = std::make_shared<DRC_ENGINE>( board.get(), &board->GetDesignSettings() );
+    drc->InitEngine( wxFileName() );
+    drc->SetErrorLimitOverride( DRCE_CLEARANCE, 1000 );
+    drc->RunTests( EDA_UNITS::MM, true, false );
+    BOOST_REQUIRE( drc->TestsCompleted() );
+    BOOST_CHECK_EQUAL( drc->GetErrorLimit( DRCE_CLEARANCE ), 1000 );
+
+    drc->SetErrorLimitOverride( DRCE_CLEARANCE, -1 );
+    drc->RunTests( EDA_UNITS::MM, true, false );
+    BOOST_REQUIRE( drc->TestsCompleted() );
+    BOOST_CHECK_EQUAL( drc->GetErrorLimit( DRCE_CLEARANCE ), 499 );
 }
 
 BOOST_AUTO_TEST_CASE( HostSessionRepairsAPlaneSplitByTheNewRouting )

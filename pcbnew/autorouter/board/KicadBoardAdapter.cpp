@@ -493,6 +493,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         const std::int64_t diameter = viaDiameter > 0 ? viaDiameter : 600000;
         const std::int64_t drill = viaDrill > 0 ? viaDrill : 300000;
         std::int64_t       largestRadius = 0;
+        std::vector<ROUTING_PAD::LAYER_GEOMETRY> layerGeometry;
 
         // Keep rule metadata for filtered/foreign nets as well.  They are not
         // routed, but their pads, tracks and zones remain real obstacles and
@@ -539,6 +540,13 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             const int clearance = pad->GetOwnClearance( layerId );
             const VECTOR2I shapePos = pad->ShapePos( layerId );
             const VECTOR2I shapeSize = pad->GetSize( layerId );
+            const std::int64_t minShapeWidth = std::max<std::int64_t>(
+                    0, std::min( std::abs( shapeSize.x ), std::abs( shapeSize.y ) ) );
+            const std::int64_t maxShapeWidth = std::max<std::int64_t>(
+                    minShapeWidth,
+                    std::max( std::abs( shapeSize.x ), std::abs( shapeSize.y ) ) );
+            layerGeometry.push_back( { layer, minShapeWidth, maxShapeWidth,
+                                       std::max<std::int64_t>( 0, clearance ) } );
             largestRadius = std::max<std::int64_t>(
                     largestRadius,
                     static_cast<std::int64_t>(
@@ -698,6 +706,13 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         routingPad.netClass = className;
         routingPad.netClassPriority = netClass ? netClass->GetPriority() : 0;
         routingPad.trackWidth = width;
+        routingPad.layerGeometry.reserve( routeLayers.size() );
+        for( const ROUTING_PAD::LAYER_GEOMETRY& geometry : layerGeometry )
+            if( std::find( routeLayers.begin(), routeLayers.end(), geometry.layer )
+                != routeLayers.end() )
+            {
+                routingPad.layerGeometry.push_back( geometry );
+            }
 
         routingPad.radius = largestRadius;
         // KiCad's through-hole pad layer set spans the copper stack.  A
@@ -1022,6 +1037,39 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
                 std::max( 0, track->GetOwnClearance( track->GetLayer() ) );
         std::vector<ROUTING_OBSTACLE> obstacles;
 
+        // The source router can shove an unfixed trace/via only when it has
+        // the complete contact topology required to rebuild it.  Capture a
+        // deliberately small, safe host subset here: an unlocked straight
+        // trace or a uniform drilled via.  BatchAutorouter reconstructs the
+        // neighbourhood again and fails closed for branches, pad-attached
+        // drills, arcs, custom padstacks, and any other unsupported case.
+        // A locked BOARD_ITEM is always retained as a fixed obstacle.
+        bool movableExistingRoute = false;
+        if( !track->IsLocked() && track->Type() == PCB_TRACE_T
+            && track->GetStart() != track->GetEnd() && track->GetWidth() > 0 )
+        {
+            movableExistingRoute = true;
+        }
+        else if( !track->IsLocked() && track->Type() == PCB_VIA_T )
+        {
+            const PCB_VIA* via = static_cast<const PCB_VIA*>( track );
+            std::vector<int> viaLayers;
+            appendLayers( viaLayers, via->GetLayerSet() );
+            int expectedWidth = -1;
+            bool uniformWidth = via->GetDrill() > 0 && viaLayers.size() >= 2;
+            for( int layer : viaLayers )
+            {
+                const int width = via->GetWidth( static_cast<PCB_LAYER_ID>( layer ) );
+                if( width <= 0 || ( expectedWidth >= 0 && width != expectedWidth ) )
+                {
+                    uniformWidth = false;
+                    break;
+                }
+                expectedWidth = width;
+            }
+            movableExistingRoute = uniformWidth;
+        }
+
         auto makeObstacle = [&]()
         {
             ROUTING_OBSTACLE obstacle;
@@ -1032,6 +1080,7 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
             obstacle.blocksTracks = true;
             obstacle.blocksVias = true;
             obstacle.clearance = clearance;
+            obstacle.isMovable = movableExistingRoute;
             return obstacle;
         };
 
@@ -1113,10 +1162,12 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
         // already-connected portions of a net.  Do not remove that copper
         // from the collision model unless the user explicitly selected a
         // full-net reroute; otherwise accepting the proposal could delete
-        // valid topology that was never regenerated.
+        // valid topology that was never regenerated.  A locked item remains
+        // fixed even during a full reroute: allowing the proposal to delete a
+        // user-locked trace/via would violate KiCad's ownership contract.
         for( ROUTING_OBSTACLE& obstacle : obstacles )
         {
-            if( aSettings.allowRipupExisting && isIncludedNet )
+            if( aSettings.allowRipupExisting && isIncludedNet && !track->IsLocked() )
             {
                 aSnapshot.removableExistingRoutes.push_back( std::move( obstacle ) );
             }
@@ -1335,6 +1386,32 @@ KICAD_BOARD_ADAPTER::CreateSnapshot( const AUTOROUTER_SETTINGS& aSettings ) cons
             0, m_board->GetDesignSettings().m_HoleClearance );
     snapshot->holeToHoleClearance = std::max<std::int64_t>(
             0, m_board->GetDesignSettings().m_HoleToHoleMin );
+    snapshot->minimumTrackWidth = std::max<std::int64_t>(
+            0, m_board->GetDesignSettings().m_TrackMinWidth );
+
+    // RoutingBoard.fanout can append the board-wide via rule to a net's
+    // rule for an SMD escape.  Do this capture while we are still on the
+    // editor thread: the native worker must never inspect BOARD design
+    // settings after its snapshot has been handed to AUTOROUTER_JOB.
+    const BOARD_DESIGN_SETTINGS& designSettings = m_board->GetDesignSettings();
+    const auto appendBoardVia = [&]( int aDiameter, int aDrill )
+    {
+        if( aDiameter <= 0 || aDrill <= 0 )
+            return;
+
+        const ROUTING_VIA_DIMENSION candidate{ aDiameter, aDrill };
+        if( std::find( snapshot->boardViaDimensions.begin(),
+                       snapshot->boardViaDimensions.end(), candidate )
+            == snapshot->boardViaDimensions.end() )
+        {
+            snapshot->boardViaDimensions.push_back( candidate );
+        }
+    };
+
+    for( const VIA_DIMENSION& via : designSettings.m_ViasDimensionsList )
+        appendBoardVia( via.m_Diameter, via.m_Drill );
+
+    appendBoardVia( designSettings.GetCurrentViaSize(), designSettings.GetCurrentViaDrill() );
     addBoardOutline( *snapshot );
 
     // Seed the snapshot with every named board net before collecting pads and

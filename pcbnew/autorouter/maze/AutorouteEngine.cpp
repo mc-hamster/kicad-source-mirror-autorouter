@@ -12,6 +12,7 @@
 #include "AutorouteEngine.h"
 
 #include <algorithm>
+#include <utility>
 
 #include "MazeSearchEngine.h"
 
@@ -21,8 +22,16 @@ namespace KICAD_AUTOROUTER
 
 AUTOROUTE_ENGINE::AUTOROUTE_ENGINE( const BOARD_SNAPSHOT& aBoard,
                                     const AUTOROUTER_SETTINGS& aSettings,
-                                    ROUTING_OCCUPANCY& aOccupancy ) :
-        m_search( aBoard, aSettings, aOccupancy )
+                                    ROUTING_OCCUPANCY& aOccupancy,
+                                    int aViaOverrideNetCode,
+                                    std::optional<ROUTING_VIA_DIMENSION> aViaOverride,
+                                    int aTrackWidthOverrideNetCode,
+                                    std::optional<std::int64_t> aTrackWidthOverride ) :
+        m_search( aBoard, aSettings, aOccupancy, aViaOverrideNetCode,
+                  std::move( aViaOverride ), aTrackWidthOverrideNetCode,
+                  aTrackWidthOverride ),
+        m_trackWidthOverrideNetCode( aTrackWidthOverrideNetCode ),
+        m_trackWidthOverride( aTrackWidthOverride )
 {
     // The active multilayer search owns its budgeted page/room lifetime.
     // The old wrapper allocated a second, unused array before cancellation
@@ -38,8 +47,27 @@ std::optional<ROUTING_CONNECTION> AUTOROUTE_ENGINE::AutorouteConnection(
         const std::vector<ROUTING_TERMINAL>& aStarts,
         const std::vector<ROUTING_TERMINAL>& aTargets ) const
 {
-    return m_search.FindConnection( aStart, aTarget, aRetry, aExpandedNodes, aCancel, aProgress,
-                                    aStarts, aTargets );
+    auto connection = m_search.FindConnection( aStart, aTarget, aRetry, aExpandedNodes, aCancel,
+                                               aProgress, aStarts, aTargets );
+
+    // RouterSettings.neckWidthUm reruns a whole failed connection at a
+    // narrower width.  The search engine uses that width for every geometry
+    // predicate, but it must also reach the result model explicitly: an empty
+    // edge-style vector would make proposal materialization silently restore
+    // the ordinary net width.  Vias retain their selected/default padstack;
+    // only same-layer trace edges are necked.
+    if( connection && m_trackWidthOverride && m_trackWidthOverrideNetCode > 0
+        && connection->netCode == m_trackWidthOverrideNetCode )
+    {
+        EnsureEdgeStyles( *connection );
+        for( std::size_t edge = 1; edge < connection->nodes.size(); ++edge )
+        {
+            if( connection->nodes[edge - 1].layer == connection->nodes[edge].layer )
+                connection->edgeStyles[edge - 1].trackWidth = *m_trackWidthOverride;
+        }
+    }
+
+    return connection;
 }
 
 

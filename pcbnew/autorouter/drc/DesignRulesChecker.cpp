@@ -229,18 +229,19 @@ const ROUTING_NET* findNet( const BOARD_SNAPSHOT& aBoard, int aNetCode )
 }
 
 
-std::int64_t trackRadius( const BOARD_SNAPSHOT& aBoard, int aNetCode )
+std::int64_t trackRadius( const BOARD_SNAPSHOT& aBoard, int aNetCode,
+                          std::int64_t aWidth = 0 )
 {
     constexpr std::int64_t defaultTrackWidth = 150000;
     const ROUTING_NET* net = findNet( aBoard, aNetCode );
-    if( !net )
-        return defaultTrackWidth / 2;
-
-    std::int64_t width = 0;
-    for( std::size_t padIndex : net->padIndices )
+    std::int64_t width = aWidth;
+    if( width <= 0 && net )
     {
-        if( padIndex < aBoard.pads.size() )
-            width = std::max( width, aBoard.pads[padIndex].trackWidth );
+        for( std::size_t padIndex : net->padIndices )
+        {
+            if( padIndex < aBoard.pads.size() )
+                width = std::max( width, aBoard.pads[padIndex].trackWidth );
+        }
     }
 
     if( width <= 0 )
@@ -300,13 +301,16 @@ std::int64_t pairClearance( const BOARD_SNAPSHOT& aBoard, int aFirstNetCode,
 
 
 std::int64_t obstacleClearance( const BOARD_SNAPSHOT& aBoard, int aNetCode,
-                                const ROUTING_OBSTACLE& aObstacle, int aLayer )
+                                const ROUTING_OBSTACLE& aObstacle, int aLayer,
+                                std::int64_t aEdgeClearance = 0 )
 {
+    const std::int64_t edgeClearance = std::max<std::int64_t>( 0, aEdgeClearance );
     if( aObstacle.netCode != 0 && aObstacle.netCode != aNetCode )
         return std::max( pairClearance( aBoard, aNetCode, aObstacle.netCode, aLayer ),
-                         aObstacle.clearance );
+                         std::max( aObstacle.clearance, edgeClearance ) );
 
-    return std::max( netClearance( aBoard, aNetCode ), aObstacle.clearance );
+    return std::max( { netClearance( aBoard, aNetCode ), aObstacle.clearance,
+                       edgeClearance } );
 }
 
 
@@ -429,7 +433,7 @@ bool segmentVsObstacle( const ROUTING_SEGMENT& aSegment, std::int64_t aRouteRadi
 
     const bool routeIsViaProbe = aSegment.start == aSegment.end && aSegment.width == 0;
     const std::int64_t clearance = obstacleClearance( aBoard, aSegment.netCode, aObstacle,
-                                                      aSegment.layer );
+                                                      aSegment.layer, aSegment.clearance );
     const std::int64_t expandedRadius =
             aObstacle.isHole
                     ? aObstacle.radius
@@ -549,7 +553,9 @@ bool segmentVsSegment( const ROUTING_SEGMENT& aLeft, std::int64_t aLeftRadius,
 
     const double clearance = static_cast<double>(
             aLeftRadius + aRightRadius
-            + pairClearance( aBoard, aLeft.netCode, aRight.netCode, aLeft.layer ) );
+            + std::max( { pairClearance( aBoard, aLeft.netCode, aRight.netCode, aLeft.layer ),
+                           std::max<std::int64_t>( 0, aLeft.clearance ),
+                           std::max<std::int64_t>( 0, aRight.clearance ) } ) );
     return segmentsIntersect( aLeft.start, aLeft.end, aRight.start, aRight.end )
            || pointToSegmentDistance( aLeft.start, aRight.start, aRight.end ) <= clearance
            || pointToSegmentDistance( aLeft.end, aRight.start, aRight.end ) <= clearance
@@ -567,8 +573,11 @@ bool segmentVsVia( const ROUTING_SEGMENT& aSegment, std::int64_t aSegmentRadius,
     return pointToSegmentDistance( aVia.position, aSegment.start, aSegment.end )
            <= static_cast<double>( aSegmentRadius
                                    + viaRadius( aBoard, aVia.netCode, aVia.diameter )
-                                   + pairClearance( aBoard, aSegment.netCode, aVia.netCode,
-                                                    aSegment.layer ) );
+                                   + std::max(
+                                             { pairClearance( aBoard, aSegment.netCode,
+                                                              aVia.netCode, aSegment.layer ),
+                                               std::max<std::int64_t>( 0, aSegment.clearance ),
+                                               std::max<std::int64_t>( 0, aVia.clearance ) } ) );
 }
 
 
@@ -614,8 +623,14 @@ bool viaVsVia( const ROUTING_VIA& aLeft, const ROUTING_VIA& aRight,
                         {
                             return centerDistance
                                            <= copperRadius
-                                                      + pairClearance( aBoard, aLeft.netCode,
-                                                                       aRight.netCode, aLayer )
+                                                      + std::max(
+                                                                { pairClearance(
+                                                                          aBoard, aLeft.netCode,
+                                                                          aRight.netCode, aLayer ),
+                                                                  std::max<std::int64_t>(
+                                                                          0, aLeft.clearance ),
+                                                                  std::max<std::int64_t>(
+                                                                          0, aRight.clearance ) } )
                                    || centerDistance < drillRadius;
                         } );
 }
@@ -647,7 +662,7 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
 
     for( const ROUTING_SEGMENT& segment : aResult.segments )
     {
-        const std::int64_t radius = trackRadius( aBoard, segment.netCode );
+        const std::int64_t radius = trackRadius( aBoard, segment.netCode, segment.width );
 
         const std::int64_t startMargin = endpointMargin( aBoard, segment.netCode, segment.start,
                                                          radius );
@@ -689,6 +704,13 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
 
         for( const ROUTING_OBSTACLE& obstacle : aBoard.removableExistingRoutes )
         {
+            // An unsupported source item is mirrored into `obstacles` as a
+            // collision-only search shape during a whole-net reroute. Check
+            // that physical copper once, not once through each snapshot
+            // collection; the original record still owns UUID removal.
+            if( obstacle.isMirroredToObstacleModel )
+                continue;
+
             const bool ownPadHole =
                     obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
                     && isPadEndpoint( aBoard, segment.netCode, obstacle.start )
@@ -736,7 +758,8 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                     continue;
                 }
 
-                ROUTING_SEGMENT probe{ via.netCode, layer, via.position, via.position, 0 };
+                ROUTING_SEGMENT probe{ via.netCode, layer, via.position, via.position, 0,
+                                       via.clearance };
                 if( segmentVsObstacle( probe, radius, obstacle, aBoard ) )
                 {
                     ++violations;
@@ -758,7 +781,8 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
 
         for( const ROUTING_OBSTACLE& obstacle : aBoard.removableExistingRoutes )
         {
-            if( isRemoved( removedIds, obstacle.boardItemId ) || !obstacle.blocksVias
+            if( obstacle.isMirroredToObstacleModel
+                || isRemoved( removedIds, obstacle.boardItemId ) || !obstacle.blocksVias
                 || ( obstacle.netCode == via.netCode && !obstacle.isKeepout
                      && !obstacle.isHole ) )
                 continue;
@@ -768,7 +792,8 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                 if( !layerContains( obstacle.layers, layer ) )
                     continue;
 
-                ROUTING_SEGMENT probe{ via.netCode, layer, via.position, via.position, 0 };
+                ROUTING_SEGMENT probe{ via.netCode, layer, via.position, via.position, 0,
+                                       via.clearance };
                 if( segmentVsObstacle( probe, radius, obstacle, aBoard ) )
                 {
                     ++violations;
@@ -792,12 +817,13 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
     for( std::size_t i = 0; i < aResult.segments.size(); ++i )
     {
         const ROUTING_SEGMENT& left = aResult.segments[i];
-        const std::int64_t leftRadius = trackRadius( aBoard, left.netCode );
+        const std::int64_t leftRadius = trackRadius( aBoard, left.netCode, left.width );
 
         for( std::size_t j = i + 1; j < aResult.segments.size(); ++j )
         {
             if( segmentVsSegment( left, leftRadius, aResult.segments[j],
-                                  trackRadius( aBoard, aResult.segments[j].netCode ), aBoard ) )
+                                  trackRadius( aBoard, aResult.segments[j].netCode,
+                                               aResult.segments[j].width ), aBoard ) )
             {
                 ++violations;
                 ++segmentPairViolations;

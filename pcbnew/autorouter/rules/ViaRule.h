@@ -50,6 +50,54 @@ public:
         };
         return aSettings.allowVias && aFrom != aTo && enabled( aFrom ) && enabled( aTo );
     }
+
+    /**
+     * Return every physical copper layer occupied by a via edge.  A custom
+     * layer list is a span declaration, not permission to omit an
+     * intermediate copper layer: a blind/buried via from layer A to C still
+     * has copper on B.  Invalid custom masks fail closed by returning an
+     * empty list.
+     */
+    static std::vector<int> LayersFor( const AUTOROUTER_SETTINGS& aSettings, int aFrom,
+                                       int aTo, const ROUTING_EDGE_STYLE* aStyle = nullptr )
+    {
+        const std::vector<int> physical = ThroughLayers( aSettings );
+        const auto from = std::find( physical.begin(), physical.end(), aFrom );
+        const auto to = std::find( physical.begin(), physical.end(), aTo );
+
+        if( from == physical.end() || to == physical.end() )
+            return {};
+
+        if( !aStyle || aStyle->viaLayers.empty() )
+            return physical;
+
+        const auto has = [&]( int aLayer )
+        {
+            return std::find( aStyle->viaLayers.begin(), aStyle->viaLayers.end(), aLayer )
+                   != aStyle->viaLayers.end();
+        };
+
+        if( !has( aFrom ) || !has( aTo ) )
+            return {};
+
+        const auto first = std::min( from, to );
+        const auto last = std::max( from, to );
+        return std::vector<int>( first, last + 1 );
+    }
+
+    static bool AllowsTransition( const AUTOROUTER_SETTINGS& aSettings, int aFrom, int aTo,
+                                  const ROUTING_EDGE_STYLE* aStyle )
+    {
+        return AllowsTransition( aSettings, aFrom, aTo )
+               && !LayersFor( aSettings, aFrom, aTo, aStyle ).empty();
+    }
+
+    static bool SpansLayer( const AUTOROUTER_SETTINGS& aSettings, int aFrom, int aTo,
+                            const ROUTING_EDGE_STYLE& aStyle, int aLayer )
+    {
+        const std::vector<int> layers = LayersFor( aSettings, aFrom, aTo, &aStyle );
+        return std::find( layers.begin(), layers.end(), aLayer ) != layers.end();
+    }
 };
 
 } // namespace KICAD_AUTOROUTER

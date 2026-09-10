@@ -7,13 +7,83 @@
 #include "MazeSearchEngine.h"
 #include "../AutorouterDebug.h"
 #include "MazeExpansionEngine.h"
+#include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
+#include <algorithm>
 #include <sstream>
 
 namespace KICAD_AUTOROUTER
 {
+
+namespace
+{
+
+bool isAxisAlignedRectangle( const std::vector<ROUTER_POINT>& aPolygon )
+{
+    if( aPolygon.size() != 4 )
+        return false;
+
+    std::vector<std::int64_t> x;
+    std::vector<std::int64_t> y;
+    x.reserve( aPolygon.size() );
+    y.reserve( aPolygon.size() );
+
+    for( const ROUTER_POINT& point : aPolygon )
+    {
+        x.push_back( point.x );
+        y.push_back( point.y );
+    }
+
+    std::sort( x.begin(), x.end() );
+    std::sort( y.begin(), y.end() );
+    x.erase( std::unique( x.begin(), x.end() ), x.end() );
+    y.erase( std::unique( y.begin(), y.end() ), y.end() );
+
+    if( x.size() != 2 || y.size() != 2 )
+        return false;
+
+    return std::all_of( aPolygon.begin(), aPolygon.end(), [&]( const ROUTER_POINT& point )
+    {
+        return ( point.x == x.front() || point.x == x.back() )
+               && ( point.y == y.front() || point.y == y.back() );
+    } );
+}
+
+
+bool isGeneralConvexRoomObstacle( const ROUTING_OBSTACLE& aObstacle, int aNet,
+                                  bool aForVia )
+{
+    if( aObstacle.kind != ROUTER_OBSTACLE_KIND::POLYGON || aObstacle.isHole
+        || !( aForVia ? aObstacle.blocksVias : aObstacle.blocksTracks )
+        || !aObstacle.polygonHoles.empty() || aObstacle.radius != 0
+        || isAxisAlignedRectangle( aObstacle.polygon )
+        || ( aObstacle.netCode == aNet && !aObstacle.isKeepout ) )
+    {
+        return false;
+    }
+
+    return PLANAR::SIMPLEX::FromConvexPolygon( aObstacle.polygon ).has_value();
+}
+
+} // namespace
+
+
+bool MAZE_SEARCH_ENGINE::hasGeneralConvexRoomGeometry( int aNet, int aLayer ) const
+{
+    for( const std::size_t index : obstacleIndices( aLayer ) )
+    {
+        const ROUTING_OBSTACLE& obstacle = m_board.obstacles[index];
+        if( isGeneralConvexRoomObstacle( obstacle, aNet, false ) )
+            return true;
+    }
+
+    return false;
+}
+
+
 std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
-        int net, int aLayer, bool aForVia, const ROUTER_CANCEL_CALLBACK& aCancel ) const
+        int net, int aLayer, bool aForVia, bool aSkipGeneralConvex,
+        const ROUTER_CANCEL_CALLBACK& aCancel ) const
 {
     const auto radius = aForVia ? netViaRadius( net ) : netTrackRadius( net );
     std::vector<SHAPE_TREE_ENTRY> entries;
@@ -40,6 +110,11 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
             if( !obstacle.isHole || ( !aForVia && ( ownHole || obstacle.isExistingRoute ) ) )
                 continue;
         }
+        // The room and drill-page trees are rectangles.  Do not turn a real
+        // diagonal convex contour into its AABB: via.canDrill validates the
+        // full physical stack exactly before a page candidate is accepted.
+        if( aSkipGeneralConvex && isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
+            continue;
         // One extra IU makes the room boundary legal under the host's
         // inclusive collision predicates; do not apply clearance twice.
         add( m_obstacleBounds[index], obstacleExpansionRadius(
@@ -106,6 +181,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const
 {
     const int net = aStarts.front().pad.netCode;
+
     const auto radius = netTrackRadius( net );
     const auto margin = m_board.edgeClearance + radius + 1;
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
@@ -114,7 +190,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
     const auto started = std::chrono::steady_clock::now();
     for( const auto& layer : m_settings.layers )
     {
-        if( !layer.enabled || ( aCancel && aCancel() ) )
+        if( !layer.enabled || hasGeneralConvexRoomGeometry( net, layer.layerId )
+            || ( aCancel && aCancel() ) )
             continue;
         auto terminals = [&]( const auto& source )
         {
@@ -141,7 +218,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         const auto targets = terminals( aTargets );
         if( starts.empty() || targets.empty() )
             continue;
-        const auto entries = roomObstacles( net, layer.layerId, false, aCancel );
+        const auto entries = roomObstacles( net, layer.layerId, false, false, aCancel );
         // Geometric per-axis costs for the isolated no-via frontier. The
         // existing dialog's direction penalty is mapped here, not substituted
         // into the legacy queue's incompatible grid-normalized heuristic.
@@ -216,6 +293,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         const ROUTER_SEARCH_PROGRESS_CALLBACK& progress ) const
 {
     const int net = starts.front().pad.netCode;
+
     const auto radius = netTrackRadius( net );
     const auto margin = m_board.edgeClearance + radius + 1;
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
@@ -258,8 +336,11 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         const auto setting = std::find_if( m_settings.layers.begin(), m_settings.layers.end(),
                                            [id]( const auto& l ) { return l.layerId == id; } );
         ROOM_LAYER layer;
-        layer.id = id; layer.active = setting->enabled; layer.bounds = bounds;
-        layer.obstacles = roomObstacles( net, id, false, cancel );
+        layer.id = id;
+        layer.active = setting->enabled && !hasGeneralConvexRoomGeometry( net, id );
+        layer.bounds = bounds;
+        if( layer.active )
+            layer.obstacles = roomObstacles( net, id, false, false, cancel );
         const double preferred = std::max( 1, m_settings.traceLengthCost );
         const double against = preferred + std::max( 0, setting->directionCost ) / 10.0;
         layer.horizontalCost = setting->preferredDirection == 2 ? against : preferred;
@@ -283,7 +364,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             }
         };
         append( starts, layer.starts ); append( targets, layer.targets );
-        for( auto obstacle : roomObstacles( net, id, true, cancel ) )
+        for( auto obstacle : roomObstacles( net, id, true, true, cancel ) )
         {
             obstacle.objectId = nextObstacleId++;
             via.obstacles.push_back( obstacle );

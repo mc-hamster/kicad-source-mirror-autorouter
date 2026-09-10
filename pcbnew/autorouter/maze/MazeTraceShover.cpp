@@ -61,9 +61,12 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
             {
                 const ROUTER_NODE& start = aConnection.nodes[first];
                 const ROUTER_NODE& end = aConnection.nodes[last];
+                const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
+                        ? nullptr : &aConnection.edgeStyles[first];
 
                 if( start.layer != end.layer
-                    || !aSearch.CanUseSegment( aConnection.netCode, start, end ) )
+                    || !CanCollapseRouteEdges( aConnection, first, last - 1 )
+                    || !aSearch.CanUseSegment( aConnection.netCode, start, end, false, style ) )
                 {
                     continue;
                 }
@@ -75,10 +78,8 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
 
                 if( directLength + 1.0 < oldLength )
                 {
-                    aConnection.nodes.erase(
-                            aConnection.nodes.begin()
-                                    + static_cast<std::ptrdiff_t>( first + 1 ),
-                            aConnection.nodes.begin() + static_cast<std::ptrdiff_t>( last ) );
+                    if( !CollapseRouteNodes( aConnection, first, last ) )
+                        continue;
                     changed = true;
                     changedAny = true;
                     break;
@@ -92,15 +93,19 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
         const ROUTER_NODE& previous = aConnection.nodes[index - 1];
         const ROUTER_NODE& current = aConnection.nodes[index];
         const ROUTER_NODE& next = aConnection.nodes[index + 1];
+        const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
+                ? nullptr : &aConnection.edgeStyles[index - 1];
 
         if( previous.point == current.point && current.point == next.point
             && previous.layer != next.layer
-            && aSearch.CanUseSegment( aConnection.netCode, previous, next, true ) )
+            && CanCollapseRouteEdges( aConnection, index - 1, index )
+            && aSearch.CanUseSegment( aConnection.netCode, previous, next, true, style ) )
         {
-            aConnection.nodes.erase( aConnection.nodes.begin()
-                                             + static_cast<std::ptrdiff_t>( index ),
-                                     aConnection.nodes.begin()
-                                             + static_cast<std::ptrdiff_t>( index + 1 ) );
+            if( !CollapseRouteNodes( aConnection, index - 1, index + 1 ) )
+            {
+                ++index;
+                continue;
+            }
             changedAny = true;
             continue;
         }
