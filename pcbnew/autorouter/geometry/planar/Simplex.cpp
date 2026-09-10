@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <numeric>
 
 namespace KICAD_AUTOROUTER::PLANAR
 {
@@ -79,6 +80,109 @@ std::optional<LINE> chebyshevOffset( const LINE& aLine, std::int64_t aRadius )
     return LINE( { *ax, *ay }, { *bx, *by } );
 }
 
+
+std::vector<LINE> normalizeBorders( std::vector<LINE> aBorders )
+{
+    if( aBorders.empty() )
+        return {};
+
+    // java.util.Arrays.sort(Object[]) is stable.  Equal directions therefore
+    // retain input order, which matters when equal support lines are removed.
+    std::stable_sort( aBorders.begin(), aBorders.end(), []( const LINE& aLeft,
+                                                            const LINE& aRight )
+    {
+        return aLeft.CompareDirection( aRight ) < 0;
+    } );
+
+    std::vector<LINE> lines;
+    lines.reserve( aBorders.size() );
+    for( const LINE& border : aBorders )
+    {
+        if( lines.empty() || !border.SameDirectedSupport( lines.back() ) )
+            lines.push_back( border );
+    }
+
+    // Direct control-flow equivalent of Simplex.removeRedundantLines.  The
+    // source caches side-of-intersection values for speed; recomputing those
+    // exact values after each erase is simpler and avoids stale-index state
+    // while producing the same ordered fixed point.
+    bool removed = lines.size() > 2;
+    while( removed && lines.size() > 2 )
+    {
+        removed = false;
+
+        for( std::size_t index = 0; index < lines.size(); ++index )
+        {
+            const std::size_t previousIndex =
+                    ( index + lines.size() - 1 ) % lines.size();
+            const std::size_t nextIndex = ( index + 1 ) % lines.size();
+            const LINE previous = lines[previousIndex];
+            const LINE current = lines[index];
+            const LINE next = lines[nextIndex];
+            const INTEGER determinant = previous.DirectionDeterminant( next );
+
+            if( determinant != 0 )
+            {
+                const auto intersection = previous.Intersection( next );
+                if( !intersection )
+                    return {};
+                const int intersectionSide = current.SideOf( *intersection );
+
+                if( determinant > 0 )
+                {
+                    // Native +1 is source ON_THE_LEFT.
+                    if( intersectionSide != 1 )
+                    {
+                        lines.erase( lines.begin() + index );
+                        removed = true;
+                        break;
+                    }
+                }
+                else if( intersectionSide == 1
+                         && previous.DirectionDeterminant( current ) > 0 )
+                {
+                    // The current half-plane cannot intersect the wedge made
+                    // by its neighbours.
+                    return {};
+                }
+            }
+            else if( previous.SideOf( POINT( next.a ) ) == 1 )
+            {
+                // Opposing parallel supports face away from one another.
+                return {};
+            }
+        }
+    }
+
+    if( lines.size() == 2 && lines[0].Parallel( lines[1] ) )
+    {
+        if( lines[0].SameDirection( lines[1] ) )
+        {
+            // Retain the more restrictive of two same-direction half-planes.
+            if( lines[1].SideOf( POINT( lines[0].a ) ) == 1 )
+                lines[0] = lines[1];
+            lines.erase( lines.begin() + 1, lines.end() );
+        }
+        else if( lines[1].SideOf( POINT( lines[0].a ) ) == 1 )
+        {
+            return {};
+        }
+    }
+
+    return lines;
+}
+
+
+std::optional<ROUTER_POINT> translatedPoint( ROUTER_POINT aPoint,
+                                              ROUTER_POINT aVector )
+{
+    const auto x = checkedOffset( aPoint.x, aVector.x );
+    const auto y = checkedOffset( aPoint.y, aVector.y );
+    if( !x || !y )
+        return {};
+    return ROUTER_POINT{ *x, *y };
+}
+
 } // namespace
 
 
@@ -87,21 +191,277 @@ SIMPLEX::SIMPLEX( std::vector<LINE> borders ) : m_borders( std::move( borders ) 
     if( m_borders.size() < 3 ) throw std::invalid_argument( "bounded convex shape needs 3 borders" );
     for( std::size_t i = 0; i < m_borders.size(); ++i )
     {
-        auto p = m_borders[( i + m_borders.size() - 1 ) % m_borders.size()].Intersection( m_borders[i] );
+        if( !CornerIsBounded( i ) )
+            throw std::invalid_argument( "unbounded or unordered convex borders" );
+        auto p = m_borders[( i + m_borders.size() - 1 ) % m_borders.size()]
+                         .Intersection( m_borders[i] );
         if( !p ) throw std::invalid_argument( "parallel adjacent convex borders" );
         for( const auto& line : m_borders )
             if( line.SideOf( *p ) > 0 ) throw std::invalid_argument( "non-convex or unordered borders" );
         m_corners.push_back( *p );
     }
     for( std::size_t i = 0; i < m_corners.size(); ++i )
-        if( m_corners[i] == m_corners[( i + 1 ) % m_corners.size()] )
+        if( *m_corners[i] == *m_corners[( i + 1 ) % m_corners.size()] )
             throw std::invalid_argument( "redundant convex border" );
 }
+
+
+SIMPLEX::SIMPLEX( std::vector<LINE> aBorders, UNCHECKED_TAG ) :
+        m_borders( std::move( aBorders ) )
+{
+    calculateCorners();
+}
+
+
+SIMPLEX SIMPLEX::GetInstance( std::vector<LINE> aBorders )
+{
+    return SIMPLEX( normalizeBorders( std::move( aBorders ) ), UNCHECKED_TAG{} );
+}
+
+
+SIMPLEX SIMPLEX::Empty()
+{
+    return SIMPLEX( {}, UNCHECKED_TAG{} );
+}
+
+
+void SIMPLEX::calculateCorners()
+{
+    m_corners.assign( m_borders.size(), std::nullopt );
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            continue;
+
+        m_corners[index] =
+                m_borders[( index + m_borders.size() - 1 ) % m_borders.size()]
+                        .Intersection( m_borders[index] );
+    }
+}
+
+
+const POINT& SIMPLEX::Corner( std::size_t aIndex ) const
+{
+    if( aIndex >= m_corners.size() || !m_corners[aIndex] )
+        throw std::domain_error( "simplex corner is unbounded" );
+    return *m_corners[aIndex];
+}
+
+
+bool SIMPLEX::CornerIsBounded( std::size_t aIndex ) const
+{
+    if( m_borders.size() < 2 || aIndex >= m_borders.size() )
+        return false;
+
+    const std::size_t previous =
+            ( aIndex + m_borders.size() - 1 ) % m_borders.size();
+    return m_borders[previous].DirectionDeterminant( m_borders[aIndex] ) > 0;
+}
+
+
+bool SIMPLEX::IsBounded() const
+{
+    if( IsEmpty() )
+        return true;
+    if( m_borders.size() < 3 )
+        return false;
+
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            return false;
+    }
+    return true;
+}
+
+
+int SIMPLEX::Dimension() const
+{
+    if( IsEmpty() )
+        return -1;
+    if( m_borders.size() > 4 || m_borders.size() == 1 )
+        return 2;
+    if( m_borders.size() == 2 )
+        return m_borders[0].EqualOrOpposite( m_borders[1] ) ? 1 : 2;
+    if( m_borders.size() == 3 )
+    {
+        if( m_borders[0].EqualOrOpposite( m_borders[1] )
+            || m_borders[0].EqualOrOpposite( m_borders[2] )
+            || m_borders[1].EqualOrOpposite( m_borders[2] ) )
+        {
+            return 1;
+        }
+
+        const auto intersection = m_borders[1].Intersection( m_borders[2] );
+        if( !intersection )
+            return -1;
+        const int side = m_borders[0].SideOf( *intersection );
+        if( side < 0 )
+            return 2;
+        if( side > 0 )
+            return -1;
+        return 0;
+    }
+
+    const bool collinear02 = m_borders[0].EqualOrOpposite( m_borders[2] );
+    const bool collinear13 = m_borders[1].EqualOrOpposite( m_borders[3] );
+    if( collinear02 && collinear13 )
+        return 0;
+    if( collinear02 || collinear13 )
+        return 1;
+    return 2;
+}
+
+
+bool SIMPLEX::IsIntBox() const
+{
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        if( !m_borders[index].IsOrthogonal() || !CornerIsBounded( index ) )
+            return false;
+    }
+    return true;
+}
+
+
+bool SIMPLEX::IsIntOctagon() const
+{
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        if( !m_borders[index].IsMultipleOf45Degree() || !CornerIsBounded( index ) )
+            return false;
+    }
+    return true;
+}
+
+
+std::optional<ROUTER_BOX> SIMPLEX::BoundingBox() const
+{
+    if( IsEmpty() )
+        return ROUTER_BOX{ 1, 1, 0, 0 };
+    if( !IsBounded() )
+        return {};
+
+    ROUTER_BOX result{};
+    bool first = true;
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        const auto bounds = Corner( index ).SurroundingBox();
+        if( !bounds )
+            return {};
+        if( first )
+        {
+            result = *bounds;
+            first = false;
+        }
+        else
+        {
+            result.minX = std::min( result.minX, bounds->minX );
+            result.minY = std::min( result.minY, bounds->minY );
+            result.maxX = std::max( result.maxX, bounds->maxX );
+            result.maxY = std::max( result.maxY, bounds->maxY );
+        }
+    }
+    return result;
+}
+
+
+int SIMPLEX::BorderLineIndex( const LINE& aLine ) const
+{
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        if( m_borders[index].SameDirectedSupport( aLine ) )
+            return static_cast<int>( index );
+    }
+    return -1;
+}
+
+
+SIMPLEX SIMPLEX::RemoveBorderLine( std::size_t aIndex ) const
+{
+    if( aIndex >= m_borders.size() )
+        return *this;
+    std::vector<LINE> result = m_borders;
+    result.erase( result.begin() + aIndex );
+    return SIMPLEX( std::move( result ), UNCHECKED_TAG{} );
+}
+
+
+SIMPLEX SIMPLEX::Intersection( const SIMPLEX& aOther ) const
+{
+    if( IsEmpty() || aOther.IsEmpty() )
+        return Empty();
+    std::vector<LINE> result = m_borders;
+    result.insert( result.end(), aOther.m_borders.begin(), aOther.m_borders.end() );
+    return GetInstance( std::move( result ) );
+}
+
+
+bool SIMPLEX::Intersects( const SIMPLEX& aOther ) const
+{
+    return !Intersection( aOther ).IsEmpty();
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::TranslateBy( ROUTER_POINT aVector ) const
+{
+    if( aVector.x == 0 && aVector.y == 0 )
+        return *this;
+    std::vector<LINE> result;
+    result.reserve( m_borders.size() );
+    for( const LINE& border : m_borders )
+    {
+        const auto a = translatedPoint( border.a, aVector );
+        const auto b = translatedPoint( border.b, aVector );
+        if( !a || !b )
+            return {};
+        result.emplace_back( *a, *b );
+    }
+    return SIMPLEX( std::move( result ), UNCHECKED_TAG{} );
+}
+
+
+int SIMPLEX::IndexOfRightMostCorner( const POINT& aFromPoint ) const
+{
+    if( !IsBounded() || IsEmpty() )
+        return -1;
+
+    int result = 0;
+    const POINT* rightMost = &Corner( 0 );
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        const POINT& current = Corner( index );
+        const INTEGER firstX = rightMost->x * aFromPoint.z - aFromPoint.x * rightMost->z;
+        const INTEGER firstY = rightMost->y * aFromPoint.z - aFromPoint.y * rightMost->z;
+        const INTEGER secondX = current.x * aFromPoint.z - aFromPoint.x * current.z;
+        const INTEGER secondY = current.y * aFromPoint.z - aFromPoint.y * current.z;
+        const INTEGER determinant = firstX * secondY - firstY * secondX;
+        if( determinant < 0 )
+        {
+            rightMost = &current;
+            result = static_cast<int>( index );
+        }
+    }
+    return result;
+}
+
+
 SIMPLEX SIMPLEX::Box( ROUTER_BOX b )
 {
     if( b.minX >= b.maxX || b.minY >= b.maxY ) throw std::invalid_argument( "empty convex box" );
-    return SIMPLEX( { { { 0, b.minY }, { 1, b.minY } }, { { b.maxX, 0 }, { b.maxX, 1 } },
-                      { { 0, b.maxY }, { -1, b.maxY } }, { { b.minX, 0 }, { b.minX, -1 } } } );
+    if( b.minX == std::numeric_limits<std::int64_t>::max()
+        || b.minY == std::numeric_limits<std::int64_t>::min()
+        || b.maxX == std::numeric_limits<std::int64_t>::min()
+        || b.maxY == std::numeric_limits<std::int64_t>::max() )
+    {
+        throw std::overflow_error( "box support line endpoint overflow" );
+    }
+    // Preserve IntBox.toSimplex's exact anchors, not merely equivalent
+    // supports.  Stable line identity participates in source tie ordering.
+    return SIMPLEX( { { { b.minX, b.minY }, { b.minX + 1, b.minY } },
+                      { { b.maxX, b.maxY }, { b.maxX, b.maxY + 1 } },
+                      { { b.maxX, b.maxY }, { b.maxX - 1, b.maxY } },
+                      { { b.minX, b.minY }, { b.minX, b.minY - 1 } } } );
 }
 
 
@@ -269,9 +629,17 @@ std::optional<SIMPLEX> SIMPLEX::FromConvexPolygon(
 
 
 bool SIMPLEX::Contains( const POINT& p ) const
-{ return std::all_of( m_borders.begin(), m_borders.end(), [&]( const auto& l ) { return l.SideOf( p ) <= 0; } ); }
+{
+    return !IsEmpty()
+           && std::all_of( m_borders.begin(), m_borders.end(),
+                           [&]( const auto& l ) { return l.SideOf( p ) <= 0; } );
+}
 bool SIMPLEX::ContainsInside( const POINT& p ) const
-{ return std::all_of( m_borders.begin(), m_borders.end(), [&]( const auto& l ) { return l.SideOf( p ) < 0; } ); }
+{
+    return !IsEmpty()
+           && std::all_of( m_borders.begin(), m_borders.end(),
+                           [&]( const auto& l ) { return l.SideOf( p ) < 0; } );
+}
 
 bool SIMPLEX::IntersectsSegment( const POLYLINE& polyline, std::size_t index ) const
 {

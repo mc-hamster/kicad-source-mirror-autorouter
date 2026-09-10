@@ -15,6 +15,17 @@ inline void Print( std::ostream& out, const POLYLINE& p )
 }
 inline LINE ReadLine( std::istream& in )
 { ROUTER_POINT a, b; in >> a.x >> a.y >> b.x >> b.y; return { a, b }; }
+inline void PrintLine( std::ostream& out, const LINE& line )
+{ out << line.a.x << ' ' << line.a.y << ' ' << line.b.x << ' ' << line.b.y; }
+inline void PrintSimplex( std::ostream& out, const SIMPLEX& simplex )
+{
+    out << simplex.Borders().size();
+    for( const LINE& border : simplex.Borders() )
+    {
+        out << ' ';
+        PrintLine( out, border );
+    }
+}
 inline std::string CheckRecord( const std::string& record )
 {
     std::istringstream in( record );
@@ -62,6 +73,66 @@ inline std::string CheckRecord( const std::string& record )
         auto result = TRACE_SHOVER::SpringOverObstacles( POLYLINE::FromPoints( points ), obstacles );
         if( result.polyline ) Print( actual, *result.polyline );
         else actual << -1;
+    }
+    else if( tag == "SIMPLEX" )
+    {
+        std::int64_t dx, dy;
+        std::size_t count, removeIndex;
+        in >> dx >> dy >> removeIndex >> count;
+        std::vector<LINE> supplied;
+        supplied.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            supplied.push_back( ReadLine( in ) );
+
+        const SIMPLEX simplex = SIMPLEX::GetInstance( std::move( supplied ) );
+        PrintSimplex( actual, simplex );
+        actual << ' ' << simplex.Dimension()
+               << ' ' << ( simplex.IsBounded() ? 1 : 0 )
+               << ' ' << ( simplex.IsIntBox() ? 1 : 0 )
+               << ' ' << ( simplex.IsIntOctagon() ? 1 : 0 );
+
+        if( !simplex.IsEmpty() && simplex.IsBounded() )
+        {
+            const auto box = simplex.BoundingBox();
+            if( !box )
+                throw std::runtime_error( "bounded simplex has no finite box" );
+            actual << " 1 " << box->minX << ' ' << box->minY << ' '
+                   << box->maxX << ' ' << box->maxY;
+            actual << ' ' << simplex.IndexOfRightMostCorner( POINT( dx + 60, dy - 55 ) );
+            actual << ' ' << simplex.Borders().size();
+            for( std::size_t index = 0; index < simplex.Borders().size(); ++index )
+            {
+                actual << ' ';
+                Print( actual, simplex.Corner( index ) );
+            }
+        }
+        else
+        {
+            actual << " 0 -1 0";
+        }
+
+        for( const ROUTER_POINT point : { ROUTER_POINT{ dx, dy },
+                                          ROUTER_POINT{ dx - 30, dy },
+                                          ROUTER_POINT{ dx + 30, dy },
+                                          ROUTER_POINT{ dx, dy - 30 },
+                                          ROUTER_POINT{ dx, dy + 30 } } )
+        {
+            actual << ' ' << ( simplex.Contains( POINT( point ) ) ? 1 : 0 );
+            actual << ' ' << ( simplex.ContainsInside( POINT( point ) ) ? 1 : 0 );
+        }
+
+        const SIMPLEX clip = SIMPLEX::Box( { dx - 16, dy - 11, dx + 16, dy + 11 } );
+        actual << ' ';
+        PrintSimplex( actual, simplex.Intersection( clip ) );
+        actual << ' ';
+        PrintSimplex( actual, simplex.IsEmpty()
+                                      ? simplex
+                                      : simplex.RemoveBorderLine( removeIndex ) );
+        const auto translated = simplex.TranslateBy( { 7, -11 } );
+        if( !translated )
+            throw std::runtime_error( "small simplex translation overflowed" );
+        actual << ' ';
+        PrintSimplex( actual, *translated );
     }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );

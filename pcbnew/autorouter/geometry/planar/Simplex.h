@@ -1,5 +1,5 @@
-/* KiCad, GPL-3.0-or-later. Bounded, full-dimensional convex support-line
- * slice of Freerouting Simplex/TileShape. Not an unbounded half-plane solver.
+/* KiCad, GPL-3.0-or-later. Convex support-line geometry translated from
+ * Freerouting Simplex/TileShape at a11c0a42.
  */
 #pragma once
 #include "Polyline.h"
@@ -11,8 +11,12 @@ namespace KICAD_AUTOROUTER::PLANAR
 class SIMPLEX
 {
 public:
-    // Borders must already be CCW, irredundant, bounded and convex.
+    // Strict bounded constructor retained for existing production callers.
+    // Use GetInstance when the source operation may normalize to an empty,
+    // lower-dimensional, or unbounded simplex.
     explicit SIMPLEX( std::vector<LINE> aBorders );
+    static SIMPLEX GetInstance( std::vector<LINE> aBorders );
+    static SIMPLEX Empty();
     static SIMPLEX Box( ROUTER_BOX aBox );
     /** Build the full-dimensional L-infinity sweep of an integer segment.
      * This is the conservative convex centre-space used for a trace moving
@@ -31,7 +35,20 @@ public:
             const std::vector<ROUTER_POINT>& aPolygon,
             std::int64_t aChebyshevOffset = 0 );
     const std::vector<LINE>& Borders() const { return m_borders; }
-    const POINT& Corner( std::size_t i ) const { return m_corners.at( i ); }
+    const POINT& Corner( std::size_t i ) const;
+    bool CornerIsBounded( std::size_t aIndex ) const;
+    bool IsEmpty() const { return m_borders.empty(); }
+    bool IsBounded() const;
+    int Dimension() const;
+    bool IsIntBox() const;
+    bool IsIntOctagon() const;
+    std::optional<ROUTER_BOX> BoundingBox() const;
+    int BorderLineIndex( const LINE& aLine ) const;
+    SIMPLEX RemoveBorderLine( std::size_t aIndex ) const;
+    SIMPLEX Intersection( const SIMPLEX& aOther ) const;
+    bool Intersects( const SIMPLEX& aOther ) const;
+    std::optional<SIMPLEX> TranslateBy( ROUTER_POINT aVector ) const;
+    int IndexOfRightMostCorner( const POINT& aFromPoint ) const;
     bool Contains( const POINT& p ) const;
     bool ContainsInside( const POINT& p ) const;
     bool IntersectsSegment( const POLYLINE& aLine, std::size_t aIndex ) const;
@@ -40,7 +57,11 @@ public:
     std::vector<std::pair<std::size_t, std::size_t>> EntrancePoints( const POLYLINE& aLine ) const;
     std::vector<POLYLINE> Cutout( const POLYLINE& aLine ) const;
 private:
+    struct UNCHECKED_TAG {};
+    SIMPLEX( std::vector<LINE> aBorders, UNCHECKED_TAG );
+    void calculateCorners();
+
     std::vector<LINE> m_borders;
-    std::vector<POINT> m_corners;
+    std::vector<std::optional<POINT>> m_corners;
 };
 } // namespace KICAD_AUTOROUTER::PLANAR

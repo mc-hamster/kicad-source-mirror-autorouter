@@ -24,6 +24,26 @@ BOOST_AUTO_TEST_CASE( ConvexGeometryMatchesPinnedJava )
         BOOST_CHECK_EQUAL( count, std::string( name ) == "convex" ? 2048 : 384 );
     }
 }
+
+BOOST_AUTO_TEST_CASE( SimplexNormalizationAndIntersectionMatchPinnedJava )
+{
+    const auto path = KI_TEST::GetPcbnewTestDataDir()
+                      + "/autorouter/simplex-search-a11c0a42.txt";
+    std::ifstream input( path );
+    BOOST_REQUIRE( input.good() );
+    std::string line;
+    int count = 0;
+    while( std::getline( input, line ) )
+    {
+        ++count;
+        BOOST_TEST_CONTEXT( "simplex record " << count )
+        {
+            const std::string mismatch = AUTOROUTER_GEOMETRY_QA::CheckRecord( line );
+            BOOST_CHECK_MESSAGE( mismatch.empty(), mismatch );
+        }
+    }
+    BOOST_CHECK_EQUAL( count, 512 );
+}
 BOOST_AUTO_TEST_CASE( ExactRationalGeometryRejectsRoundingAndInvalidShapes )
 {
     // x is integral but y is not: do not accidentally divide both numerators

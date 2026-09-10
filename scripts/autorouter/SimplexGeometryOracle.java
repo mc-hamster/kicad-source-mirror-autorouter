@@ -1,0 +1,117 @@
+/* QA only: exercise the pinned Freerouting Simplex implementation directly. */
+import app.freerouting.geometry.planar.*;
+import java.util.*;
+
+public class SimplexGeometryOracle {
+  private static String line(Line value) {
+    IntPoint a = (IntPoint) value.a;
+    IntPoint b = (IntPoint) value.b;
+    return a.x + " " + a.y + " " + b.x + " " + b.y;
+  }
+
+  private static void lines(StringBuilder out, Simplex value) {
+    out.append(value.borderLineCount());
+    for (int index = 0; index < value.borderLineCount(); ++index) {
+      out.append(' ').append(line(value.borderLine(index)));
+    }
+  }
+
+  private static Line[] polygon(int[][] points) {
+    Line[] result = new Line[points.length];
+    for (int index = 0; index < points.length; ++index) {
+      int[] a = points[index];
+      int[] b = points[(index + 1) % points.length];
+      result[index] = new Line(a[0], a[1], b[0], b[1]);
+    }
+    return result;
+  }
+
+  private static Line[] input(int kind, int dx, int dy) {
+    return switch (kind) {
+      case 0 -> polygon(new int[][]{{-20 + dx, -12 + dy}, {19 + dx, -12 + dy},
+                                     {19 + dx, 14 + dy}, {-20 + dx, 14 + dy}});
+      case 1 -> polygon(new int[][]{{-23 + dx, -13 + dy}, {21 + dx, -8 + dy},
+                                     {9 + dx, 24 + dy}});
+      case 2 -> new Line[]{new Line(-15 + dx, -4 + dy, 17 + dx, 5 + dy)};
+      case 3 -> new Line[]{new Line(-20 + dx, -9 + dy, 21 + dx, -3 + dy),
+                            new Line(21 + dx, -3 + dy, 8 + dx, 22 + dy)};
+      case 4 -> new Line[]{new Line(-20 + dx, -8 + dy, 20 + dx, -8 + dy),
+                            new Line(20 + dx, 9 + dy, -20 + dx, 9 + dy)};
+      case 5 -> new Line[]{new Line(-20 + dx, 0 + dy, 20 + dx, 0 + dy),
+                            new Line(20 + dx, 0 + dy, -20 + dx, 0 + dy),
+                            new Line(0 + dx, 20 + dy, 0 + dx, -20 + dy),
+                            new Line(0 + dx, -20 + dy, 0 + dx, 20 + dy)};
+      case 6 -> new Line[]{new Line(-20 + dx, 8 + dy, 20 + dx, 8 + dy),
+                            new Line(20 + dx, -8 + dy, -20 + dx, -8 + dy)};
+      default -> polygon(new int[][]{{-24 + dx, -7 + dy}, {-9 + dx, -20 + dy},
+                                      {18 + dx, -14 + dy}, {25 + dx, 7 + dy},
+                                      {4 + dx, 25 + dy}, {-20 + dx, 17 + dy}});
+    };
+  }
+
+  public static void main(String[] args) throws Exception {
+    Random random = new Random(230104);
+    for (int record = 0; record < 512; ++record) {
+      int dx = random.nextInt(81) - 40;
+      int dy = random.nextInt(81) - 40;
+      Line[] source = input(record % 8, dx, dy);
+      List<Line> shuffled = new ArrayList<>(Arrays.asList(source));
+      if (record % 5 == 0 && source.length > 0) {
+        shuffled.add(source[record % source.length]);
+      }
+      Collections.shuffle(shuffled, random);
+      Line[] supplied = shuffled.toArray(Line[]::new);
+      Simplex simplex = Simplex.getInstance(supplied);
+
+      int removeIndex = simplex.borderLineCount() == 0 ? 0
+          : record % simplex.borderLineCount();
+      StringBuilder out = new StringBuilder("SIMPLEX ").append(dx).append(' ').append(dy)
+          .append(' ').append(removeIndex).append(' ').append(supplied.length);
+      for (Line border : supplied) {
+        out.append(' ').append(line(border));
+      }
+      out.append(' ');
+      lines(out, simplex);
+      out.append(' ').append(simplex.dimension());
+      out.append(' ').append(simplex.isBounded() ? 1 : 0);
+      out.append(' ').append(simplex.isIntBox() ? 1 : 0);
+      out.append(' ').append(simplex.isIntOctagon() ? 1 : 0);
+
+      if (!simplex.isEmpty() && simplex.isBounded()) {
+        IntBox box = simplex.boundingBox();
+        out.append(" 1 ").append(box.ll.x).append(' ').append(box.ll.y)
+           .append(' ').append(box.ur.x).append(' ').append(box.ur.y);
+        out.append(' ').append(simplex.indexOfRightMostCorner(new IntPoint(dx + 60, dy - 55)));
+        out.append(' ').append(simplex.borderLineCount());
+        for (int index = 0; index < simplex.borderLineCount(); ++index) {
+          out.append(' ').append(ConvexGeometryOracle.point(simplex.corner(index)));
+        }
+      } else {
+        out.append(" 0 -1 0");
+      }
+
+      for (int[] point : new int[][]{{dx, dy}, {dx - 30, dy}, {dx + 30, dy},
+                                      {dx, dy - 30}, {dx, dy + 30}}) {
+        IntPoint p = new IntPoint(point[0], point[1]);
+        out.append(' ').append(simplex.contains(p) ? 1 : 0);
+        out.append(' ').append(simplex.containsInside(p) ? 1 : 0);
+      }
+
+      Simplex clip = new IntBox(dx - 16, dy - 11, dx + 16, dy + 11).toSimplex();
+      out.append(' ');
+      lines(out, simplex.intersection(clip));
+
+      if (simplex.borderLineCount() > 0) {
+        out.append(' ');
+        lines(out, simplex.removeBorderLine(removeIndex));
+      } else {
+        out.append(" 0");
+      }
+
+      Simplex translated = simplex.translateBy(new IntVector(7, -11));
+      out.append(' ');
+      lines(out, translated);
+      System.out.println(out);
+    }
+  }
+}

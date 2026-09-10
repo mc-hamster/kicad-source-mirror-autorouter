@@ -54,7 +54,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--java", default="java")
     parser.add_argument("--javac", default="javac")
-    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "spring", "octagon", "room45", "neighbours45", "door45"), default="room")
+    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "simplex", "spring", "octagon", "room45", "neighbours45", "door45"), default="room")
     args = parser.parse_args()
     jar, output = args.reference_jar.resolve(), args.output_dir.resolve()
     verify_reference(jar)
@@ -63,7 +63,7 @@ def main() -> int:
     classes.mkdir()
     drill = args.oracle == "drill"
     main_class = {"room": "RoomSearchOracle", "drill": "app.freerouting.autoroute.maze.DrillSearchOracle",
-                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle", "convex": "ConvexGeometryOracle",
+                  "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle", "convex": "ConvexGeometryOracle", "simplex": "SimplexGeometryOracle",
                   "spring": "SpringOverOracle", "octagon": "IntOctagonOracle",
                   "room45": "ShapeSearchTree45DegreeOracle",
                   "neighbours45": "Sorted45DegreeRoomNeighboursOracle",
@@ -71,7 +71,7 @@ def main() -> int:
     source = ROOT / "scripts/autorouter" / (main_class.rsplit(".", 1)[-1] + ".java")
     expected = ROOT / f"qa/data/pcbnew/autorouter/{args.oracle}-search-a11c0a42.txt"
     sources = [source]
-    if args.oracle == "spring":
+    if args.oracle in ("spring", "simplex"):
         sources.append(ROOT / "scripts/autorouter/ConvexGeometryOracle.java")
     commands = [
         [args.javac, "-cp", str(jar), "-d", str(classes), *map(str, sources)],
