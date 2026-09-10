@@ -55,7 +55,7 @@ public:
     DIFF_PAIR_PLACER( ROUTER* aRouter );
     ~DIFF_PAIR_PLACER();
 
-    static bool FindDpPrimitivePair( NODE* aWorld, const VECTOR2I& aP, ITEM* aItem,
+    bool FindDpPrimitivePair( NODE* aWorld, const VECTOR2I& aP, ITEM* aItem,
                                      DP_PRIMITIVE_PAIR& aPair, wxString* aErrorMsg = nullptr );
 
     /**
@@ -156,7 +156,13 @@ public:
 
     void GetModifiedNets( std::vector<NET_HANDLE>& aNets ) const override;
 
+    const DIFF_PAIR CurrentTrace() const { return m_currentTrace; }
+  
+
 private:
+    static constexpr int DP_DEFAULT_GAP_EPSILON = 1000;
+
+
     int viaGap() const;
     int gap() const;
 
@@ -214,6 +220,12 @@ private:
                       bool aWindCw, bool aSolidsOnly );
     bool propagateDpHeadForces ( const VECTOR2I& aP, VECTOR2I& aNewP );
 
+    bool findDpEndingPrimitives( NODE* aWorld, const VECTOR2I& aP, ITEM* aStartItem,
+                                            DP_PRIMITIVE_PAIR& aPair, wxString* aErrorMsg );
+
+    bool findDpMidtraceIntersection( NODE* aWorld, const VECTOR2I& aP,
+                                                   ITEM* aStartItem, DP_PRIMITIVE_PAIR& aPair,
+                                                   wxString* aErrorMsg );
     enum State {
         RT_START = 0,
         RT_ROUTE = 1,
@@ -273,6 +285,7 @@ private:
 
     VECTOR2I m_currentEnd, m_currentStart;
     DIFF_PAIR m_currentTrace;
+    std::optional<DP_PRIMITIVE_PAIR> m_target;
     bool m_currentTraceOk;
 
     ITEM* m_currentEndItem;

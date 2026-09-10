@@ -127,6 +127,10 @@ public:
         return IsLinked() && LinkCount() == ShapeCount();
     }
 
+    ///< Finds a linked SEGMENT whose endpoints match aSeg (either direction)
+    SEGMENT* FindLinkedSegment( const SEG& aSeg ) const;
+
+
     ///< Assign a shape to the line (a polyline/line chain).
     void SetShape( const SHAPE_LINE_CHAIN& aLine )
     {
@@ -258,6 +262,8 @@ public:
     {
         return m_snapThreshhold;
     }
+
+    SEGMENT* FindLinkContainingVertex( const VECTOR2I& aP ) const;
 
 private:
     void dragSegment45( const VECTOR2I& aP, int aIndex );

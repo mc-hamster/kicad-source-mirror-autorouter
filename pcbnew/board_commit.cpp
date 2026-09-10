@@ -257,7 +257,7 @@ void BOARD_COMMIT::Push( const wxString& aMessage, int aCommitFlags )
                 solderMaskDirty = true;
             }
 
-            if( boardItem->GetLayer() == Edge_Cuts )
+            if( boardItem->IsOnLayer( Edge_Cuts ) )
             {
                 updateBoardBoundingBox = true;
             }
@@ -457,7 +457,7 @@ void BOARD_COMMIT::Push( const wxString& aMessage, int aCommitFlags )
             case PCB_TARGET_T:
             case PCB_POINT_T:
             case PCB_ZONE_T:
-            case PCB_GRIDITEM_T:
+            case PCB_GRID_ITEM_T:
             case PCB_FOOTPRINT_T:
             case PCB_GROUP_T:
                 if( view )
@@ -955,4 +955,18 @@ void BOARD_COMMIT::Revert()
     m_toolMgr->PostEvent( EVENTS::SelectedItemsModified );
 
     clear();
+}
+
+EDA_ITEM* BOARD_COMMIT::ResolveItem( KIID& aID )
+{
+    if( aID == niluuid )
+        return nullptr;
+
+    for( COMMIT_LINE& entry : m_entries )
+    {
+        if( entry.m_item && entry.m_item->IsBOARD_ITEM() && entry.m_item->m_Uuid == aID )
+            return entry.m_item;
+    }
+
+    return nullptr;
 }

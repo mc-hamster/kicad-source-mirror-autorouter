@@ -173,6 +173,26 @@ void CONNECTION_SUBGRAPH::ExchangeItem( SCH_ITEM* aOldItem, SCH_ITEM* aNewItem )
 }
 
 
+using DRIVER_IDENTITY = std::tuple<KIID, wxString, int, VECTOR2I>;
+using SUBGRAPH_IDENTITY = std::pair<KIID_PATH, DRIVER_IDENTITY>;
+
+
+static DRIVER_IDENTITY stableDriverIdentity( SCH_ITEM* aDriver )
+{
+    KIID owner = aDriver->m_Uuid;
+    wxString number;
+
+    if( aDriver->Type() == SCH_PIN_T )
+    {
+        SCH_PIN* pin = static_cast<SCH_PIN*>( aDriver );
+        owner = pin->GetParentSymbol()->m_Uuid;
+        number = pin->GetNumber();
+    }
+
+    return { owner, number, aDriver->GetUnit(), aDriver->GetPosition() };
+}
+
+
 /**
  * Unified driver ranking used by CONNECTION_SUBGRAPH::ResolveDrivers (within a single
  * subgraph) and by buildConnectionGraph's global-label transitive-closure pre-pass
@@ -320,12 +340,15 @@ bool CONNECTION_SUBGRAPH::ResolveDrivers( bool aCheckMultipleDrivers )
 
     if( !candidates.empty() )
     {
-        // Delegate to the shared compareDrivers helper so this site and the global-label
-        // transitive-closure pre-pass in buildConnectionGraph agree on every tie-break.
+        // Use the same driver priorities as the global-label transitive-closure pre-pass.
+        // Resolve equal candidates by persistent identity for stable weak-net suffixes.
         auto candidate_cmp = [&]( SCH_ITEM* a, SCH_ITEM* b )
         {
-            return compareDrivers( a, a->Connection( &m_sheet ), GetNameForDriver( a ),
-                                   b, b->Connection( &m_sheet ), GetNameForDriver( b ) ) < 0;
+            int priority = compareDrivers( a, a->Connection( &m_sheet ), GetNameForDriver( a ),
+                                           b, b->Connection( &m_sheet ), GetNameForDriver( b ) );
+
+            // Equal-name pins may belong to different units; their owner identity also orders later suffixes.
+            return priority != 0 ? priority < 0 : stableDriverIdentity( a ) < stableDriverIdentity( b );
         };
 
         std::sort( candidates.begin(), candidates.end(), candidate_cmp );
@@ -2103,6 +2126,53 @@ void CONNECTION_GRAPH::processSubGraphs()
 {
     // Here we do all the local (sheet) processing of each subgraph, including assigning net
     // codes, merging subgraphs together that use label connections, etc.
+
+    std::unordered_map<wxString, std::vector<size_t>> weakConflicts;
+
+    for( size_t i = 0; i < m_driver_subgraphs.size(); ++i )
+    {
+        CONNECTION_SUBGRAPH* subgraph = m_driver_subgraphs[i];
+        SCH_CONNECTION* connection = subgraph->m_driver_connection;
+
+        if( !subgraph->m_absorbed && !subgraph->m_strong_driver && connection->IsNet() )
+        {
+            const wxString name = connection->Name();
+            auto peers = m_net_name_to_subgraphs_map.find( name );
+
+            if( peers != m_net_name_to_subgraphs_map.end() && peers->second.size() > 1 )
+                weakConflicts[name].push_back( i );
+        }
+    }
+
+    // Spatial-index traversal changes after reload.  Only reorder competing weak drivers:
+    // their processing order decides which physical net receives each numeric suffix.
+    for( const auto& [name, positions] : weakConflicts )
+    {
+        if( positions.size() < 2 )
+            continue;
+
+        // Each identity allocates a sheet path and a pin number, so build them once per
+        // subgraph rather than twice per comparison.
+        std::vector<std::pair<SUBGRAPH_IDENTITY, CONNECTION_SUBGRAPH*>> ordered;
+        ordered.reserve( positions.size() );
+
+        for( size_t position : positions )
+        {
+            CONNECTION_SUBGRAPH* subgraph = m_driver_subgraphs[position];
+            ordered.emplace_back( SUBGRAPH_IDENTITY{ subgraph->m_sheet.Path(),
+                                                     stableDriverIdentity( subgraph->m_driver ) },
+                                  subgraph );
+        }
+
+        std::sort( ordered.begin(), ordered.end(),
+                   []( const auto& left, const auto& right )
+                   {
+                       return left.first < right.first;
+                   } );
+
+        for( size_t i = 0; i < positions.size(); ++i )
+            m_driver_subgraphs[positions[i]] = ordered[i].second;
+    }
 
     // Cache remaining valid subgraphs by sheet path
     for( CONNECTION_SUBGRAPH* subgraph : m_driver_subgraphs )

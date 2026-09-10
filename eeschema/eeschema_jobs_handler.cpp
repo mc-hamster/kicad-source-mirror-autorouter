@@ -38,6 +38,7 @@
 #include <jobs/job_sym_export_svg.h>
 #include <jobs/job_sym_upgrade.h>
 #include <schematic.h>
+#include <import_net_map.h>
 #include <schematic_settings.h>
 #include <sch_screen.h>
 #include <sch_sheet.h>
@@ -1442,6 +1443,8 @@ int EESCHEMA_JOBS_HANDLER::JobImport( JOB* aJob )
     if( !job )
         return CLI::EXIT_CODES::ERR_UNKNOWN;
 
+    job->m_netNameMap.clear();
+
     if( !wxFile::Exists( job->m_inputFile ) )
     {
         m_reporter->Report( wxString::Format( _( "Input file not found: '%s'\n" ), job->m_inputFile ),
@@ -1669,6 +1672,10 @@ int EESCHEMA_JOBS_HANDLER::JobImport( JOB* aJob )
         return CLI::EXIT_CODES::ERR_UNKNOWN;
     }
 
+    // The board job renames its nets from this; nothing is written beside the schematic.
+    if( const IMPORT_NET_MAP* map = schematic->GetImportNetMap() )
+        job->m_netNameMap = GetBoardNetNameMap( *map, *m_reporter );
+
     m_reporter->Report( wxString::Format( _( "Successfully saved imported schematic to '%s'\n" ),
                                           outputFn.GetFullPath() ),
                         RPT_SEVERITY_INFO );
@@ -1686,6 +1693,41 @@ int EESCHEMA_JOBS_HANDLER::JobImport( JOB* aJob )
             if( sheet && !sheet->IsVirtualRootSheet() )
                 projectSheets.emplace_back( std::make_pair( sheet->m_Uuid, sheet->GetName() ) );
         }
+
+        // Reload uses the top-level sheet list, not the UUID-to-name map.
+        const std::vector<SCH_SHEET*>& topLevelSheets = schematic->GetTopLevelSheets();
+
+        if( !topLevelSheets.empty() )
+        {
+            std::vector<TOP_LEVEL_SHEET_INFO>& infos = project.GetProjectFile().GetTopLevelSheets();
+            infos.clear();
+
+            wxString projectPath = project.GetProjectPath();
+
+            for( SCH_SHEET* sheet : topLevelSheets )
+            {
+                if( !sheet || !sheet->GetScreen() )
+                    continue;
+
+                wxFileName sheetFn( sheet->GetScreen()->GetFileName() );
+
+                if( sheetFn.IsAbsolute() )
+                    sheetFn.MakeRelativeTo( projectPath );
+
+                infos.emplace_back( sheet->m_Uuid, sheet->GetName(), sheetFn.GetFullPath() );
+            }
+        }
+    }
+
+    // Extra top-level sheets need a project file to remain reachable.
+    if( createdTransientProject && schematic->GetTopLevelSheets().size() > 1 )
+    {
+        m_reporter->Report( wxString::Format( _( "%zu sheets were written, but only '%s' is "
+                                                 "reachable: top-level sheets are recorded in a "
+                                                 "project file. Use 'kicad-cli import' to create "
+                                                 "one.\n" ),
+                                              sheetCount, outputFn.GetFullName() ),
+                            RPT_SEVERITY_WARNING );
     }
 
     if( job->m_reportFormat != IMPORT_REPORT_FORMAT::NONE )
@@ -1699,6 +1741,8 @@ int EESCHEMA_JOBS_HANDLER::JobImport( JOB* aJob )
             { wxS( "symbols" ), symbolCount },
             { wxS( "sheets" ), sheetCount }
         };
+
+        reportData.m_statistics.emplace_back( wxS( "renamed_board_nets" ), job->m_netNameMap.size() );
 
         WriteImportReport( m_reporter, job->m_reportFormat, job->m_reportFile, reportData );
     }

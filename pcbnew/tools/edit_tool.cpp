@@ -195,17 +195,19 @@ void EDIT_TOOL::Reset( RESET_REASON aReason )
 }
 
 
-static std::shared_ptr<CONDITIONAL_MENU> makeMirrorRotateMenu( TOOL_INTERACTIVE* aTool )
+static std::shared_ptr<CONDITIONAL_MENU> makeMirrorRotateMenu( EDIT_TOOL* aEditTool )
 {
-    std::shared_ptr<CONDITIONAL_MENU> menu = std::make_shared<CONDITIONAL_MENU>( aTool );
+    std::shared_ptr<CONDITIONAL_MENU> menu = std::make_shared<CONDITIONAL_MENU>( aEditTool );
 
     menu->SetIcon( BITMAPS::special_tools );
     menu->SetUntranslatedTitle( _HKI( "Mirror / Rotate" ) );
 
+    bool isBoardEditor = aEditTool && aEditTool->IsBoardEditor();
+
     auto canMirror =
-            []( const SELECTION& aSelection )
+            [isBoardEditor]( const SELECTION& aSelection )
             {
-                if( SELECTION_CONDITIONS::OnlyTypes( padTypes )( aSelection ) )
+                if( isBoardEditor && SELECTION_CONDITIONS::OnlyTypes( padTypes )( aSelection ) )
                     return false;
 
                 return selectionMirrorable( aSelection );
@@ -2678,8 +2680,20 @@ static void mirrorPad( PAD& aPad, const VECTOR2I& aMirrorPoint, FLIP_DIRECTION a
 
 
 const std::vector<KICAD_T> EDIT_TOOL::MirrorableItems = {
-    PCB_SHAPE_T, PCB_FIELD_T, PCB_TEXT_T,  PCB_TEXTBOX_T,   PCB_ZONE_T,  PCB_PAD_T,   PCB_TRACE_T,
-    PCB_ARC_T,   PCB_VIA_T,   PCB_GROUP_T, PCB_GENERATOR_T, PCB_POINT_T, PCB_TABLE_T, PCB_REFERENCE_IMAGE_T,
+    PCB_SHAPE_T,
+    PCB_FIELD_T,
+    PCB_TEXT_T,
+    PCB_TEXTBOX_T,
+    PCB_ZONE_T,
+    PCB_PAD_T,
+    PCB_TRACE_T,
+    PCB_ARC_T,
+    PCB_VIA_T,
+    PCB_GROUP_T,
+    PCB_GENERATOR_T,
+    PCB_POINT_T,
+    PCB_TABLE_T,
+    PCB_REFERENCE_IMAGE_T,
 };
 
 
@@ -3459,7 +3473,7 @@ int EDIT_TOOL::Duplicate( const TOOL_EVENT& aEvent )
             case PCB_DIM_RADIAL_T:
             case PCB_DIM_ORTHOGONAL_T:
             case PCB_DIM_LEADER_T:
-            case PCB_GRIDITEM_T:
+            case PCB_GRID_ITEM_T:
                 if( m_isFootprintEditor )
                     dupe_item = parentFootprint->DuplicateItem( true, &commit, orig_item );
                 else

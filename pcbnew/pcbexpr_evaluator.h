@@ -49,13 +49,13 @@ enum class PCBEXPR_NAV_STEP
 enum class PCBEXPR_PROPERTY_KIND
 {
     UNSUPPORTED,
-    INT,
+    INT_KIND,
     OPTIONAL_INT,
     UNSIGNED,
     LONG_LONG,
     DOUBLE,
     OPTIONAL_DOUBLE,
-    BOOL,
+    BOOL_KIND,
     STRING,
     ENUM,
     ANGLE,
@@ -74,10 +74,12 @@ public:
 
     bool HasGeometryDependentFunctions() const { return m_hasGeometryDependentFunctions; }
     bool RequiresPairItems() const { return m_requiresPairItems; }
+    bool ReferencesItemB() const { return m_referencesItemB; }
 
 private:
     bool m_hasGeometryDependentFunctions = false;
     bool m_requiresPairItems = false;
+    bool m_referencesItemB = false;
 };
 
 

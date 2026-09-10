@@ -323,17 +323,16 @@ HANDLER_RESULT<Empty> API_HANDLER_PCB::handleRevertDocument(
         return tl::unexpected( e );
     }
 
-    if( std::optional<ApiResponseStatus> headless = checkForHeadless( "RevertDocument" ) )
-        return tl::unexpected( *headless );
-
     if( std::optional<ApiResponseStatus> busy = checkForBusy() )
         return tl::unexpected( *busy );
 
-    wxFileName fn = project().AbsolutePath( board()->GetFileName() );
-
-    frame()->GetScreen()->SetContentModified( false );
-    frame()->ReleaseFile();
-    frame()->OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+    if( !pcbContext()->RevertToSaved() )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "could not revert: there is no saved file on disk to revert to" );
+        return tl::unexpected( e );
+    }
 
     return Empty();
 }
@@ -344,8 +343,7 @@ tl::expected<bool, ApiResponseStatus> API_HANDLER_PCB::validateDocumentInternal(
     if( aDocument.type() != DocumentType::DOCTYPE_PCB )
     {
         ApiResponseStatus e;
-        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
-        e.set_error_message( "the requested document is not a board" );
+        e.set_status( ApiStatusCode::AS_UNHANDLED );
         return tl::unexpected( e );
     }
 
@@ -433,7 +431,7 @@ HANDLER_RESULT<GetItemsResponse> API_HANDLER_PCB::handleGetItems( const HANDLER_
         case PCB_TEXTBOX_T:
         case PCB_BARCODE_T:
         case PCB_REFERENCE_IMAGE_T:
-        case PCB_GRIDITEM_T:
+        case PCB_GRID_ITEM_T:
         {
             handledAnything = true;
             bool inserted = false;
@@ -1363,19 +1361,19 @@ HANDLER_RESULT<BoardLayerResponse> API_HANDLER_PCB::handleGetBoardLayerByName(
 }
 
 
-std::optional<TITLE_BLOCK*> API_HANDLER_PCB::getTitleBlock()
+std::optional<TITLE_BLOCK*> API_HANDLER_PCB::getTitleBlock( const DocumentSpecifier& aDocument )
 {
     return &context()->GetBoard()->GetTitleBlock();
 }
 
 
-std::optional<PAGE_INFO> API_HANDLER_PCB::getPageSettings()
+std::optional<PAGE_INFO> API_HANDLER_PCB::getPageSettings( const DocumentSpecifier& aDocument )
 {
     return context()->GetBoard()->GetPageSettings();
 }
 
 
-bool API_HANDLER_PCB::setPageSettings( const PAGE_INFO& aPageInfo )
+bool API_HANDLER_PCB::setPageSettings( const DocumentSpecifier& aDocument, const PAGE_INFO& aPageInfo )
 {
     context()->GetBoard()->SetPageSettings( aPageInfo );
     return true;
@@ -1399,12 +1397,27 @@ void API_HANDLER_PCB::setDrawingSheetFileName( const wxString& aFileName )
 
 void API_HANDLER_PCB::onModified()
 {
+    pcbContext()->SetContentModified();
+
     if( frame() )
     {
         frame()->Refresh();
         frame()->OnModify();
         frame()->UpdateUserInterface();
     }
+}
+
+
+HANDLER_RESULT<GetDocumentModifiedStateResponse>
+API_HANDLER_PCB::handleGetDocumentModifiedState( const HANDLER_CONTEXT<GetDocumentModifiedState>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.document() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    GetDocumentModifiedStateResponse response;
+    response.set_state( pcbContext()->IsContentModified() ? DocumentModifiedState::DMS_MODIFIED
+                                                          : DocumentModifiedState::DMS_UNMODIFIED );
+    return response;
 }
 
 

@@ -24,6 +24,8 @@
 #include <netlist_reader/pcb_netlist.h>
 #include <pcb_edit_frame.h>
 #include <reporter.h>
+#include <board.h>
+#include <project.h>
 
 
 class PCB_EDIT_FRAME_CONTEXT : public PCB_CONTEXT
@@ -52,6 +54,16 @@ public:
     KIWAY* GetKiway() const override
     {
         return &m_frame->Kiway();
+    }
+
+    bool IsContentModified() const override
+    {
+        return m_frame->GetScreen()->IsContentModified();
+    }
+
+    void SetContentModified( bool aModified = true ) override
+    {
+        m_frame->GetScreen()->SetContentModified( aModified );
     }
 
     wxString GetCurrentFileName() const override
@@ -88,6 +100,17 @@ public:
     {
         bool runDragCommand = false;
         m_frame->OnNetlistChanged( aUpdater, &runDragCommand );
+    }
+
+    bool RevertToSaved() override
+    {
+        wxFileName fn = m_frame->Prj().AbsolutePath( m_frame->GetBoard()->GetFileName() );
+
+        m_frame->GetScreen()->SetContentModified( false );
+        m_frame->ReleaseFile();
+        m_frame->OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
+
+        return true;
     }
 
 private:

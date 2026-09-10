@@ -80,11 +80,11 @@ protected:
     std::optional<EDA_ITEM*> getItemFromDocument( const DocumentSpecifier& aDocument,
                                                   const KIID& aId ) override;
 
-    std::optional<TITLE_BLOCK*> getTitleBlock() override;
+    std::optional<TITLE_BLOCK*> getTitleBlock( const DocumentSpecifier& aDocument ) override;
 
-    std::optional<PAGE_INFO> getPageSettings() override;
+    std::optional<PAGE_INFO> getPageSettings( const DocumentSpecifier& aDocument ) override;
 
-    bool setPageSettings( const PAGE_INFO& aPageInfo ) override;
+    bool setPageSettings( const DocumentSpecifier& aDocument, const PAGE_INFO& aPageInfo ) override;
 
     wxString getDrawingSheetFileName() override;
 
@@ -107,6 +107,16 @@ private:
 
     HANDLER_RESULT<google::protobuf::Empty>
     handleRevertDocument( const HANDLER_CONTEXT<commands::RevertDocument>& aCtx );
+
+    HANDLER_RESULT<commands::SavedDocumentResponse>
+    handleSaveDocumentToString( const HANDLER_CONTEXT<commands::SaveDocumentToString>& aCtx );
+
+    HANDLER_RESULT<commands::SavedSelectionResponse>
+    handleSaveSelectionToString( const HANDLER_CONTEXT<commands::SaveSelectionToString>& aCtx );
+
+    HANDLER_RESULT<commands::CreateItemsResponse>
+    handleParseAndCreateItemsFromString(
+            const HANDLER_CONTEXT<commands::ParseAndCreateItemsFromString>& aCtx );
 
     HANDLER_RESULT<commands::GetOpenDocumentsResponse>
     handleGetOpenDocuments( const HANDLER_CONTEXT<commands::GetOpenDocuments>& aCtx );
@@ -184,6 +194,17 @@ private:
     SCH_EDIT_FRAME* frame() const;
 
     void filterValidSchTypes( std::set<KICAD_T>& aTypeList );
+
+    /// Returns the sheet path's screen when one is given and it is found, or null.
+    /// Otherwise, returns the editor's current sheet (or root sheet in headless mode).
+    SCH_SCREEN* resolveScreenFromDocument( const DocumentSpecifier& aDocument ) const;
+
+protected:
+
+    HANDLER_RESULT<commands::GetDocumentModifiedStateResponse>
+    handleGetDocumentModifiedState( const HANDLER_CONTEXT<commands::GetDocumentModifiedState>& aCtx ) override;
+
+private:
 
     std::shared_ptr<SCH_CONTEXT> m_context;
     static std::set<KICAD_T>     s_allowedTypes;

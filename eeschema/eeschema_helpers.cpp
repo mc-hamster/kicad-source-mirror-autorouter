@@ -25,6 +25,7 @@
 #include <locale_io.h>
 #include <project/project_file.h>
 #include <schematic.h>
+#include <reporter.h>
 #include <sch_commit.h>
 #include <sch_edit_frame.h>
 #include <sch_file_versions.h>

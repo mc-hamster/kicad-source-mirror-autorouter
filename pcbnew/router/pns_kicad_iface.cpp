@@ -82,6 +82,8 @@
 #include "pns_node.h"
 #include "pns_router.h"
 #include "pns_debug_decorator.h"
+#include "pns_diff_pair.h"
+#include "pns_topology.h"
 #include "router_preview_item.h"
 
 typedef VECTOR2I::extended_type ecoord;
@@ -983,12 +985,27 @@ int PNS_PCBNEW_RULE_RESOLVER::Clearance( const PNS::ITEM* aA, const PNS::ITEM* a
 }
 
 
-bool PNS_KICAD_IFACE_BASE::inheritTrackWidth( PNS::ITEM* aItem, int* aInheritedWidth,
-                                              const VECTOR2I& aStartPosition )
+bool PNS_KICAD_IFACE_BASE::inheritTrackWidthAndDpGap( PNS::ITEM* aItem, const VECTOR2I& aStartPosition, int* aInheritedWidth, int *aInheritedGap )
 {
     VECTOR2I p;
 
     assert( aItem->Owner() != nullptr );
+
+    PNS::NET_HANDLE coupledNet = GetRuleResolver()->DpCoupledNet( aItem->Net() );
+
+    if( coupledNet && aInheritedGap )
+    {
+        PNS::TOPOLOGY  topo( m_world );
+        PNS::DIFF_PAIR dp;
+        if( topo.AssembleDiffPair( static_cast<PNS::SEGMENT*>( aItem ), dp ) )
+        {
+            *aInheritedGap = dp.GuessMostLikelyGap();
+        }
+        else
+        {
+            return false;
+        }
+    }
 
     auto tryGetTrackWidth =
             []( PNS::ITEM* aPnsItem ) -> int
@@ -1149,7 +1166,7 @@ bool PNS_KICAD_IFACE_BASE::ImportSizes( PNS::SIZES_SETTINGS& aSizes, PNS::ITEM* 
 
     if( bds.m_UseConnectedTrackWidth && !bds.m_TempOverrideTrackWidth && aStartItem != nullptr )
     {
-        found = inheritTrackWidth( aStartItem, &trackWidth, startPosInt );
+        found = inheritTrackWidthAndDpGap( aStartItem, aStartPosition, &trackWidth, nullptr );
 
         if( found )
             aSizes.SetWidthSource( _( "existing track" ) );
@@ -1232,8 +1249,8 @@ bool PNS_KICAD_IFACE_BASE::ImportSizes( PNS::SIZES_SETTINGS& aSizes, PNS::ITEM* 
 
     // First try to pick up diff pair width from starting track, if enabled
     if( bds.m_UseConnectedTrackWidth && aStartItem )
-        found = inheritTrackWidth( aStartItem, &diffPairWidth, startPosInt );
-
+        found = inheritTrackWidthAndDpGap( aStartItem, aStartPosition, &diffPairWidth, &diffPairGap );
+ 
     // Next, pick up gap from netclass, and width also if we didn't get a starting width above
     if( bds.UseNetClassDiffPair() && aStartItem )
     {
@@ -2332,7 +2349,7 @@ void PNS_KICAD_IFACE_BASE::SyncWorld( PNS::NODE *aWorld )
 
         case PCB_REFERENCE_IMAGE_T:     // ignore
         case PCB_TARGET_T:
-        case PCB_GRIDITEM_T:
+        case PCB_GRID_ITEM_T:
             break;
 
         default:

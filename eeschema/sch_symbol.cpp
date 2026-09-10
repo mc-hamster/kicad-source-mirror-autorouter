@@ -835,6 +835,14 @@ void SCH_SYMBOL::Serialize( kiapi::schematic::types::SchematicSymbolInstance& aS
             drawItem.Serialize( *item->mutable_item() );
         }
 
+        SchematicSymbolType symbolType = SchematicSymbolType::SST_NORMAL;
+
+        if( m_part->IsGlobalPower() )
+            symbolType = SchematicSymbolType::SST_GLOBAL_POWER;
+        else if( m_part->IsLocalPower() )
+            symbolType = SchematicSymbolType::SST_LOCAL_POWER;
+
+        def->set_type( symbolType );
         def->set_unit_count( m_part->GetUnitCount() );
 
         for( int bodyStyle = BODY_STYLE::BASE; bodyStyle <= m_part->GetBodyStyleCount(); ++bodyStyle )
@@ -861,6 +869,10 @@ void SCH_SYMBOL::Serialize( kiapi::schematic::types::SchematicSymbolInstance& aS
 
         def->set_units_locked( m_part->UnitsLocked() );
         def->set_embedded_fonts( m_part->GetAreFontsEmbedded() );
+
+        def->set_show_pin_numbers( m_part->GetShowPinNumbers() );
+        def->set_show_pin_names( m_part->GetShowPinNames() );
+        PackDistance( *def->mutable_pin_name_offset(), m_part->GetPinNameOffset(), schIUScale );
 
         for( const auto& [unit, displayName] : m_part->GetUnitDisplayNames() )
         {
@@ -902,7 +914,7 @@ bool SCH_SYMBOL::Deserialize( const kiapi::schematic::types::SchematicSymbolInst
     SetFieldsAutoplaced( aSymbol.fields_autoplaced() ? AUTOPLACE_AUTO : AUTOPLACE_NONE );
     kiapi::common::UnpackCustomProperties( aSymbol.custom_properties(), *this );
 
-    if( !aSymbol.has_lib_id() )
+    if( aSymbol.has_lib_id() )
         SetSchSymbolLibraryName( UnpackLibId( aSymbol.lib_id() ).Format() );
 
     SetPassthroughMode( FromProtoEnum<SCH_SYMBOL::PASSTHROUGH_MODE>( aSymbol.passthrough() ) );
@@ -918,6 +930,10 @@ bool SCH_SYMBOL::Deserialize( const kiapi::schematic::types::SchematicSymbolInst
     LIB_SYMBOL* libSymbol = new LIB_SYMBOL( libId.GetLibItemName() );
     libSymbol->SetLibId( libId );
 
+    if( def.type() == SchematicSymbolType::SST_GLOBAL_POWER )
+        libSymbol->SetGlobalPower();
+    else if( def.type() == SchematicSymbolType::SST_LOCAL_POWER )
+        libSymbol->SetLocalPower();
 
     libSymbol->GetField( FIELD_T::REFERENCE )->Deserialize( def.reference_field(), schIUScale );
     libSymbol->GetField( FIELD_T::VALUE )->Deserialize( def.value_field(), schIUScale );
@@ -1009,6 +1025,17 @@ bool SCH_SYMBOL::Deserialize( const kiapi::schematic::types::SchematicSymbolInst
     for( const SchematicUnitDisplayName& displayName : def.unit_display_names() )
         libSymbol->GetUnitDisplayNames()[displayName.unit()] = wxString::FromUTF8( displayName.name() );
 
+    libSymbol->SetShowPinNumbers( def.show_pin_numbers() );
+    libSymbol->SetShowPinNames( def.show_pin_names() );
+    libSymbol->SetPinNameOffset( UnpackDistance( def.pin_name_offset(), schIUScale ) );
+
+    switch( def.type() )
+    {
+    case SchematicSymbolType::SST_GLOBAL_POWER: libSymbol->SetGlobalPower(); break;
+    case SchematicSymbolType::SST_LOCAL_POWER:  libSymbol->SetLocalPower();  break;
+    default: break;
+    }
+
     if( def.has_pin_maps() )
     {
         PIN_MAP_SET pinMapSet;
@@ -1091,16 +1118,12 @@ bool SCH_SYMBOL::Deserialize( const kiapi::schematic::types::SchematicSymbolInst
     // lib pins, and then we need to set the alternates for pins if applicable
 
     m_pins.clear();
-    TRANSFORM t = GetTransform().InverseTransform();
 
     for( SCH_PIN* pin : GetAllLibPins() )
     {
         m_pins.emplace_back( std::make_unique<SCH_PIN>( *pin ) );
         m_pins.back()->SetParent( this );
         const_cast<::KIID&>( m_pins.back() ->m_Uuid ) = pin->m_Uuid;
-
-        // We also need to reset the lib pin to use relative coordinates
-        pin->SetPosition( t.TransformCoordinate( pin->GetLocalPosition() - m_pos ) );
     }
 
     UpdatePins();
