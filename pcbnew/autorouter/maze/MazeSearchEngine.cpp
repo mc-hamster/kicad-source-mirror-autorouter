@@ -615,6 +615,49 @@ void ROUTING_OCCUPANCY::Remove( const ROUTING_CONNECTION& aConnection )
 }
 
 
+bool ROUTING_OCCUPANCY::RemoveItems( const ROUTING_BOARD::ITEM_ID_SET& aItems )
+{
+    if( !m_board || aItems.empty() )
+        return false;
+
+    TRANSACTION transaction( *this );
+    if( !m_board->RemoveItems( aItems ) )
+        return false;
+
+    std::vector<ROUTING_CONNECTION> normalized;
+    normalized.reserve( m_connections.size() );
+    for( const ROUTING_CONNECTION& connection : m_connections )
+    {
+        // AddStatic deliberately has no ROUTING_BOARD item. Preserve those
+        // fixed source records while replacing every mutable compound route
+        // by the exact item routes which survived removal.
+        if( connection.isExistingBoardRoute && !connection.isAutorouterOwned )
+            normalized.push_back( connection );
+    }
+    for( ROUTING_CONNECTION connection : m_board->ItemRoutes() )
+        normalized.push_back( std::move( connection ) );
+    m_connections = std::move( normalized );
+
+    m_usage.clear();
+    for( const ROUTING_CONNECTION& connection : m_connections )
+    {
+        for( std::size_t index = 1; index < connection.nodes.size(); ++index )
+        {
+            if( connection.nodes[index - 1].layer != connection.nodes[index].layer )
+                continue;
+            for( const ROUTER_CELL_KEY& cell : CellsForSegment( connection.nodes[index - 1],
+                                                                 connection.nodes[index] ) )
+            {
+                ++m_usage[cell][connection.netCode];
+            }
+        }
+    }
+
+    transaction.Commit();
+    return true;
+}
+
+
 void ROUTING_OCCUPANCY::Clear()
 {
     if( m_board )

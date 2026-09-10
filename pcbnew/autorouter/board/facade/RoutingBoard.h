@@ -76,9 +76,21 @@ public:
     int FirstCommonLayer( ITEM_ID aFirst, ITEM_ID aSecond ) const;
     ITEM_ID_SET NormalContactsAt( ITEM_ID aTrace, ROUTER_POINT aPoint ) const;
     ITEM_ID_SET NormalConnectedSet( ITEM_ID aItem ) const;
+    /** Direct translation of Item.getConnectionItems(StopConnectionOption.NONE).
+     * Returns routable trace/drill items up to the next terminal, stub or fork.
+     */
+    ITEM_ID_SET GetConnectionItems( ITEM_ID aItem ) const;
     /** Exact conduction-area identities containing a same-net point. */
     ITEM_ID_SET ConductionAreaContactsAt( int aNetCode, ROUTER_NODE aPoint ) const;
     std::optional<ITEM_INFO> GetItemInfo( ITEM_ID aItem ) const;
+    /** Exact standalone geometry and manufacturing style for a mutable item. */
+    std::optional<ROUTING_CONNECTION> ItemRoute( ITEM_ID aItem ) const;
+    /** Current mutable item geometry in source insertion-ID order. */
+    std::vector<ROUTING_CONNECTION> ItemRoutes() const;
+    /** Remove only the supplied mutable items. Fixed/unknown IDs reject the
+     * complete operation; callers use TRANSACTION for speculative edits.
+     */
+    bool RemoveItems( const ITEM_ID_SET& aItems );
     std::vector<ITEM_ID> RouteItems( const ROUTING_CONNECTION& aRoute ) const;
     std::optional<ITEM_ID> PadItem( std::size_t aPad ) const;
     std::size_t ItemCount() const;

@@ -89,6 +89,10 @@ public:
      */
     void AddStatic( const ROUTING_CONNECTION& aConnection );
     void Remove( const ROUTING_CONNECTION& aConnection );
+    /** Remove exact worker items and replace compound occupancy records with
+     * their surviving PolylineTrace/DrillItem records atomically.
+     */
+    bool RemoveItems( const ROUTING_BOARD::ITEM_ID_SET& aItems );
     void Clear();
     int  Usage( const ROUTER_CELL_KEY& aCell, int aNetCode ) const;
     int  SegmentUsage( const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,

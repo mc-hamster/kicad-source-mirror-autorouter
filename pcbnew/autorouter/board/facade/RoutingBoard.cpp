@@ -101,6 +101,11 @@ struct ROUTING_BOARD::IMPL
         NORMAL_CONTACT_ITEM normal;
         std::optional<ROUTING_OBSTACLE> trace;
         std::vector<ROUTER_POINT> traceCorners;
+        // Exact item-local route geometry. Freerouting stores a PolylineTrace
+        // or DrillItem directly on RoutingBoard; retaining the corresponding
+        // value here lets item-chain removal reconstruct the remaining board
+        // without falling back to the larger route request that created it.
+        std::optional<ROUTING_CONNECTION> route;
         std::shared_ptr<const ROUTING_OBSTACLE> area;
         std::vector<ROUTING_TERMINAL> terminals;
     };
@@ -358,6 +363,20 @@ struct ROUTING_BOARD::IMPL
                                            expanded.begin() + i + 1 );
                 piece.normal.first = piece.traceCorners.front();
                 piece.normal.last = piece.traceCorners.back();
+                if( piece.route )
+                {
+                    const int layer = piece.route->nodes.empty()
+                            ? ( piece.normal.layers.empty() ? -1 : piece.normal.layers.front() )
+                            : piece.route->nodes.front().layer;
+                    const ROUTING_EDGE_STYLE style = piece.route->edgeStyles.empty()
+                            ? ROUTING_EDGE_STYLE{} : piece.route->edgeStyles.front();
+                    piece.route->nodes.clear();
+                    piece.route->edgeStyles.clear();
+                    for( ROUTER_POINT corner : piece.traceCorners )
+                        piece.route->nodes.push_back( { corner, layer } );
+                    if( piece.route->nodes.size() > 1 )
+                        piece.route->edgeStyles.assign( piece.route->nodes.size() - 1, style );
+                }
                 for( std::size_t segment = 1; segment < piece.traceCorners.size(); ++segment )
                 {
                     ROUTING_OBSTACLE trace = *piece.trace;
@@ -618,6 +637,15 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                 ? VIA_RULE::LayersFor( state.settings, from.layer, to.layer, &style )
                 : std::vector<int>{ from.layer };
         auto& item = state.newItem( route.netCode, true );
+        ROUTING_EDGE_STYLE resolvedStyle = style;
+        resolvedStyle.trackWidth = edgeWidth;
+        resolvedStyle.clearance = std::max<std::int64_t>( 0, style.clearance );
+        if( via )
+        {
+            resolvedStyle.viaDiameter = edgeDiameter;
+            resolvedStyle.viaDrill = style.viaDrill > 0 ? style.viaDrill : drill;
+            resolvedStyle.viaLayers = edgeLayers;
+        }
         ROUTING_OBSTACLE copper;
         copper.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
         copper.start = from.point;
@@ -642,6 +670,9 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                 terminal.trackWidth = edgeWidth;
                 item.terminals.push_back( { terminal, NO_PAD, std::nullopt } );
             }
+            item.route = route;
+            item.route->nodes = { from, to };
+            item.route->edgeStyles = { resolvedStyle };
             ++edge;
         }
         else
@@ -685,6 +716,11 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                 terminal.trackWidth = edgeWidth;
                 item.terminals.push_back( { terminal, NO_PAD, traceTo.point } );
             }
+            item.route = route;
+            item.route->nodes.assign( route.nodes.begin() + static_cast<std::ptrdiff_t>( edge ),
+                                      route.nodes.begin()
+                                              + static_cast<std::ptrdiff_t>( lastEdge + 2 ) );
+            item.route->edgeStyles.assign( item.route->nodes.size() - 1, resolvedStyle );
             edge = lastEdge + 1;
         }
         record.items.push_back( item.id );
@@ -896,6 +932,81 @@ ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
 }
 
 
+ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetConnectionItems( ITEM_ID id ) const
+{
+    const auto source = m_impl->items.find( id );
+    if( source == m_impl->items.end() || !source->second.routable )
+        return {};
+
+    ITEM_ID_SET result{ id };
+    for( ITEM_ID currentId : source->second.normalContacts )
+    {
+        std::optional<ROUTER_POINT> previousPoint = NormalContactPoint( id, currentId );
+        if( !previousPoint )
+            continue;
+
+        int previousLayer = FirstCommonLayer( id, currentId );
+        if( source->second.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE
+            && NormalContactsAt( id, *previousPoint ).size() != 1 )
+        {
+            continue;
+        }
+
+        // Item.getConnectionItems() walks through exactly one contact away
+        // from the point it entered. A second outgoing contact is a fork and
+        // ends this side of the connection without consuming either branch.
+        ITEM_ID_SET visited{ id };
+        for( ;; )
+        {
+            const auto current = m_impl->items.find( currentId );
+            if( current == m_impl->items.end() || !current->second.routable )
+                break;
+
+            result.insert( currentId );
+            visited.insert( currentId );
+            std::optional<ITEM_ID> next;
+            std::optional<ROUTER_POINT> nextPoint;
+            int nextLayer = -1;
+            bool forkFound = false;
+
+            for( ITEM_ID contact : current->second.normalContacts )
+            {
+                const int contactLayer = FirstCommonLayer( currentId, contact );
+                if( contactLayer < 0 )
+                    continue;
+
+                const auto contactPoint = NormalContactPoint( currentId, contact );
+                if( !contactPoint )
+                {
+                    forkFound = true;
+                    break;
+                }
+
+                if( contactLayer != previousLayer || *contactPoint != *previousPoint )
+                {
+                    if( next )
+                    {
+                        forkFound = true;
+                        break;
+                    }
+                    next = contact;
+                    nextPoint = contactPoint;
+                    nextLayer = contactLayer;
+                }
+            }
+
+            if( !next || forkFound || visited.contains( *next ) )
+                break;
+
+            currentId = *next;
+            previousPoint = nextPoint;
+            previousLayer = nextLayer;
+        }
+    }
+    return result;
+}
+
+
 ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::ConductionAreaContactsAt(
         int net, ROUTER_NODE point ) const
 {
@@ -955,6 +1066,62 @@ std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id )
     }
     return result;
 }
+
+
+std::optional<ROUTING_CONNECTION> ROUTING_BOARD::ItemRoute( ITEM_ID id ) const
+{
+    const auto item = m_impl->items.find( id );
+    if( item == m_impl->items.end() || !item->second.dynamic || !item->second.routable
+        || !item->second.route )
+    {
+        return std::nullopt;
+    }
+
+    return item->second.route;
+}
+
+
+bool ROUTING_BOARD::RemoveItems( const ITEM_ID_SET& ids )
+{
+    if( ids.empty() )
+        return false;
+
+    auto& state = *m_impl;
+    for( ITEM_ID id : ids )
+    {
+        const auto item = state.items.find( id );
+        if( item == state.items.end() || !item->second.dynamic || !item->second.routable
+            || !item->second.route )
+        {
+            return false;
+        }
+    }
+
+    for( ITEM_ID id : ids )
+        state.removeItem( id );
+
+    // The original ROUTING_CONNECTION was only an insertion request. Once a
+    // subset of its items is removed it is no longer a faithful board record.
+    // Normalize every survivor to the source representation: one mutable
+    // PolylineTrace or DrillItem per entry, in insertion-ID order.
+    state.routes.clear();
+    for( const auto& [id, item] : state.items )
+        if( item.dynamic && item.routable && item.route )
+            state.routes.push_back( { *item.route, { id } } );
+    ++state.revision;
+    return true;
+}
+
+
+std::vector<ROUTING_CONNECTION> ROUTING_BOARD::ItemRoutes() const
+{
+    std::vector<ROUTING_CONNECTION> result;
+    for( const auto& [id, item] : m_impl->items )
+        if( item.dynamic && item.routable && item.route )
+            result.push_back( *item.route );
+    return result;
+}
+
 
 std::vector<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::RouteItems( const ROUTING_CONNECTION& route ) const
 {

@@ -2572,7 +2572,13 @@ BOOST_AUTO_TEST_CASE( ConnectionGetUsesSourcePolylineItemsForksAndReverseIdOrder
         BOOST_CHECK( part->IsComplete() );
         BOOST_CHECK_EQUAL( part->ItemCount(), 1U );
         BOOST_CHECK( part->StartPoint() == fork || part->EndPoint() == fork );
+        // Item.getConnectionItems() does not consume either branch past a
+        // fork; BatchOptimizer expands the adjacent fork traces separately.
+        BOOST_CHECK( copper.GetConnectionItems( id )
+                     == ROUTING_BOARD::ITEM_ID_SET{ id } );
     }
+    BOOST_CHECK( copper.GetConnectionItems( branchItems.front() )
+                 == ROUTING_BOARD::ITEM_ID_SET{ branchItems.front() } );
 
     ROUTING_CONNECTION layered;
     layered.netCode = 1;
@@ -2582,6 +2588,120 @@ BOOST_AUTO_TEST_CASE( ConnectionGetUsesSourcePolylineItemsForksAndReverseIdOrder
                       { { 3000, 0 }, 1 } };
     layered.edgeStyles.resize( layered.nodes.size() - 1 );
     BOOST_CHECK_EQUAL( CONNECTION::FromRoute( layered ).ItemCount(), 3U );
+}
+
+BOOST_AUTO_TEST_CASE( RoutingBoardPreservesAndTransactionallyRemovesExactItemChains )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.pads[0].layers = { 0 };
+    board.pads[1].layers = { 1 };
+
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { { 3000000, 1500000 }, 0 },
+                    { { 3000000, 1500000 }, 1 }, { board.pads[1].position, 1 } };
+    ROUTING_EDGE_STYLE firstTrace;
+    firstTrace.trackWidth = 120000;
+    firstTrace.clearance = 70000;
+    ROUTING_EDGE_STYLE via = firstTrace;
+    via.viaDiameter = 640000;
+    via.viaDrill = 310000;
+    via.viaLayers = { 0, 1 };
+    via.viaType = ROUTER_VIA_TYPE::THROUGH;
+    ROUTING_EDGE_STYLE secondTrace = firstTrace;
+    secondTrace.trackWidth = 180000;
+    route.edgeStyles = { firstTrace, via, secondTrace };
+
+    ROUTING_BOARD copper( board, settings );
+    copper.AddRoute( route );
+    const auto ids = copper.RouteItems( route );
+    BOOST_REQUIRE_EQUAL( ids.size(), 3U );
+    const auto chain = copper.GetConnectionItems( ids[1] );
+    BOOST_CHECK( chain == ROUTING_BOARD::ITEM_ID_SET( ids.begin(), ids.end() ) );
+
+    const auto traceItem = copper.ItemRoute( ids[0] );
+    const auto viaItem = copper.ItemRoute( ids[1] );
+    const auto otherTraceItem = copper.ItemRoute( ids[2] );
+    BOOST_REQUIRE( traceItem );
+    BOOST_REQUIRE( viaItem );
+    BOOST_REQUIRE( otherTraceItem );
+    BOOST_CHECK_EQUAL( traceItem->nodes.size(), 2U );
+    BOOST_CHECK( traceItem->edgeStyles == std::vector<ROUTING_EDGE_STYLE>{ firstTrace } );
+    BOOST_CHECK( viaItem->nodes == std::vector<ROUTER_NODE>( route.nodes.begin() + 1,
+                                                            route.nodes.begin() + 3 ) );
+    BOOST_CHECK( viaItem->edgeStyles == std::vector<ROUTING_EDGE_STYLE>{ via } );
+    BOOST_CHECK( otherTraceItem->edgeStyles
+                 == std::vector<ROUTING_EDGE_STYLE>{ secondTrace } );
+
+    const auto count = copper.ItemCount();
+    const auto revision = copper.Revision();
+    {
+        ROUTING_BOARD::TRANSACTION transaction( copper );
+        BOOST_REQUIRE( copper.RemoveItems( chain ) );
+        BOOST_CHECK( !copper.Connected( 0, 1 ) );
+        BOOST_CHECK_EQUAL( copper.ItemCount(), count - chain.size() );
+        BOOST_CHECK( copper.RouteItems( route ).empty() );
+    }
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), count );
+    BOOST_CHECK_GT( copper.Revision(), revision );
+    BOOST_CHECK( copper.RouteItems( route ) == ids );
+    BOOST_REQUIRE( copper.ItemRoute( ids[1] ) );
+    BOOST_CHECK( SameRouteGeometry( *copper.ItemRoute( ids[1] ), *viaItem ) );
+
+    auto invalid = chain;
+    invalid.insert( *copper.PadItem( 0 ) );
+    BOOST_CHECK( !copper.RemoveItems( invalid ) );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), count );
+}
+
+BOOST_AUTO_TEST_CASE( OccupancyItemRemovalKeepsOnlyExactForkSurvivorsAndRollsBack )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_PAD branchPad = board.pads[0];
+    branchPad.position = { 3000000, 2500000 };
+    board.pads.push_back( branchPad );
+    board.nets[0].padIndices.push_back( 2 );
+
+    ROUTING_CONNECTION trunk;
+    trunk.netCode = 1;
+    trunk.complete = true;
+    trunk.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    ROUTING_CONNECTION branch = trunk;
+    branch.nodes = { { branchPad.position, 0 }, { { 3000000, 1500000 }, 0 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( trunk );
+    occupancy.Add( branch );
+    const auto trunkItems = occupancy.Board()->RouteItems( trunk );
+    BOOST_REQUIRE_EQUAL( trunkItems.size(), 2U );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 1 ) );
+    BOOST_REQUIRE( occupancy.Board()->Connected( 0, 2 ) );
+
+    {
+        ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+        BOOST_REQUIRE( occupancy.RemoveItems( { trunkItems.front() } ) );
+        BOOST_CHECK_EQUAL( occupancy.Connections().size(), 2U );
+        BOOST_CHECK( !occupancy.Board()->Connected( 0, 1 ) );
+        BOOST_CHECK( !occupancy.Board()->Connected( 0, 2 ) );
+        BOOST_CHECK( occupancy.Board()->Connected( 1, 2 ) );
+        for( const auto& itemRoute : occupancy.Connections() )
+            BOOST_CHECK_EQUAL( occupancy.Board()->RouteItems( itemRoute ).size(), 1U );
+    }
+
+    BOOST_CHECK_EQUAL( occupancy.Connections().size(), 2U );
+    BOOST_CHECK( SameRouteGeometry( occupancy.Connections()[0], trunk ) );
+    BOOST_CHECK( SameRouteGeometry( occupancy.Connections()[1], branch ) );
+    BOOST_CHECK( occupancy.Board()->RouteItems( trunk ) == trunkItems );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 2 ) );
 }
 
 BOOST_AUTO_TEST_CASE( RetainedTraceContactsSplitVirtuallyAndRestoreOnRejectedInsertion )
