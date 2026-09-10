@@ -25,6 +25,19 @@ namespace KICAD_AUTOROUTER::PLANAR
 class INT_OCTAGON
 {
 public:
+    /** Freerouting FortyfiveDegreeDirection declaration order. */
+    enum class DIRECTION_45
+    {
+        RIGHT,
+        RIGHT45,
+        UP,
+        UP45,
+        LEFT,
+        LEFT45,
+        DOWN,
+        DOWN45
+    };
+
     static constexpr std::int64_t CRITICAL_COORDINATE = 33554432;
 
     std::int64_t leftX;
@@ -109,6 +122,18 @@ public:
     std::int64_t RightXValue( std::int64_t aY ) const;
     std::int64_t LowerYValue( std::int64_t aX ) const;
     std::int64_t UpperYValue( std::int64_t aX ) const;
+
+    /** Nearest outside integral border point reached along one of the eight
+     * source 45-degree directions.  The input is normally inside this shape;
+     * the source operation itself intentionally does not enforce that guard.
+     */
+    ROUTER_POINT BorderPoint( ROUTER_POINT aPoint, DIRECTION_45 aDirection ) const;
+
+    /** Sorted source-direction border projections. Equal distances preserve
+     * FortyfiveDegreeDirection declaration order.
+     */
+    std::vector<ROUTER_POINT> NearestBorderProjections(
+            ROUTER_POINT aPoint, int aMaximumResultPoints ) const;
 
     std::optional<SIMPLEX> ToSimplex() const;
 

@@ -35,12 +35,14 @@ snapshot callback; exact free-region search does not bypass KiCad DRC.
 ## Verification
 
 - `qa_pcbnew` and `qa_autorouter_parity` build successfully.
-- Native autorouter suite: **179 cases / 672,692 assertions passed**.
+- Native autorouter suite: **179 cases / 703,284 assertions passed**.
 - The expanded pinned-Java `IntOctagon` oracle now compares both octagon and
-  specialised box cutout dispatch for 2,048 deterministic shape pairs,
-  including every ordered empty/degenerate piece. Its 2,048-record fixture
-  SHA-256 is
-  `1e4128207a6cefe178b4fceca4c97e1f8fc56262925d7ee604fa05f40e3201ac`.
+  specialised box cutout dispatch, all eight directional `borderPoint`
+  operations, and stable distance-sorted `nearestBorderProjections` for 2,048
+  deterministic shape pairs, including every ordered empty/degenerate cutout
+  piece. The direct test contains **164,658 assertions**. Its 2,048-record
+  fixture SHA-256 is
+  `57deb7d5b6eb237fa5aa54699468ccaeef8cd94fd0a5dd77214c48e30e926773`.
 - New direct coverage proves that a candidate inside a diamond's AABB but
   outside the diamond remains available, a pin in that region is selected,
   the obstacle interior is removed, and nearest-point projection reaches the

@@ -290,6 +290,26 @@ BOOST_AUTO_TEST_CASE( IntOctagonCoreGeometryMatchesPinnedFreerouting )
             int isBox;
             input >> isBox;
             BOOST_CHECK_EQUAL( actual.IsIntBox(), isBox != 0 );
+            for( int direction = 0; direction < 8; ++direction )
+            {
+                ROUTER_POINT expected;
+                input >> expected.x >> expected.y;
+                BOOST_CHECK( actual.BorderPoint(
+                                     point,
+                                     static_cast<INT_OCTAGON::DIRECTION_45>( direction ) )
+                             == expected );
+            }
+            ROUTER_POINT inside;
+            std::size_t projectionCount;
+            input >> inside.x >> inside.y >> projectionCount;
+            const auto projections = actual.NearestBorderProjections( inside, 8 );
+            BOOST_REQUIRE_EQUAL( projections.size(), projectionCount );
+            for( std::size_t projection = 0; projection < projectionCount; ++projection )
+            {
+                ROUTER_POINT expected;
+                input >> expected.x >> expected.y;
+                BOOST_CHECK( projections[projection] == expected );
+            }
             for( bool outerIsBox : { false, true } )
             {
                 BOOST_TEST_CONTEXT( "outerIsBox=" << outerIsBox )

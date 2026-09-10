@@ -811,6 +811,98 @@ std::int64_t INT_OCTAGON::UpperYValue( std::int64_t aX ) const
 }
 
 
+ROUTER_POINT INT_OCTAGON::BorderPoint( ROUTER_POINT aPoint,
+                                       DIRECTION_45 aDirection ) const
+{
+    std::int64_t x = 0;
+    std::int64_t y = 0;
+    switch( aDirection )
+    {
+    case DIRECTION_45::RIGHT:
+        x = std::min( rightX, subtract( upperRightDiagonalX, aPoint.y ) );
+        x = std::min( x, add( lowerRightDiagonalX, aPoint.y ) );
+        y = aPoint.y;
+        break;
+    case DIRECTION_45::LEFT:
+        x = std::max( leftX, add( upperLeftDiagonalX, aPoint.y ) );
+        x = std::max( x, subtract( lowerLeftDiagonalX, aPoint.y ) );
+        y = aPoint.y;
+        break;
+    case DIRECTION_45::UP:
+        x = aPoint.x;
+        y = std::min( topY, subtract( aPoint.x, upperLeftDiagonalX ) );
+        y = std::min( y, subtract( upperRightDiagonalX, aPoint.x ) );
+        break;
+    case DIRECTION_45::DOWN:
+        x = aPoint.x;
+        y = std::max( bottomY, subtract( lowerLeftDiagonalX, aPoint.x ) );
+        y = std::max( y, subtract( aPoint.x, lowerRightDiagonalX ) );
+        break;
+    case DIRECTION_45::RIGHT45:
+        x = ceilHalf( INTEGER( aPoint.x ) - aPoint.y + upperRightDiagonalX );
+        x = std::min( x, rightX );
+        x = std::min( x, add( subtract( aPoint.x, aPoint.y ), topY ) );
+        y = add( subtract( aPoint.y, aPoint.x ), x );
+        break;
+    case DIRECTION_45::UP45:
+        x = floorHalf( INTEGER( aPoint.x ) + aPoint.y + upperLeftDiagonalX );
+        x = std::max( x, leftX );
+        x = std::max( x, subtract( add( aPoint.x, aPoint.y ), topY ) );
+        y = subtract( add( aPoint.y, aPoint.x ), x );
+        break;
+    case DIRECTION_45::LEFT45:
+        x = floorHalf( INTEGER( aPoint.x ) - aPoint.y + lowerLeftDiagonalX );
+        x = std::max( x, leftX );
+        x = std::max( x, add( subtract( aPoint.x, aPoint.y ), bottomY ) );
+        y = add( subtract( aPoint.y, aPoint.x ), x );
+        break;
+    case DIRECTION_45::DOWN45:
+        x = ceilHalf( INTEGER( aPoint.x ) + aPoint.y + lowerRightDiagonalX );
+        x = std::min( x, rightX );
+        x = std::min( x, subtract( add( aPoint.x, aPoint.y ), bottomY ) );
+        y = subtract( add( aPoint.y, aPoint.x ), x );
+        break;
+    }
+    return { x, y };
+}
+
+
+std::vector<ROUTER_POINT> INT_OCTAGON::NearestBorderProjections(
+        ROUTER_POINT aPoint, int aMaximumResultPoints ) const
+{
+    if( !Contains( aPoint ) || aMaximumResultPoints <= 0 )
+        return {};
+
+    const int resultCount = std::min( aMaximumResultPoints, 8 );
+    struct CANDIDATE
+    {
+        ROUTER_POINT point;
+        INTEGER distanceSquared;
+    };
+    std::vector<CANDIDATE> candidates;
+    candidates.reserve( 8 );
+    for( int direction = 0; direction < 8; ++direction )
+    {
+        const ROUTER_POINT point = BorderPoint(
+                aPoint, static_cast<DIRECTION_45>( direction ) );
+        const INTEGER dx = INTEGER( point.x ) - aPoint.x;
+        const INTEGER dy = INTEGER( point.y ) - aPoint.y;
+        candidates.push_back( { point, dx * dx + dy * dy } );
+    }
+    std::stable_sort( candidates.begin(), candidates.end(),
+                      []( const CANDIDATE& aLeft, const CANDIDATE& aRight )
+                      {
+                          return aLeft.distanceSquared < aRight.distanceSquared;
+                      } );
+
+    std::vector<ROUTER_POINT> result;
+    result.reserve( resultCount );
+    for( int index = 0; index < resultCount; ++index )
+        result.push_back( candidates[index].point );
+    return result;
+}
+
+
 int INT_OCTAGON::SideOfBorderLine( std::int64_t aX, std::int64_t aY,
                                    int aBorderIndex ) const
 {

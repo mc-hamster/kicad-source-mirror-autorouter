@@ -88,6 +88,21 @@ public class IntOctagonOracle {
             .append(' ').append(sideCode(octagon.compare(other, border)));
       }
       out.append(' ').append(octagon.isIntBox() ? 1 : 0);
+      for (FortyfiveDegreeDirection direction : FortyfiveDegreeDirection.values()) {
+        IntPoint border = octagon.borderPoint(new IntPoint(pointX, pointY), direction);
+        out.append(' ').append(border.x).append(' ').append(border.y);
+      }
+      if (!octagon.isEmpty()) {
+        IntPoint inside = octagon.centreOfGravity().round();
+        IntPoint[] projections = octagon.nearestBorderProjections(inside, 8);
+        out.append(' ').append(inside.x).append(' ').append(inside.y)
+            .append(' ').append(projections.length);
+        for (IntPoint projection : projections) {
+          out.append(' ').append(projection.x).append(' ').append(projection.y);
+        }
+      } else {
+        out.append(" 0 0 0");
+      }
       if (octagon.dimension() == 2 && other.dimension() == 2) {
         appendCutout(out, octagon.cutout(other));
         appendCutout(out, octagon.boundingBox().cutout(other));
