@@ -67,11 +67,21 @@ simplification (an `IntOctagon` that is geometrically a box becomes the exact
 `IntBox.toSimplex` supports), because support identity affects later routing
 order. A separate **384-record** pinned Java oracle covers orthogonal, 45-degree,
 arbitrary-angle, rational-corner, acute zig-zag and point polylines over six
-offset widths and ranged slices. The complete native autorouter suite now has
-**191 passing cases**. The production 555 smoke remains host-valid and unchanged
+offset widths and ranged slices. The source-named `LineSegment` is now a direct
+finite-support translation as well: exact and approximate endpoints,
+polyline/simplex conversion, integral containment, box/octagon bounds,
+approximate length changes, overlap/intersection classification, orthogonal
+and 45-degree stair construction, convex-border intersections, endpoint
+ordering, opposite direction, and cyclic shape-border construction are all
+covered. The source's observable function-of-y behavior in
+`stairApproximation45` is deliberately preserved rather than silently
+corrected. A separate **384-record** pinned oracle covers integral and rational
+segments, every direction quadrant, crossings, disjoint/identical/opposite
+segments, and box/triangle/general-convex borders. The complete native
+autorouter suite now has **192 passing cases**. The production 555 smoke remains host-valid and unchanged
 at 12/12 connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853
-expanded nodes. Rotation/mirroring, projection-line/shortening helpers and full
-general `LineSegment`/`TileShape` dispatch remain open.
+expanded nodes. Rotation/mirroring, projection-line/shortening helpers and the
+remaining general `TileShape` dispatch remain open.
 
 Fixed and negotiated-rip-up trace/via obstacles retain exact octagonal envelopes;
 free-space completion, neighbour gaps, door sections, source-style queue

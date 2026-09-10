@@ -2,6 +2,7 @@
 #pragma once
 #include <autorouter/board/optimize/TraceShover.h>
 #include <autorouter/geometry/planar/IntOctagon.h>
+#include <autorouter/geometry/planar/LineSegment.h>
 #include <iomanip>
 #include <sstream>
 
@@ -353,6 +354,107 @@ inline std::string CheckRecord( const std::string& record )
                << ' ' << projection.first << ' ' << projection.second;
         actual << ' ';
         Print( actual, probeLine.PerpendicularProjection( POINT( probes[0] ) ) );
+    }
+    else if( tag == "SEGMENT" )
+    {
+        const auto readSegment = [&]()
+        {
+            const LINE start = ReadLine( in );
+            const LINE middle = ReadLine( in );
+            const LINE end = ReadLine( in );
+            return LINE_SEGMENT( start, middle, end );
+        };
+        const auto printSegment = [&]( const LINE_SEGMENT& value )
+        {
+            PrintLine( actual, value.GetStartClosingLine() );
+            actual << ' ';
+            PrintLine( actual, value.GetLine() );
+            actual << ' ';
+            PrintLine( actual, value.GetEndClosingLine() );
+        };
+        const auto printPolylineLines = [&]( const POLYLINE& value )
+        {
+            actual << value.lines.size();
+            for( const LINE& line : value.lines )
+            {
+                actual << ' ';
+                PrintLine( actual, line );
+            }
+        };
+        const auto printPoints = [&]( const std::vector<ROUTER_POINT>& values )
+        {
+            actual << values.size();
+            for( const ROUTER_POINT& point : values )
+                actual << ' ' << point.x << ' ' << point.y;
+        };
+
+        const LINE_SEGMENT segment = readSegment();
+        const LINE_SEGMENT other = readSegment();
+        double width, newLength;
+        int toTheRight;
+        ROUTER_POINT probe;
+        std::size_t count;
+        in >> width >> toTheRight >> probe.x >> probe.y >> newLength >> count;
+        std::vector<LINE> shapeLines;
+        shapeLines.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            shapeLines.push_back( ReadLine( in ) );
+        const SIMPLEX shape = SIMPLEX::GetInstance( std::move( shapeLines ) );
+        std::size_t shapeLineIndex;
+        in >> shapeLineIndex;
+
+        Print( actual, segment.StartPoint() );
+        actual << ' ';
+        Print( actual, segment.EndPoint() );
+        const auto startApprox = segment.StartPointApprox();
+        const auto endApprox = segment.EndPointApprox();
+        actual << std::fixed << std::setprecision( 9 )
+               << ' ' << startApprox.first << ' ' << startApprox.second
+               << ' ' << endApprox.first << ' ' << endApprox.second << ' ';
+        printSegment( segment.Opposite() );
+        actual << ' ';
+        printPolylineLines( segment.ToPolyline() );
+        actual << ' ';
+        PrintSimplex( actual, segment.ToSimplex() );
+        actual << ' ' << ( segment.Contains( POINT( probe ) ) ? 1 : 0 );
+        const ROUTER_BOX box = segment.BoundingBox();
+        actual << ' ' << box.minX << ' ' << box.minY << ' '
+               << box.maxX << ' ' << box.maxY;
+        const INT_OCTAGON octagon = segment.BoundingOctagon();
+        actual << ' ' << octagon.leftX << ' ' << octagon.bottomY << ' '
+               << octagon.rightX << ' ' << octagon.topY << ' '
+               << octagon.upperLeftDiagonalX << ' '
+               << octagon.lowerRightDiagonalX << ' '
+               << octagon.lowerLeftDiagonalX << ' '
+               << octagon.upperRightDiagonalX;
+        const LINE_SEGMENT changed = segment.ChangeLengthApprox( newLength );
+        actual << ' ';
+        printSegment( changed );
+        actual << ' ';
+        Print( actual, changed.EndPoint() );
+        const std::vector<LINE> intersections = segment.Intersection( other );
+        actual << ' ' << intersections.size();
+        for( const LINE& line : intersections )
+        {
+            actual << ' ';
+            PrintLine( actual, line );
+        }
+        actual << ' ' << ( segment.Intersects( other ) ? 1 : 0 )
+               << ' ' << ( segment.Overlaps( other ) ? 1 : 0 ) << ' ';
+        printPoints( segment.StairApproximation( width, toTheRight != 0 ) );
+        actual << ' ';
+        printPoints( segment.StairApproximation45( width, toTheRight != 0 ) );
+        const std::vector<int> borders = segment.BorderIntersections( shape );
+        actual << ' ' << borders.size();
+        for( int border : borders )
+            actual << ' ' << border;
+        actual << ' ';
+        printSegment( segment.SortEndpointsInXY() );
+        const auto shapeSegment = LINE_SEGMENT::FromShape( shape, shapeLineIndex );
+        if( !shapeSegment )
+            throw std::runtime_error( "valid shape segment was rejected" );
+        actual << ' ';
+        printSegment( *shapeSegment );
     }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );
