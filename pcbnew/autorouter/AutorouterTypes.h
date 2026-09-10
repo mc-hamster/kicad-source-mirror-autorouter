@@ -103,6 +103,22 @@ struct ROUTER_LAYER_SETTINGS
  */
 enum class FANOUT_PIN_ORDER { OUTER_FIRST, INNER_FIRST, CLOSEST_ON_NET, DENSEST_FIRST, PIN_INDEX };
 
+
+/** Host via kind retained across the worker boundary.
+ *
+ * Freerouting selects an ordered ViaInfo/Padstack entry while routing.  KiCad
+ * additionally needs the manufactured via kind when that selected padstack is
+ * materialized.  AUTO is used by older data-only callers and is inferred from
+ * the selected physical span at the adapter boundary.
+ */
+enum class ROUTER_VIA_TYPE
+{
+    AUTO,
+    THROUGH,
+    BLIND_BURIED,
+    MICROVIA
+};
+
 struct AUTOROUTER_SETTINGS
 {
     std::vector<ROUTER_LAYER_SETTINGS> layers;
@@ -258,6 +274,13 @@ struct ROUTING_PAD
     // It is deliberately connection-local metadata, not a replacement for
     // Freerouting's item-set fanout search.
     std::vector<ROUTER_POINT> fanoutEscapePath;
+    // Complete selected padstack metadata.  Diameter/drill are retained above
+    // for compatibility with existing data-only callers; these fields prevent
+    // the fanout pre-pass from silently widening a blind/buried or microvia to
+    // the whole board stack before maze insertion and KiCad materialization.
+    std::vector<int> fanoutViaLayers;
+    bool             fanoutViaAttachSmdAllowed = false;
+    ROUTER_VIA_TYPE  fanoutViaType = ROUTER_VIA_TYPE::AUTO;
 };
 
 
@@ -328,6 +351,31 @@ struct ROUTING_OBSTACLE
 };
 
 
+/** One ordered entry in a net's Freerouting-style ViaRule.
+ *
+ * layers declares the complete padstack span (or just its two endpoints); an
+ * empty list means the complete physical copper stack.  A profile may serve a
+ * smaller search transition whenever its manufactured span contains both
+ * transition layers.  The emitted via still occupies the profile's complete
+ * span, matching FoundConnectionInserter.insertVia().
+ */
+struct ROUTING_VIA_PROFILE
+{
+    std::int64_t          diameter = 0;
+    std::int64_t          drill = 0;
+    std::vector<int>      layers;
+    bool                  attachSmdAllowed = false;
+    ROUTER_VIA_TYPE       type = ROUTER_VIA_TYPE::AUTO;
+
+    bool operator==( const ROUTING_VIA_PROFILE& aOther ) const
+    {
+        return diameter == aOther.diameter && drill == aOther.drill
+               && layers == aOther.layers
+               && attachSmdAllowed == aOther.attachSmdAllowed && type == aOther.type;
+    }
+};
+
+
 struct ROUTING_NET
 {
     int                    netCode = 0;
@@ -354,6 +402,10 @@ struct ROUTING_NET
     // connectivity clusters (not inferred from ratsnest pairs or positions).
     // Empty when existing copper is scheduled for replacement.
     std::vector<std::vector<std::size_t>> connectedPadGroups;
+    // Ordered like rules.ViaRule.  When non-empty these are the only legal
+    // new-via alternatives for this net; selection never invents a legacy
+    // through via after every declared profile has failed.
+    std::vector<ROUTING_VIA_PROFILE> viaProfiles;
 };
 
 
@@ -447,12 +499,13 @@ struct ROUTING_EDGE_STYLE
     std::int64_t     viaDiameter = 0;
     std::int64_t     viaDrill = 0;
     std::vector<int> viaLayers;
+    ROUTER_VIA_TYPE  viaType = ROUTER_VIA_TYPE::AUTO;
 
     bool operator==( const ROUTING_EDGE_STYLE& aOther ) const
     {
         return trackWidth == aOther.trackWidth && clearance == aOther.clearance
                && viaDiameter == aOther.viaDiameter && viaDrill == aOther.viaDrill
-               && viaLayers == aOther.viaLayers;
+               && viaLayers == aOther.viaLayers && viaType == aOther.viaType;
     }
 
     bool operator!=( const ROUTING_EDGE_STYLE& aOther ) const
@@ -688,6 +741,7 @@ struct ROUTING_VIA
     // See ROUTING_SEGMENT::clearance.  This applies to the via's copper
     // annulus; hole-to-hole clearance remains a distinct board rule.
     std::int64_t           clearance = 0;
+    ROUTER_VIA_TYPE        type = ROUTER_VIA_TYPE::AUTO;
 };
 
 

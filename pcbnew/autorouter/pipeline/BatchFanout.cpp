@@ -295,11 +295,11 @@ struct FANOUT_CLEARANCE_CONTEXT
 };
 
 
-std::vector<ROUTING_VIA_DIMENSION> fanoutViasForNet(
+std::vector<ROUTING_VIA_PROFILE> fanoutViasForNet(
         const BOARD_SNAPSHOT& aBoard, int aNetCode,
         const AUTOROUTER_SETTINGS& aSettings )
 {
-    std::vector<ROUTING_VIA_DIMENSION> result;
+    std::vector<ROUTING_VIA_PROFILE> result;
     const auto net = std::find_if( aBoard.nets.begin(), aBoard.nets.end(),
                                    [aNetCode]( const ROUTING_NET& aCandidate )
                                    {
@@ -309,7 +309,7 @@ std::vector<ROUTING_VIA_DIMENSION> fanoutViasForNet(
     if( net == aBoard.nets.end() )
         return result;
 
-    const auto append = [&]( ROUTING_VIA_DIMENSION aProfile )
+    const auto append = [&]( ROUTING_VIA_PROFILE aProfile )
     {
         if( aProfile.diameter <= 0 || aProfile.drill <= 0
             || std::find( result.begin(), result.end(), aProfile ) != result.end() )
@@ -325,9 +325,15 @@ std::vector<ROUTING_VIA_DIMENSION> fanoutViasForNet(
     // net rule, not merely the first one.  Keeping that ordered candidate set
     // lets a small padstack escape a channel that rejects the default large
     // board via instead of declaring the pin impossible prematurely.
-    if( net->viaDiameter > 0 )
+    if( !net->viaProfiles.empty() )
     {
-        append( { net->viaDiameter, net->viaDrill > 0 ? net->viaDrill : 300000 } );
+        for( const ROUTING_VIA_PROFILE& profile : net->viaProfiles )
+            append( profile );
+    }
+    else if( net->viaDiameter > 0 )
+    {
+        append( { net->viaDiameter, net->viaDrill > 0 ? net->viaDrill : 300000, {}, false,
+                  ROUTER_VIA_TYPE::THROUGH } );
     }
 
     if( !aSettings.fanoutFallbackToBoardVias )
@@ -337,7 +343,10 @@ std::vector<ROUTING_VIA_DIMENSION> fanoutViasForNet(
     // smallest-via heuristic.  The search evaluates the first legal profile
     // in that declared order, matching the source ViaRule traversal.
     for( const ROUTING_VIA_DIMENSION& profile : aBoard.boardViaDimensions )
-        append( profile );
+    {
+        append( { profile.diameter, profile.drill, {}, false,
+                  ROUTER_VIA_TYPE::THROUGH } );
+    }
 
     return result;
 }
@@ -680,7 +689,7 @@ bool fanoutTrackSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD&
 
 bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad,
                            const ROUTER_POINT& aPoint, int aSourceLayer, int aTargetLayer,
-                           const ROUTING_VIA_DIMENSION& aVia,
+                           const ROUTING_VIA_PROFILE& aVia,
                            const AUTOROUTER_SETTINGS& aSettings,
                            const std::vector<std::size_t>& aNearbyObstacles,
                            const FANOUT_CLEARANCE_CONTEXT& aContext,
@@ -744,10 +753,17 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
                                                    aCancel ) )
         return false;
 
-    if( !VIA_RULE::AllowsTransition( aSettings, aSourceLayer, aTargetLayer ) )
+    ROUTING_EDGE_STYLE viaStyle;
+    viaStyle.viaDiameter = aVia.diameter;
+    viaStyle.viaDrill = aVia.drill;
+    viaStyle.viaLayers = aVia.layers;
+    viaStyle.viaType = aVia.type;
+    const std::vector<int> viaLayers =
+            VIA_RULE::LayersFor( aSettings, aSourceLayer, aTargetLayer, &viaStyle );
+    if( viaLayers.empty() )
         return false;
 
-    for( const ROUTER_LAYER_SETTINGS& layer : aSettings.layers )
+    for( int layer : viaLayers )
     {
         for( std::size_t obstacleIndex : aNearbyObstacles )
         {
@@ -758,7 +774,7 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
                 continue;
 
             const ROUTING_OBSTACLE& obstacle = aBoard.obstacles[obstacleIndex];
-            if( !obstacleAllowed( obstacle, layer.layerId, true, viaRadius ) )
+            if( !obstacleAllowed( obstacle, layer, true, viaRadius ) )
             {
                 return false;
             }
@@ -772,7 +788,7 @@ bool fanoutSegmentAllowed( const BOARD_SNAPSHOT& aBoard, const ROUTING_PAD& aPad
 std::optional<ROUTER_POINT> fanoutLandingPoint( const BOARD_SNAPSHOT& aBoard,
                                                 const ROUTING_PAD& aPad,
                                                 int aTargetLayer,
-                                                const ROUTING_VIA_DIMENSION& aVia,
+                                                const ROUTING_VIA_PROFILE& aVia,
                                                 const AUTOROUTER_SETTINGS& aSettings,
                                                 const FANOUT_CLEARANCE_CONTEXT& aContext,
                                                 const ROUTER_CANCEL_CALLBACK& aCancel,
@@ -1369,13 +1385,13 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
             // evaluate every rule alternative, so a synthetic native escape
             // must try each netclass/board profile in the same declaration
             // order rather than making the first profile a hard gate.
-            const std::vector<ROUTING_VIA_DIMENSION> fanoutVias =
+            const std::vector<ROUTING_VIA_PROFILE> fanoutVias =
                     fanoutViasForNet( result, net.netCode, aSettings );
             if( fanoutVias.empty() )
                 continue;
 
             bool fanoutPlaced = false;
-            for( const ROUTING_VIA_DIMENSION& fanoutVia : fanoutVias )
+            for( const ROUTING_VIA_PROFILE& fanoutVia : fanoutVias )
             {
                 for( const int layer : fanoutLayers( aSettings, pad.layers.front() ) )
                 {
@@ -1445,6 +1461,22 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                     landing.fanoutSourcePadIndex = padIndex;
                     landing.fanoutViaDiameter = fanoutVia.diameter;
                     landing.fanoutViaDrill = fanoutVia.drill;
+                    ROUTING_EDGE_STYLE viaStyle;
+                    viaStyle.viaDiameter = fanoutVia.diameter;
+                    viaStyle.viaDrill = fanoutVia.drill;
+                    viaStyle.viaLayers = fanoutVia.layers;
+                    viaStyle.viaType = fanoutVia.type;
+                    landing.fanoutViaLayers = VIA_RULE::LayersFor(
+                            aSettings, pad.layers.front(), layer, &viaStyle );
+                    landing.fanoutViaAttachSmdAllowed = fanoutVia.attachSmdAllowed;
+                    landing.fanoutViaType = fanoutVia.type;
+                    if( landing.fanoutViaType == ROUTER_VIA_TYPE::AUTO )
+                    {
+                        landing.fanoutViaType =
+                                landing.fanoutViaLayers == VIA_RULE::ThroughLayers( aSettings )
+                                        ? ROUTER_VIA_TYPE::THROUGH
+                                        : ROUTER_VIA_TYPE::BLIND_BURIED;
+                    }
                     landing.fanoutMinEscapeLength = std::max(
                             std::max<std::int64_t>( 1, sourcePad.radius + sourcePad.clearance
                                                            + sourcePad.trackWidth / 2 ),
@@ -1477,7 +1509,7 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                     ROUTING_OBSTACLE viaObstacle;
                     viaObstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
                     viaObstacle.netCode = sourcePad.netCode;
-                    viaObstacle.layers = VIA_RULE::ThroughLayers( aSettings );
+                    viaObstacle.layers = result.pads.back().fanoutViaLayers;
                     viaObstacle.start = *landingPoint;
                     viaObstacle.end = *landingPoint;
                     viaObstacle.radius = viaRadius;

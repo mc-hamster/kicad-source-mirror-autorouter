@@ -316,6 +316,17 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                    m_board.bounds.maxX - viaMargin, m_board.bounds.maxY - viaMargin };
     via.pageWidth = std::max<std::int64_t>( 10000, 10 * netViaRadius( net ) );
     via.attachSmd = m_settings.allowViaInSmdPad;
+    const auto netRule = std::find_if( m_board.nets.begin(), m_board.nets.end(),
+                                      [net]( const ROUTING_NET& aNet )
+                                      { return aNet.netCode == net; } );
+    if( netRule != m_board.nets.end() )
+    {
+        via.attachSmd = via.attachSmd
+                        || std::any_of( netRule->viaProfiles.begin(),
+                                        netRule->viaProfiles.end(),
+                                        []( const ROUTING_VIA_PROFILE& aProfile )
+                                        { return aProfile.attachSmdAllowed; } );
+    }
     if( via.attachSmd )
         for( const auto& pad : m_board.pads )
             if( pad.netCode == net && pad.isSmd && !pad.isFanoutTarget && !pad.isPlaneTarget )
@@ -399,15 +410,20 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     std::optional<ROUTING_CONNECTION> result;
     if( path && !path->nodes.empty() )
     {
-        bool legal = true;
-        for( std::size_t i = 0; i < path->nodes.size() && legal; ++i )
-            legal = CanUseSegment( net, path->nodes[i == 0 ? 0 : i - 1], path->nodes[i] );
+        ROUTING_CONNECTION found;
+        found.netCode = net; found.fromPadIndex = path->startOwner; found.toPadIndex = path->targetOwner;
+        found.complete = true; found.nodes = path->nodes;
+        found.isFanoutConnection = fanoutTarget != nullptr;
+        bool legal = assignViaStyles( found );
+        for( std::size_t i = 0; i < found.nodes.size() && legal; ++i )
+        {
+            const std::size_t edge = i == 0 ? 0 : i - 1;
+            const bool isVia = i > 0 && found.nodes[edge].layer != found.nodes[i].layer;
+            const ROUTING_EDGE_STYLE* style = isVia ? &found.edgeStyles[edge] : nullptr;
+            legal = CanUseSegment( net, found.nodes[edge], found.nodes[i], isVia, style );
+        }
         if( legal && !( cancel && cancel() ) )
         {
-            ROUTING_CONNECTION found;
-            found.netCode = net; found.fromPadIndex = path->startOwner; found.toPadIndex = path->targetOwner;
-            found.complete = true; found.nodes = path->nodes;
-            found.isFanoutConnection = fanoutTarget != nullptr;
             AUTOROUTE_CONTROL control( m_settings, net, retry, plane,
                                        std::max( radius, netViaRadius( net ) ),
                                        hasPads && pureSmd );

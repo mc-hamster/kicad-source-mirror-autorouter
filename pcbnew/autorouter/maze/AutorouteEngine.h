@@ -36,7 +36,7 @@ public:
      */
     AUTOROUTE_ENGINE( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
                       ROUTING_OCCUPANCY& aOccupancy, int aViaOverrideNetCode = 0,
-                      std::optional<ROUTING_VIA_DIMENSION> aViaOverride = std::nullopt,
+                      std::optional<ROUTING_VIA_PROFILE> aViaOverride = std::nullopt,
                       int aTrackWidthOverrideNetCode = 0,
                       std::optional<std::int64_t> aTrackWidthOverride = std::nullopt );
 

@@ -24,7 +24,7 @@ AUTOROUTE_ENGINE::AUTOROUTE_ENGINE( const BOARD_SNAPSHOT& aBoard,
                                     const AUTOROUTER_SETTINGS& aSettings,
                                     ROUTING_OCCUPANCY& aOccupancy,
                                     int aViaOverrideNetCode,
-                                    std::optional<ROUTING_VIA_DIMENSION> aViaOverride,
+                                    std::optional<ROUTING_VIA_PROFILE> aViaOverride,
                                     int aTrackWidthOverrideNetCode,
                                     std::optional<std::int64_t> aTrackWidthOverride ) :
         m_search( aBoard, aSettings, aOccupancy, aViaOverrideNetCode,

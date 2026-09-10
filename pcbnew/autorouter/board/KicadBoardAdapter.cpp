@@ -435,12 +435,25 @@ void KICAD_BOARD_ADAPTER::addNet( BOARD_SNAPSHOT& aSnapshot, int aNetCode,
                                   int aPriority, std::int64_t aClearance,
                                   std::int64_t aViaDiameter, std::int64_t aViaDrill ) const
 {
-    if( std::find_if( aSnapshot.nets.begin(), aSnapshot.nets.end(),
-                      [aNetCode]( const ROUTING_NET& aNet )
-                      {
-                          return aNet.netCode == aNetCode;
-                      } )
-        == aSnapshot.nets.end() )
+    const auto found = std::find_if( aSnapshot.nets.begin(), aSnapshot.nets.end(),
+                                     [aNetCode]( const ROUTING_NET& aNet )
+                                     {
+                                         return aNet.netCode == aNetCode;
+                                     } );
+
+    const auto appendDefaultViaProfile = [&]( ROUTING_NET& aNet )
+    {
+        if( aNet.viaProfiles.empty() && aNet.viaDiameter > 0 && aNet.viaDrill > 0 )
+        {
+            ROUTING_VIA_PROFILE profile;
+            profile.diameter = aNet.viaDiameter;
+            profile.drill = aNet.viaDrill;
+            profile.type = ROUTER_VIA_TYPE::THROUGH;
+            aNet.viaProfiles.push_back( std::move( profile ) );
+        }
+    };
+
+    if( found == aSnapshot.nets.end() )
     {
         ROUTING_NET net;
         net.netCode = aNetCode;
@@ -450,8 +463,27 @@ void KICAD_BOARD_ADAPTER::addNet( BOARD_SNAPSHOT& aSnapshot, int aNetCode,
         net.clearance = aClearance;
         net.viaDiameter = aViaDiameter;
         net.viaDrill = aViaDrill;
+        appendDefaultViaProfile( net );
         aSnapshot.nets.push_back( std::move( net ) );
+        return;
     }
+
+    // The board-net seed pass can legitimately have incomplete rule data;
+    // pads then expose their resolved effective netclass.  Fill those missing
+    // values rather than leaving an empty ViaRule merely because the net was
+    // inserted first.  Existing non-zero metadata remains authoritative.
+    ROUTING_NET& net = *found;
+    if( net.name.empty() )
+        net.name = toStdString( aNetName );
+    if( net.netClass.empty() )
+        net.netClass = toStdString( aNetClass );
+    net.netClassPriority = std::max( net.netClassPriority, aPriority );
+    net.clearance = std::max( net.clearance, aClearance );
+    if( net.viaDiameter <= 0 )
+        net.viaDiameter = aViaDiameter;
+    if( net.viaDrill <= 0 )
+        net.viaDrill = aViaDrill;
+    appendDefaultViaProfile( net );
 }
 
 
@@ -1761,13 +1793,29 @@ KICAD_BOARD_ADAPTER::CreatePreviewItems( const ROUTING_RESULT& aResult ) const
         const bool touchesBack = topLayer == static_cast<int>( B_Cu )
                                  || bottomLayer == static_cast<int>( B_Cu );
 
-        // Freerouting primarily emits ordinary through vias, but preserving a
-        // narrower transition is both legal KiCad and materially reduces
-        // unnecessary copper obstacles on multilayer boards.
-        via->SetViaType( touchesFront && touchesBack
-                                 ? VIATYPE::THROUGH
-                                 : ( touchesFront || touchesBack ? VIATYPE::BLIND
-                                                                  : VIATYPE::BURIED ) );
+        switch( viaData.type )
+        {
+        case ROUTER_VIA_TYPE::THROUGH:
+            via->SetViaType( VIATYPE::THROUGH );
+            break;
+
+        case ROUTER_VIA_TYPE::BLIND_BURIED:
+            via->SetViaType( touchesFront || touchesBack ? VIATYPE::BLIND : VIATYPE::BURIED );
+            break;
+
+        case ROUTER_VIA_TYPE::MICROVIA:
+            via->SetViaType( VIATYPE::MICROVIA );
+            break;
+
+        case ROUTER_VIA_TYPE::AUTO:
+            // Backward-compatible inference for data-only callers which do
+            // not yet provide an explicit ViaInfo kind.
+            via->SetViaType( touchesFront && touchesBack
+                                     ? VIATYPE::THROUGH
+                                     : ( touchesFront || touchesBack ? VIATYPE::BLIND
+                                                                      : VIATYPE::BURIED ) );
+            break;
+        }
         via->SetLayerPair( static_cast<PCB_LAYER_ID>( topLayer ),
                            static_cast<PCB_LAYER_ID>( bottomLayer ) );
         via->SetNetCode( viaData.netCode );

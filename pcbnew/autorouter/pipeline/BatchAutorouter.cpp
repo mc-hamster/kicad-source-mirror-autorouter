@@ -165,6 +165,8 @@ void applyFanoutViaStyle( ROUTING_CONNECTION& aConnection, const ROUTING_PAD& aL
         ROUTING_EDGE_STYLE& style = aConnection.edgeStyles[index - 1];
         style.viaDiameter = aLanding.fanoutViaDiameter;
         style.viaDrill = aLanding.fanoutViaDrill;
+        style.viaLayers = aLanding.fanoutViaLayers;
+        style.viaType = aLanding.fanoutViaType;
     }
 }
 
@@ -2053,7 +2055,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         struct FANOUT_ENGINE
         {
             int                                  netCode = 0;
-            ROUTING_VIA_DIMENSION                via;
+            ROUTING_VIA_PROFILE                  via;
             std::unique_ptr<AUTOROUTE_ENGINE>    engine;
         };
         // Re-indexing a large board for every SMD pin would undo the batch
@@ -2070,8 +2072,11 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 return fanoutRouteEngine;
             }
 
-            const ROUTING_VIA_DIMENSION via{ aLanding.fanoutViaDiameter,
-                                              aLanding.fanoutViaDrill };
+            const ROUTING_VIA_PROFILE via{ aLanding.fanoutViaDiameter,
+                                            aLanding.fanoutViaDrill,
+                                            aLanding.fanoutViaLayers,
+                                            aLanding.fanoutViaAttachSmdAllowed,
+                                            aLanding.fanoutViaType };
             const auto found = std::find_if(
                     fanoutEngines.begin(), fanoutEngines.end(),
                     [&]( const FANOUT_ENGINE& aEntry )

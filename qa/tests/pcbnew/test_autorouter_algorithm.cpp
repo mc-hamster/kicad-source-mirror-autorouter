@@ -55,6 +55,7 @@
 #include <autorouter/maze/LegacyDestinationDistance.h>
 #include <autorouter/maze/RoomCostSpace.h>
 #include <autorouter/BoardHistory.h>
+#include <autorouter/rules/ViaRule.h>
 #include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
 #include <autorouter/pipeline/BatchFanout.h>
 #include <autorouter/pipeline/BatchOptimizer.h>
@@ -993,6 +994,57 @@ BOOST_AUTO_TEST_CASE( FanoutUsesBoardViaFallbackAndHonorsItsEscapeEnvelope )
     impossibleEnvelope.fanoutMaxEscapeLengthIU = 1000000;
     BOOST_CHECK_EQUAL( BATCH_FANOUT::PrepareSnapshot( board, impossibleEnvelope ).pads.size(),
                        board.pads.size() );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutPreservesSelectedMicroviaSpanAndType )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.bounds = { 0, 0, 8000000, 3000000 };
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].position = { 7000000, 1500000 };
+    board.pads[1].layers = { 1 };
+    board.nets[0].viaProfiles = {
+        { 300000, 100000, { 0, 1 }, false, ROUTER_VIA_TYPE::MICROVIA }
+    };
+    // A later board-rule fallback remains available but must not replace the
+    // first legal net ViaRule entry or widen its physical span.
+    board.boardViaDimensions = { { 500000, 200000 } };
+
+    // The deterministic first landing is (2 mm, 1.5 mm).  Copper on an
+    // unrelated deeper layer blocks a through via there, but is irrelevant
+    // to the selected F.Cu-In1.Cu microvia.
+    ROUTING_OBSTACLE deeperLayerBlocker;
+    deeperLayerBlocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    deeperLayerBlocker.netCode = 2;
+    deeperLayerBlocker.layers = { 3 };
+    deeperLayerBlocker.start = { 2000000, 1500000 };
+    deeperLayerBlocker.end = deeperLayerBlocker.start;
+    deeperLayerBlocker.radius = 200000;
+    deeperLayerBlocker.blocksTracks = true;
+    deeperLayerBlocker.blocksVias = true;
+    board.obstacles.push_back( deeperLayerBlocker );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20, 0 }, { 1, true, 2, 20, 1 },
+                        { 2, true, 1, 20, 2 }, { 3, true, 2, 20, 3 } };
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1000000;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), 3U );
+    const ROUTING_PAD& landing = prepared.pads.back();
+    BOOST_REQUIRE( landing.isFanoutTarget );
+    BOOST_CHECK( landing.fanoutViaLayers == std::vector<int>( { 0, 1 } ) );
+    BOOST_CHECK( landing.fanoutViaType == ROUTER_VIA_TYPE::MICROVIA );
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_REQUIRE_EQUAL( result.vias.size(), 1U );
+    BOOST_CHECK( result.vias.front().layers == std::vector<int>( { 0, 1 } ) );
+    BOOST_CHECK( result.vias.front().type == ROUTER_VIA_TYPE::MICROVIA );
 }
 
 
@@ -4519,6 +4571,113 @@ BOOST_AUTO_TEST_CASE( StyledBlindViaChecksOnlyItsPhysicalSpanAndPreservesItInOut
     BOOST_CHECK( emitted.vias.front().layers == std::vector<int>( { 0, 1 } ) );
     BOOST_CHECK_EQUAL( emitted.vias.front().topLayer, 0 );
     BOOST_CHECK_EQUAL( emitted.vias.front().bottomLayer, 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ViaRuleUsesCompletePadstackSpanForContainedTransition )
+{
+    auto settings = makeSettings();
+    settings.layers = { { 20, true, 0, 0, 0 }, { 5, true, 0, 0, 1 },
+                        { 18, true, 0, 0, 2 }, { 10, true, 0, 0, 3 } };
+
+    ROUTING_EDGE_STYLE blind;
+    blind.viaLayers = { 20, 18 };
+    blind.viaType = ROUTER_VIA_TYPE::BLIND_BURIED;
+
+    // The selected padstack spans 20 -> 5 -> 18 and can therefore perform
+    // the smaller 20 -> 5 transition.  Its emitted copper must not be shrunk
+    // to that transition.
+    BOOST_CHECK( VIA_RULE::AllowsTransition( settings, 20, 5, &blind ) );
+    BOOST_CHECK( VIA_RULE::LayersFor( settings, 20, 5, &blind )
+                 == std::vector<int>( { 20, 5, 18 } ) );
+    BOOST_CHECK( !VIA_RULE::AllowsTransition( settings, 18, 10, &blind ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( OrderedViaRuleFallsThroughToFirstGeometricallyLegalProfile )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 0, 0, 0 }, { 1, true, 0, 0, 1 },
+                        { 2, true, 0, 0, 2 }, { 3, true, 0, 0, 3 } };
+    ROUTING_NET& net = board.nets.front();
+    net.viaProfiles.clear();
+    net.viaProfiles.push_back( { 1000000, 150000, { 0, 2 }, false,
+                                 ROUTER_VIA_TYPE::BLIND_BURIED } );
+    net.viaProfiles.push_back( { 200000, 100000, { 0, 2 }, false,
+                                 ROUTER_VIA_TYPE::BLIND_BURIED } );
+
+    ROUTING_OBSTACLE blocker;
+    blocker.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    blocker.netCode = 2;
+    blocker.layers = { 0, 1, 2 };
+    blocker.start = blocker.end = { 3500000, 1500000 };
+    blocker.radius = 100000;
+    board.obstacles.push_back( blocker );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    const ROUTER_NODE from{ { 3000000, 1500000 }, 0 };
+    const ROUTER_NODE to{ from.point, 1 };
+    const auto selected = engine.SelectViaStyle( 1, from, to );
+    BOOST_REQUIRE( selected );
+    BOOST_CHECK_EQUAL( selected->viaDiameter, 200000 );
+    BOOST_CHECK_EQUAL( selected->viaDrill, 100000 );
+    BOOST_CHECK( selected->viaLayers == std::vector<int>( { 0, 1, 2 } ) );
+
+    // An explicit rule is authoritative: it cannot service a transition
+    // outside either profile and must not invent a through-via fallback.
+    BOOST_CHECK( !engine.SelectViaStyle( 1, { from.point, 2 }, { from.point, 3 } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ViaRuleAttachSmdAndMicroviaTypeSurviveMaterialization )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { static_cast<int>( F_Cu ), true, 0, 0, 0 },
+                        { static_cast<int>( In1_Cu ), true, 0, 0, 1 },
+                        { static_cast<int>( B_Cu ), true, 0, 0, 2 } };
+    board.pads.front().layers = { static_cast<int>( F_Cu ) };
+    board.pads.front().isSmd = true;
+    ROUTING_NET& net = board.nets.front();
+    net.viaProfiles.clear();
+    net.viaProfiles.push_back( { 350000, 120000,
+                                 { static_cast<int>( F_Cu ), static_cast<int>( In1_Cu ) },
+                                 false, ROUTER_VIA_TYPE::MICROVIA } );
+    net.viaProfiles.push_back( { 300000, 100000,
+                                 { static_cast<int>( F_Cu ), static_cast<int>( In1_Cu ) },
+                                 true, ROUTER_VIA_TYPE::MICROVIA } );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    const ROUTER_NODE from{ board.pads.front().position, static_cast<int>( F_Cu ) };
+    const ROUTER_NODE to{ from.point, static_cast<int>( In1_Cu ) };
+    const auto selected = engine.SelectViaStyle( 1, from, to, true );
+    BOOST_REQUIRE( selected );
+    BOOST_CHECK_EQUAL( selected->viaDiameter, 300000 );
+    BOOST_CHECK( selected->viaType == ROUTER_VIA_TYPE::MICROVIA );
+
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.nodes = { from, to };
+    route.edgeStyles = { *selected };
+    ROUTING_RESULT emitted;
+    FOUND_CONNECTION_INSERTER::Append( route, 100000, 600000, 300000,
+                                       VIA_RULE::ThroughLayers( settings ), emitted );
+    BOOST_REQUIRE_EQUAL( emitted.vias.size(), 1U );
+    BOOST_CHECK( emitted.vias.front().type == ROUTER_VIA_TYPE::MICROVIA );
+
+    BOARD host;
+    KICAD_BOARD_ADAPTER adapter( &host );
+    const auto preview = adapter.CreatePreviewItems( emitted );
+    BOOST_REQUIRE_EQUAL( preview.size(), 1U );
+    BOOST_REQUIRE_EQUAL( preview.front()->Type(), PCB_VIA_T );
+    BOOST_CHECK( static_cast<PCB_VIA*>( preview.front().get() )->GetViaType()
+                 == VIATYPE::MICROVIA );
 }
 
 

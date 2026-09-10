@@ -10,13 +10,7 @@
 namespace KICAD_AUTOROUTER
 {
 
-/**
- * Supported subset of Freerouting's rules/ViaRule: one through-hole padstack.
- *
- * Search entry/exit layers are NOT the manufactured drill span. Until the
- * adapter supplies explicit blind/buried padstacks, every new via crosses the
- * entire physical stack, including layers disabled for trace routing.
- */
+/** Data-only Freerouting rules.ViaRule span and transition semantics. */
 class VIA_RULE
 {
 public:
@@ -51,12 +45,13 @@ public:
         return aSettings.allowVias && aFrom != aTo && enabled( aFrom ) && enabled( aTo );
     }
 
-    /**
-     * Return every physical copper layer occupied by a via edge.  A custom
-     * layer list is a span declaration, not permission to omit an
-     * intermediate copper layer: a blind/buried via from layer A to C still
-     * has copper on B.  Invalid custom masks fail closed by returning an
-     * empty list.
+    /** Return every physical copper layer occupied by the selected padstack.
+     *
+     * aFrom/aTo are the layers joined by this search edge, not necessarily
+     * the selected padstack's manufactured endpoints.  Freerouting accepts a
+     * ViaInfo when its from/to span contains that transition, then inserts the
+     * complete selected Padstack.  Invalid or incompatible declarations fail
+     * closed.
      */
     static std::vector<int> LayersFor( const AUTOROUTER_SETTINGS& aSettings, int aFrom,
                                        int aTo, const ROUTING_EDGE_STYLE* aStyle = nullptr )
@@ -68,21 +63,63 @@ public:
         if( from == physical.end() || to == physical.end() )
             return {};
 
-        if( !aStyle || aStyle->viaLayers.empty() )
+        if( !aStyle )
             return physical;
 
-        const auto has = [&]( int aLayer )
+        if( aStyle->viaLayers.empty() )
         {
-            return std::find( aStyle->viaLayers.begin(), aStyle->viaLayers.end(), aLayer )
-                   != aStyle->viaLayers.end();
-        };
+            return aStyle->viaType == ROUTER_VIA_TYPE::AUTO
+                           || aStyle->viaType == ROUTER_VIA_TYPE::THROUGH
+                    ? physical : std::vector<int>{};
+        }
 
-        if( !has( aFrom ) || !has( aTo ) )
+        if( aStyle->viaLayers.size() < 2 )
             return {};
 
-        const auto first = std::min( from, to );
-        const auto last = std::max( from, to );
-        return std::vector<int>( first, last + 1 );
+        int firstOrdinal = std::numeric_limits<int>::max();
+        int lastOrdinal = std::numeric_limits<int>::min();
+        for( int declaredLayer : aStyle->viaLayers )
+        {
+            const auto declared = std::find( physical.begin(), physical.end(), declaredLayer );
+            if( declared == physical.end() )
+                return {};
+
+            const int ordinal = static_cast<int>( std::distance( physical.begin(), declared ) );
+            firstOrdinal = std::min( firstOrdinal, ordinal );
+            lastOrdinal = std::max( lastOrdinal, ordinal );
+        }
+
+        if( firstOrdinal >= lastOrdinal )
+            return {};
+
+        const int transitionFirst = static_cast<int>(
+                std::min( std::distance( physical.begin(), from ),
+                          std::distance( physical.begin(), to ) ) );
+        const int transitionLast = static_cast<int>(
+                std::max( std::distance( physical.begin(), from ),
+                          std::distance( physical.begin(), to ) ) );
+
+        if( transitionFirst < firstOrdinal || transitionLast > lastOrdinal )
+            return {};
+
+        if( aStyle->viaType == ROUTER_VIA_TYPE::THROUGH
+            && ( firstOrdinal != 0
+                 || lastOrdinal + 1 != static_cast<int>( physical.size() ) ) )
+        {
+            return {};
+        }
+
+        if( aStyle->viaType == ROUTER_VIA_TYPE::MICROVIA )
+        {
+            const bool adjacent = lastOrdinal == firstOrdinal + 1;
+            const bool touchesOuter = firstOrdinal == 0
+                                      || lastOrdinal + 1 == static_cast<int>( physical.size() );
+            if( !adjacent || !touchesOuter )
+                return {};
+        }
+
+        return std::vector<int>( physical.begin() + firstOrdinal,
+                                 physical.begin() + lastOrdinal + 1 );
     }
 
     static bool AllowsTransition( const AUTOROUTER_SETTINGS& aSettings, int aFrom, int aTo,

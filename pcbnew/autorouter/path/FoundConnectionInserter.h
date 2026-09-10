@@ -90,7 +90,8 @@ public:
                             const ROUTER_NODE& aCurrent, std::int64_t aTrackWidth,
                             std::int64_t aViaDiameter, std::int64_t aViaDrill,
                             const std::vector<int>& aViaLayers, ROUTING_RESULT& aResult,
-                            std::int64_t aClearance = 0 );
+                            std::int64_t aClearance = 0,
+                            ROUTER_VIA_TYPE aViaType = ROUTER_VIA_TYPE::AUTO );
 };
 
 } // namespace KICAD_AUTOROUTER

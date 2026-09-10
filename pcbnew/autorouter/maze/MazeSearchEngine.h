@@ -147,7 +147,7 @@ public:
      */
     MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
                         ROUTING_OCCUPANCY& aOccupancy, int aViaOverrideNetCode = 0,
-                        std::optional<ROUTING_VIA_DIMENSION> aViaOverride = std::nullopt,
+                        std::optional<ROUTING_VIA_PROFILE> aViaOverride = std::nullopt,
                         int aTrackWidthOverrideNetCode = 0,
                         std::optional<std::int64_t> aTrackWidthOverride = std::nullopt );
 
@@ -175,6 +175,15 @@ public:
      */
     bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
                            const ROUTING_EDGE_STYLE* aStyle = nullptr ) const;
+    /** Select the first legal ViaInfo in the net's ordered ViaRule.
+     *
+     * The returned style contains the complete manufactured padstack span,
+     * not merely the two layers requested by the maze transition.  No legacy
+     * fallback is considered when the net declares at least one profile.
+     */
+    std::optional<ROUTING_EDGE_STYLE> SelectViaStyle(
+            int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
+            bool aAttachesToSmd = false ) const;
     std::int64_t ResolveTrackWidth( int aNetCode,
                                     const ROUTING_EDGE_STYLE& aStyle ) const;
     std::optional<PIN_ENTRY_STYLE> PinEntryStyle( std::size_t aPadIndex,
@@ -360,6 +369,7 @@ private:
                       int aTargetLayer, const AUTOROUTE_CONTROL& aControl ) const;
     bool canFinish( const ROUTER_NODE& aNode, const ROUTING_PAD& aTarget,
                     int aNetCode ) const;
+    bool assignViaStyles( ROUTING_CONNECTION& aConnection ) const;
 
 private:
     const BOARD_SNAPSHOT&     m_board;
@@ -402,6 +412,8 @@ private:
     std::unordered_map<int, std::int64_t> m_viaRadii;
     std::unordered_map<int, std::int64_t> m_viaDrillRadii;
     std::unordered_map<int, std::int64_t> m_netClearances;
+    int m_viaOverrideNetCode = 0;
+    std::optional<ROUTING_VIA_PROFILE> m_viaOverride;
     // Pad centers are queried for almost every visibility candidate when
     // distinguishing same-net holes from foreign drills.  Cache the result by
     // net and position instead of rescanning every net's pad list per query.

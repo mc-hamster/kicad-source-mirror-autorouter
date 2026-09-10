@@ -756,13 +756,15 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
                                         const AUTOROUTER_SETTINGS& aSettings,
                                         ROUTING_OCCUPANCY& aOccupancy,
                                         int aViaOverrideNetCode,
-                                        std::optional<ROUTING_VIA_DIMENSION> aViaOverride,
+                                        std::optional<ROUTING_VIA_PROFILE> aViaOverride,
                                         int aTrackWidthOverrideNetCode,
                                         std::optional<std::int64_t> aTrackWidthOverride ) :
         m_board( aBoard ),
         m_settings( aSettings ),
         m_occupancy( aOccupancy ),
-        m_activeGridStep( std::max<std::int64_t>( 1, aSettings.gridStepIU ) )
+        m_activeGridStep( std::max<std::int64_t>( 1, aSettings.gridStepIU ) ),
+        m_viaOverrideNetCode( aViaOverrideNetCode ),
+        m_viaOverride( aViaOverride )
 {
     // A search engine is constructed for one immutable board and one
     // connection at a time.  Cache the net dimensions and obstacle bounds
@@ -780,12 +782,17 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
 
         m_trackRadii[net.netCode] = std::max<std::int64_t>( 1,
                                                             ( width > 0 ? width : 150000 ) / 2 );
-        m_viaRadii[net.netCode] = std::max<std::int64_t>( 1,
-                                                          net.viaDiameter > 0
-                                                                  ? net.viaDiameter / 2
-                                                                  : 300000 );
+        std::int64_t maximumViaDiameter = net.viaDiameter;
+        std::int64_t maximumViaDrill = net.viaDrill;
+        for( const ROUTING_VIA_PROFILE& profile : net.viaProfiles )
+        {
+            maximumViaDiameter = std::max( maximumViaDiameter, profile.diameter );
+            maximumViaDrill = std::max( maximumViaDrill, profile.drill );
+        }
+        m_viaRadii[net.netCode] = std::max<std::int64_t>(
+                1, maximumViaDiameter > 0 ? maximumViaDiameter / 2 : 300000 );
         m_viaDrillRadii[net.netCode] = std::max<std::int64_t>(
-                1, net.viaDrill > 0 ? net.viaDrill / 2 : 150000 );
+                1, maximumViaDrill > 0 ? maximumViaDrill / 2 : 150000 );
         m_netClearances[net.netCode] = std::max<std::int64_t>( 0, net.clearance );
 
         for( std::size_t padIndex : net.padIndices )
@@ -1957,6 +1964,158 @@ bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
     const auto clearance = style ? std::max<std::int64_t>( 0, style->clearance ) : 0;
     return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius,
                              radius, clearance );
+}
+
+
+std::optional<ROUTING_EDGE_STYLE> MAZE_SEARCH_ENGINE::SelectViaStyle(
+        int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
+        bool aAttachesToSmd ) const
+{
+    if( aStart.layer == aEnd.layer || aStart.point != aEnd.point )
+        return std::nullopt;
+
+    const ROUTING_NET* net = nullptr;
+    for( const ROUTING_NET& candidate : m_board.nets )
+    {
+        if( candidate.netCode == aNetCode )
+        {
+            net = &candidate;
+            break;
+        }
+    }
+
+    const auto tryStyle = [&]( ROUTING_EDGE_STYLE aStyle,
+                               bool aAttachSmdAllowed )
+            -> std::optional<ROUTING_EDGE_STYLE>
+    {
+        if( aAttachesToSmd && !m_settings.allowViaInSmdPad && !aAttachSmdAllowed )
+            return std::nullopt;
+
+        std::vector<int> span = VIA_RULE::LayersFor( m_settings, aStart.layer,
+                                                     aEnd.layer, &aStyle );
+        if( span.empty() )
+            return std::nullopt;
+
+        // Canonicalize the complete manufactured span now.  Reconstruction
+        // and proposal emission must not shrink it to the maze edge's layers.
+        aStyle.viaLayers = std::move( span );
+        if( aStyle.viaType == ROUTER_VIA_TYPE::AUTO )
+        {
+            aStyle.viaType = aStyle.viaLayers == VIA_RULE::ThroughLayers( m_settings )
+                                     ? ROUTER_VIA_TYPE::THROUGH
+                                     : ROUTER_VIA_TYPE::BLIND_BURIED;
+        }
+
+        if( !CanUseSegment( aNetCode, aStart, aEnd, true, &aStyle ) )
+            return std::nullopt;
+
+        return aStyle;
+    };
+
+    // A fanout task has already selected one entry from the combined
+    // net/board ViaRule.  Keep that decision local and exclusive so another
+    // profile cannot leak in between preflight and forced insertion.
+    if( m_viaOverride && m_viaOverrideNetCode == aNetCode )
+    {
+        ROUTING_EDGE_STYLE style;
+        style.viaDiameter = m_viaOverride->diameter;
+        style.viaDrill = m_viaOverride->drill;
+        style.viaLayers = m_viaOverride->layers;
+        style.viaType = m_viaOverride->type;
+        return tryStyle( std::move( style ), m_viaOverride->attachSmdAllowed );
+    }
+
+    if( net && !net->viaProfiles.empty() )
+    {
+        for( const ROUTING_VIA_PROFILE& profile : net->viaProfiles )
+        {
+            ROUTING_EDGE_STYLE style;
+            style.viaDiameter = profile.diameter > 0 ? profile.diameter : net->viaDiameter;
+            style.viaDrill = profile.drill > 0 ? profile.drill : net->viaDrill;
+            style.viaLayers = profile.layers;
+            style.viaType = profile.type;
+            if( style.viaDiameter <= 0 || style.viaDrill <= 0 )
+                continue;
+
+            if( auto selected = tryStyle( std::move( style ), profile.attachSmdAllowed ) )
+                return selected;
+        }
+
+        // An explicit ViaRule is authoritative.  Falling back to an invented
+        // through via here would violate the same rule that rejected every
+        // declared ViaInfo above.
+        return std::nullopt;
+    }
+
+    ROUTING_EDGE_STYLE legacy;
+    legacy.viaDiameter = net && net->viaDiameter > 0
+                                 ? net->viaDiameter : 2 * netViaRadius( aNetCode );
+    legacy.viaDrill = net && net->viaDrill > 0
+                              ? net->viaDrill : 2 * netViaDrillRadius( aNetCode );
+    legacy.viaType = ROUTER_VIA_TYPE::THROUGH;
+    return tryStyle( std::move( legacy ), false );
+}
+
+
+bool MAZE_SEARCH_ENGINE::assignViaStyles( ROUTING_CONNECTION& aConnection ) const
+{
+    if( !HasValidEdgeStyles( aConnection ) )
+        return false;
+
+    const bool hasVia = std::adjacent_find(
+            aConnection.nodes.begin(), aConnection.nodes.end(),
+            []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
+            { return aLeft.layer != aRight.layer; } ) != aConnection.nodes.end();
+    if( !hasVia )
+        return true;
+
+    EnsureEdgeStyles( aConnection );
+    for( std::size_t edge = 1; edge < aConnection.nodes.size(); ++edge )
+    {
+        const ROUTER_NODE& from = aConnection.nodes[edge - 1];
+        const ROUTER_NODE& to = aConnection.nodes[edge];
+        if( from.layer == to.layer )
+            continue;
+
+        ROUTING_EDGE_STYLE& current = aConnection.edgeStyles[edge - 1];
+        const bool explicitPadstack = current.viaDiameter > 0 || current.viaDrill > 0
+                                      || !current.viaLayers.empty()
+                                      || current.viaType != ROUTER_VIA_TYPE::AUTO;
+        if( explicitPadstack )
+        {
+            std::vector<int> span = VIA_RULE::LayersFor( m_settings, from.layer, to.layer,
+                                                         &current );
+            if( span.empty() )
+                return false;
+            current.viaLayers = std::move( span );
+            if( current.viaType == ROUTER_VIA_TYPE::AUTO )
+            {
+                current.viaType = current.viaLayers == VIA_RULE::ThroughLayers( m_settings )
+                                          ? ROUTER_VIA_TYPE::THROUGH
+                                          : ROUTER_VIA_TYPE::BLIND_BURIED;
+            }
+            if( !CanUseSegment( aConnection.netCode, from, to, true, &current ) )
+                return false;
+            continue;
+        }
+
+        const bool attachesToSmd = std::any_of(
+                m_board.pads.begin(), m_board.pads.end(), [&]( const ROUTING_PAD& aPad )
+                {
+                    return aPad.netCode == aConnection.netCode && aPad.isSmd
+                           && aPad.position == from.point
+                           && ( isOnPadLayer( aPad, from.layer )
+                                || isOnPadLayer( aPad, to.layer ) );
+                } );
+        auto selected = SelectViaStyle( aConnection.netCode, from, to, attachesToSmd );
+        if( !selected )
+            return false;
+        selected->trackWidth = current.trackWidth;
+        selected->clearance = current.clearance;
+        current = std::move( *selected );
+    }
+
+    return true;
 }
 
 
@@ -3834,7 +3993,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             planned.nodes.push_back( { point, aTarget.fanoutSourceLayer } );
         planned.nodes.push_back( { aTarget.position, aTarget.fanoutTargetLayer } );
 
-        bool allowed = true;
+        bool allowed = assignViaStyles( planned );
         for( std::size_t index = 1; index < planned.nodes.size(); ++index )
         {
             if( aCancel && aCancel() )
@@ -3843,7 +4002,8 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             const ROUTER_NODE& first = planned.nodes[index - 1];
             const ROUTER_NODE& second = planned.nodes[index];
             const bool via = first.layer != second.layer;
-            if( !CanUseSegment( planned.netCode, first, second, via ) )
+            const ROUTING_EDGE_STYLE* style = via ? &planned.edgeStyles[index - 1] : nullptr;
+            if( !CanUseSegment( planned.netCode, first, second, via, style ) )
             {
                 allowed = false;
                 break;
@@ -3890,7 +4050,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             planned.nodes.push_back( { *point, aStart.fanoutSourceLayer } );
         }
 
-        bool allowed = true;
+        bool allowed = assignViaStyles( planned );
         for( std::size_t index = 1; index < planned.nodes.size(); ++index )
         {
             if( aCancel && aCancel() )
@@ -3899,7 +4059,8 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             const ROUTER_NODE& first = planned.nodes[index - 1];
             const ROUTER_NODE& second = planned.nodes[index];
             const bool via = first.layer != second.layer;
-            if( !CanUseSegment( planned.netCode, first, second, via ) )
+            const ROUTING_EDGE_STYLE* style = via ? &planned.edgeStyles[index - 1] : nullptr;
+            if( !CanUseSegment( planned.netCode, first, second, via, style ) )
             {
                 allowed = false;
                 break;
@@ -3934,12 +4095,12 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         const ROUTER_NODE source{ aStart.position, aTarget.fanoutSourceLayer };
         const ROUTER_NODE landing{ aTarget.position, aTarget.fanoutSourceLayer };
         const ROUTER_NODE destination{ aTarget.position, aTarget.fanoutTargetLayer };
-        const bool viaAllowed = CanUseSegment( aStart.netCode, landing, destination, true );
+        const auto viaStyle = SelectViaStyle( aStart.netCode, landing, destination );
 
         const bool stubAllowed = isSegmentAllowed(
                 source.point, landing.point, source.layer, aStart.netCode, false,
                 netTrackRadius( aStart.netCode ), -1 );
-        if( viaAllowed && stubAllowed )
+        if( viaStyle && stubAllowed )
         {
             ROUTING_CONNECTION direct;
             direct.netCode = aStart.netCode;
@@ -3947,6 +4108,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             direct.cost = control.TraceCost( distance( source.point, landing.point ) )
                           + control.ViaCost();
             direct.nodes = { source, landing, destination };
+            direct.edgeStyles = { {}, *viaStyle };
 
             if( debug )
                 autorouterDebugLog( "END search via direct fanout path" );
@@ -3971,12 +4133,12 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         const ROUTER_NODE source{ aStart.position, aStart.fanoutTargetLayer };
         const ROUTER_NODE landing{ aStart.position, aStart.fanoutSourceLayer };
         const ROUTER_NODE destination{ aTarget.position, aStart.fanoutSourceLayer };
-        const bool viaAllowed = CanUseSegment( aStart.netCode, source, landing, true );
+        const auto viaStyle = SelectViaStyle( aStart.netCode, source, landing );
 
         const bool stubAllowed = isSegmentAllowed(
                 landing.point, destination.point, destination.layer, aStart.netCode, false,
                 -1, netTrackRadius( aStart.netCode ) );
-        if( viaAllowed && stubAllowed )
+        if( viaStyle && stubAllowed )
         {
             ROUTING_CONNECTION direct;
             direct.netCode = aStart.netCode;
@@ -3984,6 +4146,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             direct.cost = control.TraceCost( distance( landing.point, destination.point ) )
                           + control.ViaCost();
             direct.nodes = { source, landing, destination };
+            direct.edgeStyles = { *viaStyle, {} };
 
             if( debug )
                 autorouterDebugLog( "END search via reversed direct fanout path" );
@@ -4213,6 +4376,9 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
 
             result.nodes = std::move( simplified );
 
+            if( !assignViaStyles( result ) )
+                continue;
+
             logSearchState( "END search route found" );
             return result;
         }
@@ -4241,6 +4407,9 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                 }
                 std::reverse( result.nodes.begin(), result.nodes.end() );
                 result.fromPadIndex = startOwners.at( result.nodes.front() );
+
+                if( !assignViaStyles( result ) )
+                    continue;
 
                 logSearchState( "END fanout search at first drill" );
                 return result;
@@ -4278,20 +4447,16 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                 {
                     continue;
                 }
-                // Match Freerouting's conservative fanout policy: a via is
-                // not allowed to start in a single-layer SMD pad unless the
-                // user explicitly enabled via-in-pad.  Without this guard
-                // the cheaper layer-transition edge wins immediately and
-                // produces a via at the pad centre instead of an escaped
-                // fanout stub.
-                if( !m_settings.allowViaInSmdPad
-                    && std::any_of( starts.begin(), starts.end(), [&]( const auto& terminal )
-                       { return terminal.pad.isSmd && terminal.pad.position == current.node.point; } ) )
-                {
-                    continue;
-                }
-
-                if( !CanUseSegment( aStart.netCode, current.node, next, true ) )
+                // ViaInfo.attachSmdAllowed is profile-local.  A later entry
+                // may legally attach even when an earlier one cannot.
+                const bool attachesToSmd = std::any_of(
+                        starts.begin(), starts.end(), [&]( const auto& terminal )
+                        {
+                            return terminal.pad.isSmd
+                                   && terminal.pad.position == current.node.point;
+                        } );
+                if( !SelectViaStyle( aStart.netCode, current.node, next,
+                                     attachesToSmd ) )
                     continue;
             }
             else if( !isSegmentAllowedFromKnownStart( current.node.point, next.point, next.layer,
