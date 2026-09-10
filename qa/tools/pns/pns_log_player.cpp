@@ -19,6 +19,8 @@
 
 #include <core/profile.h>
 
+#include <board_design_settings.h>
+
 #include "pns_test_debug_decorator.h"
 #include "pns_log_file.h"
 #include "pns_log_player.h"
@@ -39,7 +41,8 @@ PNS_LOG_PLAYER::~PNS_LOG_PLAYER()
 {
 }
 
-void PNS_LOG_PLAYER::createRouter()
+
+void PNS_LOG_PLAYER::CreateRouter()
 {
     m_viewTracker.reset( new PNS_LOG_VIEW_TRACKER );
     m_iface.reset( new PNS_LOG_PLAYER_KICAD_IFACE( m_viewTracker.get() ) );
@@ -83,7 +86,9 @@ const PNS_LOG_FILE::COMMIT_STATE PNS_LOG_PLAYER::GetRouterUpdatedItems()
     // fixme: update the state with the head trace (not supported in current testsuite)
     // Note: we own the head items (cloned inside GetUpdatedItems) - we need to delete them!
     for( auto head : heads )
-        delete head;
+    {
+        state.m_heads.push_back( head );
+    }
 
     return state;
 }
@@ -93,7 +98,7 @@ void PNS_LOG_PLAYER::ReplayLog( PNS_LOG_FILE* aLog, int aStartEventIndex, int aF
 {
     m_board = aLog->GetBoard();
 
-    createRouter();
+    CreateRouter();
 
     m_router->LoadSettings( aLog->GetRoutingSettings() );
 
@@ -130,7 +135,8 @@ void PNS_LOG_PLAYER::ReplayLog( PNS_LOG_FILE* aLog, int aStartEventIndex, int aF
         case LOGGER::EVT_START_ROUTE:
         {
             wxString msg;
-            PNS::SIZES_SETTINGS sizes( m_router->Sizes() );
+            PNS::SIZES_SETTINGS sizes( evt.sizes );
+            m_board->GetDesignSettings().m_UseConnectedTrackWidth = evt.useConnectedTrackWidth;
             m_iface->SetStartLayerFromPNS( routingLayer );
             m_iface->ImportSizes( sizes, ritem, nullptr, evt.p );
             m_router->UpdateSizes( sizes );
@@ -155,7 +161,7 @@ void PNS_LOG_PLAYER::ReplayLog( PNS_LOG_FILE* aLog, int aStartEventIndex, int aF
         case LOGGER::EVT_START_MULTIDRAG:
         case LOGGER::EVT_START_DRAG:
         {
-            PNS::SIZES_SETTINGS sizes( m_router->Sizes() );
+            PNS::SIZES_SETTINGS sizes( evt.sizes );
             m_iface->SetStartLayerFromPNS( routingLayer );
             m_iface->ImportSizes( sizes, ritem, nullptr, evt.p );
             m_router->UpdateSizes( sizes );
@@ -317,10 +323,10 @@ void PNS_LOG_PLAYER::ReplayLog( PNS_LOG_FILE* aLog, int aStartEventIndex, int aF
 }
 
 
-bool PNS_LOG_PLAYER::CompareResults( PNS_LOG_FILE* aLog )
+bool PNS_LOG_PLAYER::CompareResults( PNS_LOG_FILE* aLog, bool aSkipHeads )
 {
     auto cstate = GetRouterUpdatedItems();
-    return cstate.Compare( aLog->GetExpectedResult() );
+    return cstate.Compare( aLog->GetExpectedResult(), aSkipHeads );
 }
 
 

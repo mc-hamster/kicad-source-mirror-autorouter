@@ -32,6 +32,7 @@
 #include <connection_graph.h>
 
 #include <functional>
+#include <set>
 #include <wx/log.h>
 
 
@@ -450,6 +451,21 @@ void SCH_COMMIT::pushSchEdit( const wxString& aMessage, int aCommitFlags )
         }
     }
 
+    // Mark the touched screens dirty so that the state is tracked even in headless API server mode
+    if( !( aCommitFlags & SKIP_SET_DIRTY ) )
+    {
+        std::set<SCH_SCREEN*> dirtyScreens;
+
+        for( COMMIT_LINE& entry : m_entries )
+        {
+            if( SCH_SCREEN* screen = dynamic_cast<SCH_SCREEN*>( entry.m_screen ) )
+                dirtyScreens.insert( screen );
+        }
+
+        for( SCH_SCREEN* screen : dirtyScreens )
+            screen->SetContentModified();
+    }
+
     if( !( aCommitFlags & SKIP_UNDO ) && frame && undoList.GetCount() > 0 )
         frame->SaveCopyInUndoList( undoList, UNDO_REDO::UNSPECIFIED, false );
 
@@ -719,3 +735,16 @@ void SCH_COMMIT::Revert()
     clear();
 }
 
+EDA_ITEM* SCH_COMMIT::ResolveItem( KIID& aID )
+{
+    if( aID == niluuid )
+        return nullptr;
+
+    for( COMMIT_LINE& entry : m_entries )
+    {
+        if( entry.m_item && entry.m_item->IsSCH_ITEM() && entry.m_item->m_Uuid == aID )
+            return entry.m_item;
+    }
+
+    return nullptr;
+}

@@ -35,6 +35,11 @@
 
 namespace PNS {
 
+void WALKAROUND::SetCollisionFilter( COLLISION_FILTER_FUNC aFilter )
+{
+    m_collisionFilter = aFilter;
+}
+
 void WALKAROUND::start( const LINE& aInitialPath )
 {
     m_iteration = 0;
@@ -55,15 +60,20 @@ NODE::OPT_OBSTACLE WALKAROUND::nearestObstacle( const LINE& aPath )
 
     if( ! m_restrictedSet.empty() )
     {
-        opts.m_filter = [ this ] ( const ITEM* item ) -> bool
+        opts.m_filter = [ this ] ( const ITEM* item, const ITEM* aRef ) -> bool
         {
             if( m_restrictedSet.find( item ) != m_restrictedSet.end() )
                 return true;
             return false;
         };
     }
+    else 
+    {
+        opts.m_filter = m_collisionFilter;
+    }
 
-    opts.m_useClearanceEpsilon = true;
+    opts.m_useClearanceEpsilon = false;
+    
     return m_world->NearestObstacle( &aPath, opts );
 }
 
@@ -90,6 +100,19 @@ void WALKAROUND::RestrictToCluster( bool aEnabled, const TOPOLOGY::CLUSTER& aClu
             m_restrictedVertices.push_back( solid->Anchor( 0 ) );
     }
 }
+
+/*
+static wxString policy2string ( WALKAROUND::WALK_POLICY policy )
+{
+    switch(policy)
+    {
+        case WALKAROUND::WP_CCW: return wxT("ccw");
+        case WALKAROUND::WP_CW: return wxT("cw");
+        case WALKAROUND::WP_SHORTEST: return wxT("shortest");
+    }
+    return wxT("?");
+}
+*/
 
 bool WALKAROUND::singleStep()
 {
@@ -121,8 +144,10 @@ bool WALKAROUND::singleStep()
         }
 
 
-        pendingClusters[ i ] = topo.AssembleCluster( obstacle->m_item, line.Layer(), 0.0, line.Net() );
-        PNS_DBG( Dbg(), AddItem, obstacle->m_item, BLUE, 10000, wxString::Format( "col-item owner-depth %d cl-items=%d", static_cast<const NODE*>( obstacle->m_item->Owner() )->Depth(), (int) pendingClusters[i].m_items.size() ) );
+        int clusterMargin = 2 * obstacle->m_clearance + line.Width() ;
+
+        pendingClusters[ i ] = topo.AssembleCluster( obstacle->m_item, line.Layer(), 0.0, line.Net(), clusterMargin );
+        PNS_DBG( Dbg(), AddItem, obstacle->m_item, BLUE, 10000, wxString::Format( "col-item owner-depth %d cl-items=%d cl-margin=%d", static_cast<const NODE*>( obstacle->m_item->Owner() )->Depth(), (int) pendingClusters[i].m_items.size(), clusterMargin ) );
 
     }
 
@@ -212,14 +237,17 @@ bool WALKAROUND::singleStep()
 
     if( m_enabledPolicies[WP_SHORTEST] )
     {
+        COLLISION_SEARCH_OPTIONS opts;
         LINE& line = m_currentResult.lines[WP_SHORTEST];
         LINE  path_cw( line ), path_ccw( line );
 
         auto st_cw = processCluster( pendingClusters[WP_SHORTEST], path_cw, true );
         auto st_ccw = processCluster( pendingClusters[WP_SHORTEST], path_ccw, false );
 
-        bool cw_coll = st_cw ? m_world->CheckColliding( &path_cw ).has_value() : false;
-        bool ccw_coll = st_ccw ? m_world->CheckColliding( &path_ccw ).has_value() : false;
+        opts.m_filter = m_collisionFilter;
+
+        bool cw_coll = st_cw ? m_world->CheckColliding( &path_cw, opts ).has_value() : false;
+        bool ccw_coll = st_ccw ? m_world->CheckColliding( &path_ccw, opts ).has_value() : false;
 
         double lengthFactorCw = (double) path_cw.CLine().Length() / (double) m_initialLength;
         double lengthFactorCcw = (double) path_ccw.CLine().Length() / (double) m_initialLength;
@@ -403,3 +431,4 @@ void WALKAROUND::SetAllowedPolicies( std::vector<WALK_POLICY> aPolicies)
 }
 
 }
+

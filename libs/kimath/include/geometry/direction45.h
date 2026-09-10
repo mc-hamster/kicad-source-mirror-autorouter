@@ -307,6 +307,11 @@ public:
         return 1 << ( (int) m_dir );
     }
 
+    static int AllDirectionsMask()
+    {
+        return 0xffff;
+    }
+
 private:
     /**
      * Calculate the direction from a vector. If the vector's angle is not a multiple of 45

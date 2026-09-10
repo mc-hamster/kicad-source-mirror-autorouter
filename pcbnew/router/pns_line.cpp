@@ -20,7 +20,7 @@
  */
 
 #include <optional>
-
+#include <core/typeinfo.h>
 #include <math/box2.h>
 #include <math/vector2d.h>
 
@@ -1676,6 +1676,39 @@ int LINE::FindSegment( const SEGMENT* aSeg ) const
 
     return -1;
 }
+
+
+SEGMENT* LINE::FindLinkedSegment( const SEG& aSeg ) const
+{
+    for( auto lnk : Links() )
+    {
+        if( auto seg = dyn_cast<SEGMENT*>( lnk ) )
+        {
+            if( seg->Seg() == aSeg || seg->Seg() == aSeg.Reversed() )
+                return seg;
+        }
+    }
+
+    return nullptr;
+}
+
+
+SEGMENT* LINE::FindLinkContainingVertex( const VECTOR2I& aP ) const
+{
+    for( auto lnk : Links() )
+    {
+        if( auto seg = dyn_cast<SEGMENT*>( lnk ) )
+        {
+            if( seg->Seg().Contains( aP ) )
+            {
+                return seg;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 
 }
 

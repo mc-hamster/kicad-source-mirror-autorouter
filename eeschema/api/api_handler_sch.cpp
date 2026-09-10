@@ -40,6 +40,11 @@
 #include <sch_commit.h>
 #include <string_utils.h>
 #include <sch_edit_frame.h>
+#include <io/kicad/kicad_io_utils.h>
+#include <ki_error.h>
+#include <richio.h>
+#include <sch_io/kicad_sexpr/sch_io_kicad_sexpr.h>
+
 #include <sch_label.h>
 #include <sch_screen.h>
 #include <sch_sheet.h>
@@ -132,6 +137,10 @@ API_HANDLER_SCH::API_HANDLER_SCH( std::shared_ptr<SCH_CONTEXT> aContext,
             &API_HANDLER_SCH::handleSaveCopyOfDocument );
     registerHandler<RevertDocument, google::protobuf::Empty>( &API_HANDLER_SCH::handleRevertDocument );
 
+    registerHandler<commands::SaveDocumentToString, commands::SavedDocumentResponse>(
+            &API_HANDLER_SCH::handleSaveDocumentToString );
+    registerHandler<commands::SaveSelectionToString, commands::SavedSelectionResponse>(
+            &API_HANDLER_SCH::handleSaveSelectionToString );
     registerHandler<GetItems, GetItemsResponse>( &API_HANDLER_SCH::handleGetItems );
     registerHandler<GetItemsById, GetItemsResponse>( &API_HANDLER_SCH::handleGetItemsById );
 
@@ -258,8 +267,7 @@ API_HANDLER_SCH::validateDocumentInternal( const DocumentSpecifier& aDocument ) 
     if( aDocument.type() != DocumentType::DOCTYPE_SCHEMATIC )
     {
         ApiResponseStatus e;
-        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
-        e.set_error_message( "the requested document is not a schematic" );
+        e.set_status( ApiStatusCode::AS_UNHANDLED );
         return tl::unexpected( e );
     }
 
@@ -404,29 +412,88 @@ API_HANDLER_SCH::handleRevertDocument( const HANDLER_CONTEXT<RevertDocument>& aC
         return tl::unexpected( e );
     }
 
-    if( std::optional<ApiResponseStatus> headless = checkForHeadless( "RevertDocument" ) )
-        return tl::unexpected( *headless );
-
     if( std::optional<ApiResponseStatus> busy = checkForBusy() )
         return tl::unexpected( *busy );
 
-    wxFileName fn = project().AbsolutePath( schematic()->GetFileName() );
-
-    if( frame()->GetCurrentSheet().Last() != &schematic()->Root() )
+    if( !context()->RevertToSaved() )
     {
-        SCH_SHEET_PATH rootSheetPath = schematic()->Hierarchy().at( 0 );
-        frame()->GetToolManager()->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &rootSheetPath );
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "could not revert: there is no saved file on disk to revert to" );
+        return tl::unexpected( e );
     }
 
-    SCH_SCREENS screenList( schematic()->Root() );
-
-    for( SCH_SCREEN* screen = screenList.GetFirst(); screen; screen = screenList.GetNext() )
-        screen->SetContentModified( false );
-
-    frame()->ReleaseFile();
-    frame()->OpenProjectFiles( std::vector<wxString>( 1, fn.GetFullPath() ), KICTL_REVERT );
-
     return google::protobuf::Empty();
+}
+
+
+HANDLER_RESULT<commands::SavedDocumentResponse>
+API_HANDLER_SCH::handleSaveDocumentToString( const HANDLER_CONTEXT<commands::SaveDocumentToString>& aCtx )
+{
+    HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.document() );
+
+    if( !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    commands::SavedDocumentResponse response;
+
+    SCH_SHEET* topLevelSheet = schematic()->GetTopLevelSheet( 0 );
+
+    if( !topLevelSheet || !topLevelSheet->GetScreen() )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "schematic has no top-level sheet to save" );
+        return tl::unexpected( e );
+    }
+
+    STRING_FORMATTER   formatter;
+    SCH_IO_KICAD_SEXPR plugin;
+
+    plugin.FormatSchematicToFormatter( &formatter, topLevelSheet, schematic(), nullptr );
+
+    std::string contents = formatter.GetString();
+    KICAD_FORMAT::Prettify( contents, KICAD_FORMAT::FORMAT_MODE::COMPACT_TEXT_PROPERTIES );
+    response.set_contents( contents );
+
+    return response;
+}
+
+
+HANDLER_RESULT<commands::SavedSelectionResponse>
+API_HANDLER_SCH::handleSaveSelectionToString( const HANDLER_CONTEXT<commands::SaveSelectionToString>& aCtx )
+{
+    if( std::optional<ApiResponseStatus> headless = checkForHeadless( "SaveSelectionToString" ) )
+        return tl::unexpected( *headless );
+
+    SCH_SELECTION_TOOL* selTool = toolManager()->GetTool<SCH_SELECTION_TOOL>();
+    SCH_SELECTION&      selection = selTool->GetSelection();
+
+    if( selection.Empty() )
+    {
+        ApiResponseStatus e;
+        e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+        e.set_error_message( "the selection is empty" );
+        return tl::unexpected( e );
+    }
+
+    commands::SavedSelectionResponse response;
+
+    SCH_SHEET_PATH selPath = frame()->GetCurrentSheet();
+
+    for( EDA_ITEM* item : selection )
+        response.add_ids()->set_value( item->m_Uuid.AsStdString() );
+
+    STRING_FORMATTER   formatter;
+    SCH_IO_KICAD_SEXPR plugin;
+
+    plugin.Format( &selection, &selPath, *schematic(), &formatter, true );
+
+    std::string contents = formatter.GetString();
+    KICAD_FORMAT::Prettify( contents, KICAD_FORMAT::FORMAT_MODE::COMPACT_TEXT_PROPERTIES );
+    response.set_contents( contents );
+
+    return response;
 }
 
 
@@ -455,6 +522,46 @@ HANDLER_RESULT<GetOpenDocumentsResponse> API_HANDLER_SCH::handleGetOpenDocuments
     PackProject( *doc.mutable_project(), m_context->Prj() );
 
     response.mutable_documents()->Add( std::move( doc ) );
+    return response;
+}
+
+
+HANDLER_RESULT<GetDocumentModifiedStateResponse>
+API_HANDLER_SCH::handleGetDocumentModifiedState( const HANDLER_CONTEXT<GetDocumentModifiedState>& aCtx )
+{
+    if( HANDLER_RESULT<bool> documentValidation = validateDocument( aCtx.Request.document() ); !documentValidation )
+        return tl::unexpected( documentValidation.error() );
+
+    GetDocumentModifiedStateResponse response;
+
+    if( aCtx.Request.document().has_sheet_path() )
+    {
+        KIID_PATH path = UnpackSheetPath( aCtx.Request.document().sheet_path() );
+
+        std::optional<SCH_SHEET_PATH> sheetPath = schematic()->Hierarchy().GetSheetPathByKIIDPath( path );
+
+        if( !sheetPath )
+        {
+            ApiResponseStatus e;
+            e.set_status( ApiStatusCode::AS_BAD_REQUEST );
+            e.set_error_message( "the requested sheet path is not valid for this schematic" );
+            return tl::unexpected( e );
+        }
+
+        if( const SCH_SCREEN* screen = sheetPath->LastScreen() )
+        {
+            response.set_state( screen->IsContentModified() ? DocumentModifiedState::DMS_MODIFIED
+                                                            : DocumentModifiedState::DMS_UNMODIFIED );
+        }
+
+        return response;
+    }
+
+    if( !schematic()->HasHierarchy() )
+        schematic()->RefreshHierarchy();
+
+    response.set_state( schematic()->Hierarchy().IsModified() ? DocumentModifiedState::DMS_MODIFIED
+                                                              : DocumentModifiedState::DMS_UNMODIFIED );
     return response;
 }
 
@@ -514,6 +621,10 @@ HANDLER_RESULT<GetItemsResponse> API_HANDLER_SCH::handleGetItems( const HANDLER_
             for( SCH_ITEM* aItem : aScreen->Items() )
             {
                 itemMap[ aItem->Type() ].emplace_back( aItem, aPath );
+
+                // Group members live in the screen's rtree as well as in the group
+                if( aItem->Type() == SCH_GROUP_T )
+                    continue;
 
                 aItem->RunOnChildren(
                         [&]( SCH_ITEM* aChild )
@@ -963,6 +1074,10 @@ HANDLER_RESULT<ItemRequestStatus> API_HANDLER_SCH::handleCreateUpdateItemsIntern
                 }
             }
         }
+        else if( SCH_GROUP* group = dynamic_cast<SCH_GROUP*>( item.get() ) )
+        {
+            unpacked = group->DeserializeGroup( anyItem, commit );
+        }
         else
         {
             unpacked = item->Deserialize( anyItem );
@@ -1218,25 +1333,56 @@ std::optional<EDA_ITEM*> API_HANDLER_SCH::getItemFromDocument( const DocumentSpe
 }
 
 
-std::optional<TITLE_BLOCK*> API_HANDLER_SCH::getTitleBlock()
+SCH_SCREEN* API_HANDLER_SCH::resolveScreenFromDocument( const DocumentSpecifier& aDocument ) const
 {
-    wxCHECK( m_context->GetCurrentSheet(), std::nullopt );
-    return &m_context->GetCurrentSheet()->LastScreen()->GetTitleBlock();
+    if( aDocument.has_sheet_path() )
+    {
+        KIID_PATH path = UnpackSheetPath( aDocument.sheet_path() );
+
+        if( std::optional<SCH_SHEET_PATH> sheetPath = schematic()->Hierarchy().GetSheetPathByKIIDPath( path ) )
+            return sheetPath->LastScreen();
+
+        return nullptr;
+    }
+
+    if( std::optional<SCH_SHEET_PATH> current = m_context->GetCurrentSheet() )
+        return current->LastScreen();
+
+    // Headless mode has no current sheet; the root sheet is the implicit target.
+    SCH_SHEET_PATH path;
+    path.push_back( &schematic()->Root() );
+    return path.LastScreen();
 }
 
 
-std::optional<PAGE_INFO> API_HANDLER_SCH::getPageSettings()
+std::optional<TITLE_BLOCK*> API_HANDLER_SCH::getTitleBlock( const DocumentSpecifier& aDocument )
 {
-    wxCHECK( m_context->GetCurrentSheet(), std::nullopt );
-    return m_context->GetCurrentSheet()->LastScreen()->GetPageSettings();
+    if( SCH_SCREEN* screen = resolveScreenFromDocument( aDocument ) )
+        return &screen->GetTitleBlock();
+
+    return std::nullopt;
 }
 
 
-bool API_HANDLER_SCH::setPageSettings( const PAGE_INFO& aPageInfo )
+std::optional<PAGE_INFO> API_HANDLER_SCH::getPageSettings( const DocumentSpecifier& aDocument )
 {
-    wxCHECK( m_context->GetCurrentSheet(), false );
-    m_context->GetCurrentSheet()->LastScreen()->SetPageSettings( aPageInfo );
-    return true;
+    if( SCH_SCREEN* screen = resolveScreenFromDocument( aDocument ) )
+        return screen->GetPageSettings();
+
+    return std::nullopt;
+}
+
+
+bool API_HANDLER_SCH::setPageSettings( const DocumentSpecifier& aDocument, const PAGE_INFO& aPageInfo )
+{
+    if( SCH_SCREEN* screen = resolveScreenFromDocument( aDocument ) )
+    {
+        screen->SetPageSettings( aPageInfo );
+        screen->SetContentModified();
+        return true;
+    }
+
+    return false;
 }
 
 
@@ -1262,6 +1408,10 @@ void API_HANDLER_SCH::onModified()
     {
         frame()->Refresh();
         frame()->OnModify();
+    }
+    else if( schematic()->GetCurrentScreen() )
+    {
+        schematic()->GetCurrentScreen()->SetContentModified();
     }
 }
 

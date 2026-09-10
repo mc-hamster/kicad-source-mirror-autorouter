@@ -1054,6 +1054,7 @@ set( PCB_COMMON_SRCS
     ${CMAKE_SOURCE_DIR}/pcbnew/footprint_utils.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/footprint_library_adapter.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/fix_board_shape.cpp
+    ${CMAKE_SOURCE_DIR}/pcbnew/import_net_names.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/layer_utils.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/netinfo_item.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/netinfo_list.cpp
@@ -1066,7 +1067,7 @@ set( PCB_COMMON_SRCS
     ${CMAKE_SOURCE_DIR}/pcbnew/pcb_field.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/pcb_table.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/pcb_tablecell.cpp
-    ${CMAKE_SOURCE_DIR}/pcbnew/pcb_griditem.cpp
+    ${CMAKE_SOURCE_DIR}/pcbnew/pcb_grid_item.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/pcb_text.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/pcb_textbox.cpp
     ${CMAKE_SOURCE_DIR}/pcbnew/project_pcb.cpp

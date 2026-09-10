@@ -160,6 +160,10 @@ public:
     int ViaForcePropIterationLimit() const { return m_viaForcePropIterationLimit; }
     void SetViaForcePropIterationLimit(int aLimit) { m_viaForcePropIterationLimit = aLimit; }
 
+    double DiffPairGapPickupRatioThreshold() const { return m_diffPairGapPickupRatioThreshold; }
+    double DiffPairGapCouplingRecognitionThreshold() const { return m_diffPairGapCouplingRecognitionThreshold; }
+    double DiffPairWidthToMiterRatio() const { return m_diffPairWidthToMiterRatio; }
+
 private:
     bool m_shoveVias;
     bool m_startDiagonal;
@@ -186,7 +190,10 @@ private:
     int m_walkaroundIterationLimit;
     int m_shoveIterationLimit;
     int m_viaForcePropIterationLimit;
+    double m_diffPairGapPickupRatioThreshold;
+    double m_diffPairGapCouplingRecognitionThreshold;
     double m_walkaroundHugLengthThreshold;
+    double m_diffPairWidthToMiterRatio;
 
     TIME_LIMIT m_shoveTimeLimit;
     TIME_LIMIT m_walkaroundTimeLimit;

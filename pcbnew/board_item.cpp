@@ -66,7 +66,7 @@ bool BOARD_ITEM::IsGroupableType() const
     case PCB_ZONE_T:
     case PCB_BARCODE_T:
     case PCB_POINT_T:
-    case PCB_GRIDITEM_T:
+    case PCB_GRID_ITEM_T:
         return true;
     default:
         return false;
@@ -178,6 +178,14 @@ int BOARD_ITEM::GetMaxError() const
     return ARC_HIGH_DEF;
 }
 
+
+PCB_LAYER_ID BOARD_ITEM::GetLayer() const
+{
+    wxASSERT_MSG( IsSingleLayerType( Type() ),
+                  wxString::Format( wxT( "GetLayer() must be overridden for multi-layer types (%s)." ), GetClass() ) );
+
+    return m_layer;
+}
 
 int BOARD_ITEM::BoardLayerCount() const
 {

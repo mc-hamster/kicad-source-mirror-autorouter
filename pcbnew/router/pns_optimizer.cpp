@@ -1319,7 +1319,6 @@ bool OPTIMIZER::fanoutCleanup( LINE* aLine )
     return false;
 }
 
-
 int findCoupledVertices( const VECTOR2I& aVertex, const SEG& aOrigSeg,
                          const SHAPE_LINE_CHAIN& aCoupled, DIFF_PAIR* aPair, int* aIndices )
 {
@@ -1333,7 +1332,7 @@ int findCoupledVertices( const VECTOR2I& aVertex, const SEG& aOrigSeg,
         if( s.ApproxParallel( aOrigSeg ) )
         {
             int64_t dist =
-                    int64_t{ ( ( projOverCoupled - aVertex ).EuclideanNorm() ) } - aPair->Width();
+                    int64_t{ ( ( projOverCoupled - aVertex ).EuclideanNorm() ) } - aPair->Dimensions().Width();
 
             if( aPair->GapConstraint().Matches( dist ) )
             {
@@ -1393,7 +1392,10 @@ bool coupledBypass( NODE* aNode, DIFF_PAIR* aPair, bool aRefIsP, const SHAPE_LIN
                 SHAPE_LINE_CHAIN bypass = dir.BuildInitialTrace( vs, aCoupled.CPoint(j),
                                                                  dir.IsDiagonal() );
 
-                int64_t coupledLength = aPair->CoupledLength( aRef, bypass );
+                bool tmp;                
+                int64_t coupledLength;
+                
+                std::tie(coupledLength, tmp)= aPair->CoupledLength( aRef, bypass );
 
                 SHAPE_LINE_CHAIN newCoupled = aCoupled;
 
@@ -1440,7 +1442,9 @@ bool OPTIMIZER::mergeDpStep( DIFF_PAIR* aPair, bool aTryP, int step )
 
     int n_segs = currentPath.SegmentCount() - 1;
 
-    int64_t clenPre = aPair->CoupledLength( currentPath, coupledPath );
+    bool tmp;
+    int64_t clenPre;
+    std::tie(clenPre, tmp) = aPair->CoupledLength( currentPath, coupledPath );
     int64_t budget = clenPre / 10; // fixme: come up with something more intelligent here...
 
     while( n < n_segs - step )
@@ -1461,12 +1465,14 @@ bool OPTIMIZER::mergeDpStep( DIFF_PAIR* aPair, bool aTryP, int step )
 
             newRef = currentPath;
             newRef.Replace( s1.Index(), s2.Index(), bypass );
-
-            deltaUni = aPair->CoupledLength ( newRef, coupledPath ) - clenPre + budget;
+            bool tmp2;
+            std::tie(deltaUni, tmp2) = aPair->CoupledLength ( newRef, coupledPath );
+            deltaUni += (- clenPre + budget);
 
             if( coupledBypass( m_world, aPair, aTryP, newRef, bypass, coupledPath, newCoup ) )
             {
-                deltaCoupled = aPair->CoupledLength( newRef, newCoup ) - clenPre + budget;
+                std::tie(deltaCoupled, tmp) = aPair->CoupledLength( newRef, newCoup );
+                deltaCoupled += (- clenPre + budget);
 
                 if( deltaCoupled >= 0 )
                 {
@@ -1657,7 +1663,6 @@ bool tightenSegment( bool dir, NODE *aNode, const LINE& cur, const SHAPE_LINE_CH
     return true;
 }
 
-
 void Tighten( NODE *aNode, const SHAPE_LINE_CHAIN& aOldLine, const LINE& aNewLine,
               LINE& aOptimized )
 {
@@ -1701,5 +1706,6 @@ void Tighten( NODE *aNode, const SHAPE_LINE_CHAIN& aOldLine, const LINE& aNewLin
     //auto dbg = ROUTER::GetInstance()->GetInterface()->GetDebugDecorator();
     //dbg->AddLine ( current, 4, 100000 );
 }
+
 
 }
