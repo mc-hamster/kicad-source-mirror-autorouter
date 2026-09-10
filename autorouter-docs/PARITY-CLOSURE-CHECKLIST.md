@@ -86,11 +86,19 @@ control flow. Line perpendicular direction, angle, function and length helpers
 are source-tested at the same boundary. A third **384-record** oracle covers
 those operations over integral and rational-corner paths, negative/large turn
 factors, arbitrary poles, contained and exterior projection points, every
-segment, and zero/nonzero offsets. The complete native autorouter suite now has
-**193 passing cases**. The production 555 smoke remains host-valid and unchanged
-at 12/12 connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853
-expanded nodes. The remaining general `TileShape` dispatch and rational-support
-line transforms remain open.
+segment, and zero/nonzero offsets. The source `FloatPoint` and `FloatLine`
+kernels needed by any-angle location, door shrinking, maze projection and
+airline calculation are complete too. They include directional/grid rounding,
+vector and scalar operations, rotations, circle tangents and containment; and
+line direction adjustment, intersection, translation, finite-segment distance
+and projection, shrinking, nearest points and section division. A **512-record**
+pinned oracle covers crossing, parallel, opposite, horizontal and vertical line
+pairs, every rounding direction, tangent existence/nonexistence and zero through
+six sections under strict floating-contraction settings. The complete native
+autorouter suite now has **194 passing cases**. The production 555 smoke remains
+host-valid and unchanged at 12/12 connections, zero new DRC violations, 12 vias,
+97.101 mm and 2,853 expanded nodes. The remaining general `TileShape` dispatch
+and rational-support line transforms remain open.
 
 Fixed and negotiated-rip-up trace/via obstacles retain exact octagonal envelopes;
 free-space completion, neighbour gaps, door sections, source-style queue

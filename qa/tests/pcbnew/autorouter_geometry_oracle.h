@@ -1,6 +1,7 @@
 /* QA-only differential reader. Expectations come from the pinned Java JAR. */
 #pragma once
 #include <autorouter/board/optimize/TraceShover.h>
+#include <autorouter/geometry/planar/FloatLine.h>
 #include <autorouter/geometry/planar/IntOctagon.h>
 #include <autorouter/geometry/planar/LineSegment.h>
 #include <iomanip>
@@ -551,6 +552,131 @@ inline std::string CheckRecord( const std::string& record )
             actual << " 2 " << direction->x << ' ' << direction->y;
         else
             actual << " -1";
+    }
+    else if( tag == "FGEOM" )
+    {
+        const auto readFloatPoint = [&]()
+        {
+            FLOAT_POINT point;
+            in >> point.x >> point.y;
+            return point;
+        };
+        const FLOAT_POINT p = readFloatPoint();
+        const FLOAT_POINT q = readFloatPoint();
+        const FLOAT_POINT r = readFloatPoint();
+        const FLOAT_POINT s = readFloatPoint();
+        const FLOAT_LINE first{ p, q };
+        const FLOAT_LINE second{ readFloatPoint(), readFloatPoint() };
+        double distance, horizontalWeight, verticalWeight, angle;
+        int factor;
+        std::int64_t horizontalGrid, verticalGrid;
+        ROUTER_POINT direction;
+        int sectionCount;
+        double tolerance, tangentRadius, newSize, newLength;
+        in >> distance >> horizontalWeight >> verticalWeight >> factor >> angle
+           >> horizontalGrid >> verticalGrid >> direction.x >> direction.y
+           >> sectionCount >> tolerance >> tangentRadius >> newSize >> newLength;
+        const FLOAT_POINT circle0 = readFloatPoint();
+        const FLOAT_POINT circle1 = readFloatPoint();
+        const FLOAT_POINT circle2 = readFloatPoint();
+        const auto canonicalZero = []( double aValue )
+        { return aValue == 0 ? 0.0 : aValue; };
+        const auto printFloatPoint = [&]( FLOAT_POINT aPoint )
+        {
+            actual << canonicalZero( aPoint.x ) << ' '
+                   << canonicalZero( aPoint.y );
+        };
+        const auto printFloatLine = [&]( const FLOAT_LINE& aLine )
+        {
+            printFloatPoint( aLine.a );
+            actual << ' ';
+            printFloatPoint( aLine.b );
+        };
+        const auto printOptionalPoint = [&]( const std::optional<FLOAT_POINT>& aPoint )
+        {
+            if( !aPoint )
+                actual << -1;
+            else
+            {
+                actual << "2 ";
+                printFloatPoint( *aPoint );
+            }
+        };
+        const auto printOptionalLine = [&]( const std::optional<FLOAT_LINE>& aLine )
+        {
+            if( !aLine )
+                actual << -1;
+            else
+            {
+                actual << "4 ";
+                printFloatLine( *aLine );
+            }
+        };
+
+        actual << std::fixed << std::setprecision( 9 );
+        const INT_OCTAGON octagon = FLOAT_POINT::BoundingOctagon( { p, q, r, s } );
+        actual << octagon.leftX << ' ' << octagon.bottomY << ' '
+               << octagon.rightX << ' ' << octagon.topY << ' '
+               << octagon.upperLeftDiagonalX << ' '
+               << octagon.lowerRightDiagonalX << ' '
+               << octagon.lowerLeftDiagonalX << ' '
+               << octagon.upperRightDiagonalX;
+        actual << ' ' << canonicalZero( p.SizeSquared() )
+               << ' ' << canonicalZero( p.Size() )
+               << ' ' << canonicalZero( p.DistanceSquared( q ) )
+               << ' ' << canonicalZero( p.Distance( q ) )
+               << ' ' << canonicalZero( p.WeightedDistance(
+                        q, horizontalWeight, verticalWeight ) );
+        const auto printIntegralPoint = [&]( ROUTER_POINT aPoint )
+        { actual << aPoint.x << ' ' << aPoint.y; };
+        actual << ' '; printIntegralPoint( p.Round() );
+        actual << ' '; printIntegralPoint( p.RoundToTheRight( direction ) );
+        actual << ' '; printIntegralPoint( p.RoundToGrid( horizontalGrid, verticalGrid ) );
+        actual << ' '; printIntegralPoint( p.RoundToTheLeft( direction ) );
+        actual << ' '; printFloatPoint( p.Add( q ) );
+        actual << ' '; printFloatPoint( p.Subtract( q ) );
+        actual << ' ' << canonicalZero( p.ScalarProduct( q, r ) );
+        actual << ' '; printFloatPoint( p.ChangeSize( newSize ) );
+        actual << ' '; printFloatPoint( p.ChangeLength( q, newLength ) );
+        actual << ' '; printFloatPoint( p.MiddlePoint( q ) );
+        actual << ' ' << p.SideOf( q, r );
+        actual << ' '; printFloatPoint( p.Rotate( angle, r ) );
+        actual << ' '; printFloatPoint( p.Turn90Degree( factor ) );
+        actual << ' '; printFloatPoint( p.Turn90Degree( factor, r ) );
+        actual << ' ' << ( p.IsContainedInBox( q, r, tolerance ) ? 1 : 0 );
+        const ROUTER_BOX box = p.BoundingBox();
+        actual << ' ' << box.minX << ' ' << box.minY << ' '
+               << box.maxX << ' ' << box.maxY;
+        const auto tangents = p.TangentialPoints( q, tangentRadius );
+        actual << ' ' << tangents.size();
+        for( const FLOAT_POINT tangent : tangents )
+        {
+            actual << ' ';
+            printFloatPoint( tangent );
+        }
+        actual << ' '; printOptionalPoint( p.LeftTangentialPoint( q, tangentRadius ) );
+        actual << ' '; printOptionalPoint( p.RightTangentialPoint( q, tangentRadius ) );
+        actual << ' '; printFloatPoint( circle0.CircleCenter( circle1, circle2 ) );
+        actual << ' ' << ( p.InsideCircle( circle0, circle1, circle2 ) ? 1 : 0 );
+
+        actual << ' '; printFloatLine( first.Opposite() );
+        actual << ' '; printFloatLine( first.AdjustDirection( second ) );
+        actual << ' '; printOptionalPoint( first.Intersection( second ) );
+        actual << ' '; printFloatLine( first.Translate( distance ) );
+        actual << ' ' << canonicalZero( first.SignedDistance( r ) );
+        actual << ' '; printFloatPoint( first.PerpendicularProjection( r ) );
+        actual << ' ' << canonicalZero( first.SegmentDistance( r ) );
+        actual << ' '; printOptionalLine( first.SegmentProjection( second ) );
+        actual << ' '; printOptionalLine( first.SegmentProjection2( second ) );
+        actual << ' '; printFloatLine( first.ShrinkSegment( std::abs( distance ) ) );
+        actual << ' '; printFloatPoint( first.NearestSegmentPoint( r ) );
+        const auto sections = first.DivideSegmentIntoSections( sectionCount );
+        actual << ' ' << sections.size();
+        for( const FLOAT_LINE& section : sections )
+        {
+            actual << ' ';
+            printFloatLine( section );
+        }
     }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );
