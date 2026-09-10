@@ -74,7 +74,7 @@ WIDE nearestInteger( WIDE aNumerator, WIDE aDenominator )
 }
 
 
-bool constrainAxis( std::int64_t aOrigin, const WIDE& aStep,
+bool constrainAxis( const WIDE& aOrigin, const WIDE& aStep,
                     std::int64_t aMinimum, std::int64_t aMaximum,
                     WIDE& aFirst, WIDE& aLast )
 {
@@ -164,6 +164,46 @@ std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRo
 }
 
 
+std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+        const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+        const ROUTER_POINT& aFrom, const PLANAR::INT_OCTAGON& aRoom )
+{
+    if( aRoom.Dimension() < 0 )
+        return std::nullopt;
+
+    const WIDE dx = WIDE( aEnd.x ) - aStart.x;
+    const WIDE dy = WIDE( aEnd.y ) - aStart.y;
+    const WIDE divisor = greatestCommonDivisor( dx, dy );
+
+    if( divisor == 0 )
+        return aRoom.Contains( aStart ) ? std::optional( aStart ) : std::nullopt;
+
+    const WIDE stepX = dx / divisor;
+    const WIDE stepY = dy / divisor;
+    WIDE first = 0;
+    WIDE last = divisor;
+
+    if( !constrainAxis( aStart.x, stepX, aRoom.leftX, aRoom.rightX, first, last )
+        || !constrainAxis( aStart.y, stepY, aRoom.bottomY, aRoom.topY, first, last )
+        || !constrainAxis( WIDE( aStart.x ) - aStart.y, stepX - stepY,
+                           aRoom.upperLeftDiagonalX, aRoom.lowerRightDiagonalX,
+                           first, last )
+        || !constrainAxis( WIDE( aStart.x ) + aStart.y, stepX + stepY,
+                           aRoom.lowerLeftDiagonalX, aRoom.upperRightDiagonalX,
+                           first, last ) )
+    {
+        return std::nullopt;
+    }
+
+    const WIDE denominator = stepX * stepX + stepY * stepY;
+    const WIDE numerator = ( WIDE( aFrom.x ) - aStart.x ) * stepX
+                           + ( WIDE( aFrom.y ) - aStart.y ) * stepY;
+    const WIDE index = std::clamp( nearestInteger( numerator, denominator ), first, last );
+    return ROUTER_POINT{ ( WIDE( aStart.x ) + index * stepX ).convert_to<std::int64_t>(),
+                         ( WIDE( aStart.y ) + index * stepY ).convert_to<std::int64_t>() };
+}
+
+
 std::vector<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
         const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
         const std::vector<ROUTER_BOX>& aOrthogonalCuts )
@@ -192,6 +232,56 @@ std::vector<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
         addCutIndices( aStart.x, stepX, cut.maxX, divisor, indices );
         addCutIndices( aStart.y, stepY, cut.minY, divisor, indices );
         addCutIndices( aStart.y, stepY, cut.maxY, divisor, indices );
+    }
+
+    std::vector<ROUTER_POINT> result;
+    result.reserve( indices.size() );
+    for( const WIDE& index : indices )
+    {
+        result.push_back( {
+                ( WIDE( aStart.x ) + index * stepX ).convert_to<std::int64_t>(),
+                ( WIDE( aStart.y ) + index * stepY ).convert_to<std::int64_t>() } );
+    }
+    return result;
+}
+
+
+std::vector<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+        const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+        const std::vector<PLANAR::INT_OCTAGON>& aFortyFiveDegreeCuts )
+{
+    const WIDE dx = WIDE( aEnd.x ) - aStart.x;
+    const WIDE dy = WIDE( aEnd.y ) - aStart.y;
+    const WIDE divisor = greatestCommonDivisor( dx, dy );
+    if( divisor == 0 )
+        return { aStart };
+
+    const WIDE stepX = dx / divisor;
+    const WIDE stepY = dy / divisor;
+    std::set<WIDE> indices{ 0, divisor };
+    if( divisor > 1 )
+    {
+        indices.insert( 1 );
+        indices.insert( divisor - 1 );
+    }
+
+    for( const PLANAR::INT_OCTAGON& cut : aFortyFiveDegreeCuts )
+    {
+        if( cut.Dimension() < 0 )
+            continue;
+
+        addCutIndices( aStart.x, stepX, cut.leftX, divisor, indices );
+        addCutIndices( aStart.x, stepX, cut.rightX, divisor, indices );
+        addCutIndices( aStart.y, stepY, cut.bottomY, divisor, indices );
+        addCutIndices( aStart.y, stepY, cut.topY, divisor, indices );
+        addCutIndices( WIDE( aStart.x ) - aStart.y, stepX - stepY,
+                       cut.upperLeftDiagonalX, divisor, indices );
+        addCutIndices( WIDE( aStart.x ) - aStart.y, stepX - stepY,
+                       cut.lowerRightDiagonalX, divisor, indices );
+        addCutIndices( WIDE( aStart.x ) + aStart.y, stepX + stepY,
+                       cut.lowerLeftDiagonalX, divisor, indices );
+        addCutIndices( WIDE( aStart.x ) + aStart.y, stepX + stepY,
+                       cut.upperRightDiagonalX, divisor, indices );
     }
 
     std::vector<ROUTER_POINT> result;

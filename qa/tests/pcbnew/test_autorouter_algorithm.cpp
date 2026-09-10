@@ -86,9 +86,12 @@
 #include <bit>
 #include <cmath>
 #include <fstream>
+#include <numeric>
 #include <sstream>
 #include <random>
 #include <queue>
+
+#include <boost/multiprecision/cpp_int.hpp>
 
 
 using namespace KICAD_AUTOROUTER;
@@ -7022,6 +7025,114 @@ BOOST_AUTO_TEST_CASE( TargetItemDoorClipsExactDiagonalLatticeToReachedRoom )
             { base - 200, base - 200, base + 200, base + 200 } );
     BOOST_REQUIRE( large );
     BOOST_CHECK( *large == ROUTER_POINT( { base - 50, base - 50 } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( TargetItemDoorClipsExactLatticeToOctagonalRoom )
+{
+    using PLANAR::INT_OCTAGON;
+    std::mt19937 random( 450230104 );
+    std::uniform_int_distribution<int> coordinate( -80, 80 );
+    std::uniform_int_distribution<int> extent( 10, 80 );
+
+    for( int test = 0; test < 4096; ++test )
+    {
+        const int left = coordinate( random );
+        const int bottom = coordinate( random );
+        const int right = left + extent( random );
+        const int top = bottom + extent( random );
+        const INT_OCTAGON room = INT_OCTAGON(
+                left, bottom, right, top,
+                left - top + test % 9,
+                right - bottom - ( test / 9 ) % 9,
+                left + bottom + ( test / 81 ) % 9,
+                right + top - ( test / 729 ) % 9 ).Normalize();
+        const ROUTER_POINT start{ coordinate( random ), coordinate( random ) };
+        const ROUTER_POINT end{ coordinate( random ), coordinate( random ) };
+        const ROUTER_POINT from{ coordinate( random ), coordinate( random ) };
+        const auto actual = TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                start, end, from, room );
+
+        const auto dx = end.x - start.x;
+        const auto dy = end.y - start.y;
+        const auto divisor = std::gcd( std::abs( dx ), std::abs( dy ) );
+        std::optional<ROUTER_POINT> expected;
+        boost::multiprecision::cpp_int bestDistance;
+        if( divisor == 0 )
+        {
+            if( room.Contains( start ) )
+                expected = start;
+        }
+        else
+        {
+            const auto stepX = dx / divisor;
+            const auto stepY = dy / divisor;
+            for( std::int64_t index = 0; index <= divisor; ++index )
+            {
+                const ROUTER_POINT point{ start.x + index * stepX,
+                                          start.y + index * stepY };
+                if( !room.Contains( point ) )
+                    continue;
+                const boost::multiprecision::cpp_int deltaX = point.x - from.x;
+                const boost::multiprecision::cpp_int deltaY = point.y - from.y;
+                const auto distance = deltaX * deltaX + deltaY * deltaY;
+                // The source rounding convention chooses the later lattice
+                // index at a half-way tie.
+                if( !expected || distance <= bestDistance )
+                {
+                    expected = point;
+                    bestDistance = distance;
+                }
+            }
+        }
+        BOOST_CHECK( actual == expected );
+        if( actual )
+        {
+            BOOST_CHECK( room.Contains( *actual ) );
+            BOOST_CHECK( CONTACT_GEOMETRY::OnSegment( start, end, *actual ) );
+        }
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( OctagonalRoomSeedPointsBracketEverySupportLineCrossing )
+{
+    using PLANAR::INT_OCTAGON;
+    const ROUTER_POINT start{ -100, -60 };
+    const ROUTER_POINT end{ 100, 60 };
+    const INT_OCTAGON cut( -45, -38, 52, 41, -63, 69, -57, 76 );
+    const auto seeds = TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+            start, end, std::vector<INT_OCTAGON>{ cut.Normalize() } );
+    BOOST_CHECK_LT( seeds.size(), 48U );
+    BOOST_CHECK( seeds.front() == start );
+    BOOST_CHECK( seeds.back() == end );
+
+    std::set<std::pair<std::int64_t, std::int64_t>> seedSet;
+    for( const ROUTER_POINT& point : seeds )
+        seedSet.emplace( point.x, point.y );
+    const auto divisor = std::gcd( std::abs( end.x - start.x ),
+                                   std::abs( end.y - start.y ) );
+    const ROUTER_POINT step{ ( end.x - start.x ) / divisor,
+                             ( end.y - start.y ) / divisor };
+    ROUTER_POINT previous = start;
+    bool previousInside = cut.Normalize().Contains( previous );
+    for( std::int64_t index = 1; index <= divisor; ++index )
+    {
+        const ROUTER_POINT current{ start.x + index * step.x,
+                                    start.y + index * step.y };
+        const bool currentInside = cut.Normalize().Contains( current );
+        if( currentInside != previousInside )
+        {
+            BOOST_CHECK( seedSet.contains( { previous.x, previous.y } ) );
+            BOOST_CHECK( seedSet.contains( { current.x, current.y } ) );
+        }
+        previous = current;
+        previousInside = currentInside;
+    }
+    BOOST_CHECK( std::all_of( seeds.begin(), seeds.end(), [&]( const ROUTER_POINT& point )
+                              {
+                                  return CONTACT_GEOMETRY::OnSegment( start, end, point );
+                              } ) );
 }
 
 

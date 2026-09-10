@@ -65,6 +65,11 @@ public:
             const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
             const ROUTER_POINT& aFrom, const ROUTER_BOX& aRoom );
 
+    static std::optional<ROUTER_POINT> NearestIntegralPointInRoom(
+            const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+            const ROUTER_POINT& aFrom,
+            const PLANAR::INT_OCTAGON& aRoom );
+
     /**
      * Return a bounded set of exact lattice points which represents an
      * integral segment in an orthogonal room decomposition.
@@ -80,6 +85,10 @@ public:
     static std::vector<ROUTER_POINT> IntegralRoomSeedPoints(
             const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
             const std::vector<ROUTER_BOX>& aOrthogonalCuts );
+
+    static std::vector<ROUTER_POINT> IntegralRoomSeedPoints(
+            const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+            const std::vector<PLANAR::INT_OCTAGON>& aFortyFiveDegreeCuts );
 
 private:
     std::size_t  m_padIndex;
