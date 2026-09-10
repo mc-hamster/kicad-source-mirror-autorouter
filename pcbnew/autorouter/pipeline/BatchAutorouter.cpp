@@ -2261,19 +2261,11 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     continue;
                 }
 
-                const auto hasUnconnected = [&]( const std::vector<std::size_t>& aIndices )
-                {
-                    return std::any_of(
-                            aIndices.begin(), aIndices.end(),
-                            [&]( std::size_t aIndex )
-                            {
-                                return aIndex < fanoutBoard.pads.size() && aIndex != pin
-                                       && !fanoutBoard.pads[aIndex].isFanoutTarget
-                                       && !occupancy.Board()->Connected( pin, aIndex );
-                            } );
-                };
-                if( !hasUnconnected( taskNet.padIndices )
-                    && !hasUnconnected( taskNet.planeTargetIndices ) )
+                // RoutingBoard.fanout() decides this from
+                // Pin.getUnconnectedSet(net), which includes traces, vias and
+                // conduction areas as individual items.  A ratsnest-pad-only
+                // check can skip a legal source fanout or retain false work.
+                if( occupancy.Board()->UnconnectedTargetItems( pin, taskNet.netCode ).empty() )
                 {
                     continue;
                 }

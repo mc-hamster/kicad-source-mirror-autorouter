@@ -249,13 +249,13 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
     }
 
     BOARD_SNAPSHOT result = aBoard;
-    // Create one deterministic landing pad for each SMD endpoint that still
-    // participates in the current connection graph.  Do not fan out every
-    // pad in a net during a route-only-unconnected run: pads already joined
-    // by existing copper are not part of the proposal and must remain
-    // untouched.  Synthetic landing pads are not added to
-    // ROUTING_NET::padIndices because that list describes real board pads and
-    // is used for widths, ordering and reporting.
+    // BatchFanout constructs its component list from every net-assigned SMD
+    // pin, not from the current ratsnest edges.  Create one immutable control
+    // terminal for every such pin.  The live worker item graph below decides
+    // whether the pin is already connected or has no unconnected source item,
+    // so this remains safe for route-only-unconnected jobs.  Synthetic control
+    // pads are not added to ROUTING_NET::padIndices because that list describes
+    // real board pads and is used for widths, ordering and reporting.
     const auto orderedPins = OrderedPins( aBoard, aSettings.fanoutPinOrder, aCancel );
     for( auto orderedPin : orderedPins )
     {
@@ -272,30 +272,6 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
         // source-equivalent RoutingBoard.fanout() call.  The active room/drill
         // frontier chooses the first legal drill from the pin's connected set
         // toward its real unconnected item set.
-        if( net.connections.empty() )
-            continue;
-
-        std::vector<std::size_t> connectionPads;
-        for( const auto& [source, target] : net.connections )
-        {
-            if( aCancel && aCancel() )
-                return result;
-
-            if( source < result.pads.size() && !result.pads[source].isPlaneTarget
-                && std::find( connectionPads.begin(), connectionPads.end(), source )
-                           == connectionPads.end() )
-            {
-                connectionPads.push_back( source );
-            }
-
-            if( target < result.pads.size() && !result.pads[target].isPlaneTarget
-                && std::find( connectionPads.begin(), connectionPads.end(), target )
-                           == connectionPads.end() )
-            {
-                connectionPads.push_back( target );
-            }
-        }
-
         for( std::size_t padIndex : { orderedPin } )
         {
             if( aCancel && aCancel() )
@@ -304,45 +280,9 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
             if( padIndex >= result.pads.size() )
                 continue;
 
-            if( std::find( connectionPads.begin(), connectionPads.end(), padIndex )
-                == connectionPads.end() )
-            {
-                continue;
-            }
-
             const ROUTING_PAD& pad = result.pads[padIndex];
             if( !pad.isSmd || pad.isPlaneTarget || pad.layers.size() != 1 )
                 continue;
-
-            // A source-layer SMD that already has a selected plane target on
-            // the same layer does not need a fanout or via at all.  Keeping
-            // the original pad-to-plane edge avoids manufacturing an unused
-            // buried/blind via and matches Freerouting's short plane stub.
-            if( !net.planeTargetIndices.empty()
-                && std::any_of( net.connections.begin(), net.connections.end(),
-                                [&]( const auto& connection )
-                                {
-                                    const std::size_t source = connection.first;
-                                    const std::size_t target = connection.second;
-                                    if( source != padIndex || target >= result.pads.size()
-                                        || !result.pads[target].isPlaneTarget )
-                                    {
-                                        return false;
-                                    }
-
-                                    const auto& targetLayers = result.pads[target].layers;
-                                    return std::any_of(
-                                            pad.layers.begin(), pad.layers.end(),
-                                            [&]( int layer )
-                                            {
-                                                return std::find( targetLayers.begin(),
-                                                                  targetLayers.end(), layer )
-                                                       != targetLayers.end();
-                                            } );
-                                } ) )
-            {
-                continue;
-            }
 
             // Match RoutingBoard.fanout's ViaRule traversal.  Its maze can
             // evaluate every rule alternative, so a synthetic native escape

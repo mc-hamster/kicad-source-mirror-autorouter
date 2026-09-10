@@ -1447,6 +1447,8 @@ BOOST_AUTO_TEST_CASE( PlaneTargetOnPadLayerDoesNotCreateAnUnusedVia )
     net.netCode = 1;
     net.name = "GND";
     net.netClass = "Default";
+    net.viaDiameter = 600000;
+    net.viaDrill = 300000;
     net.padIndices = { 0 };
     net.planeTargetIndices = { 1 };
     net.connections = { { 0, 1 } };
@@ -1460,12 +1462,16 @@ BOOST_AUTO_TEST_CASE( PlaneTargetOnPadLayerDoesNotCreateAnUnusedVia )
 
     const BOARD_SNAPSHOT fanned = BATCH_FANOUT::PrepareSnapshot( board, makeSettings() );
     BOOST_REQUIRE_EQUAL( fanned.nets.size(), 1 );
-    BOOST_CHECK_EQUAL( fanned.pads.size(), 2 );
+    // Freerouting still calls fanout() for a same-layer plane target.  Its
+    // TargetItemExpansionDoor completes directly, so the control exists but
+    // no via is inserted.
+    BOOST_CHECK_EQUAL( fanned.pads.size(), 3 );
     BOOST_CHECK_EQUAL( fanned.nets.front().connections.size(), 1 );
 
     const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, makeSettings(), {}, {} );
     BOOST_REQUIRE( result.complete );
     BOOST_CHECK_EQUAL( result.vias.size(), 0 );
+    BOOST_CHECK_EQUAL( result.metrics.fanoutConnections, 1 );
 }
 
 
@@ -1524,6 +1530,39 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
     {
         BOOST_CHECK( via.position != board.pads[0].position );
         BOOST_CHECK( via.position != board.pads[1].position );
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutPreparationIncludesEveryNetAssignedSmdPin )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 8000000, 3000000 };
+    for( std::int64_t x : { 1000000, 4000000, 7000000 } )
+    {
+        board.pads.push_back( { 1, { x, 1500000 }, { 0 }, "Default", 0,
+                                100000, 0, 100000, false, true } );
+    }
+
+    ROUTING_NET net;
+    net.netCode = 1;
+    net.name = "ALL_SMD_PINS";
+    net.netClass = "Default";
+    net.viaDiameter = 300000;
+    net.viaDrill = 150000;
+    net.padIndices = { 0, 1, 2 };
+    // The host ratsnest is not the source fanout enumeration.  In particular,
+    // an already-connected pin can be absent from these current task edges.
+    net.connections = { { 0, 1 } };
+    board.nets.push_back( net );
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, makeSettings() );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 3 );
+    for( std::size_t index = board.pads.size(); index < prepared.pads.size(); ++index )
+    {
+        BOOST_CHECK( prepared.pads[index].isFanoutTarget );
+        BOOST_CHECK_EQUAL( prepared.pads[index].fanoutSourcePadIndex,
+                           index - board.pads.size() );
     }
 }
 

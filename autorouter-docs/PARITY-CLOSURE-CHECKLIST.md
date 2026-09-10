@@ -124,7 +124,11 @@ fanout source-room escape envelope, matching `TargetItemExpansionDoor`'s null
 `nextRoom`, while drill-layer entries retain the ordinary destination-distance
 heuristic. This closes the first diagnosed U2-8 decision divergence: native now
 reaches the existing U2-4 via directly without adding a drill. The colocated
-synthetic pad is now only an immutable search control: it never rewrites the
+synthetic controls are enumerated for every net-assigned SMD pin, as in
+`BatchFanout`, rather than only for pins present in the current KiCad ratsnest.
+The live item graph still suppresses already-connected/no-unconnected work, so
+route-only-unconnected jobs do not edit completed copper. Each control is only
+an immutable search name: it never rewrites the
 real net ratsnest, is retired from all electrical item-set queries immediately
 after its attempt, and is not retained as copper.
 The inserted trace and drill are normalized to the real SMD endpoint before the
