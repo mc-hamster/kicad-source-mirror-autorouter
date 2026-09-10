@@ -60,6 +60,8 @@
 #include <autorouter/rules/ViaRule.h>
 #include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
 #include <autorouter/pipeline/BatchFanout.h>
+#include <autorouter/pipeline/AutoroutePassRunner.h>
+#include <autorouter/pipeline/AutorouteBatchLoop.h>
 #include <autorouter/pipeline/BatchOptimizer.h>
 #include <autorouter/pipeline/AutorouteUnroutedReport.h>
 #include <autorouter/pipeline/RoutingPipeline.h>
@@ -421,6 +423,144 @@ BOOST_AUTO_TEST_CASE( HistoryNeverTradesClearanceForCompletion )
     BOOST_CHECK_EQUAL( history.Best()->metrics.drcViolations, 0 );
     history.Add( invalid );
     BOOST_CHECK_EQUAL( history.Best()->metrics.drcViolations, 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( BoardHistoryUsesSourceNormalizedScoreAndRestoreLimits )
+{
+    const AUTOROUTER_SETTINGS settings = makeSettings();
+    auto candidate = []( int aUnrouted )
+    {
+        ROUTING_RESULT result;
+        result.metrics.totalConnections = 10;
+        result.metrics.unroutedConnections = aUnrouted;
+        result.metrics.routedConnections = 10 - aUnrouted;
+        return result;
+    };
+
+    const ROUTING_RESULT low = candidate( 3 );
+    const ROUTING_RESULT middle = candidate( 2 );
+    const ROUTING_RESULT high = candidate( 1 );
+    BOOST_CHECK_CLOSE( BOARD_HISTORY::NormalizedScore( high, settings ), 900.0, 1e-9 );
+
+    BOARD_HISTORY history( settings, 3 );
+    history.Add( low );
+    history.Add( middle );
+    history.Add( high );
+    history.Add( high );
+    BOOST_CHECK_EQUAL( history.Size(), 3U );
+    BOOST_CHECK_CLOSE( history.MaxScore(), 900.0, 1e-9 );
+
+    const auto first = history.Restore( 1 );
+    const auto second = history.Restore( 1 );
+    const auto third = history.Restore( 1 );
+    BOOST_REQUIRE( first && second && third );
+    BOOST_CHECK_EQUAL( first->metrics.unroutedConnections, 1 );
+    BOOST_CHECK_EQUAL( second->metrics.unroutedConnections, 1 );
+    BOOST_CHECK_EQUAL( third->metrics.unroutedConnections, 2 );
+    BOOST_CHECK_EQUAL( history.Rank( *first ), 1 );
+    BOOST_CHECK_EQUAL( history.Rank( *third ), 2 );
+}
+
+
+BOOST_AUTO_TEST_CASE( AutorouteBatchLoopMatchesSourceStagnationWindows )
+{
+    AUTOROUTE_BATCH_LOOP loop;
+    for( int pass = 1; pass < AUTOROUTE_BATCH_LOOP::STOP_AT_PASS_MINIMUM; ++pass )
+    {
+        const auto decision = loop.Observe( pass, 500.0, 1, true, true );
+        BOOST_CHECK( !decision.stop );
+        BOOST_CHECK( !decision.recoverFanout );
+    }
+
+    BOOST_CHECK( !loop.Observe( 8, 500.0, 1, true, true ).stop );
+    BOOST_CHECK( !loop.Observe( 9, 500.0, 1, true, true ).recoverFanout );
+    BOOST_CHECK( !loop.Observe( 10, 500.0, 1, true, true ).recoverFanout );
+    const auto recovery = loop.Observe( 11, 500.0, 1, true, true );
+    BOOST_CHECK( recovery.recoverFanout );
+    BOOST_CHECK( !recovery.stop );
+    BOOST_CHECK( !loop.ApplyFanoutRecoveryScore( 11, 500.0 ).stop );
+
+    for( int pass = 12; pass < 18; ++pass )
+        BOOST_CHECK( !loop.Observe( pass, 500.0, 1, true, true ).stop );
+    BOOST_CHECK( loop.Observe( 18, 500.0, 1, true, true ).stop );
+
+    AUTOROUTE_BATCH_LOOP improved;
+    BOOST_CHECK( !improved.Observe( 8, 500.0, 1, true, false ).stop );
+    for( int pass = 9; pass < 18; ++pass )
+        BOOST_CHECK( !improved.Observe( pass, 501.0 + pass, 1, true, false ).stop );
+    BOOST_CHECK_EQUAL( improved.PassOfBestScore(), 17 );
+    BOOST_CHECK_EQUAL( improved.StagnantPasses(), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( AutoroutePassItemsFollowNaturalConnectedSetOrder )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 5000000, 1000000 };
+    for( int x : { 500000, 1500000, 3000000, 4500000 } )
+    {
+        ROUTING_PAD pad;
+        pad.netCode = 1;
+        pad.position = { x, 500000 };
+        pad.layers = { 0 };
+        pad.radius = 100000;
+        pad.trackWidth = 100000;
+        board.pads.push_back( pad );
+    }
+    board.pads[3].isPlaneTarget = true;
+    board.conductionAreas.push_back( { ROUTER_OBSTACLE_KIND::RECTANGLE, 1, { 0 }, {}, {},
+                                       { 4300000, 300000, 4700000, 700000 } } );
+
+    ROUTING_NET net;
+    net.netCode = 1;
+    net.padIndices = { 0, 1, 2 };
+    net.planeTargetIndices = { 3 };
+    net.connections = { { 0, 1 }, { 1, 2 }, { 2, 3 } };
+    board.nets.push_back( net );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.layers.resize( 1 );
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+
+    ROUTING_CONNECTION firstComponent;
+    firstComponent.netCode = 1;
+    firstComponent.fromPadIndex = 0;
+    firstComponent.toPadIndex = 1;
+    firstComponent.complete = true;
+    firstComponent.nodes = { { board.pads[0].position, 0 },
+                             { board.pads[1].position, 0 } };
+    occupancy.Add( firstComponent );
+
+    auto items = AUTOROUTE_PASS_RUNNER::GetAutorouteItems( board, *occupancy.Board() );
+    BOOST_REQUIRE_EQUAL( items.size(), 2U );
+    BOOST_CHECK_EQUAL( items[0].pad, 0U );
+    BOOST_CHECK_EQUAL( items[1].pad, 2U );
+
+    ROUTING_CONNECTION planeComponent;
+    planeComponent.netCode = 1;
+    planeComponent.fromPadIndex = 2;
+    planeComponent.toPadIndex = 3;
+    planeComponent.complete = true;
+    planeComponent.isPlaneConnection = true;
+    planeComponent.nodes = { { board.pads[2].position, 0 },
+                             { board.pads[3].position, 0 } };
+    occupancy.Add( planeComponent );
+
+    items = AUTOROUTE_PASS_RUNNER::GetAutorouteItems( board, *occupancy.Board() );
+    BOOST_REQUIRE_EQUAL( items.size(), 1U );
+    BOOST_CHECK_EQUAL( items.front().pad, 0U );
+
+    ROUTING_CONNECTION bridge;
+    bridge.netCode = 1;
+    bridge.fromPadIndex = 1;
+    bridge.toPadIndex = 2;
+    bridge.complete = true;
+    bridge.nodes = { { board.pads[1].position, 0 }, { board.pads[2].position, 0 } };
+    occupancy.Add( bridge );
+    BOOST_CHECK( AUTOROUTE_PASS_RUNNER::GetAutorouteItems(
+                         board, *occupancy.Board() ).empty() );
 }
 
 
@@ -5901,6 +6041,40 @@ BOOST_AUTO_TEST_CASE( ObstacleRoomFrontierChoosesBetweenDetourAndRipupCost )
     BOOST_CHECK_EQUAL( ripped.ripupCost, 100 );
     BOOST_CHECK_EQUAL( rippedMetrics.rippedRooms, 1 );
     BOOST_CHECK_EQUAL( rippedMetrics.ripupCost, 100 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ObstacleRoomFrontierChargesEachSourceItemOnce )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 1000 };
+    const std::vector<ROOM_TERMINAL> starts{ { { 1000, 500 }, { 1000, 500 }, 0 } };
+    const std::vector<ROOM_TERMINAL> targets{ { { 9000, 500 }, { 9000, 500 }, 1 } };
+    const SHAPE_TREE_ENTRY firstTraceShape{ { 2500, 0, 4500, 1000 }, 7, 0, 0, 2,
+                                            false, true };
+    const SHAPE_TREE_ENTRY secondTraceShape{ { 4000, 0, 6000, 1000 }, 8, 1, 0, 2,
+                                             false, true };
+    const SHAPE_TREE_ENTRY viaShape{ { 6500, 0, 7500, 1000 }, 9, 2, 0, 2,
+                                     false, true };
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+            bounds, {}, 0, 1, starts, targets, 100, 1, 1, 10000,
+            expanded, metrics, {}, {}, false, 0,
+            { ROOM_RIPUP_OBSTACLE{ firstTraceShape, 42, 100, 3 },
+              ROOM_RIPUP_OBSTACLE{ secondTraceShape, 42, 100, 3 },
+              ROOM_RIPUP_OBSTACLE{ viaShape, 43, 200, 3 } } );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE_EQUAL( path->rippedObstacleGroups.size(), 2U );
+    BOOST_CHECK_EQUAL( path->rippedObstacleGroups[0], 42U );
+    BOOST_CHECK_EQUAL( path->rippedObstacleGroups[1], 43U );
+    // Consecutive shapes of the first source Trace pay its full cost once and
+    // ALREADY_RIPPED_COST (1) for the continuation.  The following source Via
+    // is a distinct item even though all three shapes share one native route.
+    BOOST_CHECK_EQUAL( path->ripupCost, 301 );
+    BOOST_CHECK_EQUAL( metrics.rippedRooms, 2 );
+    BOOST_CHECK_EQUAL( metrics.ripupCost, 301 );
 }
 
 

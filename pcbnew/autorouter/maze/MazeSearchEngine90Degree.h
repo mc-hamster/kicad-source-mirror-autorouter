@@ -37,6 +37,10 @@ struct ROOM_RIPUP_OBSTACLE
     SHAPE_TREE_ENTRY shape;
     std::size_t      group = std::numeric_limits<std::size_t>::max();
     int              ripupCost = 0;
+    // Native occupancy connection that owns this item shape.  This is kept
+    // separate from group: one source Connection may contain multiple trace
+    // and via items with independently paid obstacle rooms.
+    std::size_t      connectionIndex = std::numeric_limits<std::size_t>::max();
 };
 
 struct ROOM_TERMINAL

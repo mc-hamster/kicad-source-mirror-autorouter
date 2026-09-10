@@ -132,6 +132,11 @@ struct AUTOROUTER_SETTINGS
     int  traceLengthCost = 1;
     int  congestionCost = 100;
     int  bendCost = 10;
+    // BoardHistory/stagnation scoring weights.  These are distinct from the
+    // maze costs above and match Freerouting's DefaultSettings values.
+    double unroutedNetPenalty = 5000000.0;
+    double clearanceViolationPenalty = 1000000.0;
+    double bendPenalty = 10.0;
     // Optional whole-connection retry width.  Zero disables it.  This is
     // distinct from a pin-local neckdown: Freerouting retries an otherwise
     // failed connection with this width before giving up the routing item.
@@ -756,6 +761,7 @@ struct ROUTER_METRICS
     int                    optimizationPasses = 0;
     int                    expandedNodes = 0;
     int                    segmentCount = 0;
+    int                    bendCount = 0;
     int                    viaCount = 0;
     int                    fanoutConnections = 0;
     int                    drcViolations = 0;

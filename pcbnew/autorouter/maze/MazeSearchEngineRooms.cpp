@@ -183,7 +183,7 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     && std::any_of( aRipupObstacles->begin(), aRipupObstacles->end(),
                                     [&]( const ROOM_RIPUP_OBSTACLE& aObstacle )
                                     {
-                                        return aObstacle.group == routeIndex
+                                        return aObstacle.connectionIndex == routeIndex
                                                && aObstacle.shape.shapeIndex
                                                           == static_cast<int>( edge )
                                                && aObstacle.shape.layer == aLayer;
@@ -273,12 +273,24 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
     };
 
     const auto& routes = m_occupancy.Connections();
+    std::size_t nextItemGroup = 0;
     for( std::size_t routeIndex = 0; routeIndex < routes.size(); ++routeIndex )
     {
         if( aCancel && aCancel() )
             return {};
 
         const ROUTING_CONNECTION& connection = routes[routeIndex];
+        std::vector<std::size_t> edgeGroups;
+        edgeGroups.reserve( connection.nodes.empty() ? 0 : connection.nodes.size() - 1 );
+        for( std::size_t edge = 0; edge + 1 < connection.nodes.size(); ++edge )
+        {
+            const bool continuesTrace = edge > 0
+                    && connection.nodes[edge - 1].layer == connection.nodes[edge].layer
+                    && connection.nodes[edge].layer == connection.nodes[edge + 1].layer;
+            if( !continuesTrace )
+                ++nextItemGroup;
+            edgeGroups.push_back( nextItemGroup - 1 );
+        }
         const bool movableRoute = connection.isShoveMovable
                                   && ( !connection.isExistingBoardRoute
                                        || connection.isAutorouterOwned
@@ -427,7 +439,8 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     connection, edge, netTrackRadius( connection.netCode ), context,
                     nextDouble(), additionalViaTraceHalfWidths );
             if( ripupCost >= 0 )
-                result.push_back( { std::move( entry ), routeIndex, ripupCost } );
+                result.push_back( { std::move( entry ), edgeGroups[edge], ripupCost,
+                                    routeIndex } );
         }
     }
     return result;

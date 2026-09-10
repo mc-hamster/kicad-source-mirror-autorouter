@@ -19,46 +19,110 @@
 
 #pragma once
 
-#include <algorithm>
+#include <limits>
 
 namespace KICAD_AUTOROUTER
 {
 
 /**
- * Pass-convergence guard corresponding to Freerouting's batch loop.  It keeps
- * a hopeless board from spending every configured pass on an unchanged state,
- * while rip-up activity resets the stagnation counter.
+ * Score convergence state translated from Freerouting's AutorouteBatchLoop.
+ * Board restoration remains a caller responsibility because this class does
+ * not own worker snapshots.
  */
 class AUTOROUTE_BATCH_LOOP
 {
 public:
-    bool Observe( int aRoutedConnections, int aRipups )
-    {
-        ++m_passes;
-        if( m_seen && aRoutedConnections <= m_lastRouted && aRipups == m_lastRipups )
-            ++m_stagnantPasses;
-        else
-            m_stagnantPasses = 0;
+    static constexpr int STOP_AT_PASS_MINIMUM = 8;
+    static constexpr int STOP_AT_PASS_MODULO = 4;
+    static constexpr int STAGNATION_PASS_LIMIT = 10;
+    static constexpr int FANOUT_RECOVERY_STAGNATION_PASSES = 3;
+    static constexpr double STAGNATION_SCORE_THRESHOLD = 0.5;
 
-        m_lastRouted = aRoutedConnections;
-        m_lastRipups = aRipups;
-        m_seen = true;
-        // BatchAutorouter does not apply stagnation termination before pass
-        // eight and requires ten consecutive no-improvement passes. The
-        // native score is lexicographic (DRC, incompletes, vias, length), but
-        // routed/rip-up continuity is the pass-loop signal available before
-        // a checkpoint is materialized.
-        return m_passes >= 8 && m_stagnantPasses >= 10;
+    struct DECISION
+    {
+        bool stop = false;
+        bool recoverFanout = false;
+    };
+
+    DECISION Observe( int aPass, double aScore, int aIncompleteCount,
+                      bool aContinueAutorouting, bool aFanoutEnabled )
+    {
+        DECISION result;
+        if( aPass < STOP_AT_PASS_MINIMUM || !aContinueAutorouting )
+        {
+            if( aIncompleteCount == 0 && aScore > STAGNATION_SCORE_THRESHOLD )
+            {
+                m_consecutiveNoImprovementPasses = 0;
+                m_lastBestScore = aScore;
+            }
+            return result;
+        }
+
+        if( aScore > m_lastBestScore + STAGNATION_SCORE_THRESHOLD )
+        {
+            m_consecutiveNoImprovementPasses = 0;
+            m_lastBestScore = aScore;
+        }
+        else
+        {
+            ++m_consecutiveNoImprovementPasses;
+            if( aFanoutEnabled && !m_fanoutRecoveryApplied && aIncompleteCount > 0
+                && m_consecutiveNoImprovementPasses
+                           >= FANOUT_RECOVERY_STAGNATION_PASSES )
+            {
+                m_fanoutRecoveryApplied = true;
+                result.recoverFanout = true;
+                return result;
+            }
+
+            if( m_consecutiveNoImprovementPasses >= STAGNATION_PASS_LIMIT )
+                result.stop = true;
+        }
+
+        observeGlobal( aPass, aScore, result );
+        return result;
     }
 
-    int StagnantPasses() const { return m_stagnantPasses; }
+    /** Complete the source loop's one-time fanout-tail cleanup with the score
+     * recalculated from the cleaned board. */
+    DECISION ApplyFanoutRecoveryScore( int aPass, double aScore )
+    {
+        m_consecutiveNoImprovementPasses = 0;
+        m_lastBestScore = aScore;
+        DECISION result;
+        observeGlobal( aPass, aScore, result );
+        return result;
+    }
+
+    void RestoredBoard( double aScore )
+    {
+        m_consecutiveNoImprovementPasses = 0;
+        m_lastBestScore = aScore;
+    }
+
+    int StagnantPasses() const { return m_consecutiveNoImprovementPasses; }
+    int PassOfBestScore() const { return m_passOfBestScore; }
+    double GlobalBestScore() const { return m_globalBestScore; }
 
 private:
-    int  m_lastRouted = 0;
-    int  m_lastRipups = 0;
-    int  m_stagnantPasses = 0;
-    int  m_passes = 0;
-    bool m_seen = false;
+    void observeGlobal( int aPass, double aScore, DECISION& aDecision )
+    {
+        if( aScore > m_globalBestScore + STAGNATION_SCORE_THRESHOLD )
+        {
+            m_globalBestScore = aScore;
+            m_passOfBestScore = aPass;
+        }
+        else if( aPass - m_passOfBestScore >= STAGNATION_PASS_LIMIT )
+        {
+            aDecision.stop = true;
+        }
+    }
+
+    int    m_consecutiveNoImprovementPasses = 0;
+    double m_lastBestScore = -std::numeric_limits<double>::infinity();
+    double m_globalBestScore = -std::numeric_limits<double>::infinity();
+    int    m_passOfBestScore = 0;
+    bool   m_fanoutRecoveryApplied = false;
 };
 
 } // namespace KICAD_AUTOROUTER

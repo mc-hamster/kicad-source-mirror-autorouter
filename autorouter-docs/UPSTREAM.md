@@ -65,7 +65,9 @@ same change.
 | `autoroute/drill/ExpansionDrill.java` | `pcbnew/autorouter/drill/ExpansionDrill.h` | Drill centroid/region, rooms across the full physical stack, per-layer occupation and source hash. Through transitions materialize as ordinary `PCB_VIA`; general padstacks are not implemented. |
 | `autoroute/AutorouteAttemptResult.java` | `AutorouterTypes.h` (`ROUTING_RESULT`) | Worker result, completion state, metrics, message and cancellation. |
 | `autoroute/AutorouteAttemptState.java` | `ROUTER_PROGRESS` / `AUTOROUTER_JOB` | Progress state is polled by the native dialog; fanout connections are reported separately in `ROUTER_METRICS`. |
-| `autoroute/BoardHistory*.java` | `BOARD_HISTORY` plus proposal-owned objects | Bounded worker-side connection snapshots retain the best negotiated/routed state; KiCad `BOARD_COMMIT` still owns editor undo and rejected proposals never enter the board. |
+| `autoroute/BoardHistory*.java` | `BOARD_HISTORY` plus proposal-owned objects | Bounded duplicate-free worker snapshots use source-normalized scoring, restore counts/ranks, and a DRC-first native safety stratum; KiCad `BOARD_COMMIT` still owns editor undo and rejected proposals never enter the board. |
+| `autoroute/pipeline/AutoroutePassRunner.java` | `AUTOROUTE_PASS_RUNNER` | Rebuilds the natural-order item-set work list each pass, including plane false-work suppression and exact-island host-repair handling. |
+| `autoroute/pipeline/AutorouteBatchLoop.java` | `AUTOROUTE_BATCH_LOOP` | Implements pass-8/modulo-4 history cadence, 0.5-point local/global stagnation windows, restore reset, and one-time fanout recovery; job/thread time-limit orchestration remains host-owned. |
 | `autoroute/ItemAutorouteInfo.java` | `BOARD_SNAPSHOT`, `ROUTING_PAD`, `ROUTING_NET` | Immutable worker-side topology. |
 | `autoroute/ItemRouteResult.java` | `ROUTING_CONNECTION` | Per-connection result. |
 | `autoroute/ItemSelectionStrategy.java` | `BATCH_AUTOROUTER::orderNets` | Stable priority, pad-count and half-perimeter ordering. |

@@ -39,6 +39,7 @@
 #include "../drc/DesignRulesChecker.h"
 #include "../path/FoundConnectionInserter.h"
 #include "AutorouteAirlineCalculator.h"
+#include "AutoroutePassRunner.h"
 #include "AutorouteConnectionRouter.h"
 #include "AutorouteBatchLoop.h"
 #include "BatchOptimizerMultiThreaded.h"
@@ -1820,6 +1821,30 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
     aResult.metrics.segmentCount = static_cast<int>( aResult.segments.size() );
     aResult.metrics.viaCount = static_cast<int>( aResult.vias.size() );
 
+    for( const ROUTING_CONNECTION& connection : aResult.connections )
+    {
+        std::optional<std::pair<std::int64_t, std::int64_t>> previousDirection;
+        for( std::size_t edge = 0; edge + 1 < connection.nodes.size(); ++edge )
+        {
+            const ROUTER_NODE& from = connection.nodes[edge];
+            const ROUTER_NODE& to = connection.nodes[edge + 1];
+            if( from.layer != to.layer || from.point == to.point )
+            {
+                previousDirection.reset();
+                continue;
+            }
+            std::int64_t dx = to.point.x - from.point.x;
+            std::int64_t dy = to.point.y - from.point.y;
+            const std::int64_t divisor = std::gcd( std::abs( dx ), std::abs( dy ) );
+            dx /= std::max<std::int64_t>( 1, divisor );
+            dy /= std::max<std::int64_t>( 1, divisor );
+            const std::pair<std::int64_t, std::int64_t> direction{ dx, dy };
+            if( previousDirection && *previousDirection != direction )
+                ++aResult.metrics.bendCount;
+            previousDirection = direction;
+        }
+    }
+
     for( const ROUTING_SEGMENT& segment : aResult.segments )
         aResult.metrics.routedLengthIU += distance( segment.start, segment.end );
 
@@ -2011,7 +2036,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     int retries = 0;
     int ripups = 0;
     AUTOROUTE_BATCH_LOOP batchLoop;
-    BOARD_HISTORY history;
+    BOARD_HISTORY history( aSettings );
     bool complete = orderedNets.empty();
     auto elapsedMilliseconds = [&]()
     {
@@ -2467,7 +2492,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         }
     }
 
-    auto checkpoint = [&]()
+    auto makeCheckpoint = [&]()
     {
         ROUTING_RESULT candidate;
         candidate.metrics.totalConnections = totalConnections;
@@ -2484,16 +2509,19 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 DESIGN_RULES_CHECKER::CountViolations( board, aSettings, candidate );
         candidate.complete = candidate.metrics.unroutedConnections == 0
                              && candidate.metrics.drcViolations == 0;
-        history.Add( candidate );
+        return candidate;
     };
 
-    auto restoreBestCheckpoint = [&]()
+    auto checkpoint = [&]()
     {
-        const std::optional<ROUTING_RESULT> best = history.Best();
-        if( !best )
-            return;
+        ROUTING_RESULT candidate = makeCheckpoint();
+        history.Add( candidate );
+        return candidate;
+    };
 
-        connections = best->connections;
+    auto restoreCheckpoint = [&]( const ROUTING_RESULT& aCheckpoint )
+    {
+        connections = aCheckpoint.connections;
         occupancy.Clear();
         for( const ROUTING_CONNECTION& connection : connections )
         {
@@ -2508,25 +2536,20 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         result.metrics.routedConnections = routedConnectionCount();
     };
 
-    struct ROUTE_ITEM_TASK
+    auto restoreBestCheckpoint = [&]()
     {
-        const ROUTING_NET* net = nullptr;
-        std::size_t pad = std::numeric_limits<std::size_t>::max();
+        const std::optional<ROUTING_RESULT> best = history.Best();
+        if( best )
+            restoreCheckpoint( *best );
     };
-    std::vector<ROUTE_ITEM_TASK> naturalItemOrder;
-    naturalItemOrder.reserve( board.pads.size() );
-    for( std::size_t pad = 0; pad < board.pads.size(); ++pad )
-    {
-        if( board.pads[pad].isFanoutTarget || board.pads[pad].isPlaneTarget )
-            continue;
 
-        const auto net = std::find_if(
-                board.nets.begin(), board.nets.end(),
-                [&]( const ROUTING_NET& aNet )
-                { return aNet.netCode == board.pads[pad].netCode; } );
-        if( net != board.nets.end() && !net->connections.empty() )
-            naturalItemOrder.push_back( { &*net, pad } );
-    }
+    auto refreshFailedNets = [&]()
+    {
+        failedNets.clear();
+        for( const ROUTING_NET& net : board.nets )
+            if( occupancy.Board()->CountMissing( net ) > 0 )
+                failedNets.insert( net.netCode );
+    };
 
     for( int pass = 0; pass < std::max( 1, aSettings.maxPasses ); ++pass )
     {
@@ -2558,9 +2581,48 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             autorouterDebugLog( message.str() );
         }
 
+        // BoardHistory.add() records the board entering a pass.  The result
+        // after this pass becomes the next entry (or the final current board),
+        // exactly as in the source loop.
+        checkpoint();
         complete = true;
 
-        for( const ROUTE_ITEM_TASK& task : naturalItemOrder )
+        // AutoroutePassRunner.getAutorouteItems() takes a fresh, source-order
+        // snapshot for every pass and queues one representative of each
+        // connected item set.  Do not retain the pass-one pad list after the
+        // routing board's contact graph has changed.
+        const std::vector<AUTOROUTE_ITEM> autorouteItems =
+                AUTOROUTE_PASS_RUNNER::GetAutorouteItems( board, *occupancy.Board() );
+
+        if( autorouterDebugEnabled() )
+        {
+            std::ostringstream message;
+            message << "AUTOROUTE_ITEMS pass=" << pass + 1
+                    << " count=" << autorouteItems.size();
+            for( const AUTOROUTE_ITEM& item : autorouteItems )
+                message << " {net=" << item.netCode << ",pad=" << item.pad << '}';
+            autorouterDebugLog( message.str() );
+            if( autorouteItems.empty() )
+                for( std::size_t index = 0; index < board.pads.size(); ++index )
+                {
+                    const ROUTING_PAD& pad = board.pads[index];
+                    autorouterDebugLog( "AUTOROUTE_ITEM_SKIPPED pad="
+                            + std::to_string( index ) + " net="
+                            + std::to_string( pad.netCode ) + " fanout="
+                            + std::to_string( pad.isFanoutTarget ) + " plane="
+                            + std::to_string( pad.isPlaneTarget ) + " exact="
+                            + std::to_string( pad.isExactTarget ) );
+                }
+        }
+
+        if( autorouteItems.empty() )
+        {
+            complete = true;
+            result.metrics.passes = pass + 1;
+            break;
+        }
+
+        for( const AUTOROUTE_ITEM& task : autorouteItems )
         {
             if( aCancel && aCancel() )
             {
@@ -2581,9 +2643,15 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 }
             }
 
-            const bool completeNet =
-                    occupancy.Board()->CountMissing( *task.net ) == 0;
-            const bool retryFailedNet = failedNets.contains( task.net->netCode );
+            const auto netIt = std::find_if(
+                    board.nets.begin(), board.nets.end(),
+                    [&]( const ROUTING_NET& aNet ) { return aNet.netCode == task.netCode; } );
+            if( netIt == board.nets.end() )
+                continue;
+            const ROUTING_NET& taskNet = *netIt;
+
+            const bool completeNet = occupancy.Board()->CountMissing( taskNet ) == 0;
+            const bool retryFailedNet = failedNets.contains( task.netCode );
 
             // Keep successful nets stable while negotiated-congestion passes
             // revisit only nets that failed or were ripped up.  Re-routing
@@ -2593,7 +2661,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             if( completeNet && ( pass == 0 || !retryFailedNet ) )
                 continue;
 
-            const bool routed = routeNet( board, aSettings, *task.net, pass, occupancy,
+            const bool routed = routeNet( board, aSettings, taskNet, pass, occupancy,
                                           routeEngine,
                                           connections, expanded, ripups, aCancel,
                                           [&]( int aSearchExpanded )
@@ -2625,7 +2693,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             if( !routed )
             {
                 complete = false;
-                failedNets.insert( task.net->netCode );
+                failedNets.insert( task.netCode );
 
                 // Only a found path identifies the copper that must be
                 // removed. Never sacrifice an unrelated completed route
@@ -2635,8 +2703,8 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             }
             else
             {
-                if( occupancy.Board()->CountMissing( *task.net ) == 0 )
-                    failedNets.erase( task.net->netCode );
+                if( occupancy.Board()->CountMissing( taskNet ) == 0 )
+                    failedNets.erase( task.netCode );
             }
 
             // A retry may legally cross an occupied route.  routeNet removes
@@ -2681,7 +2749,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
             if( autorouterDebugEnabled() )
             {
                 std::ostringstream message;
-                message << "connection batch net=" << task.net->netCode
+                message << "connection batch net=" << task.netCode
                         << " itemPad=" << task.pad << " routed=" << routed
                         << " totalRouted=" << result.metrics.routedConnections
                         << " expanded=" << expanded << " retries=" << retries
@@ -2703,15 +2771,52 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         for( const ROUTING_NET& net : board.nets )
             if( occupancy.Board()->CountMissing( net ) == 0 )
                 failedNets.erase( net.netCode );
-        checkpoint();
-
         // The source pass returns "no more work" as soon as getAutorouteItems
         // is empty. Continuing routing passes on a complete board only delays
         // the separate optimizer and cannot discover another route.
         if( complete )
             break;
 
-        if( batchLoop.Observe( result.metrics.routedConnections, ripups ) )
+        ROUTING_RESULT currentCheckpoint = makeCheckpoint();
+        double currentScore = BOARD_HISTORY::NormalizedScore( currentCheckpoint, aSettings );
+        const int passNo = pass + 1;
+
+        if( history.Size() >= AUTOROUTE_BATCH_LOOP::STOP_AT_PASS_MINIMUM
+            && passNo >= AUTOROUTE_BATCH_LOOP::STOP_AT_PASS_MINIMUM
+            && passNo % AUTOROUTE_BATCH_LOOP::STOP_AT_PASS_MODULO == 0
+            && history.MaxScore() > currentScore )
+        {
+            const auto restored = history.Restore( 3 );
+            if( !restored || history.Rank( *restored )
+                                > static_cast<int>( BOARD_HISTORY::MAX_HISTORY_SIZE ) )
+            {
+                break;
+            }
+
+            restoreCheckpoint( *restored );
+            refreshFailedNets();
+            currentCheckpoint = makeCheckpoint();
+            currentScore = BOARD_HISTORY::NormalizedScore( currentCheckpoint, aSettings );
+            batchLoop.RestoredBoard( currentScore );
+        }
+
+        auto decision = batchLoop.Observe(
+                passNo, currentScore, currentCheckpoint.metrics.unroutedConnections,
+                true, aSettings.enableFanout );
+
+        if( decision.recoverFanout )
+        {
+            BATCH_OPTIMIZER( board, aSettings, occupancy ).RemoveRedundantViaTails(
+                    connections, aCancel );
+            refreshFailedNets();
+            currentCheckpoint = makeCheckpoint();
+            currentScore = BOARD_HISTORY::NormalizedScore( currentCheckpoint, aSettings );
+            const auto recoveryDecision =
+                    batchLoop.ApplyFanoutRecoveryScore( passNo, currentScore );
+            decision.stop = decision.stop || recoveryDecision.stop;
+        }
+
+        if( decision.stop )
             break;
 
         if( !complete && failedNets.empty() )
