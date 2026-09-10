@@ -41,9 +41,6 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             || !std::isfinite( layer.verticalCost ) || layer.verticalCost <= 0
             || !std::isfinite( layer.bendCost ) || layer.bendCost < 0 )
             return std::nullopt;
-        for( const auto& terminal : layer.starts )
-            if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
-                return std::nullopt; // Diagonal starts need exact seed-room splitting.
         for( const auto* terminals : { &layer.starts, &layer.targets } )
             for( const auto& terminal : *terminals )
             {
@@ -200,18 +197,83 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             const ROUTER_BOX contained{
                 std::min( start.start.x, start.end.x ), std::min( start.start.y, start.end.y ),
                 std::max( start.start.x, start.end.x ), std::max( start.start.y, start.end.y ) };
-            space.complete( space.incomplete( { layers[layer].bounds, layers[layer].id, contained } ) );
+            if( start.start.x == start.end.x || start.start.y == start.end.y )
+            {
+                space.complete( space.incomplete(
+                        { layers[layer].bounds, layers[layer].id, contained } ) );
+            }
+            else
+            {
+                std::vector<ROUTER_BOX> cuts;
+                cuts.reserve( layers[layer].obstacles.size() + 1 );
+                cuts.push_back( layers[layer].bounds );
+                for( const SHAPE_TREE_ENTRY& obstacle : layers[layer].obstacles )
+                    if( obstacle.layer == layers[layer].id
+                        && obstacle.IsTraceObstacle( net ) )
+                    {
+                        cuts.push_back( obstacle.shape );
+                    }
+
+                for( const ROUTER_POINT& seedPoint :
+                     TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+                             start.start, start.end, cuts ) )
+                {
+                    const ROUTER_BOX seed{ seedPoint.x, seedPoint.y,
+                                           seedPoint.x, seedPoint.y };
+                    const bool covered = std::any_of(
+                            space.byId.begin(), space.byId.end(),
+                            [&]( const auto& entry )
+                            {
+                                const ROOM* room = entry.second;
+                                return !room->shape->IsObstacle()
+                                       && room->shape->GetShape().Contains( seedPoint );
+                            } );
+                    if( !covered )
+                    {
+                        space.complete( space.incomplete(
+                                { layers[layer].bounds, layers[layer].id, seed } ) );
+                    }
+                }
+            }
             const int itemId = nextItemId++;
             for( const auto& [id, room] : space.byId )
             {
-                auto overlap = INT_BOX::Intersection( contained, room->shape->GetShape() );
-                if( INT_BOX::Dimension( overlap ) < 0 )
+                if( room->shape->IsObstacle() )
                     continue;
-                const FLOAT_POINT p{ ( static_cast<double>( overlap.minX ) + overlap.maxX ) / 2,
-                                     ( static_cast<double>( overlap.minY ) + overlap.maxY ) / 2 };
+
+                std::optional<ROUTER_POINT> attachment;
+                double bestDistance = std::numeric_limits<double>::infinity();
+                for( const ROOM_LAYER& targetLayer : layers )
+                {
+                    for( const ROOM_TERMINAL& target : targetLayer.targets )
+                    {
+                        for( const ROUTER_POINT& toward : { target.start, target.end } )
+                        {
+                            const auto candidate =
+                                    TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                                            start.start, start.end, toward,
+                                            room->shape->GetShape() );
+                            if( !candidate )
+                                continue;
+                            const FLOAT_POINT point{
+                                    static_cast<double>( candidate->x ),
+                                    static_cast<double>( candidate->y ) };
+                            const double candidateDistance = remaining( point, layer );
+                            if( !attachment || candidateDistance < bestDistance )
+                            {
+                                attachment = candidate;
+                                bestDistance = candidateDistance;
+                            }
+                        }
+                    }
+                }
+                if( !attachment )
+                    continue;
+                const FLOAT_POINT p{ static_cast<double>( attachment->x ),
+                                     static_cast<double>( attachment->y ) };
                 STATE state;
                 state.room = room; state.layer = layer; state.entry = { p, p };
-                state.f = remaining( p, layer ); state.owner = start.owner; state.itemId = itemId;
+                state.f = bestDistance; state.owner = start.owner; state.itemId = itemId;
                 push( state );
             }
         }

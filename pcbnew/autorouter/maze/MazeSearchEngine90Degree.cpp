@@ -63,9 +63,6 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         || !std::isfinite( aBendCost ) || aBendCost < 0 )
         return std::nullopt;
     ROUTER_BOX costBounds = aBounds;
-    for( const auto& terminal : aStarts )
-        if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
-            return std::nullopt; // Diagonal starts still need exact seed-room splitting.
     for( const auto& terminals : { &aStarts, &aTargets } )
         for( const auto& terminal : *terminals )
         {
@@ -114,6 +111,30 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         ++aMetrics.destinationQueries;
         return costSpace.ToNativeCost( destinationDistance.Calculate( costSpace.ToReference( from ), 0 ) );
     };
+    auto startAttachment = [&]( const ROOM_TERMINAL& aStart, const ROUTER_BOX& aRoom )
+            -> std::optional<ROUTER_POINT>
+    {
+        std::optional<ROUTER_POINT> best;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for( const ROOM_TERMINAL& target : aTargets )
+        {
+            for( const ROUTER_POINT& toward : { target.start, target.end } )
+            {
+                const auto candidate = nearestInRoom( aStart, toward, aRoom );
+                if( !candidate )
+                    continue;
+                const FLOAT_POINT point{ static_cast<double>( candidate->x ),
+                                         static_cast<double>( candidate->y ) };
+                const double candidateDistance = distance( point );
+                if( !best || candidateDistance < bestDistance )
+                {
+                    best = candidate;
+                    bestDistance = candidateDistance;
+                }
+            }
+        }
+        return best;
+    };
     auto push = [&]( STATE state )
     {
         const auto roomId = state.room ? state.room->shape->GetId()
@@ -134,30 +155,58 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                                    std::min( start.start.y, start.end.y ),
                                    std::max( start.start.x, start.end.x ),
                                    std::max( start.start.y, start.end.y ) };
-        const auto startRooms = search.complete( search.incomplete( { aBounds, aLayer, contained } ) );
-        for( ROOM* room : startRooms )
+
+        if( start.start.x == start.end.x || start.start.y == start.end.y )
         {
-            const auto attachment = INT_BOX::Intersection( contained, room->shape->GetShape() );
-            if( INT_BOX::Dimension( attachment ) < 0 )
-                continue;
-            const FLOAT_POINT p{ ( static_cast<double>( attachment.minX ) + attachment.maxX ) / 2,
-                                 ( static_cast<double>( attachment.minY ) + attachment.maxY ) / 2 };
-            push( { room, nullptr, 0, { p, p }, 0, distance( p ), NONE, start.owner, {},
-                    static_cast<std::uint32_t>( startIndex + 1 ) } );
+            // A point or axis-aligned trace is itself an orthogonal contained
+            // shape, so preserve the direct source-shaped completion path.
+            search.complete( search.incomplete( { aBounds, aLayer, contained } ) );
         }
-        // A previous seed may have already made this same free room. Preserve
-        // every electrical source instead of dropping those covered by it.
+        else
+        {
+            // A diagonal trace's AABB contains two wedges which are not
+            // copper.  Seed exact lattice points immediately around every
+            // orthogonal obstacle cut instead.  This reaches every room
+            // touched by the real centre-line with bounded work.
+            std::vector<ROUTER_BOX> cuts;
+            cuts.reserve( aObstacles.size() + 1 );
+            cuts.push_back( aBounds );
+            for( const SHAPE_TREE_ENTRY& obstacle : aObstacles )
+                if( obstacle.layer == aLayer && obstacle.IsTraceObstacle( aNet ) )
+                    cuts.push_back( obstacle.shape );
+
+            for( const ROUTER_POINT& seedPoint :
+                 TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+                         start.start, start.end, cuts ) )
+            {
+                const ROUTER_BOX seed{ seedPoint.x, seedPoint.y,
+                                       seedPoint.x, seedPoint.y };
+                const bool covered = std::any_of(
+                        search.byId.begin(), search.byId.end(),
+                        [&]( const auto& entry )
+                        {
+                            const ROOM* room = entry.second;
+                            return !room->shape->IsObstacle()
+                                   && room->shape->GetShape().Contains( seedPoint );
+                        } );
+                if( !covered )
+                    search.complete( search.incomplete( { aBounds, aLayer, seed } ) );
+            }
+        }
+
+        // Preserve every electrical source in every free room touched by its
+        // exact shape, including rooms made by an earlier source seed.
         for( const auto& [id, room] : search.byId )
         {
-            const auto b = INT_BOX::Intersection( contained, room->shape->GetShape() );
-            if( INT_BOX::Dimension( b ) >= 0
-                && std::find( startRooms.begin(), startRooms.end(), room ) == startRooms.end() )
-            {
-                const FLOAT_POINT p{ ( static_cast<double>( b.minX ) + b.maxX ) / 2,
-                                     ( static_cast<double>( b.minY ) + b.maxY ) / 2 };
-                push( { room, nullptr, 0, { p, p }, 0, distance( p ), NONE, start.owner, {},
-                        static_cast<std::uint32_t>( startIndex + 1 ) } );
-            }
+            if( room->shape->IsObstacle() )
+                continue;
+            const auto attachment = startAttachment( start, room->shape->GetShape() );
+            if( !attachment )
+                continue;
+            const FLOAT_POINT point{ static_cast<double>( attachment->x ),
+                                     static_cast<double>( attachment->y ) };
+            push( { room, nullptr, 0, { point, point }, 0, distance( point ), NONE,
+                    start.owner, {}, static_cast<std::uint32_t>( startIndex + 1 ) } );
         }
     }
 

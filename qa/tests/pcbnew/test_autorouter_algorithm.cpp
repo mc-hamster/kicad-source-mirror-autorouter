@@ -6362,6 +6362,50 @@ BOOST_AUTO_TEST_CASE( RoomSearchAttachesToInteriorOfDiagonalTraceTarget )
             { 7000, 3000 }, { 9000, 5000 }, path->points.back() ) );
 }
 
+
+BOOST_AUTO_TEST_CASE( RoomSearchSeedsTheExactInteriorOfADiagonalStartTrace )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    const ROOM_TERMINAL start{ { 1000, 1000 }, { 9000, 9000 }, 11 };
+    const ROOM_TERMINAL target{ { 5000, 6000 }, { 5000, 6000 }, 20 };
+
+    // The bounded cut sampler must stay on the real lattice segment and put
+    // representatives on both sides of every room boundary.  It must not
+    // enumerate all 8,001 points of this small example (or billions of points
+    // on a real KiCad trace).
+    const auto seeds = TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+            start.start, start.end,
+            { bounds, { 3999, 0, 4001, 3000 }, { 6999, 7000, 7001, 10000 } } );
+    BOOST_CHECK_LT( seeds.size(), 32U );
+    BOOST_CHECK( seeds.front() == start.start );
+    BOOST_CHECK( seeds.back() == start.end );
+    BOOST_CHECK( std::all_of( seeds.begin(), seeds.end(), [&]( const ROUTER_POINT& point )
+                              {
+                                  return CONTACT_GEOMETRY::OnSegment(
+                                          start.start, start.end, point );
+                              } ) );
+    BOOST_CHECK( std::find( seeds.begin(), seeds.end(), ROUTER_POINT{ 4000, 4000 } )
+                 != seeds.end() );
+    BOOST_CHECK( std::find( seeds.begin(), seeds.end(), ROUTER_POINT{ 7000, 7000 } )
+                 != seeds.end() );
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+            bounds, {}, 0, 1, { start }, { target }, 10, 1, 1, 1000,
+            expanded, metrics, {}, {}, false );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE( !path->points.empty() );
+    BOOST_CHECK_EQUAL( path->startOwner, 11U );
+    BOOST_CHECK_EQUAL( path->targetOwner, 20U );
+    BOOST_CHECK( CONTACT_GEOMETRY::OnSegment(
+            start.start, start.end, path->points.front() ) );
+    BOOST_CHECK( path->points.front() != start.start );
+    BOOST_CHECK( path->points.front() != start.end );
+    BOOST_CHECK( path->points.back() == target.start );
+}
+
 BOOST_AUTO_TEST_CASE( RoomLocatorRespectsAnglesAndBendThreshold )
 {
     const std::vector<RECTANGULAR_CORRIDOR_STEP> corridor{
@@ -6628,6 +6672,38 @@ BOOST_AUTO_TEST_CASE( MultilayerRoomSearchUsesDrillSectionsAndFullPhysicalStack 
     via.canDrill = []( auto ) { return false; }; expanded = 0;
     BOOST_CHECK( !MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
             { a, b }, 1, 100, via, 10000, expanded, metrics ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( MultilayerRoomSearchSeedsADiagonalConnectedTrace )
+{
+    ROOM_LAYER top, bottom;
+    top.id = 0;
+    bottom.id = 31;
+    top.bounds = bottom.bounds = { 0, 0, 10000, 10000 };
+    top.starts = { { { 1000, 1000 }, { 5000, 5000 }, 7 } };
+    bottom.targets = { { { 9000, 5000 }, { 9000, 5000 }, 9 } };
+
+    ROOM_VIA_SETTINGS via;
+    via.bounds = top.bounds;
+    via.pageWidth = 2000;
+    via.normalCost = 1000;
+    via.canDrill = []( auto ) { return true; };
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto found = MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+            { top, bottom }, 1, 100, via, 10000, expanded, metrics, {}, {}, true );
+
+    BOOST_REQUIRE( found );
+    BOOST_REQUIRE( !found->nodes.empty() );
+    BOOST_CHECK_EQUAL( found->startOwner, 7U );
+    BOOST_CHECK_EQUAL( found->targetOwner, 9U );
+    BOOST_CHECK( CONTACT_GEOMETRY::OnSegment(
+            top.starts.front().start, top.starts.front().end,
+            found->nodes.front().point ) );
+    BOOST_CHECK( found->nodes.front().point != top.starts.front().start );
+    BOOST_CHECK_GT( metrics.layerTransitions, 0 );
 }
 
 BOOST_AUTO_TEST_CASE( ProductionMultilayerRoutingUsesTheRoomDrillFrontier )

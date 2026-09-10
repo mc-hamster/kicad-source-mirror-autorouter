@@ -146,7 +146,7 @@ same change.
 | `autoroute/expansion/ExpansionDoor.java` | `expansion/ExpansionDoor.h/.cpp` | Rectangle overlap/line sections, narrow-door handling, explicit host section-budget guard. |
 | `autoroute/maze/AutorouteEngine.java`, `MazeSearchEngine.java` | `maze/MazeSearchEngine90Degree.h/.cpp` | Active free-room lifecycle/frontier; shared lifecycle now resides in `RoomSearchContext.h`, with the through-drill frontier in `MazeSearchEngineMultilayer.cpp`. No shove/rip-up rooms. |
 | `autoroute/maze/MazeListElement.java` | `maze/MazeListElement.h` | Exact ordering key; full backtracking state resides in the rectangular search. |
-| `autoroute/expansion/TargetItemExpansionDoor.java` | `expansion/TargetItemExpansionDoor.h/.cpp` | Exact integral point/axis/oblique trace-target intersection with the reached rectangular room. General item shapes, rational endpoints and diagonal start-room seeds remain open. |
+| `autoroute/expansion/TargetItemExpansionDoor.java` | `expansion/TargetItemExpansionDoor.h/.cpp` | Exact integral point/axis/oblique trace intersection with reached rectangular rooms. Diagonal start traces use bounded exact lattice samples around all compensated orthogonal cuts instead of an AABB; general finite-width item shapes and rational endpoints remain open. |
 | `autoroute/path/FoundConnectionLocator*.java` | `path/FoundConnectionLocator45Degree.h/.cpp` | Reference corner construction and rectangular corridor subset; no full 45/general geometry. |
 | `geometry/planar/IntBox.java`, `FloatPoint.java` | `geometry/planar/IntBox.h`, `FloatLine.h` | Required rectangle/rounding/weighted-distance primitives only. |
 

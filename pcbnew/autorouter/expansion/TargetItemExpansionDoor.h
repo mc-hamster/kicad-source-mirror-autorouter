@@ -20,6 +20,7 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include "ExpansionDoor.h"
 
@@ -63,6 +64,22 @@ public:
     static std::optional<ROUTER_POINT> NearestIntegralPointInRoom(
             const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
             const ROUTER_POINT& aFrom, const ROUTER_BOX& aRoom );
+
+    /**
+     * Return a bounded set of exact lattice points which represents an
+     * integral segment in an orthogonal room decomposition.
+     *
+     * A diagonal source trace cannot be seeded with its axis-aligned bounding
+     * box: doing so invents electrical copper in both empty corner wedges.
+     * Orthogonal room membership can change only where the segment crosses an
+     * x/y side of a compensated obstacle.  Sampling the lattice indices on
+     * both sides of every such cut therefore reaches every rectangular room
+     * touched by the real centre-line without walking a potentially enormous
+     * segment point by point.
+     */
+    static std::vector<ROUTER_POINT> IntegralRoomSeedPoints(
+            const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
+            const std::vector<ROUTER_BOX>& aOrthogonalCuts );
 
 private:
     std::size_t  m_padIndex;
