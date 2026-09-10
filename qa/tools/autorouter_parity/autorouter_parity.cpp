@@ -104,6 +104,20 @@ public:
         clear();
     }
 
+    EDA_ITEM* ResolveItem( KIID& aID ) override
+    {
+        if( aID == niluuid )
+            return nullptr;
+
+        for( COMMIT_LINE& entry : m_entries )
+        {
+            if( entry.m_item && entry.m_item->IsBOARD_ITEM() && entry.m_item->m_Uuid == aID )
+                return entry.m_item;
+        }
+
+        return nullptr;
+    }
+
 private:
     EDA_ITEM* undoLevelItem( EDA_ITEM* aItem ) const override { return aItem; }
     EDA_ITEM* makeImage( EDA_ITEM* aItem ) const override { return aItem->Clone(); }

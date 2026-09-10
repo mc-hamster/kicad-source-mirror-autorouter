@@ -20,6 +20,7 @@
 #include "../facade/RoutingBoard.h"
 #include "../../geometry/planar/ContactGeometry.h"
 #include "../../maze/MazeSearchEngine.h"
+#include "../../rules/ViaRule.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -130,6 +131,110 @@ bool insertable( const ROUTING_CONNECTION& aCandidate, const MAZE_SEARCH_ENGINE&
         {
             return false;
         }
+    }
+
+    return true;
+}
+
+
+bool profileAllowsSmdAttachment( const ROUTING_CONNECTION& aConnection,
+                                 std::size_t aViaEdge,
+                                 const BOARD_SNAPSHOT& aBoard,
+                                 const AUTOROUTER_SETTINGS& aSettings )
+{
+    if( aSettings.allowViaInSmdPad )
+        return true;
+
+    const ROUTING_EDGE_STYLE& style = EdgeStyle( aConnection, aViaEdge - 1 );
+    const ROUTING_NET* net = nullptr;
+    for( const ROUTING_NET& candidate : aBoard.nets )
+        if( candidate.netCode == aConnection.netCode )
+        {
+            net = &candidate;
+            break;
+        }
+
+    if( !net )
+        return false;
+
+    return std::any_of(
+            net->viaProfiles.begin(), net->viaProfiles.end(),
+            [&]( const ROUTING_VIA_PROFILE& aProfile )
+            {
+                if( !aProfile.attachSmdAllowed )
+                    return false;
+                if( aProfile.diameter > 0 && style.viaDiameter > 0
+                    && aProfile.diameter != style.viaDiameter )
+                {
+                    return false;
+                }
+                if( aProfile.drill > 0 && style.viaDrill > 0
+                    && aProfile.drill != style.viaDrill )
+                {
+                    return false;
+                }
+                ROUTING_EDGE_STYLE profileStyle;
+                profileStyle.viaDiameter = aProfile.diameter;
+                profileStyle.viaDrill = aProfile.drill;
+                profileStyle.viaLayers = aProfile.layers;
+                profileStyle.viaType = aProfile.type;
+                const std::vector<int> span = VIA_RULE::LayersFor(
+                        aSettings, aConnection.nodes[aViaEdge - 1].layer,
+                        aConnection.nodes[aViaEdge].layer, &profileStyle );
+                return style.viaLayers.empty() || span == style.viaLayers;
+            } );
+}
+
+
+bool avoidsForbiddenSmdAttachment( const ROUTING_CONNECTION& aCandidate,
+                                   std::size_t aViaEdge,
+                                   const BOARD_SNAPSHOT& aBoard,
+                                   const AUTOROUTER_SETTINGS& aSettings )
+{
+    if( profileAllowsSmdAttachment( aCandidate, aViaEdge, aBoard, aSettings ) )
+        return true;
+
+    const ROUTER_POINT& point = aCandidate.nodes[aViaEdge - 1].point;
+    const ROUTING_EDGE_STYLE& style = EdgeStyle( aCandidate, aViaEdge - 1 );
+    std::int64_t viaDiameter = style.viaDiameter;
+    if( viaDiameter <= 0 )
+    {
+        const auto net = std::find_if(
+                aBoard.nets.begin(), aBoard.nets.end(), [&]( const ROUTING_NET& aNet )
+                { return aNet.netCode == aCandidate.netCode; } );
+        if( net != aBoard.nets.end() )
+            viaDiameter = net->viaDiameter;
+    }
+    const std::int64_t viaRadius = std::max<std::int64_t>(
+            1, viaDiameter / 2 );
+    const std::vector<int> viaLayers = !style.viaLayers.empty()
+            ? style.viaLayers
+            : std::vector<int>{ aCandidate.nodes[aViaEdge - 1].layer,
+                                aCandidate.nodes[aViaEdge].layer };
+
+    for( const ROUTING_PAD& pad : aBoard.pads )
+    {
+        if( pad.netCode != aCandidate.netCode || !pad.isSmd
+            || pad.isFanoutTarget || pad.isPlaneTarget )
+        {
+            continue;
+        }
+
+        const bool sharesLayer = std::any_of(
+                viaLayers.begin(), viaLayers.end(), [&]( int aLayer )
+                {
+                    return std::find( pad.layers.begin(), pad.layers.end(), aLayer )
+                           != pad.layers.end();
+                } );
+        if( !sharesLayer )
+            continue;
+
+        using CONTACT_GEOMETRY::WIDE;
+        const WIDE dx = WIDE( point.x ) - pad.position.x;
+        const WIDE dy = WIDE( point.y ) - pad.position.y;
+        const WIDE minimum = WIDE( std::max<std::int64_t>( 1, pad.radius ) ) + viaRadius;
+        if( dx * dx + dy * dy <= minimum * minimum )
+            return false;
     }
 
     return true;
@@ -253,14 +358,18 @@ VIA_OPTIMIZER::VIA_EDGE_SET VIA_OPTIMIZER::MovableViaEdges(
         const bool hasAfter = viaEdge + 1 < aConnection.nodes.size()
                               && aConnection.nodes[viaEdge + 1].layer == viaEnd.layer;
         const bool missingBeforeIsSynthetic = !hasBefore && viaEdge == 1
-                && aConnection.fromPadIndex < aBoard.pads.size()
-                && ( aBoard.pads[aConnection.fromPadIndex].isFanoutTarget
-                     || aBoard.pads[aConnection.fromPadIndex].isPlaneTarget );
+                && ( ( aConnection.fromPadIndex < aBoard.pads.size()
+                       && ( aBoard.pads[aConnection.fromPadIndex].isFanoutTarget
+                            || aBoard.pads[aConnection.fromPadIndex].isPlaneTarget ) )
+                     || ( aConnection.isFanoutConnection
+                          && aConnection.fromPadIndex >= aBoard.pads.size() ) );
         const bool missingAfterIsSynthetic = !hasAfter
                 && viaEdge + 1 == aConnection.nodes.size()
-                && aConnection.toPadIndex < aBoard.pads.size()
-                && ( aBoard.pads[aConnection.toPadIndex].isFanoutTarget
-                     || aBoard.pads[aConnection.toPadIndex].isPlaneTarget );
+                && ( ( aConnection.toPadIndex < aBoard.pads.size()
+                       && ( aBoard.pads[aConnection.toPadIndex].isFanoutTarget
+                            || aBoard.pads[aConnection.toPadIndex].isPlaneTarget ) )
+                     || ( aConnection.isFanoutConnection
+                          && aConnection.toPadIndex >= aBoard.pads.size() ) );
         if( ( !hasBefore && !missingBeforeIsSynthetic )
             || ( !hasAfter && !missingAfterIsSynthetic ) || ( !hasBefore && !hasAfter ) )
         {
@@ -359,13 +468,17 @@ std::vector<ROUTING_CONNECTION> VIA_OPTIMIZER::Candidates(
         const bool hasAfter = viaEdge + 1 < source.nodes.size()
                               && source.nodes[viaEdge + 1].layer == viaEnd.layer;
         const bool missingBeforeIsSynthetic = !hasBefore && viaEdge == 1
-                && source.fromPadIndex < aBoard.pads.size()
-                && ( aBoard.pads[source.fromPadIndex].isFanoutTarget
-                     || aBoard.pads[source.fromPadIndex].isPlaneTarget );
+                && ( ( source.fromPadIndex < aBoard.pads.size()
+                       && ( aBoard.pads[source.fromPadIndex].isFanoutTarget
+                            || aBoard.pads[source.fromPadIndex].isPlaneTarget ) )
+                     || ( source.isFanoutConnection
+                          && source.fromPadIndex >= aBoard.pads.size() ) );
         const bool missingAfterIsSynthetic = !hasAfter && viaEdge + 1 == source.nodes.size()
-                && source.toPadIndex < aBoard.pads.size()
-                && ( aBoard.pads[source.toPadIndex].isFanoutTarget
-                     || aBoard.pads[source.toPadIndex].isPlaneTarget );
+                && ( ( source.toPadIndex < aBoard.pads.size()
+                       && ( aBoard.pads[source.toPadIndex].isFanoutTarget
+                            || aBoard.pads[source.toPadIndex].isPlaneTarget ) )
+                     || ( source.isFanoutConnection
+                          && source.toPadIndex >= aBoard.pads.size() ) );
 
         if( ( !hasBefore && !missingBeforeIsSynthetic )
             || ( !hasAfter && !missingAfterIsSynthetic ) || ( !hasBefore && !hasAfter ) )
@@ -392,6 +505,14 @@ std::vector<ROUTING_CONNECTION> VIA_OPTIMIZER::Candidates(
                     0.3 * halfWidth ) + 1;
 
             std::function<bool( const ROUTING_CONNECTION& )> placementFilter;
+            if( source.isFanoutConnection )
+            {
+                placementFilter = [&, viaEdge]( const ROUTING_CONNECTION& aCandidate )
+                {
+                    return avoidsForbiddenSmdAttachment( aCandidate, viaEdge, aBoard,
+                                                         aSettings );
+                };
+            }
             if( source.isPlaneConnection )
             {
                 const ROUTER_NODE originalPlanePoint = hasBefore ? viaEnd : viaStart;
@@ -403,9 +524,12 @@ std::vector<ROUTING_CONNECTION> VIA_OPTIMIZER::Candidates(
                 if( contactedAreas.size() != 1 )
                     continue;
                 const auto plane = *contactedAreas.begin();
-                placementFilter = [&, plane, hasBefore, viaEdge](
+                const auto previousFilter = placementFilter;
+                placementFilter = [&, plane, hasBefore, viaEdge, previousFilter](
                                           const ROUTING_CONNECTION& aCandidate )
                 {
+                    if( previousFilter && !previousFilter( aCandidate ) )
+                        return false;
                     const ROUTER_NODE& movedPoint = hasBefore ? aCandidate.nodes[viaEdge]
                                                              : aCandidate.nodes[viaEdge - 1];
                     return aRoutingBoard.ConductionAreaContactsAt(

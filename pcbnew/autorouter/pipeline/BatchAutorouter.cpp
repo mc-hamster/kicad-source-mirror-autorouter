@@ -36,6 +36,7 @@
 #include <sstream>
 
 #include "../AutorouterDebug.h"
+#include "../board/optimize/TraceTightener.h"
 #include "../drc/DesignRulesChecker.h"
 #include "../path/FoundConnectionInserter.h"
 #include "AutorouteAirlineCalculator.h"
@@ -2434,17 +2435,6 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     occupancy.Add( normalized );
                     connections[insertedIndex] = std::move( normalized );
 
-                    // RoutingBoard.fanout() immediately runs
-                    // optChangedArea() for this net.  The complete source
-                    // tightener is still being translated, but its
-                    // source-safe tail/via retirement subset must happen at
-                    // the same per-pin boundary: later pins must see the
-                    // topology produced by cleanup, not every provisional
-                    // escape accumulated until the end of the stage.
-                    BATCH_OPTIMIZER( board, fanoutSettings, occupancy )
-                            .RemoveRedundantViaTails( connections, pinCancel,
-                                                      net.netCode );
-                    connections = occupancy.Connections();
                 }
 
                 // A faithful fanout search can stop at its first inserted
@@ -2452,6 +2442,52 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 // is a successful escape even though the synthetic
                 // pad-to-landing task remains electrically incomplete.
                 const bool routed = taskComplete || insertedFanoutFound;
+
+                if( routed )
+                {
+                    // BatchFanout starts changed-area marking immediately
+                    // before each pin and RoutingBoard.fanout() runs the
+                    // source TraceTightener before the next pin.  Build the
+                    // same physical edit region from every removed/inserted
+                    // route in this attempt, including negotiated shove or
+                    // rip-up work, then converge only this net inside it.
+                    CHANGED_AREA changedArea(
+                            TRACE_TIGHTENER::LayerCount( board, fanoutSettings ) );
+                    for( const ROUTING_CONNECTION& previous : connectionsBeforePin )
+                    {
+                        if( std::none_of(
+                                    connections.begin(), connections.end(),
+                                    [&]( const ROUTING_CONNECTION& current )
+                                    { return SameRouteGeometry( previous, current ); } ) )
+                        {
+                            TRACE_TIGHTENER::MarkConnection(
+                                    changedArea, previous, board, fanoutSettings );
+                        }
+                    }
+                    for( const ROUTING_CONNECTION& current : connections )
+                    {
+                        if( std::none_of(
+                                    connectionsBeforePin.begin(), connectionsBeforePin.end(),
+                                    [&]( const ROUTING_CONNECTION& previous )
+                                    { return SameRouteGeometry( current, previous ); } ) )
+                        {
+                            TRACE_TIGHTENER::MarkConnection(
+                                    changedArea, current, board, fanoutSettings );
+                        }
+                    }
+
+                    TRACE_TIGHTENER( board, fanoutSettings, occupancy )
+                            .OptChangedArea( changedArea, connections, net.netCode,
+                                             fanoutStageCancel, 1000 );
+
+                    // The source normalizes trace items around each accepted
+                    // edit. Keep the native exact-junction tail/via subset at
+                    // this same boundary after pull-tight and via movement.
+                    BATCH_OPTIMIZER( board, fanoutSettings, occupancy )
+                            .RemoveRedundantViaTails( connections, fanoutStageCancel,
+                                                      net.netCode );
+                    connections = occupancy.Connections();
+                }
 
                 if( aCancel && aCancel() )
                 {

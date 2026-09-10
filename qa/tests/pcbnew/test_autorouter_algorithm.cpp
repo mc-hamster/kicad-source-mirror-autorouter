@@ -40,7 +40,9 @@
 #include <autorouter/geometry/planar/ContactGeometry.h>
 #include <autorouter/geometry/planar/IntOctagon.h>
 #include <autorouter/geometry/planar/Simplex.h>
+#include <autorouter/board/state/ChangedArea.h>
 #include <autorouter/board/optimize/TraceShover.h>
+#include <autorouter/board/optimize/TraceTightener.h>
 #include <autorouter/path/FoundConnectionInserter.h>
 #include <autorouter/path/Connection.h>
 #include <autorouter/maze/MazeSearchEngine90Degree.h>
@@ -144,6 +146,38 @@ AUTOROUTER_SETTINGS makeSettings()
 
 
 BOOST_AUTO_TEST_SUITE( NativeAutorouter )
+
+
+BOOST_AUTO_TEST_CASE( ChangedAreaMatchesPinnedOutwardOctagonalBounds )
+{
+    CHANGED_AREA changed( 3 );
+    BOOST_CHECK( changed.GetArea( 0 ).IsEmpty() );
+    BOOST_CHECK( changed.GetArea( 1 ).IsEmpty() );
+    BOOST_CHECK( INT_BOX::Dimension( changed.SurroundingBox() ) < 0 );
+
+    changed.Join( 1.2, 2.8, 1 );
+    changed.Join( -3.4, 5.1, 1 );
+    const PLANAR::INT_OCTAGON area = changed.GetArea( 1 );
+    BOOST_CHECK_EQUAL( area.leftX, -4 );
+    BOOST_CHECK_EQUAL( area.bottomY, 2 );
+    BOOST_CHECK_EQUAL( area.rightX, 2 );
+    BOOST_CHECK_EQUAL( area.topY, 6 );
+    BOOST_CHECK_EQUAL( area.upperLeftDiagonalX, -9 );
+    BOOST_CHECK_EQUAL( area.lowerRightDiagonalX, -1 );
+    BOOST_CHECK_EQUAL( area.lowerLeftDiagonalX, 1 );
+    BOOST_CHECK_EQUAL( area.upperRightDiagonalX, 4 );
+
+    changed.Join( PLANAR::INT_OCTAGON::FromBox( { 10, -5, 20, 7 } ), 2 );
+    const ROUTER_BOX surrounding = changed.SurroundingBox();
+    BOOST_CHECK_EQUAL( surrounding.minX, -4 );
+    BOOST_CHECK_EQUAL( surrounding.minY, -5 );
+    BOOST_CHECK_EQUAL( surrounding.maxX, 20 );
+    BOOST_CHECK_EQUAL( surrounding.maxY, 7 );
+
+    changed.SetEmpty( 1 );
+    BOOST_CHECK( changed.GetArea( 1 ).IsEmpty() );
+    BOOST_CHECK( !changed.GetArea( 2 ).IsEmpty() );
+}
 
 
 BOOST_AUTO_TEST_CASE( OrthogonalRoomRestraintMatchesPinnedFreerouting )
@@ -1619,8 +1653,14 @@ BOOST_AUTO_TEST_CASE( FanoutUsesBoardViaFallbackAndHonorsItsEscapeEnvelope )
     BOOST_CHECK_EQUAL( result.vias.front().drill, 200000 );
     const ROUTER_POINT viaDelta{ result.vias.front().position.x - board.pads[0].position.x,
                                  result.vias.front().position.y - board.pads[0].position.y };
-    BOOST_CHECK_EQUAL( viaDelta.x * viaDelta.x + viaDelta.y * viaDelta.y,
-                       1000000LL * 1000000LL );
+    const auto viaDistanceSquare = viaDelta.x * viaDelta.x + viaDelta.y * viaDelta.y;
+    // The room search initially honours the requested 1 mm fanout envelope.
+    // Freerouting then immediately runs TraceTightener.optChangedArea(), whose
+    // one-trace ViaOptimizer pulls the terminal drill back toward the pad
+    // until DrillItemMover reaches the no-attach SMD boundary.  Verify both
+    // parts of that contract rather than freezing the pre-tightening landing.
+    BOOST_CHECK_GT( viaDistanceSquare, 300000LL * 300000LL );
+    BOOST_CHECK_LE( viaDistanceSquare, 1000000LL * 1000000LL );
 
     // Falling back is opt-in: a net without a via rule must retain its
     // ordinary graph when board-via fallback is disabled.
@@ -1696,9 +1736,9 @@ BOOST_AUTO_TEST_CASE( FanoutNormalizesNonCardinalEscapeDirections )
 {
     // A real fanout maze evaluates physical distances in all legal outgoing
     // directions.  Block the four cardinal exits but leave a 45-degree
-    // channel.  The synthetic planner must treat its diagonal probe as a
-    // one-millimetre physical escape, not as a sqrt(2)-millimetre vector that
-    // falls outside the configured envelope before it is checked.
+    // channel.  The initial drill must fit the configured envelope; the
+    // source's immediate changed-area optimization may then pull it back to
+    // the no-attach SMD boundary without changing that selected direction.
     BOARD_SNAPSHOT board = makeBoard();
     board.bounds = { 0, 0, 10000000, 10000000 };
     board.pads[0].position = { 5000000, 5000000 };
@@ -1741,7 +1781,7 @@ BOOST_AUTO_TEST_CASE( FanoutNormalizesNonCardinalEscapeDirections )
     BOOST_CHECK_NE( dy, 0 );
     const long double escape = std::sqrt( static_cast<long double>( dx ) * dx
                                           + static_cast<long double>( dy ) * dy );
-    BOOST_CHECK_GE( escape, 1000000.0L );
+    BOOST_CHECK_GT( escape, 250000.0L );
     BOOST_CHECK_LE( escape, 1200000.0L );
 }
 
@@ -1986,27 +2026,13 @@ BOOST_AUTO_TEST_CASE( FanoutRoomSearchFindsBentEscapeWithoutAPlannedLanding )
     BOOST_REQUIRE( route->isFanoutConnection );
     BOOST_REQUIRE_GT( route->nodes.size(), 2U );
     BOOST_CHECK_GT( result.metrics.expandedNodes, 0 );
-    const auto transitionRoute = std::find_if(
-            result.connections.begin(), result.connections.end(),
-            []( const ROUTING_CONNECTION& aConnection )
-            {
-                return aConnection.isFanoutConnection
-                       && std::adjacent_find(
-                                  aConnection.nodes.begin(), aConnection.nodes.end(),
-                                  []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
-                                  { return aLeft.layer != aRight.layer; } )
-                                  != aConnection.nodes.end();
-            } );
-    BOOST_REQUIRE( transitionRoute != result.connections.end() );
-    const auto transition = std::adjacent_find(
-            transitionRoute->nodes.begin(), transitionRoute->nodes.end(),
-            []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
-            { return aLeft.layer != aRight.layer; } );
-    BOOST_REQUIRE( transition != transitionRoute->nodes.end() );
     // Dynamic fanout now retains the real source pad as the first node.  The
-    // selected first drill, rather than a synthetic preplanned endpoint,
-    // proves that the room frontier found the bounded bent escape.
-    BOOST_CHECK_GT( transition->point.x, 2000000 );
+    // endpoint beyond the wall, rather than a synthetic preplanned endpoint,
+    // proves that the room frontier found the bounded bent escape.  The
+    // source-boundary changed-area cleanup may subsequently remove that first
+    // drill when the ordinary route reaches the escape on its source layer;
+    // the remaining bent fanout trace is then the non-redundant copper.
+    BOOST_CHECK_GT( route->nodes.back().point.x, 2000000 );
 }
 
 
@@ -7955,6 +7981,45 @@ BOOST_AUTO_TEST_CASE( TraceTailCleanupSplitsAtInteriorViaAndKeepsTheUsefulTrunk 
 }
 
 
+BOOST_AUTO_TEST_CASE( TraceTightenerOnlyPullsRoutesInsideTheChangedArea )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = false;
+
+    ROUTING_CONNECTION route;
+    route.complete = true;
+    route.netCode = 1;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 },
+                    { { 2000000, 500000 }, 0 },
+                    { { 4000000, 2500000 }, 0 },
+                    { board.pads[1].position, 0 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( route );
+    std::vector<ROUTING_CONNECTION> routes{ route };
+    TRACE_TIGHTENER tightener( board, settings, occupancy );
+
+    CHANGED_AREA unrelated( TRACE_TIGHTENER::LayerCount( board, settings ) );
+    unrelated.Join( ROUTER_POINT{ 5900000, 2900000 }, 0 );
+    BOOST_CHECK( !tightener.OptChangedArea( unrelated, routes, 1, {}, 1000 ) );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1U );
+    BOOST_CHECK( routes.front().nodes == route.nodes );
+
+    CHANGED_AREA changed( TRACE_TIGHTENER::LayerCount( board, settings ) );
+    TRACE_TIGHTENER::MarkConnection( changed, route, board, settings );
+    BOOST_REQUIRE( tightener.OptChangedArea( changed, routes, 1, {}, 1000 ) );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1U );
+    BOOST_REQUIRE_EQUAL( routes.front().nodes.size(), 2U );
+    BOOST_CHECK( routes.front().nodes.front() == route.nodes.front() );
+    BOOST_CHECK( routes.front().nodes.back() == route.nodes.back() );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.front() ), 0 );
+}
+
+
 BOOST_AUTO_TEST_CASE( RequiredFanoutViaIsNeverReducedToADanglingSourceStub )
 {
     auto board = makeBoard();
@@ -7986,6 +8051,32 @@ BOOST_AUTO_TEST_CASE( RequiredFanoutViaIsNeverReducedToADanglingSourceStub )
     BOOST_REQUIRE_EQUAL( routes.size(), 2U );
     BOOST_CHECK( routes.front().nodes == fanout.nodes );
     BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ViaOptimizerRecognizesFanoutDrillAfterControlRetirement )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    board.pads[0].layers = { 0 };
+
+    ROUTING_CONNECTION fanout;
+    fanout.complete = true;
+    fanout.isFanoutConnection = true;
+    fanout.netCode = 1;
+    fanout.fromPadIndex = 0;
+    fanout.toPadIndex = std::numeric_limits<std::size_t>::max();
+    fanout.nodes = { { board.pads[0].position, 0 }, { { 3000000, 1500000 }, 0 },
+                     { { 3000000, 1500000 }, 1 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( fanout );
+
+    const auto movable = VIA_OPTIMIZER::MovableViaEdges(
+            fanout, board, *occupancy.Board() );
+    BOOST_REQUIRE_EQUAL( movable.size(), 1U );
+    BOOST_CHECK( movable.contains( 2 ) );
 }
 
 
