@@ -5432,6 +5432,50 @@ BOOST_AUTO_TEST_CASE( OrderedViaRuleFallsThroughToFirstGeometricallyLegalProfile
 }
 
 
+BOOST_AUTO_TEST_CASE( RoomDrillSearchDoesNotTreatBlindViaAsThroughVia )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 0, 0, 0 }, { 1, true, 0, 0, 1 },
+                        { 2, false, 0, 0, 2 } };
+    board.pads[0].layers = { 0 };
+    board.pads[1].layers = { 1 };
+    board.nets[0].viaProfiles = {
+        { 300000, 150000, { 0, 1 }, false, ROUTER_VIA_TYPE::BLIND_BURIED }
+    };
+
+    // Copper on an unrelated physical layer must not block a top-to-inner
+    // padstack.  The old net-wide through-stack preflight included this
+    // obstacle and rejected the room path before ViaRule selection.
+    ROUTING_OBSTACLE unrelated;
+    unrelated.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    unrelated.netCode = 2;
+    unrelated.layers = { 2 };
+    unrelated.box = board.bounds;
+    unrelated.blocksTracks = true;
+    unrelated.blocksVias = true;
+    board.obstacles.push_back( unrelated );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    int expanded = 0;
+    const auto found = engine.FindConnection( board.pads[0], board.pads[1], 0,
+                                               expanded, {}, {}, {}, {}, false );
+    BOOST_REQUIRE( found );
+    BOOST_REQUIRE_EQUAL( found->edgeStyles.size(), found->nodes.size() - 1 );
+    const auto via = std::find_if(
+            found->edgeStyles.begin(), found->edgeStyles.end(),
+            []( const ROUTING_EDGE_STYLE& style ) { return style.viaDiameter > 0; } );
+    BOOST_REQUIRE( via != found->edgeStyles.end() );
+    BOOST_CHECK_EQUAL( via->viaDiameter, 300000 );
+    BOOST_CHECK_EQUAL( via->viaDrill, 150000 );
+    BOOST_CHECK( via->viaLayers == std::vector<int>( { 0, 1 } ) );
+    BOOST_CHECK( via->viaType == ROUTER_VIA_TYPE::BLIND_BURIED );
+    BOOST_CHECK( engine.LastRoomSearchMetrics().routed );
+}
+
+
 BOOST_AUTO_TEST_CASE( ViaRuleAttachSmdAndMicroviaTypeSurviveMaterialization )
 {
     auto board = makeBoard();
@@ -7661,6 +7705,20 @@ BOOST_AUTO_TEST_CASE( ExactOctagonalMultilayerSearchUsesRoomsDoorsAndDrills )
     via.normalCost = 1000;
     via.obstacles = top.obstacles;
     via.canDrill = []( auto ) { return true; };
+    int selectedTransitions = 0;
+    via.selectViaStyle = [&]( ROUTER_POINT, int fromLayer, int toLayer )
+            -> std::optional<ROUTING_EDGE_STYLE>
+    {
+        ++selectedTransitions;
+        if( fromLayer != top.id || toLayer != bottom.id )
+            return std::nullopt;
+        ROUTING_EDGE_STYLE style;
+        style.viaDiameter = 321;
+        style.viaDrill = 123;
+        style.viaLayers = { top.id, bottom.id };
+        style.viaType = ROUTER_VIA_TYPE::BLIND_BURIED;
+        return style;
+    };
 
     int expanded = 0;
     ROOM_SEARCH_METRICS metrics;
@@ -7675,7 +7733,9 @@ BOOST_AUTO_TEST_CASE( ExactOctagonalMultilayerSearchUsesRoomsDoorsAndDrills )
     BOOST_CHECK_GT( metrics.drillPages, 0 );
     BOOST_CHECK_GT( metrics.drills, 0 );
     BOOST_CHECK_GT( metrics.layerTransitions, 0 );
+    BOOST_CHECK_GT( selectedTransitions, 0 );
     BOOST_CHECK_LT( expanded, 1000 );
+    BOOST_REQUIRE_EQUAL( found->edgeStyles.size(), found->nodes.size() - 1 );
     int transitions = 0;
     for( std::size_t index = 1; index < found->nodes.size(); ++index )
     {
@@ -7685,6 +7745,10 @@ BOOST_AUTO_TEST_CASE( ExactOctagonalMultilayerSearchUsesRoomsDoorsAndDrills )
         {
             ++transitions;
             BOOST_CHECK( from.point == to.point );
+            BOOST_CHECK_EQUAL( found->edgeStyles[index - 1].viaDiameter, 321 );
+            BOOST_CHECK_EQUAL( found->edgeStyles[index - 1].viaDrill, 123 );
+            BOOST_CHECK( found->edgeStyles[index - 1].viaType
+                         == ROUTER_VIA_TYPE::BLIND_BURIED );
         }
         else if( from.layer == top.id )
         {

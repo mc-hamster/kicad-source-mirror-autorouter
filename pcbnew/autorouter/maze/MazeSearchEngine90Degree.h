@@ -83,6 +83,13 @@ struct ROOM_VIA_SETTINGS
     std::vector<DRILL_PIN> pins; // Physical layer ordinals, not host layer IDs.
     // Must validate the entire manufactured via, not only entry/exit layers.
     std::function<bool( ROUTER_POINT )> canDrill;
+    // Select and validate the first ordered ViaRule entry which can perform
+    // this exact layer transition at the candidate drill.  The returned
+    // style carries the complete manufactured padstack span into
+    // backtracking and insertion.  A missing callback retains the legacy
+    // lower-level room-search behavior used by geometry-only tests.
+    std::function<std::optional<ROUTING_EDGE_STYLE>( ROUTER_POINT, int, int )>
+            selectViaStyle;
     // RoutingBoard.fanout terminates at the first drill reached from the
     // pin's one-layer connected set. These fields keep that state inside the
     // same room/drill frontier instead of falling back to a second grid maze.
@@ -100,6 +107,9 @@ struct ROOM_MULTILAYER_PATH
     std::size_t targetOwner;
     std::vector<std::size_t> rippedObstacleGroups;
     std::int64_t ripupCost = 0;
+    // One entry per node edge.  Via entries are selected while the drill
+    // transition is queued rather than guessed after path reconstruction.
+    std::vector<ROUTING_EDGE_STYLE> edgeStyles;
 };
 
 /**

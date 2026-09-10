@@ -28,14 +28,19 @@ not a `ROUTER_BOX`. Empty and lower-dimensional cutout pieces are discarded by
 Box-shaped intermediate pieces retain source double-dispatch semantics for
 later holes.
 
-This geometry is active in both multilayer room frontiers. Final manufactured
-padstack legality remains independently checked on every physical layer by the
-snapshot callback; exact free-region search does not bypass KiCad DRC.
+This geometry is active in both multilayer room frontiers. The frontier now
+selects and validates the first legal ordered `ViaRule` entry when each drill
+transition is queued, carries that complete manufactured span/type through
+backtracking, and uses source-equivalent per-layer maximum via radii when
+building drill obstacles. Layers outside a blind/buried/microvia padstack no
+longer make that transition behave like a through via. Final manufactured
+padstack legality remains independently checked before insertion; exact
+free-region search does not bypass KiCad DRC.
 
 ## Verification
 
 - `qa_pcbnew` and `qa_autorouter_parity` build successfully.
-- Native autorouter suite: **179 cases / 703,284 assertions passed**.
+- Native autorouter suite: **180 cases / 703,297 assertions passed**.
 - The expanded pinned-Java `IntOctagon` oracle now compares both octagon and
   specialised box cutout dispatch, all eight directional `borderPoint`
   operations, and stable distance-sorted `nearestBorderProjections` for 2,048
@@ -61,11 +66,19 @@ Freerouting v2.3.0 also uses seven vias on this fixture. Track length and
 decision-stream parity remain separate gates and are not implied by this via
 count match.
 
+The post-padstack checkpoint repeats the same smoke without host repair at
+22/22 connections, seven vias, 125.205 mm and 17,740 expanded nodes. Evidence
+is under
+`build/autorouter/online-simple-stable/native-via-transition-style-20260910-115420/`.
+
 ## Remaining dependency
 
 This closes exact 45-degree drill regions and activates them for both ordinary
-routing and fanout. Arbitrary-angle `Simplex` shape intersection/cutout,
-rational convex region centres, and unrestricted-angle drill-room search are
-still missing. Fanout still uses a planning-only synthetic landing adapter;
-the search itself now consumes the source-shaped dynamic item sets and exact
-first-drill queue, but the provisional landing chooser must still be removed.
+routing and fanout. Transition-time ViaRule selection and layer-span obstacle
+filtering are active, but the snapshot still represents each padstack with one
+uniform diameter rather than its complete layer-local shapes and clearance
+class. Arbitrary-angle `Simplex` shape intersection/cutout, rational convex
+region centres, and unrestricted-angle drill-room search are still missing.
+Fanout still uses a planning-only synthetic landing adapter; the search itself
+now consumes the source-shaped dynamic item sets and exact first-drill queue,
+but the provisional landing chooser must still be removed.

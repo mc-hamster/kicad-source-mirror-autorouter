@@ -243,7 +243,9 @@ private:
                                                bool aSkipGeneralConvex,
                                                const ROUTER_CANCEL_CALLBACK& aCancel,
                                                const std::vector<ROOM_RIPUP_OBSTACLE>*
-                                                       aRipupObstacles = nullptr ) const;
+                                                       aRipupObstacles = nullptr,
+                                               std::int64_t aCandidateRadius = -1,
+                                               std::int64_t aCandidateDrillRadius = -1 ) const;
     std::vector<ROOM_RIPUP_OBSTACLE> roomRipupObstacles(
             int aNet, int aLayer, bool aForVia, int aRetry, bool aFanout,
             const ROUTER_CANCEL_CALLBACK& aCancel ) const;

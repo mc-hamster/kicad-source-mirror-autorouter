@@ -198,9 +198,16 @@ bool MAZE_SEARCH_ENGINE::hasGeneralConvexRoomGeometry( int aNet, int aLayer ) co
 std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         int net, int aLayer, bool aForVia, bool aSkipGeneralConvex,
         const ROUTER_CANCEL_CALLBACK& aCancel,
-        const std::vector<ROOM_RIPUP_OBSTACLE>* aRipupObstacles ) const
+        const std::vector<ROOM_RIPUP_OBSTACLE>* aRipupObstacles,
+        std::int64_t aCandidateRadius,
+        std::int64_t aCandidateDrillRadius ) const
 {
-    const auto radius = aForVia ? netViaRadius( net ) : netTrackRadius( net );
+    const auto radius = aCandidateRadius >= 0
+                                ? aCandidateRadius
+                                : aForVia ? netViaRadius( net ) : netTrackRadius( net );
+    const auto drillRadius = aCandidateDrillRadius >= 0
+                                     ? aCandidateDrillRadius
+                                     : netViaDrillRadius( net );
     std::vector<SHAPE_TREE_ENTRY> entries;
     int id = 1;
     auto addOctagon = [&]( INT_OCTAGON shape )
@@ -241,7 +248,7 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         // One extra IU makes the room boundary legal under the host's
         // inclusive collision predicates; do not apply clearance twice.
         addOctagon( octagonalEnvelope( obstacle, obstacleExpansionRadius(
-                obstacle, net, aLayer, aForVia, radius ) + 1 ) );
+                obstacle, net, aLayer, aForVia, radius, drillRadius ) + 1 ) );
     }
     // Every attempt sees current copper, including through-via copper on
     // intermediate layers. No stale per-net tree survives add/remove/rip-up.
@@ -260,7 +267,8 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     if( connection.nodes[i - 1].layer != connection.nodes[i].layer )
                     {
                         const auto p = connection.nodes[i].point;
-                        add( { p.x, p.y, p.x, p.y }, 2 * netViaDrillRadius( net )
+                        add( { p.x, p.y, p.x, p.y }, drillRadius
+                                + netViaDrillRadius( net )
                                 + m_board.holeToHoleClearance + 1 );
                     }
             continue;
@@ -308,7 +316,7 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                                                      style.clearance ),
                         otherDrillRadius + m_board.holeClearance );
                 if( aForVia )
-                    expansion = std::max( expansion, netViaDrillRadius( net )
+                    expansion = std::max( expansion, drillRadius
                             + otherDrillRadius + m_board.holeToHoleClearance );
             }
             addSegment( from.point, to.point, expansion + 1 );
@@ -707,24 +715,113 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
                              m_board.bounds.maxX - margin, m_board.bounds.maxY - margin };
     const auto physical = VIA_RULE::ThroughLayers( m_settings );
+    if( physical.size() < 2 )
+        return std::nullopt;
     std::vector<ROOM_LAYER> layers;
     ROOM_VIA_SETTINGS via;
-    const auto viaMargin = m_board.edgeClearance + std::max( radius, netViaRadius( net ) ) + 1;
-    via.bounds = { m_board.bounds.minX + viaMargin, m_board.bounds.minY + viaMargin,
-                   m_board.bounds.maxX - viaMargin, m_board.bounds.maxY - viaMargin };
-    via.pageWidth = std::max<std::int64_t>( 10000, 10 * netViaRadius( net ) );
     via.attachSmd = m_settings.allowViaInSmdPad;
     const auto netRule = std::find_if( m_board.nets.begin(), m_board.nets.end(),
                                       [net]( const ROUTING_NET& aNet )
                                       { return aNet.netCode == net; } );
-    if( netRule != m_board.nets.end() )
+
+    // AutorouteControl.rebuildViaInfo builds one maximum copper radius per
+    // physical layer from the ordered ViaRule.  Preserve that distinction:
+    // a top-to-inner blind rule must not inherit an unrelated bottom-layer
+    // obstacle merely because another net-wide scalar happened to be larger.
+    // The exact selected ViaInfo is still checked at every transition below.
+    std::vector<ROUTING_VIA_PROFILE> profiles;
+    if( m_viaOverride && m_viaOverrideNetCode == net )
     {
-        via.attachSmd = via.attachSmd
-                        || std::any_of( netRule->viaProfiles.begin(),
-                                        netRule->viaProfiles.end(),
-                                        []( const ROUTING_VIA_PROFILE& aProfile )
-                                        { return aProfile.attachSmdAllowed; } );
+        profiles.push_back( *m_viaOverride );
     }
+    else if( netRule != m_board.nets.end() && !netRule->viaProfiles.empty() )
+    {
+        profiles = netRule->viaProfiles;
+    }
+    else
+    {
+        ROUTING_VIA_PROFILE legacy;
+        legacy.diameter = netRule != m_board.nets.end() && netRule->viaDiameter > 0
+                                  ? netRule->viaDiameter : 2 * netViaRadius( net );
+        legacy.drill = netRule != m_board.nets.end() && netRule->viaDrill > 0
+                               ? netRule->viaDrill : 2 * netViaDrillRadius( net );
+        legacy.type = ROUTER_VIA_TYPE::THROUGH;
+        profiles.push_back( std::move( legacy ) );
+    }
+
+    std::map<int, std::int64_t> viaRadiusByLayer;
+    std::map<int, std::int64_t> viaDrillRadiusByLayer;
+    std::set<int> viaLayers;
+    std::int64_t maximumViaRadius = radius;
+    for( const ROUTING_VIA_PROFILE& profile : profiles )
+    {
+        ROUTING_EDGE_STYLE style;
+        style.viaDiameter = profile.diameter > 0
+                                    ? profile.diameter
+                                    : netRule != m_board.nets.end()
+                                              ? netRule->viaDiameter : 0;
+        style.viaDrill = profile.drill > 0
+                                 ? profile.drill
+                                 : netRule != m_board.nets.end()
+                                           ? netRule->viaDrill : 0;
+        style.viaLayers = profile.layers;
+        style.viaType = profile.type;
+        if( style.viaDiameter <= 0 || style.viaDrill <= 0 )
+            continue;
+
+        std::vector<int> span;
+        if( style.viaLayers.empty() )
+        {
+            span = VIA_RULE::LayersFor( m_settings, physical.front(), physical.back(),
+                                        &style );
+        }
+        else
+        {
+            int firstOrdinal = std::numeric_limits<int>::max();
+            int lastOrdinal = std::numeric_limits<int>::min();
+            for( int declared : style.viaLayers )
+            {
+                const auto position = std::find( physical.begin(), physical.end(), declared );
+                if( position == physical.end() )
+                {
+                    firstOrdinal = std::numeric_limits<int>::max();
+                    break;
+                }
+                const int ordinal = static_cast<int>( std::distance( physical.begin(), position ) );
+                firstOrdinal = std::min( firstOrdinal, ordinal );
+                lastOrdinal = std::max( lastOrdinal, ordinal );
+            }
+            if( firstOrdinal < lastOrdinal )
+                span = VIA_RULE::LayersFor( m_settings, physical[firstOrdinal],
+                                            physical[lastOrdinal], &style );
+        }
+        if( span.empty() )
+            continue;
+
+        const std::int64_t profileRadius = std::max<std::int64_t>( radius,
+                                                                   style.viaDiameter / 2 );
+        const std::int64_t profileDrillRadius = std::max<std::int64_t>( 1,
+                                                                        style.viaDrill / 2 );
+        maximumViaRadius = std::max( maximumViaRadius, profileRadius );
+        for( int layer : span )
+        {
+            viaLayers.insert( layer );
+            viaRadiusByLayer[layer] = std::max( viaRadiusByLayer[layer], profileRadius );
+            viaDrillRadiusByLayer[layer] = std::max( viaDrillRadiusByLayer[layer],
+                                                     profileDrillRadius );
+        }
+    }
+    if( viaLayers.empty() )
+        return std::nullopt;
+
+    const auto viaMargin = m_board.edgeClearance + maximumViaRadius + 1;
+    via.bounds = { m_board.bounds.minX + viaMargin, m_board.bounds.minY + viaMargin,
+                   m_board.bounds.maxX - viaMargin, m_board.bounds.maxY - viaMargin };
+    via.pageWidth = std::max<std::int64_t>( 10000, 10 * maximumViaRadius );
+    via.attachSmd = via.attachSmd
+                    || std::any_of( profiles.begin(), profiles.end(),
+                                    []( const ROUTING_VIA_PROFILE& aProfile )
+                                    { return aProfile.attachSmdAllowed; } );
     if( via.attachSmd )
         for( const auto& pad : m_board.pads )
             if( pad.netCode == net && pad.isSmd && !pad.isFanoutTarget && !pad.isPlaneTarget )
@@ -737,14 +834,43 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         { hasPads = true; pureSmd = pureSmd && pad.isSmd; }
     const bool plane = std::any_of( targets.begin(), targets.end(),
                                     []( const auto& t ) { return t.pad.isPlaneTarget; } );
-    via.normalCost = MAZE_EXPANSION_ENGINE::NormalViaCost( std::max( radius, netViaRadius( net ) ),
+    via.normalCost = MAZE_EXPANSION_ENGINE::NormalViaCost( maximumViaRadius,
             std::max( 0, plane ? m_settings.planeViaCost : m_settings.viaCost ), hasPads && pureSmd );
-    via.canDrill = [&]( ROUTER_POINT point )
+    const auto selectViaStyle = [&]( ROUTER_POINT point, int fromLayer, int toLayer )
+            -> std::optional<ROUTING_EDGE_STYLE>
     {
-        for( int layer : physical )
-            if( !isPointAllowed( point, layer, net, true ) )
-                return false;
-        return true;
+        const bool attachesToSmd = std::any_of(
+                m_board.pads.begin(), m_board.pads.end(),
+                [&]( const ROUTING_PAD& pad )
+                {
+                    return pad.netCode == net && pad.isSmd && pad.position == point
+                           && ( isOnPadLayer( pad, fromLayer )
+                                || isOnPadLayer( pad, toLayer ) );
+                } );
+        return SelectViaStyle( net, { point, fromLayer }, { point, toLayer },
+                               attachesToSmd );
+    };
+    via.selectViaStyle = selectViaStyle;
+    via.canDrill = [&, selectViaStyle]( ROUTER_POINT point )
+    {
+        // Drill pages are a geometric broad phase.  Accept a candidate only
+        // if at least one enabled transition has an actually legal ordered
+        // ViaRule entry; the transition queue repeats this test and retains
+        // the selected complete padstack style.
+        for( std::size_t from = 0; from < physical.size(); ++from )
+        {
+            if( !isLayerEnabled( physical[from] ) )
+                continue;
+            for( std::size_t to = from + 1; to < physical.size(); ++to )
+            {
+                if( isLayerEnabled( physical[to] )
+                    && selectViaStyle( point, physical[from], physical[to] ) )
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     };
     if( fanoutTarget )
     {
@@ -809,10 +935,15 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         };
         append( starts, layer.starts, false );
         append( targets, layer.targets, true );
-        for( auto obstacle : roomObstacles( net, id, true, true, cancel ) )
+        if( viaLayers.contains( id ) )
         {
-            obstacle.objectId = nextObstacleId++;
-            via.obstacles.push_back( obstacle );
+            for( auto obstacle : roomObstacles(
+                         net, id, true, true, cancel, nullptr,
+                         viaRadiusByLayer.at( id ), viaDrillRadiusByLayer.at( id ) ) )
+            {
+                obstacle.objectId = nextObstacleId++;
+                via.obstacles.push_back( obstacle );
+            }
         }
         layers.push_back( std::move( layer ) );
     }
@@ -831,6 +962,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         ROUTING_CONNECTION found;
         found.netCode = net; found.fromPadIndex = path->startOwner; found.toPadIndex = path->targetOwner;
         found.complete = true; found.nodes = path->nodes;
+        found.edgeStyles = path->edgeStyles;
         found.cost = path->ripupCost;
         found.isFanoutConnection = fanoutTarget != nullptr;
         bool legal = assignViaStyles( found );

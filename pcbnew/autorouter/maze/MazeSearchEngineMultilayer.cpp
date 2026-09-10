@@ -149,6 +149,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         std::size_t targetOwner = 0;
         int itemId = 0;
         int ripupCost = 0;
+        std::optional<ROUTING_EDGE_STYLE> viaStyle;
     };
     constexpr auto NONE = std::numeric_limits<std::size_t>::max();
     std::deque<STATE> states;
@@ -372,11 +373,21 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 {
                     if( to == current.layer || !layers[to].active || current.drill->occupied[to] )
                         continue;
+                    std::optional<ROUTING_EDGE_STYLE> selectedStyle;
+                    if( via.selectViaStyle )
+                    {
+                        selectedStyle = via.selectViaStyle(
+                                current.drill->location, layers[current.layer].id,
+                                layers[to].id );
+                        if( !selectedStyle )
+                            continue;
+                    }
                     STATE state = current;
                     state.kind = fanoutDrill ? KIND::FANOUT_TARGET : KIND::DRILL_EXIT;
                     state.layer = to; state.section = to;
                     state.room = spaces[to]->byShape.at( current.drill->rooms[to] );
                     state.parent = index;
+                    state.viaStyle = std::move( selectedStyle );
                     if( const auto* obstacle =
                                 dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
                                         state.room->shape.get() ) )
@@ -398,7 +409,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     current.kind == KIND::FANOUT_TARGET
                             ? std::numeric_limits<std::size_t>::max()
                             : current.targetOwner,
-                    {}, 0 };
+                    {}, 0, {} };
             std::vector<std::size_t> chain;
             for( auto i = index; i != NONE; i = states[i].parent )
                 chain.push_back( i );
@@ -427,6 +438,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     if( result.nodes.back().point != after.drill->location )
                     { valid = false; break; }
                     result.nodes.push_back( { after.drill->location, layers[after.layer].id } );
+                    result.edgeStyles.push_back( after.viaStyle.value_or(
+                            ROUTING_EDGE_STYLE{} ) );
                     continue;
                 }
                 FLOAT_LINE entry = after.entry;
@@ -442,7 +455,10 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                             entry } }, orthogonal );
                 if( !located ) { valid = false; break; }
                 for( std::size_t j = 1; j < located->size(); ++j )
+                {
                     result.nodes.push_back( { ( *located )[j], layers[after.layer].id } );
+                    result.edgeStyles.emplace_back();
+                }
             }
             if( valid && !( cancel && cancel() ) )
             {
