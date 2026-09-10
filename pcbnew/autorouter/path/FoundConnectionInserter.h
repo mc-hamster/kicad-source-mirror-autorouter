@@ -30,11 +30,11 @@ namespace KICAD_AUTOROUTER
 class MAZE_SEARCH_ENGINE;
 class ROUTING_OCCUPANCY;
 
-/** Checked, atomic insertion plus result emission. It supports terminal
- * neckdown, fixed-obstacle spring-over, and bounded recursive displacement of
- * generated trace/via (including generated fanout) copper plus supported
- * source-via trace contacts. Full host-board contact-graph mutation and
- * partial-progress insertion remain deliberately outside this data-only API.
+/** Checked, atomic insertion plus result emission. It supports incremental
+ * trace-polyline insertion, terminal neckdown, fixed-obstacle spring-over,
+ * and bounded recursive displacement of generated trace/via (including
+ * generated fanout) copper plus supported source-via trace contacts. Full
+ * host-board contact-graph mutation remains outside this data-only API.
  */
 class FOUND_CONNECTION_INSERTER
 {

@@ -2738,6 +2738,69 @@ BOOST_AUTO_TEST_CASE( ForcedSpringOverPublishesCheckedReplacementAtomically )
     }
 }
 
+
+BOOST_AUTO_TEST_CASE( ForcedInsertionRetriesWithAReusableApproachCorner )
+{
+    // FoundConnectionInserter.insertTrace() does not fail permanently when a
+    // short source span ends inside a compensated obstacle.  It rewinds the
+    // previously accepted corner and lets the next, longer polyline give
+    // TraceShover enough approach/exit geometry to spring around the shape.
+    // This exact corner sequence used to work only because the native port
+    // applied one unrelated whole-connection spring-over after preflight.
+    auto board = makeBoard();
+    board.bounds = { 0, 0, 10000000, 4000000 };
+    board.pads[0].position = { 1000000, 2000000 };
+    board.pads[1].position = { 9000000, 2000000 };
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 1, 20 } };
+    settings.allowVias = false;
+
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    obstacle.netCode = 2;
+    obstacle.layers = { 0 };
+    obstacle.box = { 4000000, 1500000, 6000000, 2500000 };
+    obstacle.blocksTracks = true;
+    obstacle.blocksVias = true;
+    board.obstacles.push_back( obstacle );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { { 3000000, 2000000 }, 0 },
+                    { { 5000000, 2000000 }, 0 }, { board.pads[1].position, 0 } };
+
+    const ROUTING_CONNECTION shortBlocked = {
+            .netCode = route.netCode,
+            .nodes = { route.nodes[1], route.nodes[2] },
+            .complete = true,
+            .fromPadIndex = route.fromPadIndex,
+            .toPadIndex = route.toPadIndex };
+    BOOST_CHECK( !engine.SpringOverConnection( shortBlocked, {} ) );
+    BOOST_REQUIRE( engine.SpringOverConnection( route, {} ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( inserted.connection );
+    BOOST_CHECK( inserted.connection->nodes.front() == route.nodes.front() );
+    BOOST_CHECK( inserted.connection->nodes.back() == route.nodes.back() );
+    BOOST_CHECK( std::find( inserted.connection->nodes.begin(), inserted.connection->nodes.end(),
+                            route.nodes[2] ) == inserted.connection->nodes.end() );
+    for( std::size_t edge = 1; edge < inserted.connection->nodes.size(); ++edge )
+    {
+        BOOST_CHECK( engine.CanInsertSegment( inserted.connection->netCode,
+                                              inserted.connection->nodes[edge - 1],
+                                              inserted.connection->nodes[edge] ) );
+    }
+    BOOST_CHECK( occupancy.Board()->Connected( 0, 1 ) );
+}
+
 BOOST_AUTO_TEST_CASE( ForcedSpringOverHandlesFixedCircularAndOvalObstacles )
 {
     // KiCad snapshots circles and ovals as SEGMENT + radius.  These are the

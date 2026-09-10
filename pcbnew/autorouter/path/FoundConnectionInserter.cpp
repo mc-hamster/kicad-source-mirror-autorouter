@@ -214,13 +214,15 @@ std::optional<ROUTING_CONNECTION> tryTerminalNeckdown(
 
 std::optional<ROUTING_CONNECTION> tryNeckdown( const ROUTING_CONNECTION& aConnection,
                                                 std::size_t aBlockedEdge,
-                                                const MAZE_SEARCH_ENGINE& aEngine )
+                                                const MAZE_SEARCH_ENGINE& aEngine,
+                                                bool aAtPhysicalStart,
+                                                bool aAtPhysicalEnd )
 {
     // The pinned source tries the start pin first, then the end pin. Limit
     // the mapped fallback to terminal edges; a non-terminal source corner is
     // not necessarily a physical PAD in the immutable KiCad snapshot.
-    const bool atStart = aBlockedEdge == 1;
-    const bool atEnd = aBlockedEdge + 1 == aConnection.nodes.size();
+    const bool atStart = aAtPhysicalStart && aBlockedEdge == 1;
+    const bool atEnd = aAtPhysicalEnd && aBlockedEdge + 1 == aConnection.nodes.size();
     if( atStart )
         if( auto result = tryTerminalNeckdown( aConnection, aBlockedEdge, true, aEngine ) )
             return result;
@@ -240,6 +242,248 @@ std::optional<ROUTING_CONNECTION> tryNeckdown( const ROUTING_CONNECTION& aConnec
         return tryTerminalNeckdown( aConnection, aBlockedEdge, false, aEngine, true );
 
     return {};
+}
+
+
+struct INCREMENTAL_INSERTION
+{
+    std::optional<ROUTING_CONNECTION> connection;
+    std::size_t                       blockedEdge = 0;
+    bool                              cancelled = false;
+};
+
+
+ROUTING_CONNECTION connectionSlice( const ROUTING_CONNECTION& aConnection,
+                                    std::size_t aFirstNode, std::size_t aLastNode )
+{
+    ROUTING_CONNECTION result = aConnection;
+    result.nodes.assign( aConnection.nodes.begin() + static_cast<std::ptrdiff_t>( aFirstNode ),
+                         aConnection.nodes.begin()
+                                 + static_cast<std::ptrdiff_t>( aLastNode + 1 ) );
+
+    if( !aConnection.edgeStyles.empty() )
+    {
+        result.edgeStyles.assign(
+                aConnection.edgeStyles.begin()
+                        + static_cast<std::ptrdiff_t>( aFirstNode ),
+                aConnection.edgeStyles.begin()
+                        + static_cast<std::ptrdiff_t>( aLastNode ) );
+    }
+
+    return result;
+}
+
+
+bool appendConnection( ROUTING_CONNECTION& aDestination,
+                       const ROUTING_CONNECTION& aSource )
+{
+    if( aSource.nodes.empty() || !HasValidEdgeStyles( aSource ) )
+        return false;
+
+    if( aDestination.nodes.empty() )
+        aDestination.nodes.push_back( aSource.nodes.front() );
+    else if( aDestination.nodes.back() != aSource.nodes.front() )
+        return false;
+
+    for( std::size_t edge = 0; edge + 1 < aSource.nodes.size(); ++edge )
+    {
+        aDestination.nodes.push_back( aSource.nodes[edge + 1] );
+        aDestination.edgeStyles.push_back( EdgeStyle( aSource, edge ) );
+    }
+
+    return true;
+}
+
+
+/**
+ * Reconstruct FoundConnectionInserter.insertTrace's fromCornerNo loop without
+ * publishing an incomplete host proposal.  A failed short insertion is
+ * allowed to consume another source corner; when the failed span started at
+ * the previously accepted corner, the source rewinds one corner so its next
+ * spring-over sees enough approach geometry to repair a compensated-clearance
+ * violation.  The accepted prefix is therefore represented here by exact
+ * original-corner checkpoints and is truncated on the same rewind.
+ *
+ * Freerouting mutates its private RoutingBoard after every successful span and
+ * relies on the caller's board snapshot for rollback.  The native worker keeps
+ * the equivalent geometry private until this function has reconstructed the
+ * whole connection; the surrounding ROUTING_OCCUPANCY::TRANSACTION provides
+ * the same all-or-nothing externally visible result.
+ */
+INCREMENTAL_INSERTION buildIncrementalConnection(
+        const ROUTING_CONNECTION& aConnection, const MAZE_SEARCH_ENGINE& aEngine,
+        const ROUTER_CANCEL_CALLBACK& aCancel )
+{
+    INCREMENTAL_INSERTION outcome;
+    ROUTING_CONNECTION result = aConnection;
+    result.nodes.clear();
+    result.edgeStyles.clear();
+    result.nodes.push_back( aConnection.nodes.front() );
+
+    // Map each accepted original corner to the corresponding last node in the
+    // reconstructed route.  Wrapped spans can add any number of intermediate
+    // corners, so an original-index decrement cannot be implemented by merely
+    // popping one result node.
+    std::vector<std::size_t> resultNodeAtOriginal( aConnection.nodes.size(), 0 );
+    resultNodeAtOriginal.front() = 0;
+
+    std::size_t edge = 0;
+    while( edge + 1 < aConnection.nodes.size() )
+    {
+        if( aCancel && aCancel() )
+        {
+            outcome.cancelled = true;
+            return outcome;
+        }
+
+        // ResultItems are layer-local traces separated by forced via inserts.
+        // A via is not a trace-polyline corner and remains atomic.
+        if( aConnection.nodes[edge].layer != aConnection.nodes[edge + 1].layer )
+        {
+            const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
+                    ? nullptr : &aConnection.edgeStyles[edge];
+            if( !aEngine.CanInsertSegment( aConnection.netCode, aConnection.nodes[edge],
+                                           aConnection.nodes[edge + 1], style ) )
+            {
+                outcome.blockedEdge = edge + 1;
+                return outcome;
+            }
+
+            const ROUTING_CONNECTION via = connectionSlice( aConnection, edge, edge + 1 );
+            if( !appendConnection( result, via ) )
+            {
+                outcome.blockedEdge = edge + 1;
+                return outcome;
+            }
+            resultNodeAtOriginal[edge + 1] = result.nodes.size() - 1;
+            ++edge;
+            continue;
+        }
+
+        // TraceShover receives one layer and one width/clearance class at a
+        // time.  Preserve native per-edge style boundaries by treating them
+        // as separate source ResultItems.
+        const std::size_t runFirstEdge = edge;
+        std::size_t runLastEdge = edge;
+        while( runLastEdge + 2 < aConnection.nodes.size()
+               && aConnection.nodes[runLastEdge + 1].layer
+                          == aConnection.nodes[runLastEdge + 2].layer
+               && EdgeStyle( aConnection, runLastEdge + 1 )
+                          == EdgeStyle( aConnection, runFirstEdge ) )
+        {
+            ++runLastEdge;
+        }
+
+        const std::size_t runFirstNode = runFirstEdge;
+        const std::size_t runLastNode = runLastEdge + 1;
+        std::size_t fromCornerNo = runFirstNode;
+
+        for( std::size_t currentCornerNo = runFirstNode + 1;
+             currentCornerNo <= runLastNode; ++currentCornerNo )
+        {
+            if( aCancel && aCancel() )
+            {
+                outcome.cancelled = true;
+                return outcome;
+            }
+
+            ROUTING_CONNECTION span = connectionSlice( aConnection, fromCornerNo,
+                                                        currentCornerNo );
+            std::optional<ROUTING_CONNECTION> accepted;
+            if( strictlyInsertable( span, aEngine ) )
+            {
+                accepted = std::move( span );
+            }
+            else
+            {
+                std::size_t blockedInSpan = 0;
+                for( std::size_t spanEdge = 1; spanEdge < span.nodes.size(); ++spanEdge )
+                {
+                    const ROUTING_EDGE_STYLE* style = span.edgeStyles.empty()
+                            ? nullptr : &span.edgeStyles[spanEdge - 1];
+                    if( !aEngine.CanInsertSegment( span.netCode, span.nodes[spanEdge - 1],
+                                                   span.nodes[spanEdge], style ) )
+                    {
+                        blockedInSpan = spanEdge;
+                        break;
+                    }
+                }
+
+                // Source neckdown is attempted only for a two-corner trace
+                // insertion and only when that endpoint really is a pin of
+                // the complete connection.  A local ResultItem boundary is
+                // not sufficient evidence of a physical pad.
+                if( span.nodes.size() == 2 && blockedInSpan != 0 )
+                {
+                    accepted = tryNeckdown( span, blockedInSpan, aEngine,
+                                            fromCornerNo == 0,
+                                            currentCornerNo + 1 == aConnection.nodes.size() );
+                }
+
+                if( !accepted )
+                    accepted = aEngine.SpringOverConnection( span, aCancel );
+
+                if( aCancel && aCancel() )
+                {
+                    outcome.cancelled = true;
+                    return outcome;
+                }
+
+                if( accepted && !strictlyInsertable( *accepted, aEngine ) )
+                    accepted.reset();
+            }
+
+            if( accepted )
+            {
+                if( !appendConnection( result, *accepted ) )
+                {
+                    outcome.blockedEdge = currentCornerNo;
+                    return outcome;
+                }
+
+                fromCornerNo = currentCornerNo;
+                resultNodeAtOriginal[currentCornerNo] = result.nodes.size() - 1;
+                continue;
+            }
+
+            if( currentCornerNo != runLastNode )
+            {
+                // An insertion which is valid only with compensated shapes
+                // can fail its real-shape spring-over at the next corner. The
+                // source retries on the next loop iteration with more distant
+                // corners, and on the first correction includes one already
+                // accepted approach edge as well.
+                if( fromCornerNo > runFirstNode
+                    && currentCornerNo == fromCornerNo + 1 )
+                {
+                    --fromCornerNo;
+                    const std::size_t keepNode = resultNodeAtOriginal[fromCornerNo];
+                    result.nodes.resize( keepNode + 1 );
+                    result.edgeStyles.resize( keepNode );
+                }
+                continue;
+            }
+
+            outcome.blockedEdge = currentCornerNo;
+            return outcome;
+        }
+
+        edge = runLastEdge + 1;
+    }
+
+    // Keep the historical inherited-style representation when no operation
+    // changed it.  This avoids publishing an otherwise identical replacement
+    // solely because the reconstruction needed explicit temporary styles.
+    if( aConnection.edgeStyles.empty()
+        && std::all_of( result.edgeStyles.begin(), result.edgeStyles.end(),
+                        []( const ROUTING_EDGE_STYLE& aStyle )
+                        { return aStyle == ROUTING_EDGE_STYLE{}; } ) )
+    {
+        result.edgeStyles.clear();
+    }
+
+    outcome.connection = std::move( result );
+    return outcome;
 }
 
 
@@ -544,35 +788,17 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
         return { STATE::BLOCKED };
     std::optional<ROUTING_CONNECTION> replacement;
     std::size_t blockedEdge = 0;
-    for( std::size_t i = 1; i < connection.nodes.size(); ++i )
+    if( connection.nodes.size() > 1 )
     {
-        if( cancel && cancel() ) return { STATE::CANCELLED, i };
-        const ROUTING_EDGE_STYLE* style = connection.edgeStyles.empty()
-                ? nullptr : &connection.edgeStyles[i - 1];
-        if( !engine.CanInsertSegment( connection.netCode, connection.nodes[i - 1],
-                                      connection.nodes[i], style ) )
-        { blockedEdge = i; break; }
-    }
-    if( blockedEdge != 0 )
-    {
-        // This mirrors FoundConnectionInserter.insertTrace(): first retain
-        // the ordinary-width prefix and enter a terminal pin at its legal
-        // neckdown width; only then try spring-over for an obstacle that
-        // cannot be solved by the pin-entry rule.
-        replacement = tryNeckdown( connection, blockedEdge, engine );
-        if( !replacement )
-            replacement = engine.SpringOverConnection( connection, cancel );
-        if( cancel && cancel() ) return { STATE::CANCELLED };
-        if( !replacement ) return { STATE::BLOCKED, blockedEdge };
-        for( std::size_t i = 1; i < replacement->nodes.size(); ++i )
-        {
-            if( cancel && cancel() ) return { STATE::CANCELLED, i };
-            const ROUTING_EDGE_STYLE* style = replacement->edgeStyles.empty()
-                    ? nullptr : &replacement->edgeStyles[i - 1];
-            if( !engine.CanInsertSegment( replacement->netCode, replacement->nodes[i - 1],
-                                          replacement->nodes[i], style ) )
-                return { STATE::BLOCKED, blockedEdge };
-        }
+        INCREMENTAL_INSERTION rebuilt = buildIncrementalConnection( connection, engine, cancel );
+        if( rebuilt.cancelled )
+            return { STATE::CANCELLED, rebuilt.blockedEdge };
+        if( !rebuilt.connection )
+            return { STATE::BLOCKED, rebuilt.blockedEdge };
+
+        blockedEdge = rebuilt.blockedEdge;
+        if( !SameRouteGeometry( *rebuilt.connection, connection ) )
+            replacement = std::move( rebuilt.connection );
     }
 
     const ROUTING_CONNECTION& candidate = replacement ? *replacement : connection;
