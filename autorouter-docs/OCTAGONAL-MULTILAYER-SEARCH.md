@@ -44,15 +44,15 @@ without reducing the required copper clearance.
   regions through drill selection; see
   [the drill-region checkpoint](OCTAGONAL-DRILL-REGIONS.md). Arbitrary-angle
   `Simplex` cutouts remain open.
-- Ordinary multilayer routing selects the exact-octagonal frontier. Fanout stays
-  on the qualified rectangular frontier because enabling the new queue for
-  first-drill termination regressed the 555 smoke from eight to eleven vias and
-  required host repair. That failed experiment is not shipped as parity.
+- Ordinary multilayer routing and fanout select the exact-octagonal frontier.
+  The earlier experiment was rejected before exact drill-region cutout was
+  available; after that dependency landed, exact first-drill fanout produces a
+  DRC-clean 555 result without host repair and with the reference's seven vias.
 - The rectangular single-layer fallback and broad grid/visibility fallback
   remain available for unsupported or rejected paths. General-convex layers do
   not collapse to bounding rectangles.
-- Full locator room shrinking, thin/acute-room correction, pin exits and source
-  first-drill ordering are still open.
+- Full locator room shrinking, thin/acute-room correction and pin exits remain
+  open. First-drill termination now shares the exact room/drill queue.
 
 ## Verification
 

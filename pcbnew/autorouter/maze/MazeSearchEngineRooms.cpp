@@ -759,10 +759,13 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             via.fanoutCenter = m_board.pads[fanoutTarget->fanoutSourcePadIndex].position;
     }
     const auto started = std::chrono::steady_clock::now();
-    // Keep the production fanout gate on its already-qualified rectangular
-    // drill frontier while the octagonal first-drill ordering is compared to
-    // the source. Ordinary multilayer routing uses the exact frontier below.
-    const bool exactFrontier = fanoutTarget == nullptr;
+    // RoutingBoard.fanout() uses the same 45-degree room/door/drill frontier
+    // as an ordinary connection and changes only its termination condition:
+    // the first drill which exits the source layer is a destination.  Keeping
+    // fanout on the older rectangular frontier changed both drill ordering and
+    // narrow diagonal clearance decisions.  Exact drill free regions are now
+    // available, so use the source-shaped frontier for both call paths.
+    const bool exactFrontier = true;
     int nextObstacleId = 1;
     for( int id : physical )
     {

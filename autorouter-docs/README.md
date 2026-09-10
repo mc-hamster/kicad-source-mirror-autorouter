@@ -102,14 +102,14 @@ not enter the routing algorithm and therefore do not need a Freerouting GUI coun
 source tree intentionally includes corresponding Freerouting filenames even where KiCad's
 immutable snapshot/transaction model replaces a mutable Java board event or thread pool.
 
-Ordinary single-layer and multilayer attempts now use exact-octagonal
-room/door geometry and 45-degree corridor location. Multilayer search adds the
-source-shaped rectangular drill-page layer and exact full-stack host via
-preflight; fanout temporarily retains the qualified rectangular room frontier.
+Ordinary and fanout single-layer/multilayer attempts now use exact-octagonal
+room/door geometry, exact free-drill regions and 45-degree corridor location.
+Multilayer search retains source-shaped rectangular page enumeration and exact
+full-stack host via preflight; fanout stops at the first exit drill.
 The source destination estimate is translated and used by both frontiers; the
 remaining legacy grid/visibility fallback has a separately named heuristic.
-General convex free-drill regions, complete forced insertion/shove, source
-first-drill fanout ordering, and optimizer equivalence are still incomplete. See the
+General-convex non-45-degree free-drill regions, complete forced insertion/shove,
+synthetic-free fanout setup, and optimizer equivalence are still incomplete. See the
 [latest translation audit](DESTINATION-DISTANCE-PARITY.md): matching filenames
 or isolated numeric methods does not establish whole-engine parity.
 

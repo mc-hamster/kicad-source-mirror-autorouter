@@ -50,18 +50,20 @@ snapshot callback; exact free-region search does not bypass KiCad DRC.
   a compensated support line remains legal, as in the source; production
   obstacle compensation retains its separate one-IU host-safety margin.
 
-The 555 production smoke remains complete and DRC-clean but changed from eight
-to nine vias and required one host repair pass: 21/21 connections, 124.171 mm,
-12,396 expanded nodes, and 2,203 ms worker time. Evidence is under
-`build/autorouter/online-simple-stable/native-octdrill-20260910-111632/`.
-Freerouting v2.3.0 uses seven vias, so the quality gate remains failed and this
-regression is not hidden by the safety pass.
+With exact drill regions available, the same octagonal room/drill frontier is
+also active for fanout.  The 555 production smoke is complete and DRC-clean
+without host repair: 22/22 worker connections, seven vias, 125.205 mm, 17,740
+expanded nodes, and 2,407 ms worker time. Evidence is under
+`build/autorouter/online-simple-stable/native-exact-fanout-20260910-112916/`.
+Freerouting v2.3.0 also uses seven vias on this fixture. Track length and
+decision-stream parity remain separate gates and are not implied by this via
+count match.
 
 ## Remaining dependency
 
-This closes exact 45-degree drill regions only. Arbitrary-angle `Simplex`
-shape intersection/cutout, rational convex region centres, and unrestricted-
-angle drill-room search are still missing. Fanout still uses a synthetic
-landing adapter and the qualified rectangular first-drill frontier; source
-item-set fanout and exact queue ordering must replace it before the exact
-frontier can be enabled there safely.
+This closes exact 45-degree drill regions and activates them for both ordinary
+routing and fanout. Arbitrary-angle `Simplex` shape intersection/cutout,
+rational convex region centres, and unrestricted-angle drill-room search are
+still missing. Fanout still uses a planning-only synthetic landing adapter;
+the search itself now consumes the source-shaped dynamic item sets and exact
+first-drill queue, but the provisional landing chooser must still be removed.
