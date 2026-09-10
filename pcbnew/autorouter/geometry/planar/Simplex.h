@@ -2,6 +2,7 @@
  * Freerouting Simplex/TileShape at a11c0a42.
  */
 #pragma once
+#include "FloatLine.h"
 #include "Polyline.h"
 
 #include <optional>
@@ -38,6 +39,7 @@ public:
     SIMPLEX Simplify() const;
     const std::vector<LINE>& Borders() const { return m_borders; }
     const POINT& Corner( std::size_t i ) const;
+    FLOAT_POINT CornerApprox( std::size_t aIndex ) const;
     bool CornerIsBounded( std::size_t aIndex ) const;
     bool IsEmpty() const { return m_borders.empty(); }
     bool IsBounded() const;
@@ -61,8 +63,23 @@ public:
     std::optional<SIMPLEX> Offset( double aWidth ) const;
     std::optional<SIMPLEX> Enlarge( double aOffset ) const;
     std::pair<double, double> CentreOfGravity() const;
+    bool Contains( FLOAT_POINT aPoint, double aTolerance = 0 ) const;
+    int SideOfBorder( FLOAT_POINT aPoint, double aTolerance ) const;
+    bool Contains( const SIMPLEX& aOther ) const;
+    bool ContainsApprox( const SIMPLEX& aOther ) const;
+    double Distance( FLOAT_POINT aPoint ) const;
+    double BorderDistance( FLOAT_POINT aPoint ) const;
+    double SmallestRadius() const;
     std::pair<double, double> NearestPointApprox( double aX, double aY ) const;
     std::pair<double, double> NearestBorderPointApprox( double aX, double aY ) const;
+    std::vector<FLOAT_POINT> NearestBorderPointsApprox(
+            FLOAT_POINT aFromPoint, int aCount ) const;
+    int IndexOfNearestCorner( const POINT& aFromPoint ) const;
+    std::optional<FLOAT_LINE> DiagonalCornerSegment() const;
+    std::vector<FLOAT_POINT> NearestRelativeOutsideLocations(
+            const SIMPLEX& aShape, int aCount ) const;
+    std::optional<SIMPLEX> Shrink( double aOffset ) const;
+    double Length() const;
     int EqualsCorner( const POINT& aPoint ) const;
     int ContainsOnBorderLineNo( const POINT& aPoint ) const;
     std::vector<int> TouchingSides( const SIMPLEX& aOther ) const;
@@ -77,6 +94,15 @@ public:
     std::size_t PrevNo( std::size_t aIndex ) const
     { return ( aIndex + m_borders.size() - 1 ) % m_borders.size(); }
     int IndexOfRightMostCorner( const POINT& aFromPoint ) const;
+    int IndexOfLeftMostCorner( FLOAT_POINT aFromPoint ) const;
+    int IndexOfRightMostCorner( FLOAT_POINT aFromPoint ) const;
+    std::optional<FLOAT_LINE> PolarLineSegment( FLOAT_POINT aFromPoint ) const;
+    bool Intersects( const LINE& aLine ) const;
+    POINT LeftMostCorner( const POINT& aFromPoint ) const;
+    POINT RightMostCorner( const POINT& aFromPoint ) const;
+    bool IsContainedIn( ROUTER_BOX aBox ) const;
+    int IntersectingBorderLineNo( const POINT& aPoint,
+                                  ROUTER_POINT aDirection ) const;
     bool Contains( const POINT& p ) const;
     bool ContainsInside( const POINT& p ) const;
     bool IntersectsSegment( const POLYLINE& aLine, std::size_t aIndex ) const;

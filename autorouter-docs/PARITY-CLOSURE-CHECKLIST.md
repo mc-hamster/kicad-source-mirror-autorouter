@@ -95,10 +95,21 @@ and projection, shrinking, nearest points and section division. A **512-record**
 pinned oracle covers crossing, parallel, opposite, horizontal and vertical line
 pairs, every rounding direction, tangent existence/nonexistence and zero through
 six sections under strict floating-contraction settings. The complete native
-autorouter suite now has **194 passing cases**. The production 555 smoke remains
-host-valid and unchanged at 12/12 connections, zero new DRC violations, 12 vias,
-97.101 mm and 2,853 expanded nodes. The remaining general `TileShape` dispatch
-and rational-support line transforms remain open.
+`TileShape`/`PolylineShape` query surface is now translated over general
+simplexes as well: approximate containment and border classification, nearest
+border sets, relative outside translations, shape containment, distance and
+radius, shrinking and length, diagonal/polar segments, nearest/left/right
+corner selection, line intersection, box containment and ray-to-border lookup.
+All approximate corner-dependent methods use the source floating support-line
+intersection rather than converting exact rationals back to doubles, preserving
+even signed-zero and endpoint side decisions. A **512-record** pinned oracle
+covers boxes, arbitrary triangles, rational-corner hexagons and octagons with
+interior, border and exterior probes, intersecting/contained/disjoint peers and
+eight ray directions. The complete native autorouter suite now has **195 passing
+cases**. The production 555 smoke remains host-valid and unchanged at 12/12
+connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853 expanded
+nodes. General shape transforms, exact nearest-point helpers and arbitrary-angle
+search-tree activation remain open.
 
 Fixed and negotiated-rip-up trace/via obstacles retain exact octagonal envelopes;
 free-space completion, neighbour gaps, door sections, source-style queue

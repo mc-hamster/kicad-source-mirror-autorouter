@@ -237,6 +237,91 @@ inline std::string CheckRecord( const std::string& record )
             PrintSimplex( actual, section );
         }
     }
+    else if( tag == "TILE2" )
+    {
+        const auto readSimplex = [&]()
+        {
+            std::size_t count;
+            in >> count;
+            std::vector<LINE> lines;
+            lines.reserve( count );
+            for( std::size_t index = 0; index < count; ++index )
+                lines.push_back( ReadLine( in ) );
+            return SIMPLEX::GetInstance( std::move( lines ) );
+        };
+        const SIMPLEX simplex = readSimplex();
+        const SIMPLEX other = readSimplex();
+        FLOAT_POINT query;
+        ROUTER_POINT rayStart;
+        int resultCount;
+        double tolerance;
+        in >> query.x >> query.y >> rayStart.x >> rayStart.y
+           >> resultCount >> tolerance;
+        const LINE probe = ReadLine( in );
+        ROUTER_BOX container;
+        ROUTER_POINT direction;
+        in >> container.minX >> container.minY >> container.maxX >> container.maxY
+           >> direction.x >> direction.y;
+
+        const auto printFloatPoint = [&]( FLOAT_POINT aPoint )
+        { actual << aPoint.x << ' ' << aPoint.y; };
+        const auto printFloatLine = [&]( const std::optional<FLOAT_LINE>& aLine )
+        {
+            if( !aLine )
+                actual << -1;
+            else
+            {
+                actual << "4 ";
+                printFloatPoint( aLine->a );
+                actual << ' ';
+                printFloatPoint( aLine->b );
+            }
+        };
+
+        actual << std::fixed << std::setprecision( 9 )
+               << ( simplex.Contains( query, tolerance ) ? 1 : 0 )
+               << ' ' << simplex.SideOfBorder( query, tolerance )
+               << ' ' << ( simplex.Contains( other ) ? 1 : 0 )
+               << ' ' << ( simplex.ContainsApprox( other ) ? 1 : 0 )
+               << ' ' << simplex.Distance( query )
+               << ' ' << simplex.BorderDistance( query )
+               << ' ' << simplex.SmallestRadius()
+               << ' ' << simplex.Length();
+        const auto nearest = simplex.NearestBorderPointsApprox( query, resultCount );
+        actual << ' ' << nearest.size();
+        for( FLOAT_POINT point : nearest )
+        {
+            actual << ' ';
+            printFloatPoint( point );
+        }
+        actual << ' ' << simplex.IndexOfNearestCorner( POINT( rayStart ) ) << ' ';
+        printFloatLine( simplex.DiagonalCornerSegment() );
+        const auto outside = simplex.NearestRelativeOutsideLocations(
+                other, resultCount );
+        actual << ' ' << outside.size();
+        for( FLOAT_POINT point : outside )
+        {
+            actual << ' ';
+            printFloatPoint( point );
+        }
+        const auto shrunk = simplex.Shrink( 1.25 );
+        if( !shrunk )
+            throw std::runtime_error( "small simplex shrink overflowed" );
+        actual << ' ';
+        PrintSimplex( actual, *shrunk );
+        actual << ' ' << simplex.IndexOfLeftMostCorner( query )
+               << ' ' << simplex.IndexOfRightMostCorner( query )
+               << ' ' << simplex.IndexOfRightMostCorner( POINT( rayStart ) )
+               << ' ';
+        printFloatLine( simplex.PolarLineSegment( query ) );
+        actual << ' ' << ( simplex.Intersects( probe ) ? 1 : 0 ) << ' ';
+        Print( actual, simplex.LeftMostCorner( POINT( rayStart ) ) );
+        actual << ' ';
+        Print( actual, simplex.RightMostCorner( POINT( rayStart ) ) );
+        actual << ' ' << ( simplex.IsContainedIn( container ) ? 1 : 0 )
+               << ' ' << simplex.IntersectingBorderLineNo(
+                        POINT( rayStart ), direction );
+    }
     else if( tag == "POLY" )
     {
         std::size_t count;

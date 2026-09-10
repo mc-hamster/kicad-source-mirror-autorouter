@@ -549,28 +549,36 @@ std::optional<INT_OCTAGON> exactIntOctagon( const SIMPLEX& aSimplex )
 }
 
 
-std::pair<double, double> projectToLine( double aX, double aY,
-                                         const LINE& aLine )
+int sideOfApprox( const LINE& aLine, FLOAT_POINT aPoint, double aTolerance )
 {
-    const long double dx = aLine.Dx().convert_to<long double>();
-    const long double dy = aLine.Dy().convert_to<long double>();
-    const long double lengthSquared = dx * dx + dy * dy;
-    const long double ratio =
-            ( ( static_cast<long double>( aX ) - aLine.a.x ) * dx
-              + ( static_cast<long double>( aY ) - aLine.a.y ) * dy )
-            / lengthSquared;
-    return { static_cast<double>( aLine.a.x + ratio * dx ),
-             static_cast<double>( aLine.a.y + ratio * dy ) };
+    const double value = aLine.Dy().convert_to<double>() * ( aPoint.x - aLine.a.x )
+                         - aLine.Dx().convert_to<double>() * ( aPoint.y - aLine.a.y );
+    if( value - aTolerance > 0 )
+        return 1;
+    if( value + aTolerance < 0 )
+        return -1;
+    return 0;
 }
 
 
-int sideOfApprox( const LINE& aLine, const std::pair<double, double>& aPoint )
+int pointSide( const POINT& aPoint, const POINT& aFirst, const POINT& aSecond )
 {
-    const long double value = aLine.Dy().convert_to<long double>()
-                                      * ( aPoint.first - aLine.a.x )
-                              - aLine.Dx().convert_to<long double>()
-                                      * ( aPoint.second - aLine.a.y );
-    return value > 0 ? 1 : value < 0 ? -1 : 0;
+    // Point.sideOf(first, second): sign of
+    // (second - first) x (point - first), without introducing rationals.
+    const INTEGER firstX = aSecond.x * aFirst.z - aFirst.x * aSecond.z;
+    const INTEGER firstY = aSecond.y * aFirst.z - aFirst.y * aSecond.z;
+    const INTEGER secondX = aPoint.x * aFirst.z - aFirst.x * aPoint.z;
+    const INTEGER secondY = aPoint.y * aFirst.z - aFirst.y * aPoint.z;
+    return Sign( firstX * secondY - firstY * secondX );
+}
+
+
+FLOAT_LINE toFloatLine( const LINE& aLine )
+{
+    return { { static_cast<double>( aLine.a.x ),
+               static_cast<double>( aLine.a.y ) },
+             { static_cast<double>( aLine.b.x ),
+               static_cast<double>( aLine.b.y ) } };
 }
 
 } // namespace
@@ -659,6 +667,21 @@ const POINT& SIMPLEX::Corner( std::size_t aIndex ) const
     if( aIndex >= m_corners.size() || !m_corners[aIndex] )
         throw std::domain_error( "simplex corner is unbounded" );
     return *m_corners[aIndex];
+}
+
+
+FLOAT_POINT SIMPLEX::CornerApprox( std::size_t aIndex ) const
+{
+    if( aIndex >= m_borders.size() )
+        throw std::out_of_range( "simplex corner index" );
+    const std::size_t previous =
+            ( aIndex + m_borders.size() - 1 ) % m_borders.size();
+    const auto intersection = toFloatLine( m_borders[aIndex] ).Intersection(
+            toFloatLine( m_borders[previous] ) );
+    if( intersection )
+        return *intersection;
+    return { static_cast<double>( std::numeric_limits<std::int32_t>::max() ),
+             static_cast<double>( std::numeric_limits<std::int32_t>::max() ) };
 }
 
 
@@ -1060,64 +1083,316 @@ std::pair<double, double> SIMPLEX::CentreOfGravity() const
     double y = 0;
     for( std::size_t index = 0; index < m_corners.size(); ++index )
     {
-        x += Corner( index ).X();
-        y += Corner( index ).Y();
+        const FLOAT_POINT corner = CornerApprox( index );
+        x += corner.x;
+        y += corner.y;
     }
     return { x / m_corners.size(), y / m_corners.size() };
+}
+
+
+bool SIMPLEX::Contains( FLOAT_POINT aPoint, double aTolerance ) const
+{
+    if( IsEmpty() )
+        return false;
+
+    // This intentionally mirrors TileShape.contains(FloatPoint, tolerance),
+    // whose floating overload requires ON_THE_RIGHT rather than accepting a
+    // collinear border point like the exact Point overload does.
+    for( const LINE& border : m_borders )
+    {
+        if( sideOfApprox( border, aPoint, aTolerance ) != -1 )
+            return false;
+    }
+    return true;
+}
+
+
+int SIMPLEX::SideOfBorder( FLOAT_POINT aPoint, double aTolerance ) const
+{
+    if( IsEmpty() )
+        return 0;
+
+    int result = -1;
+    for( const LINE& border : m_borders )
+    {
+        const int side = sideOfApprox( border, aPoint, aTolerance );
+        if( side > 0 )
+            return 1;
+        if( side == 0 )
+            result = 0;
+    }
+    return result;
+}
+
+
+bool SIMPLEX::Contains( const SIMPLEX& aOther ) const
+{
+    for( std::size_t index = 0; index < aOther.m_borders.size(); ++index )
+    {
+        if( !aOther.CornerIsBounded( index ) || !Contains( aOther.Corner( index ) ) )
+            return false;
+    }
+    return true;
+}
+
+
+bool SIMPLEX::ContainsApprox( const SIMPLEX& aOther ) const
+{
+    for( std::size_t index = 0; index < aOther.m_borders.size(); ++index )
+    {
+        if( !aOther.CornerIsBounded( index )
+            || !Contains( aOther.CornerApprox( index ) ) )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+double SIMPLEX::Distance( FLOAT_POINT aPoint ) const
+{
+    const auto nearest = NearestPointApprox( aPoint.x, aPoint.y );
+    return aPoint.Distance( { nearest.first, nearest.second } );
+}
+
+
+double SIMPLEX::BorderDistance( FLOAT_POINT aPoint ) const
+{
+    const auto nearest = NearestBorderPointApprox( aPoint.x, aPoint.y );
+    return aPoint.Distance( { nearest.first, nearest.second } );
+}
+
+
+double SIMPLEX::SmallestRadius() const
+{
+    const auto centre = CentreOfGravity();
+    return BorderDistance( { centre.first, centre.second } );
 }
 
 
 std::pair<double, double> SIMPLEX::NearestBorderPointApprox(
         double aX, double aY ) const
 {
-    if( IsEmpty() )
+    const auto nearest = NearestBorderPointsApprox( { aX, aY }, 1 );
+    if( nearest.empty() )
         return { aX, aY };
-    if( m_borders.size() == 1 )
-        return projectToLine( aX, aY, m_borders.front() );
-    if( Dimension() == 0 && CornerIsBounded( 0 ) )
-        return { Corner( 0 ).X(), Corner( 0 ).Y() };
+    return { nearest.front().x, nearest.front().y };
+}
 
-    std::pair<double, double> nearest{ aX, aY };
-    long double minimum = std::numeric_limits<long double>::infinity();
+
+std::vector<FLOAT_POINT> SIMPLEX::NearestBorderPointsApprox(
+        FLOAT_POINT aFromPoint, int aCount ) const
+{
+    if( aCount <= 0 || IsEmpty() )
+        return {};
+    if( m_borders.size() == 1 )
+    {
+        const LINE& border = m_borders.front();
+        return { FLOAT_LINE{ { static_cast<double>( border.a.x ),
+                               static_cast<double>( border.a.y ) },
+                             { static_cast<double>( border.b.x ),
+                               static_cast<double>( border.b.y ) } }
+                         .PerpendicularProjection( aFromPoint ) };
+    }
+    if( Dimension() == 0 )
+    {
+        const POINT& corner = Corner( 0 );
+        return { { corner.X(), corner.Y() } };
+    }
+
+    const std::size_t resultCount = std::min<std::size_t>(
+            static_cast<std::size_t>( aCount ), m_borders.size() );
+    std::vector<FLOAT_POINT> nearestPoints( resultCount );
+    std::vector<double> minimumDistances(
+            resultCount, std::numeric_limits<double>::max() );
+
+    const auto insert = [&]( FLOAT_POINT aPoint, double aDistance )
+    {
+        for( std::size_t resultIndex = 0; resultIndex < resultCount; ++resultIndex )
+        {
+            if( aDistance < minimumDistances[resultIndex] )
+            {
+                // Preserve the source's forward assignment order.  Although
+                // unusual for an insertion shift, its duplicate entries are
+                // observable by the maze caller when count is greater than 1.
+                for( std::size_t index = resultIndex + 1;
+                     index < resultCount; ++index )
+                {
+                    minimumDistances[index] = minimumDistances[index - 1];
+                    nearestPoints[index] = nearestPoints[index - 1];
+                }
+                minimumDistances[resultIndex] = aDistance;
+                nearestPoints[resultIndex] = aPoint;
+                break;
+            }
+        }
+    };
+
     for( std::size_t index = 0; index < m_corners.size(); ++index )
     {
         if( !CornerIsBounded( index ) )
             continue;
-        const double x = Corner( index ).X();
-        const double y = Corner( index ).Y();
-        const long double dx = static_cast<long double>( x ) - aX;
-        const long double dy = static_cast<long double>( y ) - aY;
-        const long double distance = dx * dx + dy * dy;
-        if( distance < minimum )
-        {
-            minimum = distance;
-            nearest = { x, y };
-        }
+        const FLOAT_POINT corner = CornerApprox( index );
+        insert( corner, corner.DistanceSquared( aFromPoint ) );
     }
 
     std::size_t previous = m_borders.size() - 2;
     std::size_t current = m_borders.size() - 1;
     for( std::size_t next = 0; next < m_borders.size(); ++next )
     {
-        const auto projection = projectToLine( aX, aY, m_borders[current] );
+        const LINE& border = m_borders[current];
+        const FLOAT_POINT projection = FLOAT_LINE{
+                { static_cast<double>( border.a.x ), static_cast<double>( border.a.y ) },
+                { static_cast<double>( border.b.x ), static_cast<double>( border.b.y ) } }
+                                                       .PerpendicularProjection( aFromPoint );
         if( ( !CornerIsBounded( current )
-              || sideOfApprox( m_borders[previous], projection ) < 0 )
+              || sideOfApprox( m_borders[previous], projection, 0 ) < 0 )
             && ( !CornerIsBounded( next )
-                 || sideOfApprox( m_borders[next], projection ) < 0 ) )
+                 || sideOfApprox( m_borders[next], projection, 0 ) < 0 ) )
         {
-            const long double dx = static_cast<long double>( projection.first ) - aX;
-            const long double dy = static_cast<long double>( projection.second ) - aY;
-            const long double distance = dx * dx + dy * dy;
-            if( distance < minimum )
-            {
-                minimum = distance;
-                nearest = projection;
-            }
+            insert( projection, projection.DistanceSquared( aFromPoint ) );
         }
         previous = current;
         current = next;
     }
-    return nearest;
+    return nearestPoints;
+}
+
+
+int SIMPLEX::IndexOfNearestCorner( const POINT& aFromPoint ) const
+{
+    int result = 0;
+    double minimumDistance = std::numeric_limits<double>::denorm_min();
+    const FLOAT_POINT from{ aFromPoint.X(), aFromPoint.Y() };
+    for( std::size_t index = 0; index < m_corners.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) )
+            continue;
+        const FLOAT_POINT corner = CornerApprox( index );
+        const double distance = corner.Distance( from );
+        if( distance < minimumDistance )
+        {
+            minimumDistance = distance;
+            result = static_cast<int>( index );
+        }
+    }
+    return result;
+}
+
+
+std::optional<FLOAT_LINE> SIMPLEX::DiagonalCornerSegment() const
+{
+    if( IsEmpty() )
+        return {};
+    return FLOAT_LINE{ CornerApprox( 0 ),
+                       CornerApprox( m_borders.size() / 2 ) };
+}
+
+
+std::vector<FLOAT_POINT> SIMPLEX::NearestRelativeOutsideLocations(
+        const SIMPLEX& aShape, int aCount ) const
+{
+    if( aCount <= 0 || m_borders.size() < 3 || !Intersects( aShape ) )
+        return {};
+
+    const std::size_t resultCount = std::min<std::size_t>(
+            static_cast<std::size_t>( aCount ), m_borders.size() );
+    std::vector<FLOAT_POINT> translations( resultCount );
+    std::vector<double> minimumDistances(
+            resultCount, std::numeric_limits<double>::max() );
+    std::size_t current = m_borders.size() - 1;
+
+    for( std::size_t next = 0; next < m_borders.size(); ++next )
+    {
+        double maximumDistance = 0;
+        FLOAT_POINT translation;
+        for( std::size_t cornerIndex = 0;
+             cornerIndex < aShape.m_borders.size(); ++cornerIndex )
+        {
+            if( !aShape.CornerIsBounded( cornerIndex ) )
+                continue;
+            const FLOAT_POINT corner = aShape.CornerApprox( cornerIndex );
+            if( sideOfApprox( m_borders[current], corner, 0 ) < 0 )
+            {
+                const LINE& border = m_borders[current];
+                const FLOAT_POINT projection = FLOAT_LINE{
+                        { static_cast<double>( border.a.x ),
+                          static_cast<double>( border.a.y ) },
+                        { static_cast<double>( border.b.x ),
+                          static_cast<double>( border.b.y ) } }
+                                                               .PerpendicularProjection( corner );
+                const double distance = projection.DistanceSquared( corner );
+                if( distance > maximumDistance )
+                {
+                    maximumDistance = distance;
+                    translation = projection.Subtract( corner );
+                }
+            }
+        }
+
+        for( std::size_t resultIndex = 0; resultIndex < resultCount; ++resultIndex )
+        {
+            if( maximumDistance < minimumDistances[resultIndex] )
+            {
+                for( std::size_t index = resultIndex + 1;
+                     index < resultCount; ++index )
+                {
+                    minimumDistances[index] = minimumDistances[index - 1];
+                    translations[index] = translations[index - 1];
+                }
+                minimumDistances[resultIndex] = maximumDistance;
+                translations[resultIndex] = translation;
+                break;
+            }
+        }
+        current = next;
+    }
+    return translations;
+}
+
+
+std::optional<SIMPLEX> SIMPLEX::Shrink( double aOffset ) const
+{
+    const auto shrunk = Offset( -aOffset );
+    if( !shrunk || !shrunk->IsEmpty() )
+        return shrunk;
+
+    const auto centre = CentreOfGravity();
+    const ROUTER_BOX centreBox = FLOAT_POINT{ centre.first, centre.second }.BoundingBox();
+    return Intersection( boxSimplexAllowDegenerate( centreBox ) );
+}
+
+
+double SIMPLEX::Length() const
+{
+    if( !IsBounded() )
+        return std::numeric_limits<std::int32_t>::max();
+    const int dimension = Dimension();
+    if( dimension <= 0 )
+        return 0;
+    if( dimension == 1 )
+        return Circumference() / 2;
+
+    double maximumDistance = -1;
+    double secondMaximumDistance = -1;
+    const auto centre = CentreOfGravity();
+    for( const LINE& border : m_borders )
+    {
+        const double distance = std::abs( border.SignedDistance(
+                centre.first, centre.second ) );
+        if( distance > maximumDistance )
+        {
+            secondMaximumDistance = maximumDistance;
+            maximumDistance = distance;
+        }
+        else if( distance > secondMaximumDistance )
+        {
+            secondMaximumDistance = distance;
+        }
+    }
+    return maximumDistance + secondMaximumDistance;
 }
 
 
@@ -1129,7 +1404,7 @@ std::pair<double, double> SIMPLEX::NearestPointApprox(
         bool contains = true;
         for( const LINE& border : m_borders )
         {
-            if( sideOfApprox( border, { aX, aY } ) > 0 )
+            if( sideOfApprox( border, { aX, aY }, 0 ) > 0 )
             {
                 contains = false;
                 break;
@@ -1367,6 +1642,159 @@ int SIMPLEX::IndexOfRightMostCorner( const POINT& aFromPoint ) const
         {
             rightMost = &current;
             result = static_cast<int>( index );
+        }
+    }
+    return result;
+}
+
+
+int SIMPLEX::IndexOfLeftMostCorner( FLOAT_POINT aFromPoint ) const
+{
+    if( IsEmpty() )
+        return -1;
+    FLOAT_POINT leftMost = CornerApprox( 0 );
+    int result = 0;
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        const FLOAT_POINT current = CornerApprox( index );
+        if( current.SideOf( aFromPoint, leftMost ) > 0 )
+        {
+            leftMost = current;
+            result = static_cast<int>( index );
+        }
+    }
+    return result;
+}
+
+
+int SIMPLEX::IndexOfRightMostCorner( FLOAT_POINT aFromPoint ) const
+{
+    if( IsEmpty() )
+        return -1;
+    FLOAT_POINT rightMost = CornerApprox( 0 );
+    int result = 0;
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        const FLOAT_POINT current = CornerApprox( index );
+        if( current.SideOf( aFromPoint, rightMost ) < 0 )
+        {
+            rightMost = current;
+            result = static_cast<int>( index );
+        }
+    }
+    return result;
+}
+
+
+std::optional<FLOAT_LINE> SIMPLEX::PolarLineSegment( FLOAT_POINT aFromPoint ) const
+{
+    if( IsEmpty() )
+        return {};
+    FLOAT_POINT leftMost = CornerApprox( 0 );
+    FLOAT_POINT rightMost = leftMost;
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        const FLOAT_POINT current = CornerApprox( index );
+        if( current.SideOf( aFromPoint, rightMost ) < 0 )
+            rightMost = current;
+        if( current.SideOf( aFromPoint, leftMost ) > 0 )
+            leftMost = current;
+    }
+    return FLOAT_LINE{ leftMost, rightMost };
+}
+
+
+bool SIMPLEX::Intersects( const LINE& aLine ) const
+{
+    if( IsEmpty() || !CornerIsBounded( 0 ) )
+        return false;
+    const int firstSide = aLine.SideOf( Corner( 0 ) );
+    if( firstSide == 0 )
+        return true;
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        if( !CornerIsBounded( index ) || aLine.SideOf( Corner( index ) ) != firstSide )
+            return true;
+    }
+    return false;
+}
+
+
+POINT SIMPLEX::LeftMostCorner( const POINT& aFromPoint ) const
+{
+    if( IsEmpty() )
+        return aFromPoint;
+    POINT result = Corner( 0 );
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        const POINT& current = Corner( index );
+        if( pointSide( current, aFromPoint, result ) > 0 )
+            result = current;
+    }
+    return result;
+}
+
+
+POINT SIMPLEX::RightMostCorner( const POINT& aFromPoint ) const
+{
+    if( IsEmpty() )
+        return aFromPoint;
+    POINT result = Corner( 0 );
+    for( std::size_t index = 1; index < m_corners.size(); ++index )
+    {
+        const POINT& current = Corner( index );
+        if( pointSide( current, aFromPoint, result ) < 0 )
+            result = current;
+    }
+    return result;
+}
+
+
+bool SIMPLEX::IsContainedIn( ROUTER_BOX aBox ) const
+{
+    if( IsEmpty() )
+        return true;
+    const auto bounds = BoundingBox();
+    return bounds && bounds->minX >= aBox.minX && bounds->minY >= aBox.minY
+           && bounds->maxX <= aBox.maxX && bounds->maxY <= aBox.maxY;
+}
+
+
+int SIMPLEX::IntersectingBorderLineNo( const POINT& aPoint,
+                                        ROUTER_POINT aDirection ) const
+{
+    if( !Contains( aPoint ) )
+        return -1;
+    const auto integralPoint = aPoint.Integral();
+    if( !integralPoint )
+        return -1;
+    const auto ray = LINE::FromDirection( *integralPoint,
+                                         aDirection.x, aDirection.y );
+    if( !ray )
+        return -1;
+
+    const FLOAT_POINT from{ aPoint.X(), aPoint.Y() };
+    const FLOAT_POINT second{ static_cast<double>( ray->b.x ),
+                              static_cast<double>( ray->b.y ) };
+    int result = -1;
+    double minimumDistance = std::numeric_limits<float>::max();
+    for( std::size_t index = 0; index < m_borders.size(); ++index )
+    {
+        const auto exactIntersection = m_borders[index].Intersection( *ray );
+        if( !exactIntersection )
+            continue;
+        const FLOAT_POINT intersection{ exactIntersection->X(),
+                                        exactIntersection->Y() };
+        const double distance = intersection.DistanceSquared( from );
+        if( distance < minimumDistance )
+        {
+            const bool directionOk = sideOfApprox( m_borders[index], second, 0 ) > 0
+                                     || second.DistanceSquared( intersection ) < distance;
+            if( directionOk )
+            {
+                result = static_cast<int>( index );
+                minimumDistance = distance;
+            }
         }
     }
     return result;
