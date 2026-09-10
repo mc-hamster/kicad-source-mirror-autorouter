@@ -134,6 +134,38 @@ inline std::string CheckRecord( const std::string& record )
         actual << ' ';
         PrintSimplex( actual, *translated );
     }
+    else if( tag == "SCUT" )
+    {
+        std::size_t count;
+        in >> count;
+        std::vector<LINE> outerLines;
+        outerLines.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            outerLines.push_back( ReadLine( in ) );
+        in >> count;
+        std::vector<LINE> innerLines;
+        innerLines.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            innerLines.push_back( ReadLine( in ) );
+
+        const SIMPLEX outer = SIMPLEX::GetInstance( std::move( outerLines ) );
+        const SIMPLEX inner = SIMPLEX::GetInstance( std::move( innerLines ) );
+        const auto pieces = inner.CutoutFrom( outer );
+        if( !pieces )
+        {
+            actual << -1;
+        }
+        else
+        {
+            actual << pieces->size();
+            for( const SIMPLEX& piece : *pieces )
+            {
+                actual << ' ';
+                PrintSimplex( actual, piece );
+                actual << ' ' << piece.Dimension();
+            }
+        }
+    }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );
     std::string expected; std::getline( in >> std::ws, expected );

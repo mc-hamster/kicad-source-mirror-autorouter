@@ -183,6 +183,198 @@ std::optional<ROUTER_POINT> translatedPoint( ROUTER_POINT aPoint,
     return ROUTER_POINT{ *x, *y };
 }
 
+
+struct DIVISION_LINE
+{
+    ROUTER_POINT a;
+    ROUTER_POINT b;
+
+    bool Degenerate() const { return a == b; }
+    INTEGER Dx() const { return INTEGER( b.x ) - a.x; }
+    INTEGER Dy() const { return INTEGER( b.y ) - a.y; }
+    INTEGER Determinant( const DIVISION_LINE& aOther ) const
+    { return Dx() * aOther.Dy() - Dy() * aOther.Dx(); }
+    INTEGER ScalarProduct( const DIVISION_LINE& aOther ) const
+    { return Dx() * aOther.Dx() + Dy() * aOther.Dy(); }
+    DIVISION_LINE Opposite() const { return { b, a }; }
+    std::optional<LINE> Support() const
+    {
+        if( Degenerate() )
+            return {};
+        return LINE( a, b );
+    }
+};
+
+
+DIVISION_LINE divisionLine( const LINE& aLine )
+{
+    return { aLine.a, aLine.b };
+}
+
+
+std::optional<ROUTER_POINT> directionEndpoint( ROUTER_POINT aStart,
+                                               const INTEGER& aDx,
+                                               const INTEGER& aDy )
+{
+    if( aDx == 0 && aDy == 0 )
+        return aStart;
+
+    const INTEGER divisor = Gcd( aDx, aDy );
+    const INTEGER dx = aDx / divisor;
+    const INTEGER dy = aDy / divisor;
+    if( dx < std::numeric_limits<std::int64_t>::min()
+        || dx > std::numeric_limits<std::int64_t>::max()
+        || dy < std::numeric_limits<std::int64_t>::min()
+        || dy > std::numeric_limits<std::int64_t>::max() )
+    {
+        return {};
+    }
+
+    return translatedPoint( aStart, { dx.convert_to<std::int64_t>(),
+                                      dy.convert_to<std::int64_t>() } );
+}
+
+
+std::optional<DIVISION_LINE> perpendicularDirectionLine( ROUTER_POINT aPoint,
+                                                          const LINE& aLine )
+{
+    const int side = aLine.SideOf( POINT( aPoint ) );
+    if( side == 0 )
+        return DIVISION_LINE{ aPoint, aPoint };
+
+    // Point.perpendicularDirection(Line): source Point-side RIGHT chooses
+    // +90 degrees and LEFT chooses -90.  Native Line::SideOf has the inverse
+    // sign convention, so +1 selects (-dy, dx).
+    const INTEGER dx = side > 0 ? -aLine.Dy() : aLine.Dy();
+    const INTEGER dy = side > 0 ? aLine.Dx() : -aLine.Dx();
+    const auto endpoint = directionEndpoint( aPoint, dx, dy );
+    if( !endpoint )
+        return {};
+    return DIVISION_LINE{ aPoint, *endpoint };
+}
+
+
+double distanceToSupport( ROUTER_POINT aPoint, const LINE& aLine )
+{
+    const double dx = aLine.Dx().convert_to<double>();
+    const double dy = aLine.Dy().convert_to<double>();
+    const double px = static_cast<double>( aPoint.x ) - aLine.a.x;
+    const double py = static_cast<double>( aPoint.y ) - aLine.a.y;
+    return std::abs( dy * px - dx * py ) / std::sqrt( dx * dx + dy * dy );
+}
+
+
+std::optional<std::vector<DIVISION_LINE>> calculateDivisionLines(
+        const SIMPLEX& aInner, std::size_t aCornerIndex,
+        const SIMPLEX& aOuter )
+{
+    const auto& innerBorders = aInner.Borders();
+    const LINE& currentInner = innerBorders[aCornerIndex];
+    const LINE& previousInner =
+            innerBorders[( aCornerIndex + innerBorders.size() - 1 )
+                         % innerBorders.size()];
+    const auto exactCorner = currentInner.Intersection( previousInner );
+    if( !exactCorner )
+        return {};
+
+    const auto innerCorner = exactCorner->Integral();
+    if( !innerCorner )
+    {
+        // A non-integral corner was introduced by clipping against the outer
+        // simplex and already lies on its border; the source does not divide
+        // from it.
+        return std::vector<DIVISION_LINE>{ divisionLine( previousInner ) };
+    }
+
+    const DIVISION_LINE previousDirection = divisionLine( previousInner ).Opposite();
+    const DIVISION_LINE nextDirection = divisionLine( currentInner );
+
+    std::optional<DIVISION_LINE> firstProjection;
+    std::optional<DIVISION_LINE> secondProjection;
+    double minimumDistance = std::numeric_limits<double>::max();
+    const auto& outerBorders = aOuter.Borders();
+
+    for( std::size_t outerIndex = 0; outerIndex < outerBorders.size(); ++outerIndex )
+    {
+        const auto projection = perpendicularDirectionLine( *innerCorner,
+                                                             outerBorders[outerIndex] );
+        if( !projection )
+            return {};
+        if( projection->Degenerate() )
+            return std::vector<DIVISION_LINE>{ *projection };
+
+        const bool visible = previousDirection.Determinant( *projection ) >= 0;
+        if( !visible )
+            continue;
+
+        double currentDistance = distanceToSupport( *innerCorner,
+                                                     outerBorders[outerIndex] );
+        const bool secondNecessary = projection->Determinant( nextDirection ) < 0;
+        DIVISION_LINE currentSecond = *projection;
+
+        if( secondNecessary )
+        {
+            bool secondVisible = false;
+            std::size_t secondIndex = outerIndex;
+            std::size_t checked = 0;
+            while( !secondVisible && checked++ <= outerBorders.size() )
+            {
+                secondIndex = ( secondIndex + 1 ) % outerBorders.size();
+                const auto candidate = perpendicularDirectionLine(
+                        *innerCorner, outerBorders[secondIndex] );
+                if( !candidate )
+                    return {};
+                if( candidate->Degenerate() )
+                    return std::vector<DIVISION_LINE>{ *candidate };
+
+                currentSecond = *candidate;
+                if( projection->Determinant( currentSecond ) < 0 )
+                {
+                    currentDistance = std::numeric_limits<double>::max();
+                    break;
+                }
+                secondVisible = currentSecond.Determinant( nextDirection ) >= 0;
+                if( secondVisible )
+                {
+                    currentDistance += distanceToSupport( *innerCorner,
+                                                          outerBorders[secondIndex] );
+                }
+            }
+            if( !secondVisible )
+                currentDistance = std::numeric_limits<double>::max();
+        }
+
+        if( currentDistance < minimumDistance )
+        {
+            minimumDistance = currentDistance;
+            firstProjection = *projection;
+            secondProjection = currentSecond;
+        }
+    }
+
+    if( !firstProjection || !secondProjection
+        || minimumDistance == std::numeric_limits<double>::max() )
+    {
+        return {};
+    }
+
+    if( firstProjection->Determinant( *secondProjection ) == 0
+        && firstProjection->ScalarProduct( *secondProjection ) > 0 )
+    {
+        return std::vector<DIVISION_LINE>{ *firstProjection };
+    }
+    return std::vector<DIVISION_LINE>{ *firstProjection, *secondProjection };
+}
+
+
+void appendSupport( std::vector<LINE>& aLines, const DIVISION_LINE& aDivision,
+                    bool aOpposite = false )
+{
+    const DIVISION_LINE selected = aOpposite ? aDivision.Opposite() : aDivision;
+    if( const auto support = selected.Support() )
+        aLines.push_back( *support );
+}
+
 } // namespace
 
 
@@ -400,6 +592,98 @@ SIMPLEX SIMPLEX::Intersection( const SIMPLEX& aOther ) const
 bool SIMPLEX::Intersects( const SIMPLEX& aOther ) const
 {
     return !Intersection( aOther ).IsEmpty();
+}
+
+
+std::optional<std::vector<SIMPLEX>> SIMPLEX::CutoutFrom(
+        const SIMPLEX& aOuter ) const
+{
+    if( Dimension() < 2 )
+        return {};
+
+    const SIMPLEX inner = Intersection( aOuter );
+    if( inner.Dimension() < 2 )
+        return std::vector<SIMPLEX>{ aOuter };
+
+    std::vector<std::vector<DIVISION_LINE>> divisionLines;
+    divisionLines.reserve( inner.Borders().size() );
+    for( std::size_t corner = 0; corner < inner.Borders().size(); ++corner )
+    {
+        const auto lines = calculateDivisionLines( inner, corner, aOuter );
+        if( !lines )
+        {
+            // The pinned source fails closed to the uncut outer simplex when
+            // it cannot construct a division line.
+            return std::vector<SIMPLEX>{ aOuter };
+        }
+        divisionLines.push_back( *lines );
+    }
+
+    bool checkCrossFirstLine = false;
+    const DIVISION_LINE firstDivision = divisionLines.front().front();
+    std::vector<SIMPLEX> result;
+
+    for( std::size_t corner = 0; corner < divisionLines.size(); ++corner )
+    {
+        const std::size_t nextCorner = ( corner + 1 ) % divisionLines.size();
+        const DIVISION_LINE nextDivision = divisionLines[nextCorner].front();
+        const auto& currentDivisions = divisionLines[corner];
+
+        if( currentDivisions.size() == 2 )
+        {
+            const DIVISION_LINE& currentDirection = currentDivisions.front();
+            bool mergeFirstDivision = false;
+            if( !checkCrossFirstLine )
+            {
+                checkCrossFirstLine = corner > 0
+                                      && currentDirection.Determinant(
+                                                 firstDivision ) > 0;
+            }
+            if( checkCrossFirstLine
+                && currentDivisions.back().Determinant( firstDivision ) < 0 )
+            {
+                mergeFirstDivision = true;
+            }
+
+            std::vector<LINE> pieceLines;
+            appendSupport( pieceLines, currentDivisions.back(), true );
+            appendSupport( pieceLines, currentDivisions.front() );
+            if( mergeFirstDivision )
+                appendSupport( pieceLines, firstDivision, true );
+            result.push_back( SIMPLEX::GetInstance( std::move( pieceLines ) )
+                                      .Intersection( aOuter ) );
+        }
+
+        const DIVISION_LINE& lastCurrent = currentDivisions.back();
+        bool mergeFirstDivision = false;
+        if( !checkCrossFirstLine )
+        {
+            checkCrossFirstLine = corner > 0
+                                  && lastCurrent.Determinant( firstDivision ) > 0
+                                  && lastCurrent.ScalarProduct( firstDivision ) < 0;
+        }
+        if( checkCrossFirstLine
+            && nextDivision.Determinant( firstDivision ) < 0 )
+        {
+            mergeFirstDivision = true;
+        }
+
+        std::vector<LINE> pieceLines;
+        pieceLines.push_back( inner.Borders()[corner].Opposite() );
+        appendSupport( pieceLines, nextDivision, true );
+        appendSupport( pieceLines, lastCurrent );
+        if( mergeFirstDivision )
+            appendSupport( pieceLines, firstDivision, true );
+        result.push_back( SIMPLEX::GetInstance( std::move( pieceLines ) )
+                                  .Intersection( aOuter ) );
+
+        // Preserve pinned a11c0a42 control flow exactly.  The Java source
+        // assigns nextDivisionLine = prevDivisionLine here rather than the
+        // apparent inverse, so prevDivisionLine remains null and contributes
+        // no extra support to later pieces.
+    }
+
+    return result;
 }
 
 

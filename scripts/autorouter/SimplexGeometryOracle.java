@@ -49,6 +49,34 @@ public class SimplexGeometryOracle {
     };
   }
 
+  private static Line[] cutoutInner(int kind, int dx, int dy) {
+    return switch (kind) {
+      case 0 -> polygon(new int[][]{{dx - 11, dy - 7}, {dx + 12, dy - 7},
+                                     {dx + 12, dy + 8}, {dx - 11, dy + 8}});
+      case 1 -> polygon(new int[][]{{dx - 13, dy - 8}, {dx + 15, dy - 3},
+                                     {dx + 2, dy + 14}});
+      case 2 -> polygon(new int[][]{{dx + 12, dy - 9}, {dx + 31, dy - 4},
+                                     {dx + 28, dy + 16}, {dx + 9, dy + 11}});
+      case 3 -> polygon(new int[][]{{dx + 45, dy + 36}, {dx + 58, dy + 36},
+                                     {dx + 58, dy + 49}, {dx + 45, dy + 49}});
+      case 4 -> polygon(new int[][]{{dx - 55, dy - 40}, {dx + 55, dy - 40},
+                                     {dx + 55, dy + 40}, {dx - 55, dy + 40}});
+      case 5 -> polygon(new int[][]{{dx - 17, dy - 2}, {dx + 14, dy - 1},
+                                     {dx + 16, dy + 2}, {dx - 15, dy + 13}});
+      case 6 -> new Line[]{new Line(dx - 15, dy, dx + 15, dy),
+                            new Line(dx + 15, dy, dx - 15, dy)};
+      default -> polygon(new int[][]{{dx - 15, dy - 4}, {dx - 5, dy - 14},
+                                      {dx + 13, dy - 10}, {dx + 17, dy + 4},
+                                      {dx + 3, dy + 15}, {dx - 13, dy + 10}});
+    };
+  }
+
+  private static Line[] shuffled(Line[] input, Random random) {
+    List<Line> result = new ArrayList<>(Arrays.asList(input));
+    Collections.shuffle(result, random);
+    return result.toArray(Line[]::new);
+  }
+
   public static void main(String[] args) throws Exception {
     Random random = new Random(230104);
     for (int record = 0; record < 512; ++record) {
@@ -111,6 +139,38 @@ public class SimplexGeometryOracle {
       Simplex translated = simplex.translateBy(new IntVector(7, -11));
       out.append(' ');
       lines(out, translated);
+      System.out.println(out);
+    }
+
+    for (int record = 0; record < 256; ++record) {
+      int dx = random.nextInt(81) - 40;
+      int dy = random.nextInt(81) - 40;
+      Line[] outerInput = shuffled(record % 3 == 0
+          ? input(7, dx, dy)
+          : input(0, dx, dy), random);
+      Line[] innerInput = shuffled(cutoutInner(record % 8, dx, dy), random);
+      Simplex outer = Simplex.getInstance(outerInput);
+      Simplex inner = Simplex.getInstance(innerInput);
+      Simplex[] pieces = inner.cutoutFrom(outer);
+
+      StringBuilder out = new StringBuilder("SCUT ").append(outerInput.length);
+      for (Line border : outerInput) {
+        out.append(' ').append(line(border));
+      }
+      out.append(' ').append(innerInput.length);
+      for (Line border : innerInput) {
+        out.append(' ').append(line(border));
+      }
+      if (pieces == null) {
+        out.append(" -1");
+      } else {
+        out.append(' ').append(pieces.length);
+        for (Simplex piece : pieces) {
+          out.append(' ');
+          lines(out, piece);
+          out.append(' ').append(piece.dimension());
+        }
+      }
       System.out.println(out);
     }
   }

@@ -1,5 +1,6 @@
 /* KiCad, GPL-3.0-or-later. Exact geometry / recursive spring-over parity. */
 #include "autorouter_geometry_oracle.h"
+#include <autorouter/geometry/planar/PolylineArea.h>
 #include <pcbnew_utils/board_file_utils.h>
 #include <boost/test/unit_test.hpp>
 #include <fstream>
@@ -42,7 +43,30 @@ BOOST_AUTO_TEST_CASE( SimplexNormalizationAndIntersectionMatchPinnedJava )
             BOOST_CHECK_MESSAGE( mismatch.empty(), mismatch );
         }
     }
-    BOOST_CHECK_EQUAL( count, 512 );
+    BOOST_CHECK_EQUAL( count, 768 );
+}
+
+BOOST_AUTO_TEST_CASE( GeneralConvexPolylineAreaCutoutIsBoundedAndFailClosed )
+{
+    const SIMPLEX border = SIMPLEX::Box( { -100, -80, 100, 80 } );
+    const auto hole = SIMPLEX::FromConvexPolygon(
+            { { -25, -20 }, { 35, -11 }, { 8, 37 } } );
+    BOOST_REQUIRE( hole );
+    const auto pieces = POLYLINE_AREA::SplitSimplexToConvex(
+            border, { *hole } );
+    BOOST_REQUIRE( pieces );
+    BOOST_CHECK( pieces->size() >= 3 );
+    for( const SIMPLEX& piece : *pieces )
+    {
+        BOOST_CHECK_EQUAL( piece.Dimension(), 2 );
+        BOOST_CHECK( piece.IsBounded() );
+        BOOST_CHECK( !piece.ContainsInside( POINT( 0, 0 ) ) );
+    }
+
+    BOOST_CHECK( !POLYLINE_AREA::SplitSimplexToConvex(
+            border, { *hole }, {}, 1 ) );
+    BOOST_CHECK( !POLYLINE_AREA::SplitSimplexToConvex(
+            border, { *hole }, [] { return true; } ) );
 }
 BOOST_AUTO_TEST_CASE( ExactRationalGeometryRejectsRoundingAndInvalidShapes )
 {

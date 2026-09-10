@@ -47,6 +47,10 @@ public:
     SIMPLEX RemoveBorderLine( std::size_t aIndex ) const;
     SIMPLEX Intersection( const SIMPLEX& aOther ) const;
     bool Intersects( const SIMPLEX& aOther ) const;
+    /** Cut this (inner) simplex out of aOuter using the pinned source's
+     * ordered minimum-distance division lines.  A null result has the same
+     * meaning as Java's null return for a lower-dimensional inner shape. */
+    std::optional<std::vector<SIMPLEX>> CutoutFrom( const SIMPLEX& aOuter ) const;
     std::optional<SIMPLEX> TranslateBy( ROUTER_POINT aVector ) const;
     int IndexOfRightMostCorner( const POINT& aFromPoint ) const;
     bool Contains( const POINT& p ) const;

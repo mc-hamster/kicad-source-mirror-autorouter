@@ -93,4 +93,50 @@ inline std::optional<std::vector<PLANAR::INT_OCTAGON>> SplitOctagonalToConvex(
                    : std::optional<std::vector<PLANAR::INT_OCTAGON>>(
                              std::move( pieces ) );
 }
+
+
+/** General-convex PolylineArea cutout stage.  Border and hole decomposition
+ * happen before this method in the source; this overload accepts those convex
+ * Simplex pieces and preserves their exact cutout order and dimensions. */
+inline std::optional<std::vector<PLANAR::SIMPLEX>> SplitSimplexToConvex(
+        PLANAR::SIMPLEX aBorder, const std::vector<PLANAR::SIMPLEX>& aHoles,
+        const ROUTER_CANCEL_CALLBACK& aCancel = {},
+        std::size_t aMaxPieces = std::numeric_limits<std::size_t>::max() )
+{
+    if( aBorder.Dimension() != 2 || aMaxPieces == 0 )
+        return std::nullopt;
+
+    std::vector<PLANAR::SIMPLEX> pieces{ std::move( aBorder ) };
+    for( const PLANAR::SIMPLEX& hole : aHoles )
+    {
+        if( aCancel && aCancel() )
+            return std::nullopt;
+        if( hole.Dimension() < 2 )
+            continue;
+
+        std::vector<PLANAR::SIMPLEX> next;
+        for( const PLANAR::SIMPLEX& piece : pieces )
+        {
+            if( aCancel && aCancel() )
+                return std::nullopt;
+            const auto divided = hole.CutoutFrom( piece );
+            if( !divided )
+                return std::nullopt;
+            for( const PLANAR::SIMPLEX& result : *divided )
+            {
+                if( result.Dimension() != 2 )
+                    continue;
+                if( next.size() >= aMaxPieces )
+                    return std::nullopt;
+                next.push_back( result );
+            }
+        }
+        pieces = std::move( next );
+    }
+
+    return aCancel && aCancel()
+                   ? std::nullopt
+                   : std::optional<std::vector<PLANAR::SIMPLEX>>(
+                             std::move( pieces ) );
+}
 }

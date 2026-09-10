@@ -48,6 +48,22 @@ def normalize_drill_records(raw: str) -> str:
     return "\n".join(records) + "\n"
 
 
+def normalize_simplex_records(raw: str) -> str:
+    records = []
+    warning = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+ WARN\s+"
+                         r"Simplex\.cutout_from only implemented for 2-dim simplex")
+    for line in raw.splitlines():
+        if line.startswith(("SIMPLEX ", "SCUT ")):
+            records.append(line)
+        elif not warning.fullmatch(line):
+            raise ValueError(f"unexpected simplex oracle diagnostic: {line}")
+    if sum(line.startswith("SIMPLEX ") for line in records) != 512:
+        raise ValueError("incomplete simplex primitive output")
+    if sum(line.startswith("SCUT ") for line in records) != 256:
+        raise ValueError("incomplete simplex cutout output")
+    return "\n".join(records) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-jar", type=Path, required=True)
@@ -87,13 +103,16 @@ def main() -> int:
         actual = output / "oracle.txt"
         with actual.open("w") as out, (output / "oracle-stderr.log").open("w") as err:
             subprocess.run(commands[1], stdout=out, stderr=err, check=True, timeout=60, cwd=output)
-        if drill:
+        if drill or args.oracle == "simplex":
             raw = actual.read_text()
             (output / "oracle-raw.txt").write_text(raw)
-            # PolylineArea logs a timestamped warning for degenerate holes.
-            # Retain raw diagnostics; compare only declared oracle records.
-            actual.write_text(normalize_drill_records(raw))
-            metadata["normalization"] = "only known degenerate-hole warnings removed; all raw diagnostics retained in oracle-raw.txt"
+            # The source logs timestamped warnings for deliberately exercised
+            # lower-dimensional inputs. Retain raw diagnostics and compare
+            # only the declared deterministic oracle records.
+            actual.write_text(normalize_drill_records(raw) if drill
+                              else normalize_simplex_records(raw))
+            metadata["normalization"] = ("only known lower-dimensional input warnings removed; "
+                                         "all raw diagnostics retained in oracle-raw.txt")
         metadata["actual_sha256"] = sha256(actual)
         metadata["matches"] = actual.read_bytes() == expected.read_bytes()
         print(f"Pinned {args.oracle} oracle: " + ("PASS" if metadata["matches"] else "FAIL"))
