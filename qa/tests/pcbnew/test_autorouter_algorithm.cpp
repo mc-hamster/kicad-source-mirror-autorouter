@@ -55,6 +55,7 @@
 #include <autorouter/expansion/TargetItemExpansionDoor.h>
 #include <autorouter/expansion/CompleteFreeSpaceExpansionRoom.h>
 #include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
+#include <autorouter/expansion/Sorted45DegreeRoomNeighbours.h>
 #include <autorouter/maze/DestinationDistance.h>
 #include <autorouter/maze/LegacyDestinationDistance.h>
 #include <autorouter/maze/RoomCostSpace.h>
@@ -330,6 +331,83 @@ BOOST_AUTO_TEST_CASE( FortyFiveDegreeRoomRestraintMatchesPinnedFreerouting )
                 BOOST_CHECK( candidate.shape == readOctagon() );
                 BOOST_CHECK( candidate.containedShape == readOctagon() );
                 BOOST_CHECK_EQUAL( candidate.layer, 3 );
+            }
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeNeighbourOrderingMatchesPinnedFreerouting )
+{
+    using PLANAR::INT_OCTAGON;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/neighbours45-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readOctagon = [&]()
+    {
+        std::array<std::int64_t, 8> value;
+        for( auto& coordinate : value )
+            input >> coordinate;
+        BOOST_REQUIRE( !input.fail() );
+        return INT_OCTAGON( value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7] );
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "45-degree neighbour oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "NEIGHBOURS45" );
+            const INT_OCTAGON room = readOctagon();
+            std::size_t inputCount;
+            input >> inputCount;
+            std::vector<SHAPE_TREE_ENTRY> entries;
+            entries.reserve( inputCount );
+            for( std::size_t i = 0; i < inputCount; ++i )
+            {
+                int id;
+                input >> id;
+                const INT_OCTAGON shape = readOctagon();
+                entries.emplace_back( shape.BoundingBox(), id, 0, 2, 0,
+                                      false, true, shape );
+            }
+            std::array<bool, 8> expectedEdges;
+            for( std::size_t i = 0; i < expectedEdges.size(); ++i )
+            {
+                int value;
+                input >> value;
+                expectedEdges[i] = value != 0;
+            }
+            const INT_OCTAGON expectedEnlarged = readOctagon();
+            std::size_t expectedCount;
+            input >> expectedCount;
+
+            const SORTED_45_DEGREE_ROOM_NEIGHBOURS actual( room, entries );
+            BOOST_CHECK_EQUAL_COLLECTIONS(
+                    actual.EdgeInteriorTouchesObstacle().begin(),
+                    actual.EdgeInteriorTouchesObstacle().end(),
+                    expectedEdges.begin(), expectedEdges.end() );
+            BOOST_CHECK( SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
+                                 room, actual.EdgeInteriorTouchesObstacle() )
+                         == expectedEnlarged );
+            BOOST_REQUIRE_EQUAL( actual.Neighbours().size(), expectedCount );
+            for( const auto& neighbour : actual.Neighbours() )
+            {
+                int id;
+                input >> id;
+                BOOST_CHECK_EQUAL( neighbour.entry.objectId, id );
+                BOOST_CHECK( neighbour.intersection == readOctagon() );
+                int first;
+                int last;
+                input >> first >> last;
+                BOOST_CHECK_EQUAL( neighbour.firstTouchingSide, first );
+                BOOST_CHECK_EQUAL( neighbour.lastTouchingSide, last );
             }
             BOOST_REQUIRE( !input.fail() );
         }

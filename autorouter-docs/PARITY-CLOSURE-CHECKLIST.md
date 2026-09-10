@@ -20,13 +20,15 @@ octagon preserves all eight orthogonal/diagonal support coordinates,
 normalization, dimensionality, corners, area, offset, union/intersection,
 containment, overlap and boundary comparisons. The minimum-area tree remains a
 bounding-box broad phase while its 45-degree leaf path retains exact octagons.
-2,048 deterministic core-geometry records and 2,048 private source
-`restrainShape` records were generated from a clean GitHub checkout at the
-pinned revision and agree with the native implementation. These classes are
-built into pcbnew, but the active maze room/door lifecycle is still rectangular:
-the 45-degree tree must be connected to octagonal neighbour sorting, doors,
-drill rooms and backtracking as one coherent change before it replaces that
-safe production path.
+2,048 deterministic core-geometry records, 2,048 private source
+`restrainShape` records, and 2,048 octagonal neighbour-order/edge-removal
+records were generated from a clean GitHub checkout at the pinned revision and
+agree with the native implementation. `Sorted45DegreeRoomNeighbours` is now a
+real source-derived class rather than an alias of the unrelated radial sorter.
+These classes are built into pcbnew, but the active maze room/door lifecycle is
+still rectangular: octagonal incomplete-room gaps, doors, drill rooms and
+backtracking must be connected as one coherent change before that safe
+production path is replaced.
 
 The active pipeline now performs one normal routing search per item/pass (plus
 the source-style optional neck-width retry) and enables negotiated rip-up on
@@ -291,7 +293,7 @@ Every row below is required or needs an explicit, justified host adaptation.
 
 | Area | Current state and what must still be implemented | Required proof |
 |---|---|---|
-| **1. Geometric primitives** | **Partial.** Exact rational line intersections, line-array polylines and bounded convex entrance/polyline-cutout semantics are source-tested and used by fixed-obstacle spring-over. Source-named `IntOctagon` core operations and `ShapeSearchTree45Degree.restrainShape` now pass 4,096 pinned Java records and are production-built. The active maze lifecycle still uses rectangular rooms. General `TileShape` offsets/cutouts, unbounded/degenerate simplex behavior, octagonal neighbour/door/drill propagation and arbitrary convex room search remain absent. KiMath shapes and conservative adapter contours are not yet full upstream `IntBox`/`IntOctagon`/`Simplex`/`TileShape`/`Polyline` semantics. Curved/custom copper and holes must not create false contacts or close routable channels. | Extend the pinned differential corpus to full octagon cutout/projection, degenerate/negative/large coordinates, tangencies, acute angles, narrow corridors, holes, 90/45/any-angle cases; then run the active room topology against source decisions. |
+| **1. Geometric primitives** | **Partial.** Exact rational line intersections, line-array polylines and bounded convex entrance/polyline-cutout semantics are source-tested and used by fixed-obstacle spring-over. Source-named `IntOctagon` core operations, `ShapeSearchTree45Degree.restrainShape`, and 45-degree neighbour ordering/edge removal now pass 6,144 pinned Java records and are production-built. The active maze lifecycle still uses rectangular rooms. General `TileShape` offsets/cutouts, unbounded/degenerate simplex behavior, octagonal incomplete-room/door/drill propagation and arbitrary convex room search remain absent. KiMath shapes and conservative adapter contours are not yet full upstream `IntBox`/`IntOctagon`/`Simplex`/`TileShape`/`Polyline` semantics. Curved/custom copper and holes must not create false contacts or close routable channels. | Extend the pinned differential corpus to full octagon cutout/projection, degenerate/negative/large coordinates, tangencies, acute angles, narrow corridors, holes, 90/45/any-angle cases; then run the active room topology against source decisions. |
 | **2. Mutable item model and contacts** | **Partial.** Physical and separate source-tested endpoint/centre normal-contact graphs now exist. A same-layer/same-style run is one polyline item; exact integer junctions split complete polylines with stable first-piece identity and transaction rollback. `Connection.get()` and `Item.getConnectionItems(NONE)` use source reverse-ID contact iteration and chain/fork/terminal traversal, with exact item-set trace length and detour. Each mutable item retains exact standalone geometry and manufacturing style; exact item subsets can be removed atomically while occupancy is rebuilt from surviving item records. Retained straight copper can be split virtually without editing host items. Paid obstacle rooms distinguish native occupancy connections from source trace/via items. Need rational/curved contacts, full source split/combine normalization, entry restrictions, fixed-state semantics, and precise contact preservation during every general shove/change. Immutable host cluster unions and outward-approximated contacts are not a completed port. | Insert/split/join/remove/shove/rollback contact graphs compared to reference, plus independent KiCad connectivity. |
 | **3. Rules and clearance compensation** | **Partial.** Pair/layer clearances, widths, edge and hole constraints exist. Need complete clearance classes/compensation, item-specific and layer-specific padstack geometry and width rules. Dummy-track rule evaluation cannot fully represent rules conditional on actual item/footprint/geometry. Do not silently claim unsupported contextual rules are enforced by search. | Per-constraint adapter tests and matching host/reference DRC thresholds; deliberately conflicting and non-default rules. |
 | **4. Spatial search trees** | **Partial, now active.** `MinAreaTree` insertion/removal/traversal and orthogonal `completeShape`, restraint and ignore-object/overlap semantics are ported and differentially tested. The host supplies conservative, fully expanded centre-space rectangles and rebuilds them per attempt. Still need exact compensation classes, 45/general convex trees, incremental trace updates and room invalidation/reuse after edits. | Multi-obstacle completion sequences, stable visitation/tie order, insertion/removal invalidation and exact free-space coverage. |

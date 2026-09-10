@@ -447,6 +447,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/expansion/ExpansionRoom.cpp
     autorouter/expansion/SortedRoomNeighbours.cpp
     autorouter/expansion/SortedOrthogonalRoomNeighbours.cpp
+    autorouter/expansion/Sorted45DegreeRoomNeighbours.cpp
     autorouter/maze/AutorouteControl.cpp
     autorouter/maze/AutorouteEngine.cpp
     autorouter/maze/DestinationDistance.cpp
