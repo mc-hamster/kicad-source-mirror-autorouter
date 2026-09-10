@@ -7541,6 +7541,69 @@ BOOST_AUTO_TEST_CASE( MultilayerRoomSearchSeedsADiagonalConnectedTrace )
     BOOST_CHECK_GT( metrics.layerTransitions, 0 );
 }
 
+
+BOOST_AUTO_TEST_CASE( ExactOctagonalMultilayerSearchUsesRoomsDoorsAndDrills )
+{
+    using PLANAR::INT_OCTAGON;
+
+    ROOM_LAYER top, bottom;
+    top.id = 0;
+    bottom.id = 31;
+    top.bounds = bottom.bounds = { 0, 0, 10000, 10000 };
+    top.starts = { { { 1000, 5000 }, { 1000, 5000 }, 7 } };
+    bottom.targets = { { { 9000, 5000 }, { 9000, 5000 }, 9 } };
+
+    // A compensated 45-degree diamond blocks the direct top-layer crossing.
+    // Retaining only its bounding box would erase legal diagonal room corners;
+    // the exact frontier must reach a drill on one side and continue below it.
+    const INT_OCTAGON diamond( 2000, 2000, 8000, 8000,
+                               -3000, 3000, 7000, 13000 );
+    top.obstacles.push_back( { diamond.BoundingBox(), 1, 0, top.id, 2,
+                               false, true, diamond } );
+
+    ROOM_VIA_SETTINGS via;
+    via.bounds = top.bounds;
+    via.pageWidth = 2000;
+    via.normalCost = 1000;
+    via.obstacles = top.obstacles;
+    via.canDrill = []( auto ) { return true; };
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto found = MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
+            { top, bottom }, 1, 100, via, 10000, expanded, metrics );
+
+    BOOST_REQUIRE( found );
+    BOOST_CHECK_EQUAL( found->startOwner, 7U );
+    BOOST_CHECK_EQUAL( found->targetOwner, 9U );
+    BOOST_CHECK_GT( metrics.rooms, 0 );
+    BOOST_CHECK_GT( metrics.doors, 0 );
+    BOOST_CHECK_GT( metrics.drillPages, 0 );
+    BOOST_CHECK_GT( metrics.drills, 0 );
+    BOOST_CHECK_GT( metrics.layerTransitions, 0 );
+    BOOST_CHECK_LT( expanded, 1000 );
+    int transitions = 0;
+    for( std::size_t index = 1; index < found->nodes.size(); ++index )
+    {
+        const ROUTER_NODE& from = found->nodes[index - 1];
+        const ROUTER_NODE& to = found->nodes[index];
+        if( from.layer != to.layer )
+        {
+            ++transitions;
+            BOOST_CHECK( from.point == to.point );
+        }
+        else if( from.layer == top.id )
+        {
+            const auto path = PLANAR::POLYLINE::FromPoints(
+                    { from.point, to.point } );
+            const auto obstacle = diamond.ToSimplex();
+            BOOST_REQUIRE( obstacle );
+            BOOST_CHECK( path.Empty() || !obstacle->IntersectsSegment( path, 1 ) );
+        }
+    }
+    BOOST_CHECK_EQUAL( transitions, 1 );
+}
+
 BOOST_AUTO_TEST_CASE( ProductionMultilayerRoutingUsesTheRoomDrillFrontier )
 {
     auto board = makeBoard(); auto settings = makeSettings();

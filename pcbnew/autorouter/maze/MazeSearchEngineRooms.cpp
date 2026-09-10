@@ -142,6 +142,43 @@ bool areaTouchesVia( const ROUTING_OBSTACLE& aArea, ROUTER_POINT aCenter,
     return false;
 }
 
+
+void removeGeneratedCollinearNodes( ROUTING_CONNECTION& aConnection,
+                                    const MAZE_SEARCH_ENGINE& aSearch )
+{
+    // FoundConnectionLocator normalizes corners while it walks one complete
+    // source backtrack chain.  The native multilayer adapter reconstructs a
+    // same-layer chain one corridor step at a time so it must perform that
+    // harmless normalization at the adapter boundary.  This is done before
+    // insertion, where no branch contact can live on an intermediate node.
+    for( std::size_t middle = 1; middle + 1 < aConnection.nodes.size(); )
+    {
+        const ROUTER_NODE& first = aConnection.nodes[middle - 1];
+        const ROUTER_NODE& current = aConnection.nodes[middle];
+        const ROUTER_NODE& last = aConnection.nodes[middle + 1];
+        const long double firstDx = static_cast<long double>( current.point.x ) - first.point.x;
+        const long double firstDy = static_cast<long double>( current.point.y ) - first.point.y;
+        const long double lastDx = static_cast<long double>( last.point.x ) - current.point.x;
+        const long double lastDy = static_cast<long double>( last.point.y ) - current.point.y;
+        const bool forwardCollinear = firstDx * lastDy == firstDy * lastDx
+                                      && firstDx * lastDx + firstDy * lastDy >= 0;
+        const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
+                                                  ? nullptr
+                                                  : &aConnection.edgeStyles[middle - 1];
+        if( first.layer == current.layer && current.layer == last.layer
+            && forwardCollinear
+            && CanCollapseRouteEdges( aConnection, middle - 1, middle )
+            && aSearch.CanInsertSegment( aConnection.netCode, first, last, style )
+            && CollapseRouteNodes( aConnection, middle - 1, middle + 1 ) )
+        {
+            if( middle > 1 )
+                --middle;
+            continue;
+        }
+        ++middle;
+    }
+}
+
 } // namespace
 
 
@@ -595,16 +632,20 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         for( const auto& point : path->points )
             found.nodes.push_back( { point, layer.layerId } );
         bool legal = !found.nodes.empty();
-        for( std::size_t i = 0; i < found.nodes.size() && legal; ++i )
+        // The first node is an already-existing source/target contact. It may
+        // legitimately lie inside its pad or inside the board-edge centre
+        // margin. Validate generated edges, not a synthetic zero-length edge
+        // at that existing contact.
+        for( std::size_t i = 1; i < found.nodes.size() && legal; ++i )
         {
-            const auto& from = found.nodes[i == 0 ? i : i - 1];
+            const auto& from = found.nodes[i - 1];
             const auto& to = found.nodes[i];
             legal = CanUseSegment( net, from, to );
             if( !legal && autorouterDebugEnabled() )
             {
                 std::ostringstream message;
                 message << "ROOM_PATH_REJECTED net=" << net << " edge="
-                        << ( i == 0 ? 0 : i - 1 ) << " from=(" << from.point.x << ','
+                        << i - 1 << " from=(" << from.point.x << ','
                         << from.point.y << ",L" << from.layer << ") to=(" << to.point.x
                         << ',' << to.point.y << ",L" << to.layer << ") ripup_cost="
                         << path->ripupCost << " ripped_groups="
@@ -718,6 +759,10 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             via.fanoutCenter = m_board.pads[fanoutTarget->fanoutSourcePadIndex].position;
     }
     const auto started = std::chrono::steady_clock::now();
+    // Keep the production fanout gate on its already-qualified rectangular
+    // drill frontier while the octagonal first-drill ordering is compared to
+    // the source. Ordinary multilayer routing uses the exact frontier below.
+    const bool exactFrontier = fanoutTarget == nullptr;
     int nextObstacleId = 1;
     for( int id : physical )
     {
@@ -727,7 +772,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                                            [id]( const auto& l ) { return l.layerId == id; } );
         ROOM_LAYER layer;
         layer.id = id;
-        layer.active = setting->enabled && !hasGeneralConvexRoomGeometry( net, id );
+        layer.active = setting->enabled
+                       && ( exactFrontier || !hasGeneralConvexRoomGeometry( net, id ) );
         layer.bounds = bounds;
         if( layer.active )
         {
@@ -749,7 +795,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                 if( !isOnPadLayer( t.pad, id ) )
                     continue;
                 const auto a = t.pad.position, b = t.segmentEnd.value_or( a );
-                if( aTarget || a.x == b.x || a.y == b.y )
+                if( exactFrontier || aTarget || a.x == b.x || a.y == b.y )
                     output.push_back( { a, b, t.padIndex } );
                 else
                 {
@@ -767,9 +813,15 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         }
         layers.push_back( std::move( layer ) );
     }
-    const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
-            layers, net, std::max<std::int64_t>( 1, radius ), via,
-            m_settings.maxExpandedNodes, expanded, m_roomMetrics, cancel, progress );
+    const auto path = exactFrontier
+            ? MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
+                      layers, net, std::max<std::int64_t>( 1, radius ), via,
+                      m_settings.maxExpandedNodes, expanded, m_roomMetrics,
+                      cancel, progress )
+            : MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+                      layers, net, std::max<std::int64_t>( 1, radius ), via,
+                      m_settings.maxExpandedNodes, expanded, m_roomMetrics,
+                      cancel, progress );
     std::optional<ROUTING_CONNECTION> result;
     if( path && !path->nodes.empty() )
     {
@@ -779,12 +831,27 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         found.cost = path->ripupCost;
         found.isFanoutConnection = fanoutTarget != nullptr;
         bool legal = assignViaStyles( found );
-        for( std::size_t i = 0; i < found.nodes.size() && legal; ++i )
+        if( legal )
+            removeGeneratedCollinearNodes( found, *this );
+        for( std::size_t i = 1; i < found.nodes.size() && legal; ++i )
         {
-            const std::size_t edge = i == 0 ? 0 : i - 1;
+            const std::size_t edge = i - 1;
             const bool isVia = i > 0 && found.nodes[edge].layer != found.nodes[i].layer;
             const ROUTING_EDGE_STYLE* style = isVia ? &found.edgeStyles[edge] : nullptr;
             legal = CanUseSegment( net, found.nodes[edge], found.nodes[i], isVia, style );
+            if( !legal && autorouterDebugEnabled() )
+            {
+                const auto& from = found.nodes[edge];
+                const auto& to = found.nodes[i];
+                std::ostringstream message;
+                message << "ROOM_DRILL_PATH_REJECTED net=" << net << " edge=" << edge
+                        << " from=(" << from.point.x << ',' << from.point.y << ",L"
+                        << from.layer << ") to=(" << to.point.x << ',' << to.point.y
+                        << ",L" << to.layer << ") via=" << isVia
+                        << " ripup_cost=" << path->ripupCost
+                        << " ripped_groups=" << path->rippedObstacleGroups.size();
+                autorouterDebugLog( message.str() );
+            }
         }
         if( legal && !( cancel && cancel() ) )
         {

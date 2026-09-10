@@ -1,7 +1,7 @@
 # Native autorouter engineering notes
 
-Latest core work: [exact line/convex geometry and recursive fixed-obstacle spring-over](CONVEX-SPRING-OVER-PARITY.md).
-This is still a partial implementation, not full forced-insertion/shove/neckdown parity.
+Latest core work: [active exact-octagonal ordinary multilayer search](OCTAGONAL-MULTILAYER-SEARCH.md).
+This is still a partial implementation, not full Freerouting parity.
 
 **Status: experimental; Freerouting parity has not been achieved.** See
 [Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) for the current implementation audit,
@@ -10,6 +10,8 @@ not be interpreted as proof that the named upstream algorithms are implemented.
 
 * [Complete parity checklist](PARITY-CLOSURE-CHECKLIST.md) — all sixteen remaining
   core/integration areas, production host validation/repair, and latest A/B evidence.
+* [Exact-octagonal ordinary multilayer search](OCTAGONAL-MULTILAYER-SEARCH.md) —
+  active room/door/drill-layer checkpoint, safety gates, and remaining fanout/free-drill gaps.
 * [Java → C++ destination translation audit](DESTINATION-DISTANCE-PARITY.md) —
   latest method-level port, bit-exact Java oracle, plane start-set fix and remaining substitutions.
 * [Active multilayer room/drill search](DRILL-SEARCH-PARITY.md) — previous core
@@ -100,12 +102,14 @@ not enter the routing algorithm and therefore do not need a Freerouting GUI coun
 source tree intentionally includes corresponding Freerouting filenames even where KiCad's
 immutable snapshot/transaction model replaces a mutable Java board event or thread pool.
 
-Single-layer and default multilayer attempts now try the active rectangular
-room/door/page/drill frontier with 90/45-degree corridor location and exact
-snapshot edge checks. The source destination estimate is translated and used
-by both frontiers; the remaining legacy grid/visibility fallback has a separately
-named heuristic. General convex geometry, full forced insertion, shove, fanout
-and optimization are not ported. See the
+Ordinary single-layer and multilayer attempts now use exact-octagonal
+room/door geometry and 45-degree corridor location. Multilayer search adds the
+source-shaped rectangular drill-page layer and exact full-stack host via
+preflight; fanout temporarily retains the qualified rectangular room frontier.
+The source destination estimate is translated and used by both frontiers; the
+remaining legacy grid/visibility fallback has a separately named heuristic.
+General convex free-drill regions, complete forced insertion/shove, source
+first-drill fanout ordering, and optimizer equivalence are still incomplete. See the
 [latest translation audit](DESTINATION-DISTANCE-PARITY.md): matching filenames
 or isolated numeric methods does not establish whole-engine parity.
 

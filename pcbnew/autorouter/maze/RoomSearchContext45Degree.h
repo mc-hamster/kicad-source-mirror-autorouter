@@ -26,10 +26,12 @@ public:
             int aLayer, int aNet, double aOffset, int aMaxExpanded, int& aExpanded,
             ROOM_SEARCH_METRICS& aMetrics, const ROUTER_CANCEL_CALLBACK& aCancel,
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress,
-            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {} ) :
+            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {},
+            int* aSharedNextId = nullptr ) :
             tree( aBounds ), layer( aLayer ), net( aNet ), offset( aOffset ),
             maxExpanded( aMaxExpanded ), expanded( aExpanded ), metrics( aMetrics ),
-            cancel( aCancel ), progress( aProgress )
+            cancel( aCancel ), progress( aProgress ),
+            nextId( aSharedNextId ? *aSharedNextId : localNextId )
     {
         for( const SHAPE_TREE_ENTRY& entry : aObstacles )
         {
@@ -329,7 +331,8 @@ public:
     ROOM_SEARCH_METRICS& metrics;
     const ROUTER_CANCEL_CALLBACK& cancel;
     const ROUTER_SEARCH_PROGRESS_CALLBACK& progress;
-    int nextId = 1;
+    int localNextId = 1;
+    int& nextId;
     std::vector<std::unique_ptr<ROOM>> rooms;
     std::map<int, ROOM*> byId;
     std::unordered_map<EXPANSION_ROOM*, ROOM*> byShape;

@@ -4,6 +4,11 @@
 supersedes the heuristic and plane start-set status below. These measurements
 and earlier limitations are preserved as evidence.
 
+The ordinary multilayer production path described here has since been replaced
+by the [exact-octagonal multilayer checkpoint](OCTAGONAL-MULTILAYER-SEARCH.md).
+The rectangular implementation remains active for fanout until source
+first-drill ordering is qualified.
+
 **Not feature parity.** This pass moves default multilayer search from a
 standalone grid/visibility proposal to an active room/page/drill-layer frontier
 first. It does not replace the full Freerouting geometric, insertion, fanout,

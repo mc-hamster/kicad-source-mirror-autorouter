@@ -1,30 +1,33 @@
 /*
  * KiCad, GPL-3.0-or-later. Freerouting a11c0a42 room -> drill-page -> drill ->
- * layer expansion, with the native rectangular centre-space shape adapter.
- * Forced pad shove, obstacle rooms and non-through padstacks are not emulated.
+ * layer expansion with exact-octagonal centre-space rooms. Drill pages retain
+ * their source IntBox partition; general-convex free-drill cutouts remain open.
  */
-#include "MazeSearchEngine90Degree.h"
-#include "RoomSearchContext.h"
+#include "MazeSearchEngine45Degree.h"
+#include "RoomSearchContext45Degree.h"
 #include "MazeExpansionEngine.h"
 #include "MazeListElement.h"
 #include "RoomCostSpace.h"
+#include "../AutorouterDebug.h"
 #include "../drill/DrillPageArray.h"
 #include "../expansion/TargetItemExpansionDoor.h"
 #include "../path/FoundConnectionLocator45Degree.h"
 #include <deque>
 #include <map>
 #include <set>
+#include <sstream>
 
 namespace KICAD_AUTOROUTER
 {
-std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
+std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
         const std::vector<ROOM_LAYER>& layers, int net, double sectionOffset,
         const ROOM_VIA_SETTINGS& via, int maxExpanded, int& expanded,
         ROOM_SEARCH_METRICS& metrics, const ROUTER_CANCEL_CALLBACK& cancel,
-        const ROUTER_SEARCH_PROGRESS_CALLBACK& progress, bool orthogonal )
+        const ROUTER_SEARCH_PROGRESS_CALLBACK& progress )
 {
     using DETAIL::ROOM;
-    using DETAIL::ROOM_SEARCH;
+    using DETAIL::ROOM_SEARCH_45_DEGREE;
+    using PLANAR::INT_OCTAGON;
     if( layers.size() < 2 || !via.canDrill || !std::isfinite( via.normalCost ) || via.normalCost < 0
         || !std::isfinite( sectionOffset ) || sectionOffset <= 0 || via.pageWidth <= 0
         || INT_BOX::Dimension( via.bounds ) != 2 || maxExpanded <= expanded )
@@ -75,12 +78,12 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     if( columns * rows > maxExpanded )
         return std::nullopt;
     DRILL_PAGE_ARRAY pages( via.bounds, via.pageWidth );
-    std::vector<std::unique_ptr<ROOM_SEARCH>> spaces;
+    std::vector<std::unique_ptr<ROOM_SEARCH_45_DEGREE>> spaces;
     int nextRoomId = 1;
     for( const auto& layer : layers )
-        spaces.push_back( std::make_unique<ROOM_SEARCH>( layer.bounds, layer.obstacles,
+        spaces.push_back( std::make_unique<ROOM_SEARCH_45_DEGREE>( layer.bounds, layer.obstacles,
                 layer.id, net, sectionOffset, maxExpanded, expanded, metrics, cancel, progress,
-                &nextRoomId, layer.ripupObstacles ) );
+                layer.ripupObstacles, &nextRoomId ) );
 
     // `active` controls whether a layer can carry a trace-room state; it
     // must not make that physical copper layer transparent to a manufactured
@@ -99,6 +102,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                    && aKnown.shape.minY == aEntry.shape.minY
                    && aKnown.shape.maxX == aEntry.shape.maxX
                    && aKnown.shape.maxY == aEntry.shape.maxY
+                   && aKnown.BoundingOctagon() == aEntry.BoundingOctagon()
                    && aKnown.objectId == aEntry.objectId
                    && aKnown.shapeIndex == aEntry.shapeIndex && aKnown.layer == aEntry.layer
                    && aKnown.net == aEntry.net && aKnown.isRoom == aEntry.isRoom
@@ -124,11 +128,13 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     auto roomAt = [&]( std::size_t layer, ROUTER_POINT point ) -> ROOM*
     {
         auto& space = *spaces[layer];
-        const ROUTER_BOX seed{ point.x, point.y, point.x, point.y };
+        const INT_OCTAGON seed = INT_OCTAGON::FromBox(
+                { point.x, point.y, point.x, point.y } );
         for( const auto& item : space.tree.Overlaps( seed ) )
             if( item.isRoom )
                 return space.byId.at( item.objectId );
-        auto rooms = space.complete( space.incomplete( { layers[layer].bounds, layers[layer].id, seed } ) );
+        auto rooms = space.complete( space.incomplete( {
+                INT_OCTAGON::FromBox( layers[layer].bounds ), layers[layer].id, seed } ) );
         return rooms.size() == 1 ? rooms.front() : nullptr;
     };
     enum class KIND { ROOM_ENTRY, PAGE, DRILL_ENTER, DRILL_EXIT, TARGET, FANOUT_TARGET };
@@ -154,6 +160,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     std::deque<STATE> states;
     std::map<decltype( MAZE_LIST_ELEMENT{}.SortKey() ), std::size_t> open;
     std::set<std::pair<EXPANSION_DOOR*, std::size_t>> occupied;
+    bool allocationLimit = false;
     auto push = [&]( STATE state )
     {
         if( via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
@@ -178,13 +185,14 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         const MAZE_LIST_ELEMENT key{ state.g, state.f, id, state.section };
         if( open.contains( key.SortKey() ) )
             return;
-        // Bound pending work rather than the append-only parent store.  Popped
-        // ancestors must remain available for backtracking and are not queue
-        // pressure.  With at most maxExpanded pops and pending states this
-        // still retains O(maxExpanded) state while allowing a dense door to
-        // drain before later target/drill states are enqueued.
+        // Bound pending work, not the append-only parent store.  A parent
+        // state must remain alive for backtracking after it has left the
+        // queue; counting those historical states as pending work could stop
+        // the search immediately after one door contributed many sections.
+        // At most maxExpanded states can be popped and at most maxExpanded
+        // remain queued, so the retained chain store is still O(maxExpanded).
         if( open.size() >= static_cast<std::size_t>( maxExpanded ) )
-            return;
+        { allocationLimit = true; return; }
         open.emplace( key.SortKey(), states.size() );
         states.push_back( state );
     };
@@ -198,46 +206,38 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         {
             if( stopped() )
                 return std::nullopt;
-            const ROUTER_BOX contained{
-                std::min( start.start.x, start.end.x ), std::min( start.start.y, start.end.y ),
-                std::max( start.start.x, start.end.x ), std::max( start.start.y, start.end.y ) };
-            if( start.start.x == start.end.x || start.start.y == start.end.y )
+            std::vector<INT_OCTAGON> cuts;
+            cuts.reserve( layers[layer].obstacles.size() + 1 );
+            cuts.push_back( INT_OCTAGON::FromBox( layers[layer].bounds ) );
+            for( const SHAPE_TREE_ENTRY& obstacle : layers[layer].obstacles )
             {
-                space.complete( space.incomplete(
-                        { layers[layer].bounds, layers[layer].id, contained } ) );
-            }
-            else
-            {
-                std::vector<ROUTER_BOX> cuts;
-                cuts.reserve( layers[layer].obstacles.size() + 1 );
-                cuts.push_back( layers[layer].bounds );
-                for( const SHAPE_TREE_ENTRY& obstacle : layers[layer].obstacles )
-                    if( obstacle.layer == layers[layer].id
-                        && obstacle.IsTraceObstacle( net ) )
-                    {
-                        cuts.push_back( obstacle.shape );
-                    }
-
-                for( const ROUTER_POINT& seedPoint :
-                     TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
-                             start.start, start.end, cuts ) )
+                if( obstacle.layer == layers[layer].id
+                    && obstacle.IsTraceObstacle( net ) )
                 {
-                    const ROUTER_BOX seed{ seedPoint.x, seedPoint.y,
-                                           seedPoint.x, seedPoint.y };
-                    const bool covered = std::any_of(
-                            space.byId.begin(), space.byId.end(),
-                            [&]( const auto& entry )
-                            {
-                                const ROOM* room = entry.second;
-                                return !room->shape->IsObstacle()
-                                       && room->shape->GetShape().Contains( seedPoint );
-                            } );
-                    if( !covered )
-                    {
-                        space.complete( space.incomplete(
-                                { layers[layer].bounds, layers[layer].id, seed } ) );
-                    }
+                    cuts.push_back( obstacle.BoundingOctagon() );
                 }
+            }
+
+            for( const ROUTER_POINT& seedPoint :
+                 TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+                         start.start, start.end, cuts ) )
+            {
+                const bool covered = std::any_of(
+                        space.byId.begin(), space.byId.end(),
+                        [&]( const auto& entry )
+                        {
+                            const ROOM* room = entry.second;
+                            return !room->shape->IsObstacle()
+                                   && room->shape->GetOctagon().Contains( seedPoint );
+                        } );
+                if( covered )
+                    continue;
+
+                const INT_OCTAGON seed = INT_OCTAGON::FromBox(
+                        { seedPoint.x, seedPoint.y, seedPoint.x, seedPoint.y } );
+                space.complete( space.incomplete( {
+                        INT_OCTAGON::FromBox( layers[layer].bounds ),
+                        layers[layer].id, seed } ) );
             }
             const int itemId = nextItemId++;
             for( const auto& [id, room] : space.byId )
@@ -256,7 +256,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                             const auto candidate =
                                     TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
                                             start.start, start.end, toward,
-                                            room->shape->GetShape() );
+                                            room->shape->GetOctagon() );
                             if( !candidate )
                                 continue;
                             const FLOAT_POINT point{
@@ -436,11 +436,32 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     entry = { { static_cast<double>( p.x ), static_cast<double>( p.y ) },
                               { static_cast<double>( p.x ), static_cast<double>( p.y ) } };
                 }
-                const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateRectangular(
-                        result.nodes.back().point, { { before.room->shape->GetShape(),
-                            after.door ? std::optional<ROUTER_BOX>( after.door->GetShape() ) : std::nullopt,
-                            entry } }, orthogonal );
-                if( !located ) { valid = false; break; }
+                const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
+                        result.nodes.back().point,
+                        { { before.room->shape->GetOctagon(),
+                            after.door
+                                    ? std::optional<INT_OCTAGON>(
+                                              after.door->GetOctagonShape() )
+                                    : std::nullopt,
+                            entry } } );
+                if( !located )
+                {
+                    if( autorouterDebugEnabled() )
+                    {
+                        std::ostringstream message;
+                        message << "ROOM45_DRILL_LOCATOR_REJECTED net=" << net
+                                << " chain=" << chain.size() << " step=" << i
+                                << " kind=" << static_cast<int>( after.kind )
+                                << " layer=" << layers[after.layer].id
+                                << " from=(" << result.nodes.back().point.x << ','
+                                << result.nodes.back().point.y << ") entry=("
+                                << entry.a.x << ',' << entry.a.y << ")-("
+                                << entry.b.x << ',' << entry.b.y << ')';
+                        autorouterDebugLog( message.str() );
+                    }
+                    valid = false;
+                    break;
+                }
                 for( std::size_t j = 1; j < located->size(); ++j )
                     result.nodes.push_back( { ( *located )[j], layers[after.layer].id } );
             }
@@ -468,7 +489,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             const auto targetPoint =
                     TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
                             target.start, target.end, from.Round(),
-                            current.room->shape->GetShape() );
+                            current.room->shape->GetOctagon() );
             if( !targetPoint )
                 continue;
             const FLOAT_POINT to{ static_cast<double>( targetPoint->x ),
@@ -520,7 +541,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         // there too, otherwise a legitimate two-via crossing is unreachable.
         // Per-drill/per-layer occupation still prevents cycling back through it.
         if( !current.drill || current.room->shape->GetDoors().empty() )
-            for( auto* page : pages.OverlappingPages( current.room->shape->GetShape() ) )
+            for( auto* page : pages.OverlappingPages(
+                         current.room->shape->GetOctagon().BoundingBox() ) )
             {
                 const auto nearest = MAZE_EXPANSION_ENGINE::Nearest( page->Shape(), from );
                 const auto cost = MAZE_EXPANSION_ENGINE::ToPage( page->Shape(), from, current.g,
@@ -531,6 +553,17 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 state.g = cost.expansion; state.f = cost.sorting; state.parent = index; state.owner = current.owner;
                 push( state );
             }
+    }
+    if( autorouterDebugEnabled() )
+    {
+        std::ostringstream message;
+        message << "ROOM45_DRILL_FRONTIER_EXHAUSTED net=" << net
+                << " states=" << states.size() << " open=" << open.size()
+                << " rooms=" << metrics.rooms << " sections=" << metrics.sections
+                << " pages=" << metrics.drillPages << " drills=" << metrics.drills
+                << " transitions=" << metrics.layerTransitions
+                << " expanded=" << expanded << " allocation_limit=" << allocationLimit;
+        autorouterDebugLog( message.str() );
     }
     return std::nullopt;
 }

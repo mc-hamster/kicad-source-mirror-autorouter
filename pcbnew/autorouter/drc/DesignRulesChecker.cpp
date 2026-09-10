@@ -20,6 +20,9 @@
 #include "DesignRulesChecker.h"
 
 #include "../AutorouterDebug.h"
+#include "../geometry/planar/IntOctagon.h"
+#include "../geometry/planar/Polyline.h"
+#include "../geometry/planar/Simplex.h"
 
 #include <algorithm>
 #include <cmath>
@@ -447,6 +450,34 @@ bool segmentVsObstacle( const ROUTING_SEGMENT& aSegment, std::int64_t aRouteRadi
 
     if( aObstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
     {
+        // Match the conservative 45-degree compensated shape used by the
+        // room tree and segment preflight.  A square AABB inflation rejects
+        // legal traces around every rectangle corner even though the square
+        // corners lie outside the round KiCad clearance.  IntOctagon's
+        // diagonal support is outside that round offset, so accepting only
+        // its exterior remains conservative while keeping both independent
+        // native checks on the same geometric contract.
+        const PLANAR::INT_OCTAGON clearanceShape =
+                PLANAR::INT_OCTAGON::FromBox( aObstacle.box ).Offset( expandedRadius );
+        if( const auto simplex = clearanceShape.ToSimplex() )
+        {
+            if( aSegment.start == aSegment.end )
+                return simplex->Contains( PLANAR::POINT( aSegment.start ) );
+
+            try
+            {
+                const PLANAR::POLYLINE path = PLANAR::POLYLINE::FromPoints(
+                        { aSegment.start, aSegment.end } );
+                if( !path.Empty() )
+                    return simplex->IntersectsSegment( path, 1 );
+            }
+            catch( const std::exception& )
+            {
+                // Overflow or a degenerate exact primitive must fail closed
+                // through the enclosing AABB test below.
+            }
+        }
+
         ROUTER_BOX box = aObstacle.box;
         const auto inflate = static_cast<std::int64_t>( std::ceil( radius ) );
         box.minX -= inflate;
