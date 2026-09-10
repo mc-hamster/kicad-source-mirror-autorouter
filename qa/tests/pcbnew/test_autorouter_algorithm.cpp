@@ -67,6 +67,7 @@
 #include <autorouter/rules/ViaRule.h>
 #include <autorouter/board/searchtree/ShapeSearchTree90Degree.h>
 #include <autorouter/board/searchtree/ShapeSearchTree45Degree.h>
+#include <autorouter/board/searchtree/ShapeSearchTree.h>
 #include <autorouter/pipeline/BatchFanout.h>
 #include <autorouter/pipeline/AutoroutePassRunner.h>
 #include <autorouter/pipeline/AutorouteBatchLoop.h>
@@ -429,6 +430,70 @@ BOOST_AUTO_TEST_CASE( FortyFiveDegreeRoomRestraintMatchesPinnedFreerouting )
                 BOOST_CHECK( candidate.shape == readOctagon() );
                 BOOST_CHECK( candidate.containedShape == readOctagon() );
                 BOOST_CHECK_EQUAL( candidate.layer, 3 );
+            }
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralRoomRestraintMatchesPinnedFreerouting )
+{
+    using PLANAR::LINE;
+    using PLANAR::SIMPLEX;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/room-general-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readSimplex = [&]()
+    {
+        std::size_t lineCount;
+        input >> lineCount;
+        std::vector<LINE> lines;
+        lines.reserve( lineCount );
+        for( std::size_t lineIndex = 0; lineIndex < lineCount; ++lineIndex )
+        {
+            ROUTER_POINT a;
+            ROUTER_POINT b;
+            input >> a.x >> a.y >> b.x >> b.y;
+            lines.emplace_back( a, b );
+        }
+        BOOST_REQUIRE( !input.fail() );
+        return SIMPLEX::GetInstance( std::move( lines ) );
+    };
+    auto checkSimplex = [&]( const SIMPLEX& aActual, const SIMPLEX& aExpected )
+    {
+        BOOST_REQUIRE_EQUAL( aActual.Borders().size(), aExpected.Borders().size() );
+        for( std::size_t i = 0; i < aActual.Borders().size(); ++i )
+        {
+            BOOST_CHECK( aActual.Borders()[i].a == aExpected.Borders()[i].a );
+            BOOST_CHECK( aActual.Borders()[i].b == aExpected.Borders()[i].b );
+        }
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "general room oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "ROOMGENERAL" );
+            const SIMPLEX room = readSimplex();
+            const SIMPLEX contained = readSimplex();
+            const SIMPLEX obstacle = readSimplex();
+            std::size_t expectedCount;
+            input >> expectedCount;
+
+            const auto actual = SHAPE_SEARCH_TREE::RestrainShape(
+                    { room, 4, contained }, obstacle );
+            BOOST_REQUIRE_EQUAL( actual.size(), expectedCount );
+            for( const auto& candidate : actual )
+            {
+                checkSimplex( candidate.shape, readSimplex() );
+                checkSimplex( candidate.containedShape, readSimplex() );
+                BOOST_CHECK_EQUAL( candidate.layer, 4 );
             }
             BOOST_REQUIRE( !input.fail() );
         }

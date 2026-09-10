@@ -74,7 +74,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--java", default="java")
     parser.add_argument("--javac", default="javac")
-    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "simplex", "tile2", "tilex", "polyline", "polytransform", "segment", "float", "spring", "octagon", "room45", "neighbours45", "door45"), default="room")
+    parser.add_argument("--oracle", choices=("room", "drill", "destination", "contacts", "fanout", "convex", "simplex", "tile2", "tilex", "polyline", "polytransform", "segment", "float", "spring", "octagon", "room45", "room-general", "neighbours45", "door45"), default="room")
     args = parser.parse_args()
     jar, output = args.reference_jar.resolve(), args.output_dir.resolve()
     verify_reference(jar)
@@ -86,6 +86,7 @@ def main() -> int:
                   "destination": "DestinationDistanceOracle", "contacts": "NormalContactsOracle", "fanout": "FanoutOrderOracle", "convex": "ConvexGeometryOracle", "simplex": "SimplexGeometryOracle", "tile2": "TileShapeOracle", "tilex": "TileTransformOracle", "polyline": "PolylineGeometryOracle", "polytransform": "PolylineTransformOracle", "segment": "LineSegmentOracle", "float": "FloatGeometryOracle",
                   "spring": "SpringOverOracle", "octagon": "IntOctagonOracle",
                   "room45": "ShapeSearchTree45DegreeOracle",
+                  "room-general": "app.freerouting.board.searchtree.ShapeSearchTreeOracle",
                   "neighbours45": "Sorted45DegreeRoomNeighboursOracle",
                   "door45": "ExpansionDoorOracle"}[args.oracle]
     source = ROOT / "scripts/autorouter" / (main_class.rsplit(".", 1)[-1] + ".java")

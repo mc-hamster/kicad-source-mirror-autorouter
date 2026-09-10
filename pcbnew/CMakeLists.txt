@@ -441,6 +441,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/board/KicadBoardAdapter.cpp
     autorouter/board/KicadRoutingSession.cpp
     autorouter/board/facade/RoutingBoard.cpp
+    autorouter/board/searchtree/ShapeSearchTree.cpp
     autorouter/board/searchtree/ShapeSearchTree90Degree.cpp
     autorouter/board/searchtree/ShapeSearchTree45Degree.cpp
     autorouter/datastructures/MinAreaTree.cpp

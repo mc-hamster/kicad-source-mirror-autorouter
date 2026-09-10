@@ -7,6 +7,7 @@
 #include <functional>
 #include "../geometry/planar/IntBox.h"
 #include "../geometry/planar/IntOctagon.h"
+#include "../geometry/planar/Simplex.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -17,10 +18,11 @@ struct SHAPE_TREE_ENTRY
     SHAPE_TREE_ENTRY( ROUTER_BOX aShape, int aObjectId = 0, int aShapeIndex = 0,
                       int aLayer = 0, int aNet = 0, bool aIsRoom = false,
                       bool aObstacle = true,
-                      std::optional<PLANAR::INT_OCTAGON> aOctagon = {} ) :
+                      std::optional<PLANAR::INT_OCTAGON> aOctagon = {},
+                      std::optional<PLANAR::SIMPLEX> aSimplex = {} ) :
             shape( aShape ), objectId( aObjectId ), shapeIndex( aShapeIndex ),
             layer( aLayer ), net( aNet ), isRoom( aIsRoom ), obstacle( aObstacle ),
-            octagon( std::move( aOctagon ) )
+            octagon( std::move( aOctagon ) ), simplex( std::move( aSimplex ) )
     {
     }
 
@@ -35,6 +37,10 @@ struct SHAPE_TREE_ENTRY
     // bounding box; ShapeSearchTree45Degree applies this shape as the exact
     // narrow phase after traversal reaches a leaf.
     std::optional<PLANAR::INT_OCTAGON> octagon;
+    // Exact arbitrary-angle convex shape.  The general ShapeSearchTree keeps
+    // this representation through room restraint instead of silently
+    // replacing non-45-degree supports with their octagonal envelope.
+    std::optional<PLANAR::SIMPLEX> simplex;
 
     bool IsTraceObstacle( int aNet ) const
     {
@@ -44,6 +50,18 @@ struct SHAPE_TREE_ENTRY
     PLANAR::INT_OCTAGON BoundingOctagon() const
     {
         return octagon ? *octagon : PLANAR::INT_OCTAGON::FromBox( shape );
+    }
+
+    PLANAR::SIMPLEX BoundingSimplex() const
+    {
+        if( simplex )
+            return *simplex;
+        if( octagon )
+        {
+            const auto converted = octagon->ToSimplex();
+            return converted ? *converted : PLANAR::SIMPLEX::Empty();
+        }
+        return PLANAR::SIMPLEX::Box( shape );
     }
 };
 
