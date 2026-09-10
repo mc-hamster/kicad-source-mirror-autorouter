@@ -100,6 +100,33 @@ BOOST_AUTO_TEST_CASE( LineSegmentOperationsMatchPinnedJava )
     BOOST_CHECK_EQUAL( count, 384 );
 }
 
+BOOST_AUTO_TEST_CASE( PolylineTransformsAndProjectionMatchPinnedJava )
+{
+    const auto path = KI_TEST::GetPcbnewTestDataDir()
+                      + "/autorouter/polytransform-search-a11c0a42.txt";
+    std::ifstream input( path );
+    BOOST_REQUIRE( input.good() );
+    std::string line;
+    int count = 0;
+    while( std::getline( input, line ) )
+    {
+        ++count;
+        BOOST_TEST_CONTEXT( "polyline transform record " << count )
+        {
+            try
+            {
+                const std::string mismatch = AUTOROUTER_GEOMETRY_QA::CheckRecord( line );
+                BOOST_CHECK_MESSAGE( mismatch.empty(), mismatch );
+            }
+            catch( const std::exception& error )
+            {
+                BOOST_ERROR( "oracle evaluation failed: " << error.what() );
+            }
+        }
+    }
+    BOOST_CHECK_EQUAL( count, 384 );
+}
+
 BOOST_AUTO_TEST_CASE( GeneralConvexPolylineAreaCutoutIsBoundedAndFailClosed )
 {
     const SIMPLEX border = SIMPLEX::Box( { -100, -80, 100, 80 } );

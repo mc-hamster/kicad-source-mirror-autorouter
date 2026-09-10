@@ -456,6 +456,102 @@ inline std::string CheckRecord( const std::string& record )
         actual << ' ';
         printSegment( *shapeSegment );
     }
+    else if( tag == "PTRANS" )
+    {
+        std::size_t count;
+        in >> count;
+        std::vector<LINE> supplied;
+        supplied.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            supplied.push_back( ReadLine( in ) );
+        int factor;
+        ROUTER_POINT pole, probe;
+        double angle, rotatePoleX, rotatePoleY, lastLength, queryX, queryY;
+        std::size_t newLineCount, segmentIndex;
+        int halfWidth;
+        in >> factor >> pole.x >> pole.y >> angle >> rotatePoleX >> rotatePoleY
+           >> probe.x >> probe.y >> newLineCount >> lastLength >> halfWidth
+           >> segmentIndex >> queryX >> queryY;
+        const LINE testedLine = ReadLine( in );
+        const LINE otherLine = ReadLine( in );
+        const POLYLINE polyline( std::move( supplied ) );
+        const auto printPolylineLines = [&]( const POLYLINE& value )
+        {
+            actual << value.lines.size();
+            for( const LINE& line : value.lines )
+            {
+                actual << ' ';
+                PrintLine( actual, line );
+            }
+        };
+        const auto requirePolyline = [&]( const std::optional<POLYLINE>& value )
+                -> const POLYLINE&
+        {
+            if( !value )
+                throw std::runtime_error( "small polyline transform overflowed" );
+            return *value;
+        };
+        const auto printSegment = [&]( const LINE_SEGMENT& value )
+        {
+            PrintLine( actual, value.GetStartClosingLine() );
+            actual << ' ';
+            PrintLine( actual, value.GetLine() );
+            actual << ' ';
+            PrintLine( actual, value.GetEndClosingLine() );
+        };
+
+        printPolylineLines( requirePolyline( polyline.Turn90Degree( factor, pole ) ) );
+        actual << ' ';
+        printPolylineLines( requirePolyline(
+                polyline.RotateApprox( angle, rotatePoleX, rotatePoleY ) ) );
+        actual << ' ';
+        printPolylineLines( requirePolyline( polyline.MirrorVertical( pole ) ) );
+        actual << ' ';
+        printPolylineLines( requirePolyline( polyline.MirrorHorizontal( pole ) ) );
+        actual << std::fixed << std::setprecision( 9 )
+               << ' ' << polyline.Distance( queryX, queryY ) << ' ';
+        const auto projection = polyline.ProjectionLine( POINT( probe ) );
+        if( projection )
+            printSegment( *projection );
+        else
+            actual << -1;
+        const auto shortened = polyline.Shorten( newLineCount, lastLength );
+        if( !shortened )
+            throw std::runtime_error( "valid polyline shortening failed" );
+        actual << ' ';
+        printPolylineLines( *shortened );
+        const auto offsetShape = polyline.OffsetShape( halfWidth, segmentIndex );
+        if( !offsetShape )
+            throw std::runtime_error( "valid polyline offset shape failed" );
+        actual << ' ';
+        PrintSimplex( actual, *offsetShape );
+        const auto offsetBox = polyline.OffsetBox( halfWidth, segmentIndex );
+        if( !offsetBox )
+            throw std::runtime_error( "valid polyline offset box failed" );
+        actual << ' ' << offsetBox->minX << ' ' << offsetBox->minY << ' '
+               << offsetBox->maxX << ' ' << offsetBox->maxY;
+        const auto turnedLine = testedLine.Turn90Degree( factor, pole );
+        const auto verticalLine = testedLine.MirrorVertical( pole );
+        const auto horizontalLine = testedLine.MirrorHorizontal( pole );
+        if( !turnedLine || !verticalLine || !horizontalLine )
+            throw std::runtime_error( "small line transform overflowed" );
+        actual << ' ';
+        PrintLine( actual, *turnedLine );
+        actual << ' ';
+        PrintLine( actual, *verticalLine );
+        actual << ' ';
+        PrintLine( actual, *horizontalLine );
+        actual << ' ' << ( testedLine.Perpendicular( otherLine ) ? 1 : 0 )
+               << ' ' << testedLine.CosAngle( otherLine )
+               << ' ' << testedLine.FunctionValueApprox( queryX )
+               << ' ' << testedLine.FunctionInYValueApprox( queryY )
+               << ' ' << testedLine.Length();
+        const auto direction = testedLine.PerpendicularDirection( POINT( probe ) );
+        if( direction )
+            actual << " 2 " << direction->x << ' ' << direction->y;
+        else
+            actual << " -1";
+    }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );
     std::string expected; std::getline( in >> std::ws, expected );

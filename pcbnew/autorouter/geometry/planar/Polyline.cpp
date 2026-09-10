@@ -3,6 +3,7 @@
  */
 #include "Polyline.h"
 #include "IntOctagon.h"
+#include "LineSegment.h"
 #include "Simplex.h"
 
 #include <algorithm>
@@ -10,6 +11,23 @@
 
 namespace KICAD_AUTOROUTER::PLANAR
 {
+namespace
+{
+
+std::optional<std::int64_t> javaRoundCoordinate( double aValue )
+{
+    const double rounded = std::floor( aValue + 0.5 );
+    if( rounded < static_cast<double>( std::numeric_limits<std::int64_t>::min() )
+        || rounded > static_cast<double>( std::numeric_limits<std::int64_t>::max() ) )
+    {
+        return {};
+    }
+    return static_cast<std::int64_t>( rounded );
+}
+
+} // namespace
+
+
 POLYLINE::POLYLINE( std::vector<LINE> input )
 {
     for( const LINE& line : input )
@@ -213,6 +231,80 @@ std::optional<POLYLINE> POLYLINE::TranslateBy( ROUTER_POINT aVector ) const
 }
 
 
+std::optional<POLYLINE> POLYLINE::Turn90Degree(
+        int aFactor, ROUTER_POINT aPole ) const
+{
+    std::vector<LINE> result;
+    result.reserve( lines.size() );
+    for( const LINE& line : lines )
+    {
+        const auto transformed = line.Turn90Degree( aFactor, aPole );
+        if( !transformed )
+            return {};
+        result.push_back( *transformed );
+    }
+    return POLYLINE( std::move( result ) );
+}
+
+
+std::optional<POLYLINE> POLYLINE::RotateApprox(
+        double aAngle, double aPoleX, double aPoleY ) const
+{
+    if( aAngle == 0 )
+        return *this;
+    if( Empty() )
+        return POLYLINE( {} );
+    const double sine = std::sin( aAngle );
+    const double cosine = std::cos( aAngle );
+    std::vector<ROUTER_POINT> corners;
+    corners.reserve( CornerCount() );
+    for( std::size_t index = 0; index < CornerCount(); ++index )
+    {
+        const POINT corner = Corner( index );
+        const double dx = corner.X() - aPoleX;
+        const double dy = corner.Y() - aPoleY;
+        const auto x = javaRoundCoordinate( aPoleX + dx * cosine - dy * sine );
+        const auto y = javaRoundCoordinate( aPoleY + dx * sine + dy * cosine );
+        if( !x || !y )
+            return {};
+        const ROUTER_POINT transformed{ *x, *y };
+        if( corners.empty() || corners.back() != transformed )
+            corners.push_back( transformed );
+    }
+    return POLYLINE::FromPoints( corners );
+}
+
+
+std::optional<POLYLINE> POLYLINE::MirrorVertical( ROUTER_POINT aPole ) const
+{
+    std::vector<LINE> result;
+    result.reserve( lines.size() );
+    for( const LINE& line : lines )
+    {
+        const auto transformed = line.MirrorVertical( aPole );
+        if( !transformed )
+            return {};
+        result.push_back( *transformed );
+    }
+    return POLYLINE( std::move( result ) );
+}
+
+
+std::optional<POLYLINE> POLYLINE::MirrorHorizontal( ROUTER_POINT aPole ) const
+{
+    std::vector<LINE> result;
+    result.reserve( lines.size() );
+    for( const LINE& line : lines )
+    {
+        const auto transformed = line.MirrorHorizontal( aPole );
+        if( !transformed )
+            return {};
+        result.push_back( *transformed );
+    }
+    return POLYLINE( std::move( result ) );
+}
+
+
 double POLYLINE::LengthApprox( int aRequestedFromCorner,
                                int aRequestedToCorner ) const
 {
@@ -348,6 +440,15 @@ std::optional<std::pair<double, double>> POLYLINE::NearestPointApprox(
         }
     }
     return nearest;
+}
+
+
+double POLYLINE::Distance( double aX, double aY ) const
+{
+    const auto nearest = NearestPointApprox( aX, aY );
+    if( !nearest )
+        return std::numeric_limits<double>::max();
+    return std::hypot( nearest->first - aX, nearest->second - aY );
 }
 
 
@@ -522,6 +623,127 @@ std::vector<SIMPLEX> POLYLINE::OffsetShapes(
         currentDirection = nextDirection;
     }
     return result;
+}
+
+
+std::optional<SIMPLEX> POLYLINE::OffsetShape(
+        int aHalfWidth, std::size_t aSegmentIndex ) const
+{
+    if( aSegmentIndex + 2 >= lines.size() )
+        return {};
+    const auto shapes = OffsetShapes( aHalfWidth,
+                                      static_cast<int>( aSegmentIndex ),
+                                      static_cast<int>( aSegmentIndex ) + 2 );
+    if( shapes.empty() )
+        return {};
+    return shapes.front();
+}
+
+
+std::optional<ROUTER_BOX> POLYLINE::OffsetBox(
+        int aHalfWidth, std::size_t aSegmentIndex ) const
+{
+    const auto segment = LINE_SEGMENT::FromPolyline( *this, aSegmentIndex + 1 );
+    if( !segment )
+        return {};
+    const ROUTER_BOX box = segment->BoundingBox();
+    const INTEGER minimum = std::numeric_limits<std::int64_t>::min();
+    const INTEGER maximum = std::numeric_limits<std::int64_t>::max();
+    const INTEGER minX = INTEGER( box.minX ) - aHalfWidth;
+    const INTEGER minY = INTEGER( box.minY ) - aHalfWidth;
+    const INTEGER maxX = INTEGER( box.maxX ) + aHalfWidth;
+    const INTEGER maxY = INTEGER( box.maxY ) + aHalfWidth;
+    if( minX < minimum || minX > maximum || minY < minimum || minY > maximum
+        || maxX < minimum || maxX > maximum || maxY < minimum || maxY > maximum )
+    {
+        return {};
+    }
+    return ROUTER_BOX{ minX.convert_to<std::int64_t>(), minY.convert_to<std::int64_t>(),
+                       maxX.convert_to<std::int64_t>(), maxY.convert_to<std::int64_t>() };
+}
+
+
+std::unique_ptr<LINE_SEGMENT> POLYLINE::ProjectionLine( const POINT& aPoint ) const
+{
+    const auto integralPoint = aPoint.Integral();
+    if( !integralPoint )
+        return {};
+    const double fromX = aPoint.X();
+    const double fromY = aPoint.Y();
+    double minimumDistance = std::numeric_limits<double>::max();
+    std::optional<LINE> resultLine;
+    const LINE* nearestLine = nullptr;
+    for( std::size_t index = 1; index + 1 < lines.size(); ++index )
+    {
+        const auto projection = lines[index].ProjectionApprox( fromX, fromY );
+        const double currentDistance = std::hypot( projection.first - fromX,
+                                                   projection.second - fromY );
+        if( currentDistance >= minimumDistance )
+            continue;
+        const auto direction = lines[index].PerpendicularDirection( aPoint );
+        if( !direction )
+            continue;
+        const auto candidate = LINE::FromDirection( *integralPoint,
+                                                     direction->x, direction->y );
+        if( !candidate )
+            return {};
+        const int previousSide = candidate->SideOf( Corner( index - 1 ) );
+        const int nextSide = candidate->SideOf( Corner( index ) );
+        if( previousSide == nextSide && previousSide != 0 )
+            continue;
+        nearestLine = &lines[index];
+        minimumDistance = currentDistance;
+        resultLine = candidate;
+    }
+    if( !nearestLine || !resultLine )
+        return {};
+    const auto startLine = LINE::FromDirection( *integralPoint,
+                                                nearestLine->Dx(), nearestLine->Dy() );
+    if( !startLine )
+        return {};
+    return std::make_unique<LINE_SEGMENT>( *startLine, *resultLine, *nearestLine );
+}
+
+
+std::optional<POLYLINE> POLYLINE::Shorten(
+        std::size_t aNewLineCount, double aLastSegmentLength ) const
+{
+    if( aNewLineCount < 3 || aNewLineCount > lines.size() )
+        return {};
+    const POINT lastCorner = Corner( aNewLineCount - 2 );
+    const POINT previousLastCorner = Corner( aNewLineCount - 3 );
+    const double dx = lastCorner.X() - previousLastCorner.X();
+    const double dy = lastCorner.Y() - previousLastCorner.Y();
+    const double length = std::hypot( dx, dy );
+    if( length == 0 )
+        return {};
+    const auto newX = javaRoundCoordinate(
+            previousLastCorner.X() + dx * aLastSegmentLength / length );
+    const auto newY = javaRoundCoordinate(
+            previousLastCorner.Y() + dy * aLastSegmentLength / length );
+    if( !newX || !newY )
+        return {};
+    const ROUTER_POINT newLastCorner{ *newX, *newY };
+    if( POINT( newLastCorner ) == Corner( CornerCount() - 2 ) )
+        return SkipLines( aNewLineCount - 1, aNewLineCount - 1 );
+
+    std::vector<LINE> result;
+    result.reserve( aNewLineCount );
+    result.insert( result.end(), lines.begin(),
+                   lines.begin() + static_cast<std::ptrdiff_t>( aNewLineCount - 2 ) );
+    ROUTER_POINT firstLinePoint = lines[aNewLineCount - 2].a;
+    if( firstLinePoint == newLastCorner )
+        firstLinePoint = lines[aNewLineCount - 2].b;
+    if( firstLinePoint == newLastCorner )
+        return {};
+    const LINE previousLine( firstLinePoint, newLastCorner );
+    result.push_back( previousLine );
+    const auto endLine = LINE::FromDirection( newLastCorner,
+                                              previousLine.Dy(), -previousLine.Dx() );
+    if( !endLine )
+        return {};
+    result.push_back( *endLine );
+    return POLYLINE( std::move( result ) );
 }
 
 std::optional<std::vector<ROUTER_POINT>> POLYLINE::IntegralCorners() const

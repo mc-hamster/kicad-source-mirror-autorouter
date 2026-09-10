@@ -78,10 +78,19 @@ covered. The source's observable function-of-y behavior in
 corrected. A separate **384-record** pinned oracle covers integral and rational
 segments, every direction quadrant, crossings, disjoint/identical/opposite
 segments, and box/triangle/general-convex borders. The complete native
-autorouter suite now has **192 passing cases**. The production 555 smoke remains host-valid and unchanged
+`Line`/`Polyline` transform surface is also present: exact quarter turns and
+axis mirrors retain directed support handedness, approximate arbitrary-angle
+rotation follows source corner rounding, and offset-shape/box, nearest distance,
+perpendicular projection-segment and tail-shortening helpers use the pinned
+control flow. Line perpendicular direction, angle, function and length helpers
+are source-tested at the same boundary. A third **384-record** oracle covers
+those operations over integral and rational-corner paths, negative/large turn
+factors, arbitrary poles, contained and exterior projection points, every
+segment, and zero/nonzero offsets. The complete native autorouter suite now has
+**193 passing cases**. The production 555 smoke remains host-valid and unchanged
 at 12/12 connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853
-expanded nodes. Rotation/mirroring, projection-line/shortening helpers and the
-remaining general `TileShape` dispatch remain open.
+expanded nodes. The remaining general `TileShape` dispatch and rational-support
+line transforms remain open.
 
 Fixed and negotiated-rip-up trace/via obstacles retain exact octagonal envelopes;
 free-space completion, neighbour gaps, door sections, source-style queue

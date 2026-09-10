@@ -4,12 +4,14 @@
 #pragma once
 #include "Line.h"
 #include <cmath>
+#include <memory>
 #include <optional>
 
 namespace KICAD_AUTOROUTER::PLANAR
 {
 class SIMPLEX;
 class INT_OCTAGON;
+class LINE_SEGMENT;
 
 class POLYLINE
 {
@@ -32,6 +34,11 @@ public:
     std::vector<POLYLINE> Split( std::size_t aLineIndex, const LINE& aEndLine ) const;
     POLYLINE SkipLines( std::size_t aFrom, std::size_t aTo ) const;
     std::optional<POLYLINE> TranslateBy( ROUTER_POINT aVector ) const;
+    std::optional<POLYLINE> Turn90Degree( int aFactor, ROUTER_POINT aPole ) const;
+    std::optional<POLYLINE> RotateApprox( double aAngle, double aPoleX,
+                                          double aPoleY ) const;
+    std::optional<POLYLINE> MirrorVertical( ROUTER_POINT aPole ) const;
+    std::optional<POLYLINE> MirrorHorizontal( ROUTER_POINT aPole ) const;
     double LengthApprox() const;
     double LengthApprox( int aRequestedFromCorner, int aRequestedToCorner ) const;
     std::optional<ROUTER_BOX> BoundingBox( int aRequestedFromCorner = 0,
@@ -40,10 +47,18 @@ public:
                                                 int aRequestedToCorner = -1 ) const;
     std::optional<std::pair<double, double>> NearestPointApprox(
             double aX, double aY ) const;
+    double Distance( double aX, double aY ) const;
     bool Contains( const POINT& aPoint ) const;
     std::vector<SIMPLEX> OffsetShapes( int aHalfWidth,
                                        int aRequestedFromLine = 0,
                                        int aRequestedToLine = -1 ) const;
+    std::optional<SIMPLEX> OffsetShape( int aHalfWidth,
+                                        std::size_t aSegmentIndex ) const;
+    std::optional<ROUTER_BOX> OffsetBox( int aHalfWidth,
+                                         std::size_t aSegmentIndex ) const;
+    std::unique_ptr<LINE_SEGMENT> ProjectionLine( const POINT& aPoint ) const;
+    std::optional<POLYLINE> Shorten( std::size_t aNewLineCount,
+                                      double aLastSegmentLength ) const;
     std::optional<std::vector<ROUTER_POINT>> IntegralCorners() const;
 };
 } // namespace KICAD_AUTOROUTER::PLANAR
