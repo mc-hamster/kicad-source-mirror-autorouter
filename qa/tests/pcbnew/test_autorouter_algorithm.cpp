@@ -60,6 +60,7 @@
 #include <autorouter/expansion/IncompleteFreeSpaceExpansionRoom.h>
 #include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
 #include <autorouter/expansion/Sorted45DegreeRoomNeighbours.h>
+#include <autorouter/expansion/SortedRoomNeighbours.h>
 #include <autorouter/maze/DestinationDistance.h>
 #include <autorouter/maze/LegacyDestinationDistance.h>
 #include <autorouter/maze/RoomCostSpace.h>
@@ -779,6 +780,147 @@ BOOST_AUTO_TEST_CASE( GeneralExpansionDoorMatchesPinnedFreerouting )
                 BOOST_CHECK( sameDouble( section.b.x, readDouble() ) );
                 BOOST_CHECK( sameDouble( section.b.y, readDouble() ) );
             }
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+
+BOOST_AUTO_TEST_CASE( GeneralRoomNeighboursMatchPinnedFreerouting )
+{
+    using PLANAR::LINE;
+    using PLANAR::SIMPLEX;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/neighbours-general-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readSimplex = [&]()
+    {
+        std::size_t lineCount;
+        input >> lineCount;
+        std::vector<LINE> lines;
+        lines.reserve( lineCount );
+        for( std::size_t i = 0; i < lineCount; ++i )
+        {
+            ROUTER_POINT a;
+            ROUTER_POINT b;
+            input >> a.x >> a.y >> b.x >> b.y;
+            lines.emplace_back( a, b );
+        }
+        BOOST_REQUIRE( !input.fail() );
+        return SIMPLEX::GetInstance( std::move( lines ) );
+    };
+    auto checkSimplex = [&]( const SIMPLEX& aActual, const SIMPLEX& aExpected,
+                             const std::string& aStage )
+    {
+        BOOST_REQUIRE_MESSAGE( aActual.Borders().size() == aExpected.Borders().size(),
+                               aStage << " border count actual="
+                                      << aActual.Borders().size() << " expected="
+                                      << aExpected.Borders().size() );
+        for( std::size_t i = 0; i < aActual.Borders().size(); ++i )
+        {
+            BOOST_REQUIRE_MESSAGE(
+                    aActual.Borders()[i].a == aExpected.Borders()[i].a
+                            && aActual.Borders()[i].b == aExpected.Borders()[i].b,
+                    aStage << " support=" << i << " actual=("
+                           << aActual.Borders()[i].a.x << ','
+                           << aActual.Borders()[i].a.y << ")->("
+                           << aActual.Borders()[i].b.x << ','
+                           << aActual.Borders()[i].b.y << ") expected=("
+                           << aExpected.Borders()[i].a.x << ','
+                           << aExpected.Borders()[i].a.y << ")->("
+                           << aExpected.Borders()[i].b.x << ','
+                           << aExpected.Borders()[i].b.y << ')' );
+        }
+    };
+    auto checkRooms = [&]( const std::vector<INCOMPLETE_GENERAL_EXPANSION_ROOM>& aRooms,
+                           std::size_t aExpectedCount, const std::string& aStage )
+    {
+        BOOST_REQUIRE_EQUAL( aRooms.size(), aExpectedCount );
+        for( std::size_t index = 0; index < aRooms.size(); ++index )
+        {
+            checkSimplex( aRooms[index].shape, readSimplex(),
+                          aStage + " shape " + std::to_string( index ) );
+            checkSimplex( aRooms[index].containedShape, readSimplex(),
+                          aStage + " contained " + std::to_string( index ) );
+            BOOST_CHECK_EQUAL( aRooms[index].layer, 2 );
+        }
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "general room neighbours oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "NEIGHBOURSGENERAL" );
+            const SIMPLEX room = readSimplex();
+            const SIMPLEX contained = readSimplex();
+            std::size_t inputCount;
+            input >> inputCount;
+            std::vector<SHAPE_TREE_ENTRY> entries;
+            entries.reserve( inputCount );
+            for( std::size_t i = 0; i < inputCount; ++i )
+            {
+                int id;
+                input >> id;
+                SIMPLEX shape = readSimplex();
+                entries.push_back( { shape.BoundingBox().value(), id, 0, 2,
+                                     0, true, true, {}, std::move( shape ) } );
+            }
+
+            SORTED_ROOM_NEIGHBOURS sorted( room, entries );
+            std::size_t expectedNeighbours;
+            input >> expectedNeighbours;
+            BOOST_REQUIRE_EQUAL( sorted.Neighbours().size(), expectedNeighbours );
+            for( const SORTED_ROOM_NEIGHBOURS::NEIGHBOUR& neighbour :
+                 sorted.Neighbours() )
+            {
+                int expectedId;
+                input >> expectedId;
+                BOOST_CHECK_EQUAL( neighbour.entry.objectId, expectedId );
+                checkSimplex( neighbour.intersection, readSimplex(),
+                              "neighbour intersection" );
+                int roomSide;
+                int neighbourSide;
+                int roomCorner;
+                int neighbourCorner;
+                input >> roomSide >> neighbourSide >> roomCorner >> neighbourCorner;
+                BOOST_CHECK_EQUAL( neighbour.touchingSideNoOfRoom, roomSide );
+                BOOST_CHECK_EQUAL( neighbour.touchingSideNoOfNeighbourRoom,
+                                   neighbourSide );
+                BOOST_CHECK_EQUAL( neighbour.roomTouchIsCorner, roomCorner != 0 );
+                BOOST_CHECK_EQUAL( neighbour.neighbourRoomTouchIsCorner,
+                                   neighbourCorner != 0 );
+            }
+
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "FIRST_UNRESTRAINED" );
+            int expectedUnrestrained;
+            input >> expectedUnrestrained;
+            BOOST_CHECK_EQUAL( sorted.FirstUnrestrainedSide(),
+                               expectedUnrestrained );
+
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "COMPLETED" );
+            const SIMPLEX expectedCompleted = readSimplex();
+            SIMPLEX completed = room;
+            const auto gaps = sorted.IncompleteRooms( 2, contained, &completed );
+            checkSimplex( completed, expectedCompleted, "completed" );
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "GAPS" );
+            std::size_t expectedGaps;
+            input >> expectedGaps;
+            checkRooms( gaps, expectedGaps, "gap" );
+
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "OBSTACLE_GAPS" );
+            std::size_t expectedObstacleGaps;
+            input >> expectedObstacleGaps;
+            checkRooms( sorted.ObstacleIncompleteRooms( 2 ),
+                        expectedObstacleGaps, "obstacle gap" );
             BOOST_REQUIRE( !input.fail() );
         }
     }

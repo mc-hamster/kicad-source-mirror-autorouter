@@ -122,7 +122,14 @@ general expansion doors intersect those support sets in source double-dispatch
 order. Their dimension, door shape, rational-corner line selection, gravity,
 shrinking and section division match a separate **2,048-record** pinned oracle;
 the fixed-direction branch deliberately retains `IntOctagon`'s indexed-corner
-gravity semantics. The complete native autorouter suite now has **198
+gravity semantics. `SortedRoomNeighbours` is no longer a radial placeholder:
+its unrestricted-angle implementation now preserves exact rational touching
+geometry, source counter-clockwise ordering and duplicate suppression,
+unrestrained-edge selection, rounded corner smoothing, and free/obstacle
+incomplete-room construction. A separate **2,048-record** source-reflection
+oracle covers arbitrary-slope side and corner contacts, sparse/full neighbour
+fans, completed-room cuts, unbounded gap simplexes, and empty-obstacle fans.
+The complete native autorouter suite now has **199
 passing cases**. The production 555 smoke remains host-valid and unchanged at
 12/12 connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853
 expanded nodes. Arbitrary-angle search-tree activation remains open.

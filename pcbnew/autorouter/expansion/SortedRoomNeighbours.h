@@ -1,36 +1,74 @@
 /*
- * This program source code file is part of KiCad, a free EDA CAD application.
- *
- * Copyright The KiCad Developers, see AUTHORS.txt for contributors.
- *
- * This program is free software: you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation, either version 3 of the License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * This file is part of KiCad, licensed under GPL version 3 or later.
+ * Direct translation of Freerouting SortedRoomNeighbours.java at
+ * a11c0a42d1b3827e5126429c5c9820c4ab5bec7c (GPL-3.0).
  */
-
 #pragma once
 
-#include <vector>
-
-#include "ExpansionRoom.h"
+#include "../board/searchtree/ShapeSearchTree.h"
 
 namespace KICAD_AUTOROUTER
 {
 
-/** Stable nearest-room ordering used by expansion-door traversal. */
+/** Counter-clockwise neighbour topology for unrestricted-angle Simplex rooms.
+ *
+ * The source class also owns expansion-room allocation and target-item doors.
+ * Those lifecycle concerns remain in the maze context; this class translates
+ * the exact sorting, edge-removal and incomplete-room geometry without
+ * replacing rational support intersections by their bounding boxes.
+ */
 class SORTED_ROOM_NEIGHBOURS
 {
 public:
-    static void Sort( std::vector<EXPANSION_ROOM*>& aRooms, const ROUTER_POINT& aOrigin );
+    struct NEIGHBOUR
+    {
+        SHAPE_TREE_ENTRY entry;
+        PLANAR::SIMPLEX shape;
+        PLANAR::SIMPLEX intersection;
+        int touchingSideNoOfRoom = -1;
+        int touchingSideNoOfNeighbourRoom = -1;
+        bool roomTouchIsCorner = false;
+        bool neighbourRoomTouchIsCorner = false;
+
+        const PLANAR::POINT& FirstCorner( const PLANAR::SIMPLEX& aRoom ) const;
+        const PLANAR::POINT& LastCorner( const PLANAR::SIMPLEX& aRoom ) const;
+    };
+
+    SORTED_ROOM_NEIGHBOURS(
+            PLANAR::SIMPLEX aRoom,
+            const std::vector<SHAPE_TREE_ENTRY>& aEntries );
+
+    const std::vector<NEIGHBOUR>& Neighbours() const { return m_neighbours; }
+
+    /** First source border without a touching neighbour, or -1. */
+    int FirstUnrestrainedSide() const;
+
+    /** Source calculateNewIncompleteRooms for an incomplete free room.
+     * aCompletedShape receives the corner-smoothed completed-room shape.
+     */
+    std::vector<INCOMPLETE_GENERAL_EXPANSION_ROOM> IncompleteRooms(
+            int aLayer, const PLANAR::SIMPLEX& aContainedShape,
+            PLANAR::SIMPLEX* aCompletedShape = nullptr ) const;
+
+    /** Source obstacle branch, including the no-neighbour half-plane fan. */
+    std::vector<INCOMPLETE_GENERAL_EXPANSION_ROOM> ObstacleIncompleteRooms(
+            int aLayer ) const;
+
+private:
+    static int compareDirectionsFrom( const PLANAR::LINE& aBase,
+                                      const PLANAR::LINE& aFirst,
+                                      const PLANAR::LINE& aSecond );
+    int compare( const NEIGHBOUR& aLeft, const NEIGHBOUR& aRight ) const;
+    void addNeighbour( const SHAPE_TREE_ENTRY& aEntry,
+                       const PLANAR::SIMPLEX& aShape,
+                       const PLANAR::SIMPLEX& aIntersection );
+    std::vector<INCOMPLETE_GENERAL_EXPANSION_ROOM> calculateIncompleteRooms(
+            int aLayer, bool aFromIncomplete,
+            const PLANAR::SIMPLEX& aContainedShape,
+            PLANAR::SIMPLEX* aCompletedShape ) const;
+
+    PLANAR::SIMPLEX m_room;
+    std::vector<NEIGHBOUR> m_neighbours;
 };
 
 } // namespace KICAD_AUTOROUTER
