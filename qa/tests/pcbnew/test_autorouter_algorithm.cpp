@@ -51,6 +51,7 @@
 #include <autorouter/path/FoundConnectionLocator45Degree.h>
 #include <autorouter/expansion/ExpansionGraph.h>
 #include <autorouter/expansion/ExpansionDoor.h>
+#include <autorouter/expansion/TargetItemExpansionDoor.h>
 #include <autorouter/expansion/CompleteFreeSpaceExpansionRoom.h>
 #include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
 #include <autorouter/maze/DestinationDistance.h>
@@ -6308,6 +6309,57 @@ BOOST_AUTO_TEST_CASE( RoomSearchPreservesMultipleSourceAndTraceInteriorTargets )
             BOOST_CHECK( path->points == previous->points );
         previous = path;
     }
+}
+
+
+BOOST_AUTO_TEST_CASE( TargetItemDoorClipsExactDiagonalLatticeToReachedRoom )
+{
+    const auto point = TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            { 0, 0 }, { 6, 4 }, { 4, 1 }, { 2, 1, 5, 4 } );
+    BOOST_REQUIRE( point );
+    BOOST_CHECK( *point == ROUTER_POINT( { 3, 2 } ) );
+
+    const auto reversed = TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            { 6, 4 }, { 0, 0 }, { 4, 1 }, { 2, 1, 5, 4 } );
+    BOOST_REQUIRE( reversed );
+    BOOST_CHECK( *reversed == ROUTER_POINT( { 3, 2 } ) );
+
+    // This segment crosses the room only at non-integral coordinates.  The
+    // worker must not turn its enclosing box into a false target contact.
+    BOOST_CHECK( !TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            { 0, 0 }, { 2, 1 }, { 1, 0 }, { 1, 0, 1, 1 } ) );
+
+    constexpr std::int64_t base = 2000000000LL;
+    const auto large = TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            { base - 3000000000LL, base - 3000000000LL },
+            { base + 1000000000LL, base + 1000000000LL },
+            { base, base - 100 },
+            { base - 200, base - 200, base + 200, base + 200 } );
+    BOOST_REQUIRE( large );
+    BOOST_CHECK( *large == ROUTER_POINT( { base - 50, base - 50 } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( RoomSearchAttachesToInteriorOfDiagonalTraceTarget )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+            bounds, {}, 0, 1,
+            { { { 5000, 7000 }, { 5000, 7000 }, 11 } },
+            { { { 7000, 3000 }, { 9000, 5000 }, 20 } },
+            10, 1, 1, 1000, expanded, metrics, {}, {}, false );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE( !path->points.empty() );
+    BOOST_CHECK_EQUAL( path->startOwner, 11U );
+    BOOST_CHECK_EQUAL( path->targetOwner, 20U );
+    BOOST_CHECK( path->points.back() == ROUTER_POINT( { 8000, 4000 } ) );
+    BOOST_CHECK( path->points.back() != ROUTER_POINT( { 7000, 3000 } ) );
+    BOOST_CHECK( path->points.back() != ROUTER_POINT( { 9000, 5000 } ) );
+    BOOST_CHECK( CONTACT_GEOMETRY::OnSegment(
+            { 7000, 3000 }, { 9000, 5000 }, path->points.back() ) );
 }
 
 BOOST_AUTO_TEST_CASE( RoomLocatorRespectsAnglesAndBendThreshold )

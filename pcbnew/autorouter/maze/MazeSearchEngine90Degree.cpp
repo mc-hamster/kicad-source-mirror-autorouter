@@ -16,6 +16,7 @@
 #include "RoomSearchContext.h"
 #include "RoomCostSpace.h"
 #include "../AutorouterDebug.h"
+#include "../expansion/TargetItemExpansionDoor.h"
 
 #include <deque>
 #include <map>
@@ -33,14 +34,12 @@ namespace KICAD_AUTOROUTER
 {
 namespace
 {
-ROUTER_POINT nearest( const ROOM_TERMINAL& terminal, ROUTER_POINT point )
+std::optional<ROUTER_POINT> nearestInRoom( const ROOM_TERMINAL& terminal,
+                                           ROUTER_POINT point,
+                                           const ROUTER_BOX& room )
 {
-    // The host splits diagonal terminal traces into endpoint seeds. All
-    // terminals in this rectangular slice are points or axis-aligned lines.
-    return { std::clamp( point.x, std::min( terminal.start.x, terminal.end.x ),
-                                  std::max( terminal.start.x, terminal.end.x ) ),
-             std::clamp( point.y, std::min( terminal.start.y, terminal.end.y ),
-                                  std::max( terminal.start.y, terminal.end.y ) ) };
+    return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            terminal.start, terminal.end, point, room );
 }
 
 using DETAIL::ROOM;
@@ -64,11 +63,12 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         || !std::isfinite( aBendCost ) || aBendCost < 0 )
         return std::nullopt;
     ROUTER_BOX costBounds = aBounds;
+    for( const auto& terminal : aStarts )
+        if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
+            return std::nullopt; // Diagonal starts still need exact seed-room splitting.
     for( const auto& terminals : { &aStarts, &aTargets } )
         for( const auto& terminal : *terminals )
         {
-            if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
-                return std::nullopt; // A diagonal line is not its enclosing rectangle.
             costBounds = INT_BOX::Union( costBounds, {
                     std::min( terminal.start.x, terminal.end.x ), std::min( terminal.start.y, terminal.end.y ),
                     std::max( terminal.start.x, terminal.end.x ), std::max( terminal.start.y, terminal.end.y ) } );
@@ -220,10 +220,11 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
         for( std::size_t targetIndex = 0; targetIndex < aTargets.size(); ++targetIndex )
         {
             const auto& target = aTargets[targetIndex];
-            const auto p = nearest( target, from.Round() );
-            if( !current.room->shape->Contains( p ) )
+            const auto p = nearestInRoom( target, from.Round(),
+                                          current.room->shape->GetShape() );
+            if( !p )
                 continue;
-            const FLOAT_POINT to{ static_cast<double>( p.x ), static_cast<double>( p.y ) };
+            const FLOAT_POINT to{ static_cast<double>( p->x ), static_cast<double>( p->y ) };
             const double g = current.g + cost( from, to );
             push( { nullptr, nullptr, 0, { to, to }, g, g, index, current.owner, target.owner,
                     static_cast<std::uint32_t>( aStarts.size() + targetIndex + 1 ) } );

@@ -9,6 +9,7 @@
 #include "MazeListElement.h"
 #include "RoomCostSpace.h"
 #include "../drill/DrillPageArray.h"
+#include "../expansion/TargetItemExpansionDoor.h"
 #include "../path/FoundConnectionLocator45Degree.h"
 #include <deque>
 #include <map>
@@ -40,11 +41,12 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             || !std::isfinite( layer.verticalCost ) || layer.verticalCost <= 0
             || !std::isfinite( layer.bendCost ) || layer.bendCost < 0 )
             return std::nullopt;
+        for( const auto& terminal : layer.starts )
+            if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
+                return std::nullopt; // Diagonal starts need exact seed-room splitting.
         for( const auto* terminals : { &layer.starts, &layer.targets } )
             for( const auto& terminal : *terminals )
             {
-                if( terminal.start.x != terminal.end.x && terminal.start.y != terminal.end.y )
-                    return std::nullopt;
                 costBounds = INT_BOX::Union( costBounds, {
                         std::min( terminal.start.x, terminal.end.x ), std::min( terminal.start.y, terminal.end.y ),
                         std::max( terminal.start.x, terminal.end.x ), std::max( terminal.start.y, terminal.end.y ) } );
@@ -116,12 +118,6 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
 
     auto stopped = [&]() { return expanded >= maxExpanded || ( cancel && cancel() ); };
     auto step = [&]() { return spaces.front()->step(); };
-    auto nearestTerminal = []( const ROOM_TERMINAL& terminal, FLOAT_POINT point )
-    {
-        return MAZE_EXPANSION_ENGINE::Nearest( {
-                std::min( terminal.start.x, terminal.end.x ), std::min( terminal.start.y, terminal.end.y ),
-                std::max( terminal.start.x, terminal.end.x ), std::max( terminal.start.y, terminal.end.y ) }, point );
-    };
     auto remaining = [&]( FLOAT_POINT from, std::size_t fromLayer )
     {
         ++metrics.destinationQueries;
@@ -402,10 +398,15 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             targetId += layers[i].targets.size();
         for( const auto& target : layer.targets )
         {
-            const auto to = nearestTerminal( target, from );
             ++targetId;
-            if( !current.room->shape->Contains( to.Round() ) )
+            const auto targetPoint =
+                    TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                            target.start, target.end, from.Round(),
+                            current.room->shape->GetShape() );
+            if( !targetPoint )
                 continue;
+            const FLOAT_POINT to{ static_cast<double>( targetPoint->x ),
+                                  static_cast<double>( targetPoint->y ) };
             STATE state;
             state.kind = KIND::TARGET; state.room = current.room; state.layer = current.layer;
             state.entry = { to, to }; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost );

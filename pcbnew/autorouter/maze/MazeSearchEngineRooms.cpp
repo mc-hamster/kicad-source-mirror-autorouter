@@ -488,7 +488,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         if( !layer.enabled || hasGeneralConvexRoomGeometry( net, layer.layerId )
             || ( aCancel && aCancel() ) )
             continue;
-        auto terminals = [&]( const auto& source )
+        auto terminals = [&]( const auto& source, bool aTarget )
         {
             std::vector<ROOM_TERMINAL> result;
             for( const auto& terminal : source )
@@ -497,9 +497,10 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                     continue;
                 const auto start = terminal.pad.position;
                 const auto end = terminal.segmentEnd.value_or( start );
-                // Axis-aligned trace-interior attachment is exact. A diagonal
-                // trace cannot be replaced by its filled rectangular envelope.
-                if( start.x == end.x || start.y == end.y )
+                // A diagonal source trace still uses exact endpoint seeds;
+                // target traces keep their complete centre-line connection
+                // shape and are intersected with each reached room.
+                if( aTarget || start.x == end.x || start.y == end.y )
                     result.push_back( { start, end, terminal.padIndex } );
                 else
                 {
@@ -509,8 +510,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
             }
             return result;
         };
-        const auto starts = terminals( aStarts );
-        const auto targets = terminals( aTargets );
+        const auto starts = terminals( aStarts, false );
+        const auto targets = terminals( aTargets, true );
         if( starts.empty() || targets.empty() )
             continue;
         const auto ripupEntries = roomRipupObstacles(
@@ -688,14 +689,14 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         layer.verticalCost = setting->preferredDirection == 1 ? against : preferred;
         layer.bendCost = static_cast<double>( std::max( 0, m_settings.bendCost ) )
                          * std::max( 1, m_settings.gridStepIU );
-        auto append = [&]( const auto& terminals, auto& output )
+        auto append = [&]( const auto& terminals, auto& output, bool aTarget )
         {
             for( const auto& t : terminals )
             {
                 if( !isOnPadLayer( t.pad, id ) )
                     continue;
                 const auto a = t.pad.position, b = t.segmentEnd.value_or( a );
-                if( a.x == b.x || a.y == b.y )
+                if( aTarget || a.x == b.x || a.y == b.y )
                     output.push_back( { a, b, t.padIndex } );
                 else
                 {
@@ -704,7 +705,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                 }
             }
         };
-        append( starts, layer.starts ); append( targets, layer.targets );
+        append( starts, layer.starts, false );
+        append( targets, layer.targets, true );
         for( auto obstacle : roomObstacles( net, id, true, true, cancel ) )
         {
             obstacle.objectId = nextObstacleId++;

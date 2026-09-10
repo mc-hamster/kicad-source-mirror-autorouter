@@ -439,6 +439,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/drill/DrillPageArray.cpp
     autorouter/drc/DesignRulesChecker.cpp
     autorouter/expansion/ExpansionDoor.cpp
+    autorouter/expansion/TargetItemExpansionDoor.cpp
     autorouter/expansion/ExpansionGraph.cpp
     autorouter/expansion/ExpansionRoom.cpp
     autorouter/expansion/SortedRoomNeighbours.cpp
