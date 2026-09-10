@@ -33,6 +33,7 @@ public:
     int                   GetDimension() const { return m_dimension; }
     ROUTER_BOX            GetShape() const;
     PLANAR::INT_OCTAGON   GetOctagonShape() const;
+    PLANAR::SIMPLEX       GetSimplexShape() const;
     // Tolerance is explicit because KiCad IU and reference coordinates differ.
     std::vector<FLOAT_LINE> GetSectionSegments( double aOffset, double aTolerance = 2,
                                                double aMaxSectionWidth = 0,

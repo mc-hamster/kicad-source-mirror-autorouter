@@ -689,6 +689,104 @@ BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
 }
 
 
+BOOST_AUTO_TEST_CASE( GeneralExpansionDoorMatchesPinnedFreerouting )
+{
+    using PLANAR::LINE;
+    using PLANAR::SIMPLEX;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/door-general-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readSimplex = [&]()
+    {
+        std::size_t lineCount;
+        input >> lineCount;
+        std::vector<LINE> lines;
+        lines.reserve( lineCount );
+        for( std::size_t i = 0; i < lineCount; ++i )
+        {
+            ROUTER_POINT a;
+            ROUTER_POINT b;
+            input >> a.x >> a.y >> b.x >> b.y;
+            lines.emplace_back( a, b );
+        }
+        BOOST_REQUIRE( !input.fail() );
+        return SIMPLEX::GetInstance( std::move( lines ) );
+    };
+    auto checkSimplex = [&]( const SIMPLEX& aActual, const SIMPLEX& aExpected )
+    {
+        BOOST_REQUIRE_EQUAL( aActual.Borders().size(), aExpected.Borders().size() );
+        for( std::size_t i = 0; i < aActual.Borders().size(); ++i )
+        {
+            BOOST_CHECK( aActual.Borders()[i].a == aExpected.Borders()[i].a );
+            BOOST_CHECK( aActual.Borders()[i].b == aExpected.Borders()[i].b );
+        }
+    };
+    auto readDouble = [&]()
+    {
+        std::string value;
+        input >> value;
+        BOOST_REQUIRE( !input.fail() );
+        return std::stod( value );
+    };
+    auto sameDouble = []( double aActual, double aExpected )
+    {
+        return std::abs( aActual - aExpected )
+               <= 1e-12 * std::max( { 1.0, std::abs( aActual ),
+                                      std::abs( aExpected ) } );
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "general expansion door oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "DOORGENERAL" );
+            const SIMPLEX firstShape = readSimplex();
+            const SIMPLEX secondShape = readSimplex();
+            int completePair;
+            input >> completePair;
+            const double offset = readDouble();
+            int expectedDimension;
+            input >> expectedDimension;
+            const SIMPLEX expectedShape = readSimplex();
+            std::size_t expectedSections;
+            input >> expectedSections;
+
+            COMPLETE_FREE_SPACE_EXPANSION_ROOM second(
+                    20001 + 2 * test, 3, secondShape );
+            std::unique_ptr<EXPANSION_ROOM> first;
+            if( completePair )
+            {
+                first = std::make_unique<COMPLETE_FREE_SPACE_EXPANSION_ROOM>(
+                        20000 + 2 * test, 3, firstShape );
+            }
+            else
+            {
+                first = std::make_unique<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM>(
+                        firstShape, 3, firstShape );
+            }
+            EXPANSION_DOOR door( first.get(), &second );
+            BOOST_CHECK_EQUAL( door.GetDimension(), expectedDimension );
+            checkSimplex( door.GetSimplexShape(), expectedShape );
+            const auto sections = door.GetSectionSegments( offset );
+            BOOST_REQUIRE_EQUAL( sections.size(), expectedSections );
+            for( const FLOAT_LINE& section : sections )
+            {
+                BOOST_CHECK( sameDouble( section.a.x, readDouble() ) );
+                BOOST_CHECK( sameDouble( section.a.y, readDouble() ) );
+                BOOST_CHECK( sameDouble( section.b.x, readDouble() ) );
+                BOOST_CHECK( sameDouble( section.b.y, readDouble() ) );
+            }
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+
 BOOST_AUTO_TEST_CASE( SearchesEveryMemberOfTheDestinationSet )
 {
     BOARD_SNAPSHOT board = makeBoard();

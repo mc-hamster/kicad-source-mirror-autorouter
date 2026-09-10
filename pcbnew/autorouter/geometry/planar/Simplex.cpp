@@ -624,6 +624,12 @@ SIMPLEX SIMPLEX::Empty()
 }
 
 
+SIMPLEX SIMPLEX::FromBox( ROUTER_BOX aBox )
+{
+    return boxSimplexAllowDegenerate( aBox );
+}
+
+
 SIMPLEX SIMPLEX::Simplify() const
 {
     if( IsEmpty() )

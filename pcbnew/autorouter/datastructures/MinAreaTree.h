@@ -61,7 +61,7 @@ struct SHAPE_TREE_ENTRY
             const auto converted = octagon->ToSimplex();
             return converted ? *converted : PLANAR::SIMPLEX::Empty();
         }
-        return PLANAR::SIMPLEX::Box( shape );
+        return PLANAR::SIMPLEX::FromBox( shape );
     }
 };
 

@@ -116,7 +116,13 @@ queries and the complete general-shape transform family (quarter turns,
 arbitrary-angle rounded rotation and both axis mirrors) are now direct source
 translations. A separate **384-record** oracle covers integral and rational
 queries, signed-zero approximate corners, negative/large turn factors, seven
-angles and translated poles. The complete native autorouter suite now has **197
+angles and translated poles. Expansion-room values now preserve the exact
+general `Simplex` alongside their broad-phase box and octagonal envelope, and
+general expansion doors intersect those support sets in source double-dispatch
+order. Their dimension, door shape, rational-corner line selection, gravity,
+shrinking and section division match a separate **2,048-record** pinned oracle;
+the fixed-direction branch deliberately retains `IntOctagon`'s indexed-corner
+gravity semantics. The complete native autorouter suite now has **198
 passing cases**. The production 555 smoke remains host-valid and unchanged at
 12/12 connections, zero new DRC violations, 12 vias, 97.101 mm and 2,853
 expanded nodes. Arbitrary-angle search-tree activation remains open.

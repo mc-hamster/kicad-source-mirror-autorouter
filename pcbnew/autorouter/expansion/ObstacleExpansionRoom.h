@@ -49,6 +49,17 @@ public:
     {
     }
 
+    OBSTACLE_EXPANSION_ROOM( int aId, int aLayer,
+                             PLANAR::SIMPLEX aShape,
+                             std::size_t aGroup = std::numeric_limits<std::size_t>::max(),
+                             int aRipupCost = 0, int aShapeIndex = 0 ) :
+            EXPANSION_ROOM( aId, aLayer, std::move( aShape ), true ),
+            m_group( aGroup ),
+            m_ripupCost( aRipupCost ),
+            m_shapeIndex( aShapeIndex )
+    {
+    }
+
     std::size_t GetGroup() const { return m_group; }
     int         GetRipupCost() const { return m_ripupCost; }
     int         GetShapeIndex() const { return m_shapeIndex; }

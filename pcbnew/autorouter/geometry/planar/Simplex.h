@@ -18,6 +18,8 @@ public:
     explicit SIMPLEX( std::vector<LINE> aBorders );
     static SIMPLEX GetInstance( std::vector<LINE> aBorders );
     static SIMPLEX Empty();
+    /** Source IntBox.toSimplex conversion, including point/line/empty boxes. */
+    static SIMPLEX FromBox( ROUTER_BOX aBox );
     static SIMPLEX Box( ROUTER_BOX aBox );
     /** Build the full-dimensional L-infinity sweep of an integer segment.
      * This is the conservative convex centre-space used for a trace moving

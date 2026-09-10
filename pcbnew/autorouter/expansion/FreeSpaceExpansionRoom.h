@@ -38,6 +38,12 @@ public:
             EXPANSION_ROOM( aId, aLayer, std::move( aShape ), false )
     {
     }
+
+    FREE_SPACE_EXPANSION_ROOM( int aId, int aLayer,
+                               PLANAR::SIMPLEX aShape ) :
+            EXPANSION_ROOM( aId, aLayer, std::move( aShape ), false )
+    {
+    }
 };
 
 } // namespace KICAD_AUTOROUTER
