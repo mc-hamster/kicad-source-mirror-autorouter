@@ -1,6 +1,7 @@
 /* QA-only differential reader. Expectations come from the pinned Java JAR. */
 #pragma once
 #include <autorouter/board/optimize/TraceShover.h>
+#include <autorouter/geometry/planar/IntOctagon.h>
 #include <iomanip>
 #include <sstream>
 
@@ -233,6 +234,125 @@ inline std::string CheckRecord( const std::string& record )
             actual << ' ';
             PrintSimplex( actual, section );
         }
+    }
+    else if( tag == "POLY" )
+    {
+        std::size_t count;
+        in >> count;
+        std::vector<LINE> supplied;
+        supplied.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            supplied.push_back( ReadLine( in ) );
+        int width, from, to;
+        double queryX, queryY;
+        ROUTER_POINT translation;
+        std::size_t splitIndex;
+        in >> width >> from >> to >> queryX >> queryY
+           >> translation.x >> translation.y >> splitIndex;
+        const LINE endLine = ReadLine( in );
+        in >> count;
+        std::vector<LINE> otherSupplied;
+        otherSupplied.reserve( count );
+        for( std::size_t index = 0; index < count; ++index )
+            otherSupplied.push_back( ReadLine( in ) );
+        std::array<ROUTER_POINT, 4> probes;
+        for( ROUTER_POINT& probe : probes )
+            in >> probe.x >> probe.y;
+
+        const POLYLINE polyline( std::move( supplied ) );
+        const POLYLINE other( std::move( otherSupplied ) );
+        actual << polyline.lines.size();
+        for( const LINE& line : polyline.lines )
+        {
+            actual << ' ';
+            PrintLine( actual, line );
+        }
+        actual << ' ' << polyline.CornerCount();
+        for( std::size_t index = 0; index < polyline.CornerCount(); ++index )
+        {
+            actual << ' ';
+            Print( actual, polyline.Corner( index ) );
+        }
+        actual << ' ' << ( polyline.IsPoint() ? 1 : 0 )
+               << ' ' << ( polyline.IsOrthogonal() ? 1 : 0 )
+               << ' ' << ( polyline.IsMultipleOf45Degree() ? 1 : 0 );
+        actual << std::fixed << std::setprecision( 9 )
+               << ' ' << polyline.LengthApprox()
+               << ' ' << polyline.LengthApprox( 1,
+                        static_cast<int>( polyline.CornerCount() ) - 1 );
+        const auto box = polyline.BoundingBox();
+        if( !box )
+            throw std::runtime_error( "nonempty polyline has no bounds" );
+        actual << ' ' << box->minX << ' ' << box->minY << ' '
+               << box->maxX << ' ' << box->maxY;
+        const auto octagon = polyline.BoundingOctagon();
+        if( !octagon )
+            throw std::runtime_error( "nonempty polyline has no octagon" );
+        actual << ' ' << octagon->leftX << ' ' << octagon->bottomY << ' '
+               << octagon->rightX << ' ' << octagon->topY << ' '
+               << octagon->upperLeftDiagonalX << ' '
+               << octagon->lowerRightDiagonalX << ' '
+               << octagon->lowerLeftDiagonalX << ' '
+               << octagon->upperRightDiagonalX;
+        const auto nearest = polyline.NearestPointApprox( queryX, queryY );
+        if( !nearest )
+            throw std::runtime_error( "nonempty polyline has no nearest point" );
+        actual << ' ' << nearest->first << ' ' << nearest->second;
+        for( const ROUTER_POINT& probe : probes )
+            actual << ' ' << ( polyline.Contains( POINT( probe ) ) ? 1 : 0 );
+        const auto printPolylineLines = [&]( const POLYLINE& value )
+        {
+            actual << value.lines.size();
+            for( const LINE& line : value.lines )
+            {
+                actual << ' ';
+                PrintLine( actual, line );
+            }
+        };
+        actual << ' ';
+        printPolylineLines( polyline.Reverse() );
+        const auto translated = polyline.TranslateBy( translation );
+        if( !translated )
+            throw std::runtime_error( "small polyline translation overflowed" );
+        actual << ' ';
+        printPolylineLines( *translated );
+        actual << ' ';
+        printPolylineLines( polyline.Combine( other ) );
+        const auto split = polyline.Split( splitIndex, endLine );
+        if( split.empty() )
+        {
+            actual << " -1";
+        }
+        else
+        {
+            actual << " 2 ";
+            printPolylineLines( split[0] );
+            actual << ' ';
+            printPolylineLines( split[1] );
+        }
+        const std::size_t skipIndex = std::min(
+                std::max<std::size_t>( splitIndex, 1 ),
+                polyline.lines.size() - 2 );
+        actual << ' ';
+        printPolylineLines( polyline.SkipLines( skipIndex, skipIndex ) );
+        const auto offsets = polyline.OffsetShapes( width, from, to );
+        actual << ' ' << offsets.size();
+        for( const SIMPLEX& shape : offsets )
+        {
+            actual << ' ';
+            PrintSimplex( actual, shape );
+        }
+        const LINE& probeLine = polyline.lines[1];
+        const auto translatedLine = probeLine.Translate( width - 3.5 );
+        if( !translatedLine )
+            throw std::runtime_error( "small line translation overflowed" );
+        actual << ' ';
+        PrintLine( actual, *translatedLine );
+        const auto projection = probeLine.ProjectionApprox( queryX, queryY );
+        actual << ' ' << probeLine.SignedDistance( queryX, queryY )
+               << ' ' << projection.first << ' ' << projection.second;
+        actual << ' ';
+        Print( actual, probeLine.PerpendicularProjection( POINT( probes[0] ) ) );
     }
     else throw std::runtime_error( "Unexpected oracle record: " + tag );
     if( !in ) throw std::runtime_error( "Malformed oracle input" );

@@ -27,6 +27,25 @@ std::optional<std::int64_t> checkedOffset( std::int64_t aValue, std::int64_t aOf
 }
 
 
+SIMPLEX boxSimplexAllowDegenerate( ROUTER_BOX aBox )
+{
+    if( aBox.minX > aBox.maxX || aBox.minY > aBox.maxY )
+        return SIMPLEX::Empty();
+    if( aBox.minX == std::numeric_limits<std::int64_t>::max()
+        || aBox.minY == std::numeric_limits<std::int64_t>::min()
+        || aBox.maxX == std::numeric_limits<std::int64_t>::min()
+        || aBox.maxY == std::numeric_limits<std::int64_t>::max() )
+    {
+        throw std::overflow_error( "box support line endpoint overflow" );
+    }
+    return SIMPLEX::GetInstance(
+            { { { aBox.minX, aBox.minY }, { aBox.minX + 1, aBox.minY } },
+              { { aBox.maxX, aBox.maxY }, { aBox.maxX, aBox.maxY + 1 } },
+              { { aBox.maxX, aBox.maxY }, { aBox.maxX - 1, aBox.maxY } },
+              { { aBox.minX, aBox.minY }, { aBox.minX, aBox.minY - 1 } } } );
+}
+
+
 int sign( const INTEGER& aValue )
 {
     return aValue == 0 ? 0 : aValue < 0 ? -1 : 1;
@@ -103,55 +122,88 @@ std::vector<LINE> normalizeBorders( std::vector<LINE> aBorders )
             lines.push_back( border );
     }
 
-    // Direct control-flow equivalent of Simplex.removeRedundantLines.  The
-    // source caches side-of-intersection values for speed; recomputing those
-    // exact values after each erase is simpler and avoids stale-index state
-    // while producing the same ordered fixed point.
-    bool removed = lines.size() > 2;
-    while( removed && lines.size() > 2 )
+    // Preserve the source's removal walk and its cached side values exactly.
+    // When several supports meet at the same degenerate corner, restarting a
+    // fresh scan chooses a different (though geometrically equivalent) line.
+    // The chosen support is observable in later door ordering and therefore
+    // belongs to routing parity, not merely serialization parity.
+    std::vector<std::optional<int>> intersectionSides( lines.size() );
+    bool tryAgain = lines.size() > 2;
+    int indexOfLastRemovedLine = static_cast<int>( lines.size() );
+    while( tryAgain )
     {
-        removed = false;
-
-        for( std::size_t index = 0; index < lines.size(); ++index )
+        tryAgain = false;
+        int previousIndex = static_cast<int>( lines.size() ) - 1;
+        LINE previousLine = lines[previousIndex];
+        LINE currentLine = lines[0];
+        for( int index = 0; index < static_cast<int>( lines.size() ); ++index )
         {
-            const std::size_t previousIndex =
-                    ( index + lines.size() - 1 ) % lines.size();
-            const std::size_t nextIndex = ( index + 1 ) % lines.size();
-            const LINE previous = lines[previousIndex];
-            const LINE current = lines[index];
-            const LINE next = lines[nextIndex];
-            const INTEGER determinant = previous.DirectionDeterminant( next );
-
+            int nextIndex = index == static_cast<int>( lines.size() ) - 1
+                            ? 0 : index + 1;
+            const LINE nextLine = lines[nextIndex];
+            bool removeLine = false;
+            const INTEGER determinant = previousLine.DirectionDeterminant( nextLine );
             if( determinant != 0 )
             {
-                const auto intersection = previous.Intersection( next );
-                if( !intersection )
-                    return {};
-                const int intersectionSide = current.SideOf( *intersection );
-
+                if( !intersectionSides[index] )
+                {
+                    const auto intersection = previousLine.Intersection( nextLine );
+                    if( !intersection )
+                        return {};
+                    const double x = intersection->X();
+                    const double y = intersection->Y();
+                    const double sideValue = currentLine.Dy().convert_to<double>()
+                                                     * ( x - currentLine.a.x )
+                                             - currentLine.Dx().convert_to<double>()
+                                                     * ( y - currentLine.a.y );
+                    if( sideValue - 1.0 > 0 )
+                        intersectionSides[index] = 1;
+                    else if( sideValue + 1.0 < 0 )
+                        intersectionSides[index] = -1;
+                    else
+                        intersectionSides[index] = currentLine.SideOf( *intersection );
+                }
                 if( determinant > 0 )
                 {
-                    // Native +1 is source ON_THE_LEFT.
-                    if( intersectionSide != 1 )
-                    {
-                        lines.erase( lines.begin() + index );
-                        removed = true;
-                        break;
-                    }
+                    removeLine = *intersectionSides[index] != 1;
                 }
-                else if( intersectionSide == 1
-                         && previous.DirectionDeterminant( current ) > 0 )
+                else if( *intersectionSides[index] == 1
+                         && previousLine.DirectionDeterminant( currentLine ) > 0 )
                 {
-                    // The current half-plane cannot intersect the wedge made
-                    // by its neighbours.
                     return {};
                 }
             }
-            else if( previous.SideOf( POINT( next.a ) ) == 1 )
+            else if( previousLine.SideOf( POINT( nextLine.a ) ) == 1 )
             {
-                // Opposing parallel supports face away from one another.
                 return {};
             }
+
+            if( removeLine )
+            {
+                tryAgain = true;
+                lines.erase( lines.begin() + index );
+                intersectionSides.erase( intersectionSides.begin() + index );
+                if( lines.size() < 3 )
+                {
+                    tryAgain = false;
+                    break;
+                }
+                if( index == 0 )
+                    previousIndex = static_cast<int>( lines.size() ) - 1;
+                intersectionSides[previousIndex].reset();
+                nextIndex = index >= static_cast<int>( lines.size() ) ? 0 : index;
+                intersectionSides[nextIndex].reset();
+                --index;
+                indexOfLastRemovedLine = index;
+            }
+            else
+            {
+                previousLine = currentLine;
+                previousIndex = index;
+            }
+            currentLine = nextLine;
+            if( !tryAgain && index >= indexOfLastRemovedLine )
+                break;
         }
     }
 
@@ -377,65 +429,6 @@ void appendSupport( std::vector<LINE>& aLines, const DIVISION_LINE& aDivision,
 }
 
 
-std::optional<LINE> translateSupport( const LINE& aLine, double aDistance )
-{
-    const INTEGER divisor = Gcd( aLine.Dx(), aLine.Dy() );
-    if( divisor == 0 )
-        return {};
-    const INTEGER exactDx = aLine.Dx() / divisor;
-    const INTEGER exactDy = aLine.Dy() / divisor;
-    if( exactDx < std::numeric_limits<std::int64_t>::min()
-        || exactDx > std::numeric_limits<std::int64_t>::max()
-        || exactDy < std::numeric_limits<std::int64_t>::min()
-        || exactDy > std::numeric_limits<std::int64_t>::max() )
-    {
-        return {};
-    }
-
-    const std::int64_t dx = exactDx.convert_to<std::int64_t>();
-    const std::int64_t dy = exactDy.convert_to<std::int64_t>();
-    const double dxSquared = static_cast<double>( dx ) * dx;
-    const double dySquared = static_cast<double>( dy ) * dy;
-    const double length = std::sqrt( dxSquared + dySquared );
-    ROUTER_POINT shift{};
-
-    // Java Math.round is floor(value + 0.5), including for negative ties.
-    const auto javaRound = []( double aValue )
-    {
-        const double rounded = std::floor( aValue + 0.5 );
-        if( rounded < static_cast<double>( std::numeric_limits<std::int64_t>::min() )
-            || rounded > static_cast<double>( std::numeric_limits<std::int64_t>::max() ) )
-        {
-            return std::optional<std::int64_t>{};
-        }
-        return std::optional<std::int64_t>{ static_cast<std::int64_t>( rounded ) };
-    };
-
-    if( dxSquared <= dySquared )
-    {
-        const auto relativeX = javaRound( aDistance * length / dy );
-        if( !relativeX || *relativeX == std::numeric_limits<std::int64_t>::min() )
-            return {};
-        shift.x = -*relativeX;
-    }
-    else
-    {
-        const auto relativeY = javaRound( aDistance * length / dx );
-        if( !relativeY )
-            return {};
-        shift.y = *relativeY;
-    }
-
-    const auto newA = translatedPoint( aLine.a, shift );
-    if( !newA )
-        return {};
-    const auto newB = translatedPoint( *newA, { dx, dy } );
-    if( !newB )
-        return {};
-    return LINE( *newA, *newB );
-}
-
-
 std::optional<std::int64_t> floorRational( const INTEGER& aNumerator,
                                            const INTEGER& aDenominator )
 {
@@ -619,6 +612,30 @@ SIMPLEX SIMPLEX::GetInstance( std::vector<LINE> aBorders )
 SIMPLEX SIMPLEX::Empty()
 {
     return SIMPLEX( {}, UNCHECKED_TAG{} );
+}
+
+
+SIMPLEX SIMPLEX::Simplify() const
+{
+    if( IsEmpty() )
+        return Empty();
+    if( IsIntBox() )
+    {
+        const auto bounds = BoundingBox();
+        return bounds ? boxSimplexAllowDegenerate( *bounds ) : Empty();
+    }
+    if( const auto octagon = exactIntOctagon( *this ) )
+    {
+        // The Java operation may have retained IntOctagon as the physical
+        // intersection type.  IntOctagon.simplify performs one additional
+        // geometric box test that Simplex.isIntBox cannot see from diagonal
+        // supports alone.
+        if( octagon->IsIntBox() )
+            return boxSimplexAllowDegenerate( octagon->BoundingBox() );
+        const auto result = octagon->ToSimplex();
+        return result ? *result : Empty();
+    }
+    return *this;
 }
 
 
@@ -1008,7 +1025,7 @@ std::optional<SIMPLEX> SIMPLEX::Offset( double aWidth ) const
     result.reserve( m_borders.size() );
     for( const LINE& border : m_borders )
     {
-        const auto translated = translateSupport( border, -aWidth );
+        const auto translated = border.Translate( -aWidth );
         if( !translated )
             return {};
         result.push_back( *translated );
@@ -1324,19 +1341,7 @@ std::vector<SIMPLEX> SIMPLEX::DivideIntoSections(
             // IntBox/IntOctagon before the caller sees them.  Convert those
             // values back to Simplex here while retaining their source line
             // anchors; this is observable in later stable line ordering.
-            if( section.IsIntBox() )
-            {
-                const auto sectionBounds = section.BoundingBox();
-                if( sectionBounds )
-                    section = Box( *sectionBounds );
-            }
-            else if( const auto octagon = exactIntOctagon( section ) )
-            {
-                const auto simplified = octagon->ToSimplex();
-                if( simplified )
-                    section = *simplified;
-            }
-            result.push_back( std::move( section ) );
+            result.push_back( section.Simplify() );
         }
     }
     return result;

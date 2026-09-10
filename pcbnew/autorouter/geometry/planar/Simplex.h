@@ -34,6 +34,8 @@ public:
     static std::optional<SIMPLEX> FromConvexPolygon(
             const std::vector<ROUTER_POINT>& aPolygon,
             std::int64_t aChebyshevOffset = 0 );
+    /** Source simplify represented in the common C++ SIMPLEX value type. */
+    SIMPLEX Simplify() const;
     const std::vector<LINE>& Borders() const { return m_borders; }
     const POINT& Corner( std::size_t i ) const;
     bool CornerIsBounded( std::size_t aIndex ) const;
