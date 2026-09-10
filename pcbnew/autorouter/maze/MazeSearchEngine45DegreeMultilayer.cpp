@@ -182,7 +182,14 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
     bool allocationLimit = false;
     auto push = [&]( STATE state )
     {
-        if( via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
+        // The reference queue bounds source-layer elements only when they
+        // still have a next expansion room. A TargetItemExpansionDoor has
+        // nextRoom == null and remains a legal completion even when the
+        // contacted item's centre lies beyond the fanout escape envelope.
+        // Applying the envelope to TARGET here rejected an already-routed via
+        // that Freerouting reaches directly and forced an unnecessary drill.
+        if( state.kind != KIND::TARGET && state.kind != KIND::FANOUT_TARGET
+            && via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
             && via.fanoutMaxDistance > 0 )
         {
             const FLOAT_POINT point = state.entry.Middle();
@@ -455,7 +462,14 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                         state.ripupCost = obstacle->GetRipupCost();
                         state.g += state.ripupCost;
                     }
-                    state.f = fanoutDrill ? state.g : state.g + remaining( from, to );
+                    // Fanout changes the stopping condition, not the A* lower bound.
+                    // Freerouting's MazeExpansionEngine.expandToOtherLayers()
+                    // always adds DestinationDistance on the destination layer;
+                    // MazeSearchEngine stops only when that queued drill-layer
+                    // element is later removed from the frontier.  Zeroing the
+                    // heuristic here made every reachable drill outrank a nearby
+                    // real target and produced a via for almost every SMD pin.
+                    state.f = state.g + remaining( from, to );
                     push( state );
                     ++metrics.layerTransitions;
                 }

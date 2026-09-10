@@ -157,7 +157,11 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     std::set<std::pair<EXPANSION_DOOR*, std::size_t>> occupied;
     auto push = [&]( STATE state )
     {
-        if( via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
+        // Source TargetItemExpansionDoor queue entries have no next room in
+        // Freerouting and therefore bypass the fanout escape-length queue
+        // guard. Keep the native target completion outside that guard too.
+        if( state.kind != KIND::TARGET && state.kind != KIND::FANOUT_TARGET
+            && via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
             && via.fanoutMaxDistance > 0 )
         {
             const FLOAT_POINT point = state.entry.Middle();
@@ -395,7 +399,11 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                         state.ripupCost = obstacle->GetRipupCost();
                         state.g += state.ripupCost;
                     }
-                    state.f = fanoutDrill ? state.g : state.g + remaining( from, to );
+                    // A fanout exits at the first drill-layer element popped
+                    // from the queue, but that element retains the ordinary
+                    // destination-distance ordering in the reference engine.
+                    // Do not turn the fanout condition into a zero heuristic.
+                    state.f = state.g + remaining( from, to );
                     push( state );
                     ++metrics.layerTransitions;
                 }

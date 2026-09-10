@@ -95,6 +95,15 @@ bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
         return true;
     }
 
+    // A direct TargetItemExpansionDoor completion has no nextRoom in the
+    // reference queue, so neither the maximum source-room envelope nor the
+    // minimum drill distance is applied.  The room frontier already checked
+    // every non-target state leading to this completion.  Re-validating the
+    // reconstructed centre-line here rejected legal contacts to an existing
+    // same-net via just beyond the envelope even though Freerouting routes it.
+    if( aAllowSameLayerFinish )
+        return true;
+
     const std::int64_t minimum = std::max<std::int64_t>( 0,
                                                            aLanding.fanoutMinEscapeLength );
     const std::int64_t maximum = aLanding.fanoutMaxEscapeLength > 0
@@ -111,10 +120,7 @@ bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
     for( std::size_t index = 0; index < aConnection.nodes.size(); ++index )
     {
         const ROUTER_NODE& node = aConnection.nodes[index];
-        const bool sameLayerDestination = aAllowSameLayerFinish
-                                          && index + 1 == aConnection.nodes.size();
-        if( !sameLayerDestination && !sawTransition
-            && node.layer == aLanding.fanoutSourceLayer
+        if( !sawTransition && node.layer == aLanding.fanoutSourceLayer
             && distance( node.point, aSource.position ) > static_cast<double>( maximum ) )
         {
             return false;
@@ -146,8 +152,7 @@ bool fanoutEscapeFitsEnvelope( const ROUTING_CONNECTION& aConnection,
     // through its fanout via.  Dynamic fanout is the exception: reaching a
     // real same-layer destination before a drill is a completed fanout
     // attempt in the reference implementation.
-    return sawTransition || aAllowSameLayerFinish
-           || aLanding.fanoutSourceLayer == aLanding.fanoutTargetLayer;
+    return sawTransition || aLanding.fanoutSourceLayer == aLanding.fanoutTargetLayer;
 }
 
 
@@ -1251,56 +1256,40 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                 // their attached trace/via terminals through the worker
                 // board, so this remains dynamic after every insertion and
                 // rip-up instead of freezing one ratsnest edge.
-                std::vector<std::size_t> unconnected;
-                for( std::size_t index : aNet.padIndices )
-                {
-                    if( index < aBoard.pads.size() && index != sourceIndex
-                        && !aBoard.pads[index].isFanoutTarget
-                        && !aBoard.pads[index].isPlaneTarget
-                        && !aOccupancy.Board()->Connected( sourceIndex, index ) )
-                    {
-                        unconnected.push_back( index );
-                    }
-                }
-                for( std::size_t index : aNet.planeTargetIndices )
-                {
-                    if( index < aBoard.pads.size()
-                        && !aOccupancy.Board()->Connected( sourceIndex, index ) )
-                    {
-                        unconnected.push_back( index );
-                    }
-                }
+                auto unconnected = aOccupancy.Board()->UnconnectedTargetItems(
+                        sourceIndex, aNet.netCode );
                 std::stable_sort(
                         unconnected.begin(), unconnected.end(),
-                        [&]( std::size_t aLeft, std::size_t aRight )
+                        [&]( const ROUTING_BOARD::TARGET_ITEM& aLeft,
+                             const ROUTING_BOARD::TARGET_ITEM& aRight )
                         {
-                            const double left = distance( source.position,
-                                                          aBoard.pads[aLeft].position );
-                            const double right = distance( source.position,
-                                                           aBoard.pads[aRight].position );
-                            return left != right ? left < right : aLeft < aRight;
+                            const long double leftX =
+                                    ( static_cast<long double>( aLeft.bounds.minX )
+                                      + aLeft.bounds.maxX ) / 2.0L;
+                            const long double leftY =
+                                    ( static_cast<long double>( aLeft.bounds.minY )
+                                      + aLeft.bounds.maxY ) / 2.0L;
+                            const long double rightX =
+                                    ( static_cast<long double>( aRight.bounds.minX )
+                                      + aRight.bounds.maxX ) / 2.0L;
+                            const long double rightY =
+                                    ( static_cast<long double>( aRight.bounds.minY )
+                                      + aRight.bounds.maxY ) / 2.0L;
+                            const long double leftDx = leftX - source.position.x;
+                            const long double leftDy = leftY - source.position.y;
+                            const long double rightDx = rightX - source.position.x;
+                            const long double rightDy = rightY - source.position.y;
+                            const long double left = leftDx * leftDx + leftDy * leftDy;
+                            const long double right = rightDx * rightDx + rightDy * rightDy;
+                            return left != right ? left < right : aLeft.id > aRight.id;
                         } );
                 std::vector<std::vector<ROUTING_TERMINAL>> unconnectedTerminalSets;
                 unconnectedTerminalSets.reserve( unconnected.size() );
-                for( std::size_t index : unconnected )
+                for( const ROUTING_BOARD::TARGET_ITEM& item : unconnected )
                 {
-                    auto terminals = aOccupancy.Board()->Terminals( index );
-                    // A conduction area is a real reference target item, but
-                    // the native worker stores its geometry as an area rather
-                    // than manufacturing a point terminal.  Its exact sampled
-                    // adapter target still has to participate in the fanout
-                    // item set so the search can terminate at the first drill.
-                    if( terminals.empty() && index < aBoard.pads.size()
-                        && aBoard.pads[index].isPlaneTarget )
-                    {
-                        ROUTING_TERMINAL terminal;
-                        terminal.pad = aBoard.pads[index];
-                        terminal.padIndex = index;
-                        terminals.push_back( std::move( terminal ) );
-                    }
-                    unconnectedTerminalSets.push_back( terminals );
-                    destinations.insert( destinations.end(), terminals.begin(),
-                                         terminals.end() );
+                    unconnectedTerminalSets.push_back( item.terminals );
+                    destinations.insert( destinations.end(), item.terminals.begin(),
+                                         item.terminals.end() );
                 }
 
                 // RoutingBoard.fanout() deliberately avoids searching a
@@ -1324,8 +1313,8 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                     destinationAttempts.push_back( destinations );
                 }
 
-                // Plane conduction areas are represented by target terminals
-                // above.  If no real destination remains, the reference
+                // Plane conduction areas are represented by grouped target
+                // terminals above. If no real destination remains, the reference
                 // returns FAILED instead of routing toward the synthetic
                 // control item itself.
             }

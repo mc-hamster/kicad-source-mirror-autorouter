@@ -113,11 +113,20 @@ and global 0.5-point stagnation windows, and one-time fanout-tail recovery.
 Native history keeps a DRC-first safety stratum before applying that score; it
 will not imitate a reference intermediate state that adds a clearance error.
 
-Fanout now uses dynamic connected/unconnected terminal sets, terminates on the
-first inserted drill (or a real same-layer target), and preserves successful
-partial fanout work. The colocated synthetic pad is now only an immutable search
-control: it never rewrites the real net ratsnest, is retired from all electrical
-item-set queries immediately after its attempt, and is not retained as copper.
+Fanout now uses dynamic connected/unconnected source-item sets, terminates on
+the first inserted drill (or a real same-layer target), and preserves successful
+partial fanout work. The worker equivalent of `Item.getUnconnectedSet()` retains
+one identity and bounding box per pad, trace, via or conduction area instead of
+collapsing the set to disconnected pads. The reference's four-item closest-
+target branch is therefore selected by item cardinality, and each selected item
+contributes all of its terminals. Target-item queue entries also bypass the
+fanout source-room escape envelope, matching `TargetItemExpansionDoor`'s null
+`nextRoom`, while drill-layer entries retain the ordinary destination-distance
+heuristic. This closes the first diagnosed U2-8 decision divergence: native now
+reaches the existing U2-4 via directly without adding a drill. The colocated
+synthetic pad is now only an immutable search control: it never rewrites the
+real net ratsnest, is retired from all electrical item-set queries immediately
+after its attempt, and is not retained as copper.
 The inserted trace and drill are normalized to the real SMD endpoint before the
 next pin, matching the source's physical item topology.
 ViaRule traversal is ordered and authoritative: a failed alternative falls
@@ -145,9 +154,12 @@ translation algorithms and arbitrary contact recursion are still open.
 
 On the production 555 smoke this checkpoint is host-valid with zero missing
 connections and zero new DRC violations, 12 real routing tasks, 12 vias,
-87.7771 mm track, 1,776 expanded nodes and 98 ms core time. The pinned source
-uses seven vias: changed-area tightening materially reduces route length and
-search work but does not yet close the drill-count gap.
+97.101 mm track and 2,853 expanded nodes. The pinned source uses seven vias.
+Although the U2-8 target decision now agrees, the complete board still has the
+same five-via gap and this exact-semantics change regressed route length and
+search work from the preceding 87.7771 mm / 1,776-node checkpoint. That
+regression is recorded rather than hidden; subsequent work must locate the next
+stable decision divergence before changing costs or heuristics again.
 The optimizer now stores exact item-local geometry/styles and transactionally
 removes the same fork-expanded `Item.getConnectionItems(NONE)` set as the
 source. Compound insertion requests are normalized to their surviving

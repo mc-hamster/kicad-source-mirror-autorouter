@@ -860,6 +860,94 @@ std::vector<ROUTING_TERMINAL> ROUTING_BOARD::Terminals( std::size_t pad ) const
     return result;
 }
 
+std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
+        std::size_t pad, int net ) const
+{
+    const auto sourceRoots = m_impl->padRoots( pad );
+    std::vector<TARGET_ITEM> result;
+    if( sourceRoots.empty() || net <= 0 )
+        return result;
+
+    m_impl->updateComponents();
+
+    // A maze target that happens to be a trace or via still has to identify
+    // the real pad component it will join.  Use the lowest pad index as the
+    // stable native representative; source Item identity remains TARGET_ITEM::id.
+    std::map<ITEM_ID, std::size_t> representativePad;
+    for( const auto& [padIndex, itemId] : m_impl->pads )
+    {
+        const ITEM_ID root = m_impl->components.at( itemId );
+        auto [entry, inserted] = representativePad.emplace( root, padIndex );
+        if( !inserted )
+            entry->second = std::min( entry->second, padIndex );
+    }
+
+    // Item.compareTo() orders the reference TreeSet by descending insertion
+    // id.  Preserve that order before fanout's stable distance sort.
+    for( auto itemEntry = m_impl->items.rbegin(); itemEntry != m_impl->items.rend();
+         ++itemEntry )
+    {
+        const auto& [id, item] = *itemEntry;
+        if( item.net != net )
+            continue;
+
+        const ITEM_ID root = m_impl->components.at( id );
+        if( sourceRoots.contains( root ) )
+            continue;
+
+        TARGET_ITEM target;
+        target.id = id;
+        std::optional<ROUTER_BOX> bounds;
+        for( const auto& part : item.shapes )
+        {
+            const BOX2I box = part.geometry->BBox();
+            const ROUTER_BOX partBounds{ box.GetLeft(), box.GetTop(),
+                                         box.GetRight(), box.GetBottom() };
+            bounds = bounds
+                    ? std::optional<ROUTER_BOX>( ROUTER_BOX{
+                              std::min( bounds->minX, partBounds.minX ),
+                              std::min( bounds->minY, partBounds.minY ),
+                              std::max( bounds->maxX, partBounds.maxX ),
+                              std::max( bounds->maxY, partBounds.maxY ) } )
+                    : std::optional<ROUTER_BOX>( partBounds );
+        }
+
+        target.terminals = item.terminals;
+        const auto representative = representativePad.find( root );
+        for( ROUTING_TERMINAL& terminal : target.terminals )
+        {
+            if( terminal.padIndex == NO_PAD && representative != representativePad.end() )
+                terminal.padIndex = representative->second;
+        }
+
+        // ConductionArea is one connectable source Item even though KiCad
+        // exposes its exact interior through deterministic plane targets.
+        // Keep those samples grouped under that one identity so fanout's
+        // small-set branch uses source item cardinality.
+        if( item.conductionArea && item.area )
+        {
+            for( std::size_t padIndex = 0; padIndex < m_impl->snapshot.pads.size(); ++padIndex )
+            {
+                const ROUTING_PAD& planeTarget = m_impl->snapshot.pads[padIndex];
+                if( planeTarget.netCode == net && planeTarget.isPlaneTarget
+                    && CONTACT_GEOMETRY::ContainsArea( *item.area,
+                                                       planeTarget.position ) )
+                {
+                    target.terminals.push_back( { planeTarget, padIndex, {} } );
+                }
+            }
+        }
+
+        if( target.terminals.empty() || !bounds )
+            continue;
+
+        target.bounds = *bounds;
+        result.push_back( std::move( target ) );
+    }
+
+    return result;
+}
+
 std::set<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::ConnectedSet( ITEM_ID item ) const
 {
     m_impl->updateComponents();

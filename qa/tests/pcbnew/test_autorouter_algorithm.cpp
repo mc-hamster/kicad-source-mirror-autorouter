@@ -1528,6 +1528,50 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
 }
 
 
+BOOST_AUTO_TEST_CASE( FanoutDirectTargetBypassesTheDrillEscapeEnvelope )
+{
+    BOARD_SNAPSHOT board;
+    board.bounds = { 0, 0, 8000000, 3000000 };
+    board.pads.push_back( { 1, { 1000000, 1500000 }, { 0 }, "Default", 0,
+                            100000, 0, 100000, false, true } );
+    board.pads.push_back( { 1, { 7000000, 1500000 }, { 0 }, "Default", 0,
+                            100000, 0, 100000, false, true } );
+
+    ROUTING_NET net;
+    net.netCode = 1;
+    net.name = "DIRECT_FANOUT_TARGET";
+    net.netClass = "Default";
+    net.viaDiameter = 300000;
+    net.viaDrill = 150000;
+    net.padIndices = { 0, 1 };
+    net.connections = { { 0, 1 } };
+    board.nets.push_back( net );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = true;
+    settings.maxFanoutPasses = 1;
+    settings.fanoutMinEscapeLengthIU = 1000000;
+    settings.fanoutMaxEscapeLengthIU = 1000000;
+
+    const ROUTING_RESULT result = ROUTING_PIPELINE().Run( board, settings, {}, {} );
+    BOOST_REQUIRE( result.complete );
+    BOOST_CHECK_EQUAL( result.vias.size(), 0U );
+    BOOST_CHECK( std::any_of(
+            result.connections.begin(), result.connections.end(),
+            []( const ROUTING_CONNECTION& aConnection )
+            {
+                return aConnection.isFanoutConnection
+                       && std::all_of(
+                               aConnection.nodes.begin(), aConnection.nodes.end(),
+                               []( const ROUTER_NODE& aNode ) { return aNode.layer == 0; } );
+            } ) );
+    ROUTING_BOARD copper( board, settings );
+    for( const ROUTING_CONNECTION& connection : result.connections )
+        copper.AddRoute( connection );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( RetiredFanoutControlLeavesOnlyPhysicalCopperTopology )
 {
     BOARD_SNAPSHOT board = makeBoard();
@@ -6088,6 +6132,47 @@ BOOST_AUTO_TEST_CASE( CopperTJunctionsSurviveRollbackAndDisconnectOnRipup )
     BOOST_CHECK( !copper.Connected( 0, 2 ) );
     copper.ClearRoutes();
     BOOST_CHECK_EQUAL( copper.ItemCount(), 3 );
+}
+
+
+BOOST_AUTO_TEST_CASE( FanoutUnconnectedSetRetainsSourceItemCardinality )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+
+    board.pads.push_back( board.pads[0] );
+    board.pads.back().position = { 3000000, 500000 };
+    board.pads.push_back( board.pads[0] );
+    board.pads.back().position = { 3000000, 2500000 };
+    board.nets[0].padIndices = { 0, 1, 2, 3 };
+    board.nets[0].connections = { { 0, 1 }, { 0, 2 }, { 0, 3 } };
+
+    ROUTING_BOARD copper( board, settings );
+    ROUTING_CONNECTION escaped;
+    escaped.complete = true;
+    escaped.isFanoutConnection = true;
+    escaped.netCode = 1;
+    escaped.fromPadIndex = 1;
+    escaped.nodes = { { board.pads[1].position, 0 }, { { 4500000, 1000000 }, 0 },
+                      { { 4500000, 1000000 }, 1 } };
+    copper.AddRoute( escaped );
+
+    // The source set contains pad 1, its inserted PolylineTrace and Via, plus
+    // pads 2 and 3. Counting only disconnected pads would incorrectly select
+    // RoutingBoard.fanout()'s <= 4 closest-item fast path.
+    const auto targets = copper.UnconnectedTargetItems( 0, 1 );
+    BOOST_REQUIRE_EQUAL( targets.size(), 5U );
+    for( std::size_t index = 1; index < targets.size(); ++index )
+        BOOST_CHECK_GT( targets[index - 1].id, targets[index].id );
+    BOOST_CHECK_EQUAL( std::count_if(
+                               targets.begin(), targets.end(),
+                               []( const ROUTING_BOARD::TARGET_ITEM& aItem )
+                               { return aItem.terminals.size() == 2; } ),
+                       1 );
+    BOOST_CHECK( std::all_of(
+            targets.begin(), targets.end(),
+            []( const ROUTING_BOARD::TARGET_ITEM& aItem )
+            { return !aItem.terminals.empty() && INT_BOX::Dimension( aItem.bounds ) == 2; } ) );
 }
 
 BOOST_AUTO_TEST_CASE( SyntheticLandingsRequireRealViasAndValidTransitions )
