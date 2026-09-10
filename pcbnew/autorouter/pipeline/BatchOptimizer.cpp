@@ -326,6 +326,53 @@ ROUTING_PAD boundaryPad( const ITEM_BOUNDARY& aBoundary, int aNetCode,
     result.isExactTarget = true;
     return result;
 }
+
+
+bool fanoutEscapeIsRedundant( const BOARD_SNAPSHOT& aBoard,
+                              const ROUTING_CONNECTION& aConnection,
+                              const ROUTING_BOARD& aRoutingBoard )
+{
+    std::size_t source = std::numeric_limits<std::size_t>::max();
+    for( std::size_t endpoint : { aConnection.fromPadIndex, aConnection.toPadIndex } )
+    {
+        if( endpoint < aBoard.pads.size() && !aBoard.pads[endpoint].isFanoutTarget
+            && aBoard.pads[endpoint].isSmd
+            && aBoard.pads[endpoint].netCode == aConnection.netCode )
+        {
+            source = endpoint;
+            break;
+        }
+    }
+
+    if( source >= aBoard.pads.size() || aBoard.pads[source].layers.empty() )
+        return false;
+
+    const int sourceLayer = aBoard.pads[source].layers.front();
+    if( aRoutingBoard.ConnectedSetTouchesOtherLayer( source, sourceLayer ) )
+        return true;
+
+    const auto net = std::find_if( aBoard.nets.begin(), aBoard.nets.end(),
+                                   [&]( const ROUTING_NET& aNet )
+                                   { return aNet.netCode == aConnection.netCode; } );
+    if( net == aBoard.nets.end() )
+        return false;
+
+    const auto allConnected = [&]( const std::vector<std::size_t>& aItems )
+    {
+        return std::all_of( aItems.begin(), aItems.end(), [&]( std::size_t aItem )
+        {
+            return aItem >= aBoard.pads.size() || aItem == source
+                   || aBoard.pads[aItem].isFanoutTarget
+                   || aRoutingBoard.Connected( source, aItem );
+        } );
+    };
+
+    // RoutingBoard.fanout() reports NO_UNCONNECTED_NETS instead of inserting
+    // an escape when the pin's current item component already reaches every
+    // real net item.  This is the only same-layer case in which deleting the
+    // terminal drill is legitimate.
+    return allConnected( net->padIndices ) && allConnected( net->planeTargetIndices );
+}
 }
 
 void BATCH_OPTIMIZER::simplifyConnection( ROUTING_CONNECTION& aConnection,
@@ -336,13 +383,16 @@ void BATCH_OPTIMIZER::simplifyConnection( ROUTING_CONNECTION& aConnection,
 
 
 void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& aConnections,
-                                             const ROUTER_CANCEL_CALLBACK& aCancel ) const
+                                             const ROUTER_CANCEL_CALLBACK& aCancel,
+                                             int aOnlyNetCode ) const
 {
     if( !m_occupancy.Board() )
         return;
 
     for( auto& connection : aConnections )
     {
+        if( aOnlyNetCode > 0 && connection.netCode != aOnlyNetCode )
+            continue;
         // A source BOARD_ITEM held in static occupancy has no worker copper
         // record to trim.  It is either retained unchanged or first promoted
         // to a proposal route by the checked forced-shove path.
@@ -365,7 +415,9 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
                 for( auto pad : group )
                     if( !m_occupancy.Board()->Connected( group.front(), pad ) )
                         preservesContacts = false;
-            if( preservesContacts )
+            if( preservesContacts
+                && fanoutEscapeIsRedundant( m_board, connection,
+                                            *m_occupancy.Board() ) )
             {
                 ClearRouteGeometry( connection );
                 continue;
@@ -398,6 +450,12 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
                 for( auto pad : group )
                     if( !m_occupancy.Board()->Connected( group.front(), pad ) )
                         preservesContacts = false;
+            if( connection.isFanoutConnection
+                && !fanoutEscapeIsRedundant( m_board, connection,
+                                              *m_occupancy.Board() ) )
+            {
+                preservesContacts = false;
+            }
             if( !preservesContacts )
             {
                 m_occupancy.Remove( connection );
@@ -406,13 +464,14 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
             }
         }
     }
-    removeTraceTails( aConnections, aCancel );
+    removeTraceTails( aConnections, aCancel, aOnlyNetCode );
     std::erase_if( aConnections, []( const auto& route ) { return route.nodes.empty(); } );
 }
 
 
 void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connections,
-                                      const ROUTER_CANCEL_CALLBACK& cancel ) const
+                                      const ROUTER_CANCEL_CALLBACK& cancel,
+                                      int onlyNetCode ) const
 {
     // Freerouting removeTraceTails operates on normalized trace items, split
     // at their contacts. Native paths can still span a via/T junction, so
@@ -425,6 +484,8 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
         changed = false;
         for( auto& connection : connections )
         {
+            if( onlyNetCode > 0 && connection.netCode != onlyNetCode )
+                continue;
             if( isProtectedSourceCopper( connection ) )
                 continue;
             if( cancel && cancel() )
@@ -486,6 +547,12 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
                         for( auto pad : group )
                             if( !m_occupancy.Board()->Connected( group.front(), pad ) )
                                 preserves = false;
+                    if( connection.isFanoutConnection
+                        && !fanoutEscapeIsRedundant( m_board, connection,
+                                                     *m_occupancy.Board() ) )
+                    {
+                        preserves = false;
+                    }
                     if( !preserves )
                     {
                         m_occupancy.Remove( connection );

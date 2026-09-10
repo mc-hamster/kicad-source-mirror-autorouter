@@ -2159,13 +2159,13 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     for( ROUTING_NET& net : fanoutBoard.nets )
     {
         std::vector<std::pair<std::size_t, std::size_t>> fanoutConnections;
-        fanoutConnections.reserve( net.connections.size() );
-
-        for( const auto& [source, target] : net.connections )
+        for( std::size_t target = 0; target < fanoutBoard.pads.size(); ++target )
         {
-            if( source < fanoutBoard.pads.size() && target < fanoutBoard.pads.size()
-                && !fanoutBoard.pads[source].isFanoutTarget
-                && fanoutBoard.pads[target].isFanoutTarget )
+            const ROUTING_PAD& control = fanoutBoard.pads[target];
+            const std::size_t source = control.fanoutSourcePadIndex;
+            if( control.isFanoutTarget && control.netCode == net.netCode
+                && source < fanoutBoard.pads.size()
+                && !fanoutBoard.pads[source].isFanoutTarget )
             {
                 fanoutConnections.emplace_back( source, target );
             }
@@ -2357,6 +2357,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                                     [&]( const ROUTING_CONNECTION& aBefore )
                                     { return SameRouteGeometry( aConnection, aBefore ); } );
                         } );
+                const bool insertedFanoutFound = insertedFanout != connections.end();
 
                 // A reference fanout search ends at the first drill it finds;
                 // that drill is not constrained to the planning direction's
@@ -2367,6 +2368,8 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     && insertedFanout->toPadIndex == task->second.second
                     && !insertedFanout->nodes.empty() )
                 {
+                    const std::size_t insertedIndex = static_cast<std::size_t>(
+                            std::distance( connections.begin(), insertedFanout ) );
                     const ROUTER_POINT actualLanding = insertedFanout->nodes.back().point;
                     ROUTING_PAD& mutableLanding = fanoutBoard.pads[task->second.second];
                     mutableLanding.position = actualLanding;
@@ -2403,13 +2406,52 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                     board.pads[task->second.second] = mutableLanding;
                     occupancy.Board()->RelocateSyntheticPad( task->second.second,
                                                               actualLanding );
+
+                    // The control terminal has served its only purpose.  The
+                    // source board keeps just the real pin, inserted trace and
+                    // drill items; it never leaves a landing item in the net
+                    // graph.  Normalize the route metadata to its real SMD
+                    // endpoint and retire the synthetic pad from all later
+                    // item-set/component queries.
+                    ROUTING_CONNECTION normalized = connections[insertedIndex];
+                    occupancy.Remove( normalized );
+                    const std::size_t noPad = std::numeric_limits<std::size_t>::max();
+                    if( !normalized.nodes.empty()
+                        && normalized.nodes.front().point == taskPad.position
+                        && normalized.nodes.front().layer == sourceLayer )
+                    {
+                        normalized.fromPadIndex = pin;
+                        normalized.toPadIndex = noPad;
+                    }
+                    else
+                    {
+                        normalized.fromPadIndex = noPad;
+                        normalized.toPadIndex = pin;
+                    }
+                    occupancy.Board()->RetireSyntheticPad( task->second.second );
+                    board.pads[task->second.second].netCode = 0;
+                    board.pads[task->second.second].layers.clear();
+                    occupancy.Add( normalized );
+                    connections[insertedIndex] = std::move( normalized );
+
+                    // RoutingBoard.fanout() immediately runs
+                    // optChangedArea() for this net.  The complete source
+                    // tightener is still being translated, but its
+                    // source-safe tail/via retirement subset must happen at
+                    // the same per-pin boundary: later pins must see the
+                    // topology produced by cleanup, not every provisional
+                    // escape accumulated until the end of the stage.
+                    BATCH_OPTIMIZER( board, fanoutSettings, occupancy )
+                            .RemoveRedundantViaTails( connections, pinCancel,
+                                                      net.netCode );
+                    connections = occupancy.Connections();
                 }
 
                 // A faithful fanout search can stop at its first inserted
                 // drill without reaching the nominal net destination.  That
                 // is a successful escape even though the synthetic
                 // pad-to-landing task remains electrically incomplete.
-                const bool routed = taskComplete || insertedFanout != connections.end();
+                const bool routed = taskComplete || insertedFanoutFound;
 
                 if( aCancel && aCancel() )
                 {
@@ -2491,83 +2533,18 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
         fanoutTransaction.Commit();
     }
 
-    // Any landing that did not survive the isolated fanout pre-pass must be
-    // removed from the electrical graph.  Falling back to the original pad
-    // keeps the ordinary connection routable and, more importantly, prevents
-    // a successful-looking route from starting at a synthetic point that has
-    // no copper back to its SMD pad.
-    std::set<std::size_t> completedFanoutLandings;
-    for( const ROUTING_CONNECTION& connection : connections )
-    {
-        if( !connection.complete )
-            continue;
-
-        for( std::size_t endpoint : { connection.fromPadIndex, connection.toPadIndex } )
-        {
-            if( endpoint < board.pads.size() && board.pads[endpoint].isFanoutTarget )
-                completedFanoutLandings.insert( endpoint );
-        }
-    }
-
-    std::map<std::size_t, std::size_t> failedFanoutLandings;
+    // Failed controls are equally absent from the source item model.  Since
+    // the real ratsnest was never rewritten through them, retiring each one
+    // is sufficient; ordinary routing continues directly from the real SMD
+    // pad without graph remapping or a dangling virtual endpoint.
     for( std::size_t index = 0; index < board.pads.size(); ++index )
     {
-        const ROUTING_PAD& pad = board.pads[index];
-        if( pad.isFanoutTarget
-            && pad.fanoutSourcePadIndex != std::numeric_limits<std::size_t>::max()
-            && !completedFanoutLandings.contains( index ) )
+        ROUTING_PAD& pad = board.pads[index];
+        if( pad.isFanoutTarget && pad.netCode > 0 )
         {
-            failedFanoutLandings.emplace( index, pad.fanoutSourcePadIndex );
-        }
-    }
-
-    if( !failedFanoutLandings.empty() )
-    {
-        for( ROUTING_NET& net : board.nets )
-        {
-            std::vector<std::pair<std::size_t, std::size_t>> normalized;
-            normalized.reserve( net.connections.size() );
-
-            for( const auto& [source, target] : net.connections )
-            {
-                if( source < board.pads.size() && target < board.pads.size()
-                    && board.pads[target].isFanoutTarget
-                    && !board.pads[source].isFanoutTarget
-                    && failedFanoutLandings.contains( target ) )
-                {
-                    // This is the synthetic pad-to-landing edge itself.
-                    continue;
-                }
-
-                const auto mapEndpoint = [&]( std::size_t endpoint )
-                {
-                    const auto it = failedFanoutLandings.find( endpoint );
-                    return it == failedFanoutLandings.end() ? endpoint : it->second;
-                };
-
-                const std::size_t mappedSource = mapEndpoint( source );
-                const std::size_t mappedTarget = mapEndpoint( target );
-                if( mappedSource != mappedTarget )
-                    normalized.emplace_back( mappedSource, mappedTarget );
-            }
-
-            net.connections = std::move( normalized );
-        }
-
-        totalConnections = std::accumulate(
-                board.nets.begin(), board.nets.end(), 0,
-                []( int aTotal, const ROUTING_NET& aNet )
-                {
-                    return aTotal + static_cast<int>( aNet.connections.size() );
-                } );
-        result.metrics.totalConnections = totalConnections;
-
-        if( autorouterDebugEnabled() )
-        {
-            std::ostringstream message;
-            message << "fanout fallback landings=" << failedFanoutLandings.size()
-                    << " totalConnections=" << totalConnections;
-            autorouterDebugLog( message.str() );
+            occupancy.Board()->RetireSyntheticPad( index );
+            pad.netCode = 0;
+            pad.layers.clear();
         }
     }
 

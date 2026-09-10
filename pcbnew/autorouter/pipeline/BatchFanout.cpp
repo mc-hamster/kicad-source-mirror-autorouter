@@ -24,12 +24,6 @@ namespace KICAD_AUTOROUTER
 namespace
 {
 
-std::size_t invalidIndex()
-{
-    return std::numeric_limits<std::size_t>::max();
-}
-
-
 int layerOrdinal( const AUTOROUTER_SETTINGS& aSettings, int aLayer )
 {
     const auto it = std::find_if( aSettings.layers.begin(), aSettings.layers.end(),
@@ -255,8 +249,6 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
     }
 
     BOARD_SNAPSHOT result = aBoard;
-    std::vector<std::size_t> landingForPad( result.pads.size(), invalidIndex() );
-
     // Create one deterministic landing pad for each SMD endpoint that still
     // participates in the current connection graph.  Do not fan out every
     // pad in a net during a route-only-unconnected run: pads already joined
@@ -265,7 +257,6 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
     // ROUTING_NET::padIndices because that list describes real board pads and
     // is used for widths, ordering and reporting.
     const auto orderedPins = OrderedPins( aBoard, aSettings.fanoutPinOrder, aCancel );
-    std::map<int, std::vector<std::size_t>> fanoutPadsByNet;
     for( auto orderedPin : orderedPins )
     {
         const auto netIt = std::find_if( result.nets.begin(), result.nets.end(), [&]( const auto& net )
@@ -305,7 +296,6 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
             }
         }
 
-        auto& fanoutPads = fanoutPadsByNet[net.netCode];
         for( std::size_t padIndex : { orderedPin } )
         {
             if( aCancel && aCancel() )
@@ -425,52 +415,17 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
             landing.fanoutEscapePath.clear();
             landing.radius = 0;
 
-            const std::size_t landingIndex = result.pads.size();
             result.pads.push_back( std::move( landing ) );
-            landingForPad.resize( result.pads.size(), invalidIndex() );
-            landingForPad[padIndex] = landingIndex;
-            fanoutPads.push_back( padIndex );
         }
 
     }
 
-    // Rewrite the graph only after all globally ordered pin landings have
-    // been planned. Earlier fanout bridges must not be remapped a second time.
-    for( auto& net : result.nets )
-    {
-        const auto& fanoutPads = fanoutPadsByNet[net.netCode];
-        if( fanoutPads.empty() )
-            continue;
-
-        const std::vector<std::pair<std::size_t, std::size_t>> originalConnections =
-                net.connections;
-        std::vector<std::pair<std::size_t, std::size_t>> fanoutConnections;
-        fanoutConnections.reserve( fanoutPads.size() + originalConnections.size() );
-
-        for( std::size_t padIndex : fanoutPads )
-        {
-            const std::size_t landingIndex = landingForPad[padIndex];
-            if( landingIndex != invalidIndex() )
-                fanoutConnections.emplace_back( padIndex, landingIndex );
-        }
-
-        for( const auto& [source, target] : originalConnections )
-        {
-            const std::size_t mappedSource = source < landingForPad.size()
-                                                     && landingForPad[source] != invalidIndex()
-                                             ? landingForPad[source]
-                                             : source;
-            const std::size_t mappedTarget = target < landingForPad.size()
-                                                     && landingForPad[target] != invalidIndex()
-                                             ? landingForPad[target]
-                                             : target;
-
-            if( mappedSource != mappedTarget )
-                fanoutConnections.emplace_back( mappedSource, mappedTarget );
-        }
-
-        net.connections = std::move( fanoutConnections );
-    }
+    // RoutingBoard.fanout() never rewrites the design ratsnest through a
+    // synthetic landing.  The control pads above exist only so the immutable
+    // native search API can name one fanout attempt; BatchAutorouter builds
+    // that temporary task graph separately.  Keep the real net graph intact
+    // so a removed/redundant escape cannot strand later ordinary routing on a
+    // virtual endpoint.
 
     return result;
 }

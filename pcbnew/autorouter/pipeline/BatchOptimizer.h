@@ -47,11 +47,13 @@ public:
                   const ROUTER_CANCEL_CALLBACK& aCancel ) const;
 
     void RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& aConnections,
-                                  const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+                                  const ROUTER_CANCEL_CALLBACK& aCancel,
+                                  int aOnlyNetCode = 0 ) const;
 
 private:
     void removeTraceTails( std::vector<ROUTING_CONNECTION>& aConnections,
-                           const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+                           const ROUTER_CANCEL_CALLBACK& aCancel,
+                           int aOnlyNetCode ) const;
 
     void simplifyConnection( ROUTING_CONNECTION& aConnection,
                               const MAZE_SEARCH_ENGINE& aSearch ) const;

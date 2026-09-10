@@ -1387,13 +1387,13 @@ BOOST_AUTO_TEST_CASE( PlaneSmdPadsFanoutBeforeChangingLayers )
 
     const BOARD_SNAPSHOT fanned = BATCH_FANOUT::PrepareSnapshot( board, settings );
     BOOST_REQUIRE_EQUAL( fanned.nets.size(), 1 );
-    BOOST_CHECK_EQUAL( fanned.nets.front().connections.size(), 2 );
+    BOOST_CHECK_EQUAL( fanned.nets.front().connections.size(), 1 );
 
     ROUTING_PIPELINE pipeline;
     const ROUTING_RESULT result = pipeline.Run( board, settings, {}, {} );
 
     BOOST_REQUIRE( result.complete );
-    BOOST_CHECK_EQUAL( result.metrics.routedConnections, 2 );
+    BOOST_CHECK_EQUAL( result.metrics.routedConnections, 1 );
     BOOST_CHECK_EQUAL( result.metrics.fanoutConnections, 1 );
     BOOST_REQUIRE_EQUAL( result.vias.size(), 1 );
     BOOST_CHECK( result.vias.front().position != board.pads[0].position );
@@ -1491,6 +1491,51 @@ BOOST_AUTO_TEST_CASE( SmdPadsUseTheFreeroutingStyleFanoutStage )
         BOOST_CHECK( via.position != board.pads[0].position );
         BOOST_CHECK( via.position != board.pads[1].position );
     }
+}
+
+
+BOOST_AUTO_TEST_CASE( RetiredFanoutControlLeavesOnlyPhysicalCopperTopology )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].layers = { 1 };
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = true;
+    settings.allowViaInSmdPad = false;
+
+    const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
+    BOOST_REQUIRE( prepared.nets[0].connections == board.nets[0].connections );
+    BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 1 );
+
+    const std::size_t control = prepared.pads.size() - 1;
+    BOOST_REQUIRE( prepared.pads[control].isFanoutTarget );
+    BOOST_REQUIRE_EQUAL( prepared.pads[control].fanoutSourcePadIndex, 0U );
+
+    const ROUTER_POINT drill{ 3000000, 1500000 };
+    ROUTING_CONNECTION fanout;
+    fanout.complete = true;
+    fanout.isFanoutConnection = true;
+    fanout.netCode = 1;
+    fanout.fromPadIndex = 0;
+    fanout.toPadIndex = control;
+    fanout.nodes = { { board.pads[0].position, 0 }, { drill, 0 }, { drill, 1 } };
+
+    ROUTING_BOARD copper( prepared, settings );
+    copper.RelocateSyntheticPad( control, drill );
+    copper.AddRoute( fanout );
+    BOOST_REQUIRE( copper.Connected( 0, control ) );
+    BOOST_REQUIRE( copper.ConnectedSetTouchesOtherLayer( 0, 0 ) );
+    const std::size_t itemCount = copper.ItemCount();
+
+    copper.RetireSyntheticPad( control );
+
+    BOOST_CHECK( !copper.Connected( 0, control ) );
+    BOOST_CHECK( copper.Terminals( control ).empty() );
+    BOOST_CHECK( copper.ConnectedSetTouchesOtherLayer( 0, 0 ) );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), itemCount );
+    BOOST_CHECK_EQUAL( copper.CountMissing( prepared.nets[0] ), 1 );
 }
 
 
@@ -1916,6 +1961,8 @@ BOOST_AUTO_TEST_CASE( FanoutRoomSearchFindsBentEscapeWithoutAPlannedLanding )
     settings.fanoutMinEscapeLengthIU = 2000000;
     settings.fanoutMaxEscapeLengthIU = 3500000;
     settings.fanoutLandingSearchSteps = 20;
+    settings.allowRipupRouted = false;
+    settings.optimizeAfterComplete = false;
 
     const BOARD_SNAPSHOT prepared = BATCH_FANOUT::PrepareSnapshot( board, settings );
     BOOST_REQUIRE_EQUAL( prepared.pads.size(), board.pads.size() + 1 );
@@ -2796,15 +2843,15 @@ BOOST_AUTO_TEST_CASE( FanoutLandingPlanningUsesGlobalComponentOrderNotNetOrder )
     BOOST_REQUIRE_EQUAL( onePass.pads.size(), prepared.pads.size() );
     for( std::size_t i = 4; i < onePass.pads.size(); ++i )
         BOOST_CHECK( onePass.pads[i].position == prepared.pads[i].position );
-    // Every source bridge survived the single graph rewrite, including nets
-    // interleaved by component/pin priority.
+    // Control items are allocated in global component/pin order, but the real
+    // design ratsnest is never rewritten through them.
     for( const auto& net : prepared.nets )
     {
-        BOOST_CHECK_EQUAL( net.connections.size(), 3 );
+        BOOST_CHECK_EQUAL( net.connections.size(), 1 );
         for( auto pin : net.padIndices )
-            BOOST_CHECK( std::any_of( net.connections.begin(), net.connections.end(),
-                    [&]( const auto& edge ) { return edge.first == pin
-                        && prepared.pads[edge.second].fanoutSourcePadIndex == pin; } ) );
+            BOOST_CHECK( std::any_of( prepared.pads.begin() + 4, prepared.pads.end(),
+                    [&]( const auto& pad )
+                    { return pad.isFanoutTarget && pad.fanoutSourcePadIndex == pin; } ) );
     }
 }
 

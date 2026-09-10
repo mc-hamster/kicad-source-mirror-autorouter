@@ -767,6 +767,26 @@ void ROUTING_BOARD::RelocateSyntheticPad( std::size_t pad, ROUTER_POINT position
     terminal.position = position;
 }
 
+
+void ROUTING_BOARD::RetireSyntheticPad( std::size_t pad )
+{
+    if( pad >= m_impl->snapshot.pads.size() )
+        return;
+
+    ROUTING_PAD& terminal = m_impl->snapshot.pads[pad];
+    if( !terminal.isFanoutTarget )
+        return;
+
+    // Synthetic fanout pads never own a board item.  Clearing their net and
+    // layer membership is therefore sufficient to make padRoots() empty,
+    // while retaining the immutable index for diagnostics and for the
+    // already-created fanout search engine.  This mirrors the source model,
+    // where the inserted drill/trace items survive but no landing item does.
+    terminal.netCode = 0;
+    terminal.layers.clear();
+    ++m_impl->revision;
+}
+
 bool ROUTING_BOARD::Connected( std::size_t first, std::size_t second ) const
 {
     const auto left = m_impl->padRoots( first );

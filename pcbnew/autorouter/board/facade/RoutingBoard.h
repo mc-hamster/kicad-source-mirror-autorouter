@@ -55,6 +55,8 @@ public:
     void ClearRoutes();
     /** Move a planning-only terminal to the drill selected by dynamic fanout. */
     void RelocateSyntheticPad( std::size_t aPad, ROUTER_POINT aPosition );
+    /** Remove a planning-only terminal from electrical item-set queries. */
+    void RetireSyntheticPad( std::size_t aPad );
 
     bool Connected( std::size_t aFirstPad, std::size_t aSecondPad ) const;
     /** True when the pad's physical same-net component reaches another copper layer. */
