@@ -33,15 +33,36 @@ public:
     INCOMPLETE_FREE_SPACE_EXPANSION_ROOM( ROUTER_BOX aShape, int aLayer,
                                           ROUTER_BOX aContainedShape ) :
             FREE_SPACE_EXPANSION_ROOM( 0, aLayer, aShape ),
-            m_containedShape( aContainedShape )
+            m_containedShape( aContainedShape ),
+            m_containedOctagon( PLANAR::INT_OCTAGON::FromBox( aContainedShape ) )
+    {
+    }
+
+    INCOMPLETE_FREE_SPACE_EXPANSION_ROOM(
+            PLANAR::INT_OCTAGON aShape, int aLayer,
+            PLANAR::INT_OCTAGON aContainedShape ) :
+            FREE_SPACE_EXPANSION_ROOM( 0, aLayer, std::move( aShape ) ),
+            m_containedShape( aContainedShape.BoundingBox() ),
+            m_containedOctagon( std::move( aContainedShape ) )
     {
     }
 
     const ROUTER_BOX& GetContainedShape() const { return m_containedShape; }
-    void SetContainedShape( ROUTER_BOX aShape ) { m_containedShape = aShape; }
+    const PLANAR::INT_OCTAGON& GetContainedOctagon() const { return m_containedOctagon; }
+    void SetContainedShape( ROUTER_BOX aShape )
+    {
+        m_containedShape = aShape;
+        m_containedOctagon = PLANAR::INT_OCTAGON::FromBox( aShape );
+    }
+    void SetContainedShape( PLANAR::INT_OCTAGON aShape )
+    {
+        m_containedShape = aShape.BoundingBox();
+        m_containedOctagon = std::move( aShape );
+    }
 
 private:
     ROUTER_BOX m_containedShape{ 1, 1, 0, 0 };
+    PLANAR::INT_OCTAGON m_containedOctagon = PLANAR::INT_OCTAGON::Empty();
 };
 
 } // namespace KICAD_AUTOROUTER

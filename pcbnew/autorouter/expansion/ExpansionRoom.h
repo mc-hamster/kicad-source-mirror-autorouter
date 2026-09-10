@@ -16,6 +16,7 @@
 
 #include "ExpandableObject.h"
 #include "../AutorouterTypes.h"
+#include "../geometry/planar/IntOctagon.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -31,6 +32,17 @@ public:
             m_id( aId ),
             m_layer( aLayer ),
             m_shape( aShape ),
+            m_octagon( PLANAR::INT_OCTAGON::FromBox( aShape ) ),
+            m_obstacle( aObstacle )
+    {
+    }
+
+    EXPANSION_ROOM( int aId, int aLayer, PLANAR::INT_OCTAGON aShape,
+                    bool aObstacle = false ) :
+            m_id( aId ),
+            m_layer( aLayer ),
+            m_shape( aShape.BoundingBox() ),
+            m_octagon( std::move( aShape ) ),
             m_obstacle( aObstacle )
     {
     }
@@ -44,12 +56,14 @@ public:
     bool RemoveDoor( EXPANSION_DOOR* aDoor );
 
     const ROUTER_BOX& GetShape() const { return m_shape; }
+    const PLANAR::INT_OCTAGON& GetOctagon() const { return m_octagon; }
     int               GetLayer() const { return m_layer; }
     int               GetId() const override { return m_id; }
     bool              IsObstacle() const { return m_obstacle; }
+    virtual bool      IsCompleteFreeSpace() const { return false; }
     bool              Contains( const ROUTER_POINT& aPoint ) const
     {
-        return m_shape.Contains( aPoint );
+        return m_octagon.Contains( aPoint );
     }
 
     void Reset() override { ResetDoors(); }
@@ -58,6 +72,7 @@ private:
     int                         m_id;
     int                         m_layer;
     ROUTER_BOX                  m_shape;
+    PLANAR::INT_OCTAGON         m_octagon;
     bool                        m_obstacle;
     std::vector<EXPANSION_DOOR*> m_doors;
 };

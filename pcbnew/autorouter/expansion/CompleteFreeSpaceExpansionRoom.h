@@ -29,6 +29,7 @@ class COMPLETE_FREE_SPACE_EXPANSION_ROOM : public FREE_SPACE_EXPANSION_ROOM
 {
 public:
     using FREE_SPACE_EXPANSION_ROOM::FREE_SPACE_EXPANSION_ROOM;
+    bool IsCompleteFreeSpace() const override { return true; }
 };
 
 } // namespace KICAD_AUTOROUTER

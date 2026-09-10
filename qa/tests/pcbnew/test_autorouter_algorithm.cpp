@@ -54,6 +54,7 @@
 #include <autorouter/expansion/ExpansionDoor.h>
 #include <autorouter/expansion/TargetItemExpansionDoor.h>
 #include <autorouter/expansion/CompleteFreeSpaceExpansionRoom.h>
+#include <autorouter/expansion/IncompleteFreeSpaceExpansionRoom.h>
 #include <autorouter/expansion/SortedOrthogonalRoomNeighbours.h>
 #include <autorouter/expansion/Sorted45DegreeRoomNeighbours.h>
 #include <autorouter/maze/DestinationDistance.h>
@@ -433,6 +434,90 @@ BOOST_AUTO_TEST_CASE( FortyFiveDegreeNeighbourOrderingMatchesPinnedFreerouting )
                 BOOST_CHECK( gap.shape == readOctagon() );
                 BOOST_CHECK( gap.containedShape == readOctagon() );
                 BOOST_CHECK_EQUAL( gap.layer, 2 );
+            }
+            BOOST_REQUIRE( !input.fail() );
+        }
+    }
+    input >> std::ws;
+    BOOST_CHECK( input.eof() );
+}
+
+
+BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
+{
+    using PLANAR::INT_OCTAGON;
+
+    std::ifstream input( KI_TEST::GetPcbnewTestDataDir()
+                         + "/autorouter/door45-search-a11c0a42.txt" );
+    BOOST_REQUIRE( input.good() );
+    auto readOctagon = [&]()
+    {
+        std::array<std::int64_t, 8> value;
+        for( auto& coordinate : value )
+            input >> coordinate;
+        BOOST_REQUIRE( !input.fail() );
+        return INT_OCTAGON( value[0], value[1], value[2], value[3],
+                            value[4], value[5], value[6], value[7] );
+    };
+    auto readDouble = [&]()
+    {
+        std::string value;
+        input >> value;
+        BOOST_REQUIRE( !input.fail() );
+        return std::stod( value );
+    };
+    auto sameDouble = []( double aActual, double aExpected )
+    {
+        return std::abs( aActual - aExpected )
+               <= 1e-12 * std::max( { 1.0, std::abs( aActual ), std::abs( aExpected ) } );
+    };
+
+    for( int test = 0; test < 2048; ++test )
+    {
+        BOOST_TEST_CONTEXT( "octagonal expansion door oracle " << test )
+        {
+            std::string marker;
+            input >> marker;
+            BOOST_REQUIRE_EQUAL( marker, "DOOR45" );
+            const INT_OCTAGON firstShape = readOctagon();
+            const INT_OCTAGON secondShape = readOctagon();
+            int completePair;
+            input >> completePair;
+            const double offset = readDouble();
+            int expectedDimension;
+            input >> expectedDimension;
+            const INT_OCTAGON expectedShape = readOctagon();
+            std::size_t expectedSections;
+            input >> expectedSections;
+
+            COMPLETE_FREE_SPACE_EXPANSION_ROOM second( 10001 + 2 * test, 2,
+                                                       secondShape );
+            std::unique_ptr<EXPANSION_ROOM> first;
+            if( completePair )
+            {
+                first = std::make_unique<COMPLETE_FREE_SPACE_EXPANSION_ROOM>(
+                        10000 + 2 * test, 2, firstShape );
+            }
+            else
+            {
+                first = std::make_unique<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM>(
+                        firstShape, 2, firstShape );
+            }
+            EXPANSION_DOOR door( first.get(), &second );
+            BOOST_CHECK_EQUAL( door.GetDimension(), expectedDimension );
+            BOOST_CHECK( door.GetOctagonShape() == expectedShape );
+            const auto sections = door.GetSectionSegments( offset );
+            BOOST_REQUIRE_EQUAL( sections.size(), expectedSections );
+            for( const FLOAT_LINE& section : sections )
+            {
+                const double ax = readDouble();
+                const double ay = readDouble();
+                const double bx = readDouble();
+                const double by = readDouble();
+                BOOST_CHECK( sameDouble( section.a.x, ax ) );
+                BOOST_CHECK( sameDouble( section.a.y, ay ) );
+                BOOST_CHECK( sameDouble( section.b.x, bx ) );
+                BOOST_CHECK( sameDouble( section.b.y, by ) );
             }
             BOOST_REQUIRE( !input.fail() );
         }
