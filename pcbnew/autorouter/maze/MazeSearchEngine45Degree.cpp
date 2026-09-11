@@ -52,6 +52,137 @@ std::string pointSequence( const std::vector<ROUTER_POINT>& aPoints )
 } // namespace
 
 
+std::optional<FLOAT_LINE> MAZE_SEARCH_ENGINE_45_DEGREE::SegmentProjection(
+        const FLOAT_LINE& aFromSegment, const FLOAT_LINE& aToSegment )
+{
+    // MazeSearchEngine.segmentProjection() intentionally evaluates both
+    // projection directions.  In a thin room one direction can clip a valid
+    // endpoint which the other direction retains.
+    const FLOAT_LINE checkSegment = aFromSegment.AdjustDirection( aToSegment );
+    const auto firstProjection = aToSegment.SegmentProjection( checkSegment );
+    const auto secondProjection = aToSegment.SegmentProjection2( checkSegment );
+
+    if( !firstProjection )
+        return secondProjection;
+    if( !secondProjection )
+        return firstProjection;
+
+    FLOAT_POINT resultA;
+    const auto equalPoint = []( FLOAT_POINT aLeft, FLOAT_POINT aRight )
+    {
+        return aLeft.x == aRight.x && aLeft.y == aRight.y;
+    };
+
+    if( equalPoint( firstProjection->a, aToSegment.a )
+        || equalPoint( secondProjection->a, aToSegment.a ) )
+    {
+        resultA = aToSegment.a;
+    }
+    else
+    {
+        resultA = firstProjection->a.DistanceSquared( aToSegment.a )
+                                  <= secondProjection->a.DistanceSquared(
+                                             aToSegment.a )
+                          ? firstProjection->a
+                          : secondProjection->a;
+    }
+
+    FLOAT_POINT resultB;
+    if( equalPoint( firstProjection->b, aToSegment.b )
+        || equalPoint( secondProjection->b, aToSegment.b ) )
+    {
+        resultB = aToSegment.b;
+    }
+    else
+    {
+        resultB = firstProjection->b.DistanceSquared( aToSegment.b )
+                                  <= secondProjection->b.DistanceSquared(
+                                             aToSegment.b )
+                          ? firstProjection->b
+                          : secondProjection->b;
+    }
+
+    return FLOAT_LINE{ resultA, resultB };
+}
+
+
+bool MAZE_SEARCH_ENGINE_45_DEGREE::RoomIsThick(
+        const EXPANSION_ROOM& aRoom, double aCompensatedTraceHalfWidth,
+        const EXPANSION_DOOR* aEntryDoor, FLOAT_POINT aEntryMiddle )
+{
+    if( !std::isfinite( aCompensatedTraceHalfWidth )
+        || aCompensatedTraceHalfWidth < 0 )
+    {
+        return false;
+    }
+
+    // ObstacleExpansionRoom.roomShapeIsThick() compares the compensated
+    // obstacle half-width with the incoming compensated trace half-width.
+    // Native obstacle rooms already contain that compensation, so their
+    // minimum full width is the equivalent data available at this boundary.
+    if( aRoom.IsObstacle() )
+    {
+        const double width = aRoom.UsesGeneralShape()
+                                     ? aRoom.GetSimplex().MinWidth()
+                                     : aRoom.GetOctagon().MinWidth();
+        return width >= 2 * aCompensatedTraceHalfWidth;
+    }
+
+    const double minimumWidth = aRoom.UsesGeneralShape()
+                                        ? aRoom.GetSimplex().MinWidth()
+                                        : aRoom.GetOctagon().MinWidth();
+    if( minimumWidth < 2 * aCompensatedTraceHalfWidth )
+        return false;
+
+    if( !aEntryDoor || aEntryDoor->GetDimension() != 1
+        || aEntryDoor->IsSmallFor45DegreeTrace(
+                2 * ( aCompensatedTraceHalfWidth
+                      + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) ) )
+    {
+        return true;
+    }
+
+    const auto nearest = aRoom.GetSimplex().NearestBorderPointsApprox(
+            aEntryMiddle, 2 );
+    if( nearest.size() < 2 )
+        return false;
+
+    // Java's literal +1 is one Freerouting coordinate, not one KiCad IU.
+    return nearest[1].Distance( aEntryMiddle )
+           > aCompensatedTraceHalfWidth
+                     + FREEROUTING_COORDINATE_UNIT_IU;
+}
+
+
+bool MAZE_SEARCH_ENGINE_45_DEGREE::DoorEntryIsThick(
+        const EXPANSION_ROOM& aRoom, const EXPANSION_DOOR& aDoor,
+        const std::vector<FLOAT_LINE>& aSections,
+        double aCompensatedTraceHalfWidth )
+{
+    if( aDoor.GetDimension() != 1 || aSections.size() != 1
+        || !aDoor.FirstRoom() || !aDoor.SecondRoom()
+        || !aDoor.FirstRoom()->IsCompleteFreeSpace()
+        || !aDoor.SecondRoom()->IsCompleteFreeSpace() )
+    {
+        return true;
+    }
+
+    const double minimumWidth = aRoom.UsesGeneralShape()
+                                        ? aRoom.GetSimplex().MinWidth()
+                                        : aRoom.GetOctagon().MinWidth();
+    if( minimumWidth < 2 * aCompensatedTraceHalfWidth )
+        return false;
+
+    const FLOAT_POINT middle = aSections.front().Middle();
+    const auto nearest = aRoom.GetSimplex().NearestBorderPointsApprox(
+            middle, 2 );
+    return nearest.size() >= 2
+           && nearest[1].Distance( middle )
+                      > aCompensatedTraceHalfWidth
+                                + FREEROUTING_COORDINATE_UNIT_IU;
+}
+
+
 std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
         ROUTER_BOX aBounds, const std::vector<SHAPE_TREE_ENTRY>& aObstacles,
         int aLayer, int aNet, const std::vector<ROOM_TERMINAL>& aStarts,
@@ -284,10 +415,11 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
         if( search.stopped() )
             return std::nullopt;
 
-        if( current.door
-            && current.door->IsSmallFor45DegreeTrace(
-                    2 * ( aSectionOffset
-                          + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) ) )
+        const bool currentDoorIsSmall = current.door
+                && current.door->IsSmallFor45DegreeTrace(
+                        2 * ( aSectionOffset
+                              + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) );
+        if( currentDoorIsSmall )
         {
             EXPANSION_ROOM* fromRoom =
                     current.door->OtherRoom( current.room->shape.get() );
@@ -297,6 +429,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
 
         bool somethingExpanded = false;
         const FLOAT_POINT from = current.entry.Middle();
+        const bool nextRoomIsThick = RoomIsThick(
+                *current.room->shape, aSectionOffset, current.door, from );
         for( std::size_t targetIndex = 0; targetIndex < aTargets.size(); ++targetIndex )
         {
             const ROOM_TERMINAL& target = aTargets[targetIndex];
@@ -326,11 +460,34 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                     aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
                     static_cast<std::size_t>(
                             std::max( 0, aMaxExpanded - aExpanded ) ) );
+            if( nextRoomIsThick
+                && !DoorEntryIsThick( *current.room->shape, *door, sections,
+                                      aSectionOffset ) )
+            {
+                continue;
+            }
             for( std::size_t section = 0; section < sections.size(); ++section )
             {
                 if( occupied.contains( { door, section } ) )
                     continue;
-                const FLOAT_POINT to = sections[section].Middle();
+                FLOAT_LINE shapeEntry = sections[section];
+                if( !nextRoomIsThick )
+                {
+                    if( door->GetDimension() == 1 && section == 0
+                        && sections.size() == 1
+                        && sections.front().a.DistanceSquared(
+                                   sections.front().b ) < 1 )
+                    {
+                        continue;
+                    }
+
+                    const auto projected = SegmentProjection(
+                            current.entry, sections[section] );
+                    if( !projected )
+                        continue;
+                    shapeEntry = *projected;
+                }
+                const FLOAT_POINT to = shapeEntry.Middle();
                 double bend = 0;
                 if( current.parent != NONE )
                 {
@@ -385,7 +542,7 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                             current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
                           { "expansion_value", std::to_string( g ) },
                           { "sorting_value", std::to_string( g + distance( to ) ) } } );
-                push( { next, door, section, sections[section], g,
+                push( { next, door, section, shapeEntry, g,
                         g + distance( to ), index, current.owner, {}, 0, ripupCost } );
                 somethingExpanded = true;
             }
