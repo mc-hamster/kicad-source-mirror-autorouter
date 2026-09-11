@@ -307,6 +307,7 @@ bool MAZE_SEARCH_ENGINE::hasGeneralConvexRoomGeometry( int aNet, int aLayer ) co
 
 std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         int net, int aLayer, bool aForVia, bool aSkipGeneralConvex,
+        bool aSourceTraceRooms,
         const ROUTER_CANCEL_CALLBACK& aCancel,
         const std::vector<ROOM_RIPUP_OBSTACLE>* aRipupObstacles,
         std::int64_t aCandidateRadius,
@@ -318,6 +319,24 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
     const auto drillRadius = aCandidateDrillRadius >= 0
                                      ? aCandidateDrillRadius
                                      : netViaDrillRadius( net );
+    const std::int64_t candidateCompensation = traceClearanceCompensation( net );
+    const auto sourceTraceTreeExpansion = [&]( const ROUTING_OBSTACLE& aObstacle )
+    {
+        if( aObstacle.isHole )
+        {
+            return aObstacle.radius + std::max<std::int64_t>(
+                    0, m_board.holeClearance - candidateCompensation );
+        }
+
+        const std::int64_t clearance = aObstacle.netCode != 0
+                                                && aObstacle.netCode != net
+                ? std::max( edgePairClearance( net, aObstacle.netCode,
+                                               aLayer, 0, aObstacle.clearance ),
+                            aObstacle.clearance )
+                : std::max( netClearance( net ), aObstacle.clearance );
+        return aObstacle.radius + std::max<std::int64_t>(
+                0, clearance - candidateCompensation );
+    };
     std::vector<SHAPE_TREE_ENTRY> entries;
     int id = 1;
     auto addOctagon = [&]( INT_OCTAGON shape,
@@ -378,12 +397,15 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         // diagonal convex contour as its axis-aligned bounding box.
         if( aSkipGeneralConvex && isGeneralPolygonRoomObstacle( obstacle, net, aForVia ) )
             continue;
-        // The current native locator consumes trace-centre rooms.  Until its
-        // source room-shrink phase is complete, retain the candidate radius
-        // in the room obstacle so every reconstructed segment is legal under
-        // KiCad's inclusive collision predicates.
-        const std::int64_t expansion = obstacleExpansionRadius(
-                obstacle, net, aLayer, aForVia, radius, drillRadius ) + 1;
+        // ShapeSearchTree stores obstacle copper plus the obstacle-side share
+        // of clearance.  The 45-degree locator now applies the candidate's
+        // compensated half width while walking the selected room corridor.
+        // Keep complete-centre expansion for the paths whose source locator
+        // has not yet replaced their established native locator.
+        const std::int64_t expansion = ( aSourceTraceRooms && !aForVia
+                ? sourceTraceTreeExpansion( obstacle )
+                : obstacleExpansionRadius(
+                        obstacle, net, aLayer, aForVia, radius, drillRadius ) ) + 1;
         if( isGeneralPolygonRoomObstacle( obstacle, net, aForVia )
             && !isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
         {
@@ -456,9 +478,12 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     continue;
                 const std::int64_t otherRadius = style.trackWidth > 0
                         ? style.trackWidth / 2 : netTrackRadius( connection.netCode );
-                expansion = radius + otherRadius
-                            + edgePairClearance( net, connection.netCode, aLayer, 0,
-                                                 style.clearance );
+                const std::int64_t pairClearance = edgePairClearance(
+                        net, connection.netCode, aLayer, 0, style.clearance );
+                expansion = aSourceTraceRooms
+                        ? otherRadius + std::max<std::int64_t>(
+                                0, pairClearance - candidateCompensation )
+                        : radius + otherRadius + pairClearance;
             }
             else
             {
@@ -468,11 +493,14 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                         ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
                 const std::int64_t otherDrillRadius = style.viaDrill > 0
                         ? style.viaDrill / 2 : netViaDrillRadius( connection.netCode );
-                expansion = radius + std::max(
-                        otherViaRadius
-                                + edgePairClearance( net, connection.netCode, aLayer, 0,
-                                                     style.clearance ),
-                        otherDrillRadius + m_board.holeClearance );
+                const std::int64_t pairClearance = edgePairClearance(
+                        net, connection.netCode, aLayer, 0, style.clearance );
+                expansion = aSourceTraceRooms && !aForVia
+                        ? otherViaRadius + std::max<std::int64_t>(
+                                0, pairClearance - candidateCompensation )
+                        : radius + std::max(
+                                otherViaRadius + pairClearance,
+                                otherDrillRadius + m_board.holeClearance );
                 if( aForVia )
                     expansion = std::max( expansion, drillRadius
                             + otherDrillRadius + m_board.holeToHoleClearance );
@@ -491,6 +519,7 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
 
 std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
         int net, int aLayer, bool aForVia, int aRetry, bool aFanout,
+        bool aSourceTraceRooms,
         const ROUTER_CANCEL_CALLBACK& aCancel ) const
 {
     std::vector<ROOM_RIPUP_OBSTACLE> result;
@@ -498,6 +527,7 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
         return result;
 
     const std::int64_t radius = netTrackRadius( net );
+    const std::int64_t candidateCompensation = traceClearanceCompensation( net );
     MAZE_RIPUP_RESOLVER resolver;
     MAZE_RIPUP_RESOLVER::CONTEXT context;
     context.startRipupCosts = std::max( 0, m_settings.startRipupCost );
@@ -678,9 +708,12 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     continue;
                 const std::int64_t otherRadius = style.trackWidth > 0
                         ? style.trackWidth / 2 : netTrackRadius( connection.netCode );
-                expansion = radius + otherRadius
-                            + edgePairClearance( net, connection.netCode, aLayer, 0,
-                                                 style.clearance );
+                const std::int64_t pairClearance = edgePairClearance(
+                        net, connection.netCode, aLayer, 0, style.clearance );
+                expansion = aSourceTraceRooms
+                        ? otherRadius + std::max<std::int64_t>(
+                                0, pairClearance - candidateCompensation )
+                        : radius + otherRadius + pairClearance;
             }
             else
             {
@@ -690,11 +723,14 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                         ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
                 const std::int64_t otherDrillRadius = style.viaDrill > 0
                         ? style.viaDrill / 2 : netViaDrillRadius( connection.netCode );
-                expansion = radius + std::max(
-                        otherViaRadius
-                                + edgePairClearance( net, connection.netCode, aLayer, 0,
-                                                     style.clearance ),
-                        otherDrillRadius + m_board.holeClearance );
+                const std::int64_t pairClearance = edgePairClearance(
+                        net, connection.netCode, aLayer, 0, style.clearance );
+                expansion = aSourceTraceRooms
+                        ? otherViaRadius + std::max<std::int64_t>(
+                                0, pairClearance - candidateCompensation )
+                        : radius + std::max(
+                                otherViaRadius + pairClearance,
+                                otherDrillRadius + m_board.holeClearance );
             }
 
             const INT_OCTAGON octagon = octagonalEnvelope(
@@ -767,15 +803,25 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         const auto targets = terminals( aTargets );
         if( starts.empty() || targets.empty() )
             continue;
+        const bool anyAngle = hasGeneralConvexRoomGeometry( net, layer.layerId );
+        const bool plane = std::any_of(
+                aTargets.begin(), aTargets.end(),
+                []( const ROUTING_TERMINAL& aTarget )
+                {
+                    return aTarget.pad.isPlaneTarget;
+                } );
+        // The source 45-degree locator consumes ShapeSearchTree rooms which
+        // contain only the obstacle-side clearance share.  General-convex and
+        // plane paths still use their established complete-centre geometry.
+        const bool sourceTraceRooms = !anyAngle && !plane;
         const auto ripupEntries = roomRipupObstacles(
-                net, layer.layerId, false, aRetry, false, aCancel );
-        const auto entries = roomObstacles( net, layer.layerId, false, false, aCancel,
-                                            &ripupEntries );
+                net, layer.layerId, false, aRetry, false, sourceTraceRooms, aCancel );
+        const auto entries = roomObstacles( net, layer.layerId, false, false,
+                                            sourceTraceRooms, aCancel, &ripupEntries );
         // Geometric per-axis costs for the isolated no-via frontier. The
         // existing dialog's direction penalty is mapped here, not substituted
         // into the legacy queue's incompatible grid-normalized heuristic.
         const auto [horizontal, vertical] = layer.TraceCosts( m_settings.traceLengthCost );
-        const bool anyAngle = hasGeneralConvexRoomGeometry( net, layer.layerId );
         auto path = anyAngle
                 ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
                         bounds, entries, layer.layerId, net, starts, targets,
@@ -1122,7 +1168,16 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     // trace rooms are available, so use the source-shaped frontier for both
     // call paths. Drill pages retain their source rectangular partition.
     const bool exactFrontier = true;
-    bool anyAngleFrontier = false;
+    const bool anyAngleFrontier = std::any_of(
+            physical.begin(), physical.end(),
+            [&]( int aLayer )
+            {
+                return hasGeneralConvexRoomGeometry( net, aLayer );
+            } );
+    // Fanout and plane termination still depend on their existing complete-
+    // centre room envelopes.  Ordinary fixed-direction routing is now paired
+    // with the source-width locator and therefore uses source tree semantics.
+    const bool sourceTraceRooms = !anyAngleFrontier && !plane && fanoutTarget == nullptr;
     int nextObstacleId = 1;
     for( int id : physical )
     {
@@ -1135,13 +1190,13 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         layer.active = setting->enabled
                        && ( exactFrontier || !hasGeneralConvexRoomGeometry( net, id ) );
         layer.bounds = bounds;
-        anyAngleFrontier = anyAngleFrontier
-                           || hasGeneralConvexRoomGeometry( net, id );
         if( layer.active )
         {
             layer.ripupObstacles = roomRipupObstacles(
-                    net, id, false, retry, fanoutTarget != nullptr, cancel );
-            layer.obstacles = roomObstacles( net, id, false, false, cancel,
+                    net, id, false, retry, fanoutTarget != nullptr,
+                    sourceTraceRooms, cancel );
+            layer.obstacles = roomObstacles( net, id, false, false,
+                                             sourceTraceRooms, cancel,
                                              &layer.ripupObstacles );
         }
         const auto [horizontalCost, verticalCost] =
@@ -1179,7 +1234,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         if( via.transitionsEnabled && viaLayers.contains( id ) )
         {
             for( auto obstacle : roomObstacles(
-                         net, id, true, true, cancel, nullptr,
+                         net, id, true, true, false, cancel, nullptr,
                          viaRadiusByLayer.at( id ), viaDrillRadiusByLayer.at( id ) ) )
             {
                 obstacle.objectId = nextObstacleId++;

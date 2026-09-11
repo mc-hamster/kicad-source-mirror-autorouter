@@ -238,6 +238,7 @@ public:
 private:
     std::vector<SHAPE_TREE_ENTRY> roomObstacles( int aNet, int aLayer, bool aForVia,
                                                bool aSkipGeneralConvex,
+                                               bool aSourceTraceRooms,
                                                const ROUTER_CANCEL_CALLBACK& aCancel,
                                                const std::vector<ROOM_RIPUP_OBSTACLE>*
                                                        aRipupObstacles = nullptr,
@@ -245,6 +246,7 @@ private:
                                                std::int64_t aCandidateDrillRadius = -1 ) const;
     std::vector<ROOM_RIPUP_OBSTACLE> roomRipupObstacles(
             int aNet, int aLayer, bool aForVia, int aRetry, bool aFanout,
+            bool aSourceTraceRooms,
             const ROUTER_CANCEL_CALLBACK& aCancel ) const;
     /** The rectangular room/frontier cannot faithfully represent an arbitrary
      * convex contour. A layer which contains one stays on the exact visibility
