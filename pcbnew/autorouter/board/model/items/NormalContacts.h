@@ -4,6 +4,7 @@
  */
 #pragma once
 #include "../../../AutorouterTypes.h"
+#include "../../../geometry/planar/Point.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -13,6 +14,19 @@ struct NORMAL_CONTACT_ITEM
     KIND kind = KIND::UNKNOWN;
     std::vector<int> layers;
     ROUTER_POINT first, last;
+    // Polyline endpoints can be RationalPoint values after source-equivalent
+    // support-line splits. Integral host items leave these disengaged.
+    std::optional<PLANAR::POINT> exactFirst, exactLast;
+
+    PLANAR::POINT First() const
+    {
+        return exactFirst ? *exactFirst : PLANAR::POINT( first );
+    }
+
+    PLANAR::POINT Last() const
+    {
+        return exactLast ? *exactLast : PLANAR::POINT( last );
+    }
 
     bool SharesLayer( const NORMAL_CONTACT_ITEM& other ) const
     {
@@ -23,24 +37,32 @@ struct NORMAL_CONTACT_ITEM
     /** Java normalContactPoint deliberately does not test nets, and returns
      * null for areas, no contact, or two distinct common trace endpoints.
      */
-    std::optional<ROUTER_POINT> Point( const NORMAL_CONTACT_ITEM& other ) const
+    std::optional<PLANAR::POINT> ExactPoint( const NORMAL_CONTACT_ITEM& other ) const
     {
         if( !SharesLayer( other ) || kind == KIND::UNKNOWN || other.kind == KIND::UNKNOWN
             || kind == KIND::AREA || other.kind == KIND::AREA )
             return {};
         if( kind == KIND::DRILL )
         {
-            if( first == other.first || ( other.kind == KIND::TRACE && first == other.last ) )
-                return first;
+            if( First() == other.First()
+                || ( other.kind == KIND::TRACE && First() == other.Last() ) )
+                return First();
             return {};
         }
         if( other.kind == KIND::DRILL )
-            return other.Point( *this );
-        const bool atFirst = first == other.first || first == other.last;
-        const bool atLast = last == other.first || last == other.last;
+            return other.ExactPoint( *this );
+        const bool atFirst = First() == other.First() || First() == other.Last();
+        const bool atLast = Last() == other.First() || Last() == other.Last();
         if( atFirst == atLast )
             return {};
-        return atFirst ? first : last;
+        return atFirst ? First() : Last();
+    }
+
+    /** Integral KiCad adapter. A rational contact is deliberately not rounded. */
+    std::optional<ROUTER_POINT> Point( const NORMAL_CONTACT_ITEM& other ) const
+    {
+        const auto exact = ExactPoint( other );
+        return exact ? exact->Integral() : std::nullopt;
     }
 
     /** Caller enforces distinct IDs and a common net. Contains takes a layer
@@ -55,15 +77,17 @@ struct NORMAL_CONTACT_ITEM
         {
             if( other.kind == KIND::AREA )
                 return false;
-            return contains( other.first )
-                   || ( other.kind == KIND::TRACE && contains( other.last ) );
+            const auto otherFirst = other.First().Integral();
+            const auto otherLast = other.Last().Integral();
+            return ( otherFirst && contains( *otherFirst ) )
+                   || ( other.kind == KIND::TRACE && otherLast && contains( *otherLast ) );
         }
         if( other.kind == KIND::AREA )
             return other.Touches( *this, contains );
         if( kind == KIND::TRACE && other.kind == KIND::TRACE )
-            return first == other.first || first == other.last
-                   || last == other.first || last == other.last;
-        return Point( other ).has_value();
+            return First() == other.First() || First() == other.Last()
+                   || Last() == other.First() || Last() == other.Last();
+        return ExactPoint( other ).has_value();
     }
 };
 } // namespace KICAD_AUTOROUTER

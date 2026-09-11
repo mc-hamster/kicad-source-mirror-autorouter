@@ -3608,6 +3608,95 @@ BOOST_AUTO_TEST_CASE( ExactJunctionGeometryNeverRoundsOrOverflows )
     BOOST_CHECK( !OnSegment( { INT_MIN, INT_MIN }, { INT_MAX, INT_MAX }, { 0, 1 } ) );
 }
 
+BOOST_AUTO_TEST_CASE( RationalJunctionsRemainExactThroughContactsAndPolylines )
+{
+    using namespace CONTACT_GEOMETRY;
+    const auto crossing = ExactIntersection( { 0, 0 }, { 3, 3 },
+                                             { 0, 3 }, { 3, 0 } );
+    BOOST_REQUIRE( crossing );
+    BOOST_CHECK( !crossing->Integral() );
+    BOOST_CHECK( crossing->x == PLANAR::INTEGER( 3 ) );
+    BOOST_CHECK( crossing->y == PLANAR::INTEGER( 3 ) );
+    BOOST_CHECK( crossing->z == PLANAR::INTEGER( 2 ) );
+    BOOST_CHECK( ExactOnSegment( { 0, 0 }, { 3, 3 }, *crossing ) );
+    BOOST_CHECK( !ExactOnSegment( { 0, 0 }, { 1, 1 }, *crossing ) );
+
+    const PLANAR::POLYLINE diagonal =
+            PLANAR::POLYLINE::FromPoints( { { 0, 0 }, { 3, 3 } } );
+    BOOST_REQUIRE( !diagonal.Empty() );
+    BOOST_CHECK( diagonal.Contains( *crossing ) );
+
+    NORMAL_CONTACT_ITEM trace;
+    trace.kind = NORMAL_CONTACT_ITEM::KIND::TRACE;
+    trace.layers = { 0 };
+    trace.first = { 1, 1 };
+    trace.last = { 3, 3 };
+    trace.exactFirst = crossing;
+    NORMAL_CONTACT_ITEM drill;
+    drill.kind = NORMAL_CONTACT_ITEM::KIND::DRILL;
+    drill.layers = { 0 };
+    drill.first = { 1, 1 };
+    drill.last = drill.first;
+    drill.exactFirst = crossing;
+    drill.exactLast = crossing;
+    const auto contact = trace.ExactPoint( drill );
+    BOOST_REQUIRE( contact );
+    BOOST_CHECK( *contact == *crossing );
+    BOOST_CHECK( !trace.Point( drill ) );
+}
+
+BOOST_AUTO_TEST_CASE( RoutingBoardPreservesRationalCrossingWithoutHostRounding )
+{
+    auto board = makeBoard();
+    ROUTING_BOARD copper( board, makeSettings() );
+
+    ROUTING_CONNECTION rising;
+    rising.netCode = 1;
+    rising.complete = true;
+    rising.nodes = { { { 1000000, 1000000 }, 0 },
+                     { { 4000001, 4000001 }, 0 } };
+    ROUTING_CONNECTION falling = rising;
+    falling.nodes = { { { 1000000, 4000001 }, 0 },
+                      { { 4000001, 1000000 }, 0 } };
+
+    copper.AddRoute( rising );
+    const auto risingItems = copper.RouteItems( rising );
+    BOOST_REQUIRE_EQUAL( risingItems.size(), 1U );
+    {
+        ROUTING_BOARD::TRANSACTION transaction( copper );
+        copper.AddRoute( falling );
+        const auto fallingItems = copper.RouteItems( falling );
+        BOOST_REQUIRE_EQUAL( fallingItems.size(), 1U );
+        BOOST_CHECK( copper.GetNormalContacts( risingItems.front() )
+                     == ROUTING_BOARD::ITEM_ID_SET{ fallingItems.front() } );
+        const auto exact = copper.ExactNormalContactPoint(
+                risingItems.front(), fallingItems.front() );
+        BOOST_REQUIRE( exact );
+        BOOST_CHECK( !exact->Integral() );
+        BOOST_CHECK( exact->x == PLANAR::INTEGER( 5000001 ) );
+        BOOST_CHECK( exact->y == PLANAR::INTEGER( 5000001 ) );
+        BOOST_CHECK( exact->z == PLANAR::INTEGER( 2 ) );
+        BOOST_CHECK( !copper.NormalContactPoint(
+                risingItems.front(), fallingItems.front() ) );
+        BOOST_CHECK( copper.NormalConnectedSet( risingItems.front() )
+                     .contains( fallingItems.front() ) );
+        // The host cannot split at a half-IU corner. Treat the exact interior
+        // contact as a fork rather than walking across either unsplit item.
+        BOOST_CHECK( copper.GetConnectionItems( risingItems.front() )
+                     == ROUTING_BOARD::ITEM_ID_SET{ risingItems.front() } );
+    }
+
+    BOOST_CHECK( copper.RouteItems( falling ).empty() );
+    BOOST_CHECK( copper.GetNormalContacts( risingItems.front() ).empty() );
+    copper.AddRoute( falling );
+    const auto fallingItems = copper.RouteItems( falling );
+    BOOST_REQUIRE_EQUAL( fallingItems.size(), 1U );
+    BOOST_CHECK( copper.ExactNormalContactPoint(
+            risingItems.front(), fallingItems.front() ) );
+    copper.RemoveRoute( falling );
+    BOOST_CHECK( copper.GetNormalContacts( risingItems.front() ).empty() );
+}
+
 BOOST_AUTO_TEST_CASE( NormalContactsSplitGeneratedBranchesAndRollbackIdentity )
 {
     auto board = makeBoard(); auto settings = makeSettings();

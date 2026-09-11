@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "../../AutorouterTypes.h"
+#include "../../geometry/planar/Point.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -101,6 +102,10 @@ public:
      * Kept separate from ConnectedSet(), which answers host physical connectivity.
      */
     ITEM_ID_SET GetNormalContacts( ITEM_ID aItem ) const;
+    /** Source Point-valued contact. May be rational after two traces cross. */
+    std::optional<PLANAR::POINT> ExactNormalContactPoint(
+            ITEM_ID aFirst, ITEM_ID aSecond ) const;
+    /** Integral host adapter; returns null rather than rounding rational contacts. */
     std::optional<ROUTER_POINT> NormalContactPoint( ITEM_ID aFirst, ITEM_ID aSecond ) const;
     int FirstCommonLayer( ITEM_ID aFirst, ITEM_ID aSecond ) const;
     ITEM_ID_SET NormalContactsAt( ITEM_ID aTrace, ROUTER_POINT aPoint ) const;

@@ -1,5 +1,5 @@
-/* KiCad, GPL-3.0-or-later. Exact integer contact adapter, NOT a full port of
- * Freerouting's rational Point/Line/Polyline geometry. Never rounds junctions.
+/* KiCad, GPL-3.0-or-later. Exact contact adapter translated from Freerouting's
+ * rational Point/Line/Polyline geometry. Host-facing adapters never round.
  */
 #pragma once
 #include <boost/multiprecision/cpp_int.hpp>
@@ -21,6 +21,25 @@ inline bool OnSegment( ROUTER_POINT a, ROUTER_POINT b, ROUTER_POINT p )
     return Cross( a, b, p ) == 0 && p.x >= std::min( a.x, b.x )
            && p.x <= std::max( a.x, b.x ) && p.y >= std::min( a.y, b.y )
            && p.y <= std::max( a.y, b.y );
+}
+
+/** Exact LineSegment.contains(Point), including a RationalPoint. */
+inline bool ExactOnSegment( ROUTER_POINT a, ROUTER_POINT b, const PLANAR::POINT& p )
+{
+    if( a == b )
+        return p == PLANAR::POINT( a );
+
+    const PLANAR::LINE support( a, b );
+    if( support.SideOf( p ) != 0 )
+        return false;
+
+    const PLANAR::POINT first( a );
+    const PLANAR::POINT last( b );
+    const bool betweenX = ( p.CompareX( first ) >= 0 && p.CompareX( last ) <= 0 )
+                          || ( p.CompareX( last ) >= 0 && p.CompareX( first ) <= 0 );
+    const bool betweenY = ( p.CompareY( first ) >= 0 && p.CompareY( last ) <= 0 )
+                          || ( p.CompareY( last ) >= 0 && p.CompareY( first ) <= 0 );
+    return betweenX && betweenY;
 }
 /** -1 outside, 0 boundary, 1 inside. No epsilon or floating ray crossings. */
 inline int Locate( const std::vector<ROUTER_POINT>& polygon, ROUTER_POINT p )
@@ -55,15 +74,26 @@ inline bool ContainsArea( const ROUTING_OBSTACLE& area, ROUTER_POINT p )
     return inside && std::none_of( area.polygonHoles.begin(), area.polygonHoles.end(),
                                   [&]( const auto& hole ) { return Locate( hole, p ) > 0; } );
 }
-inline std::optional<ROUTER_POINT> Intersection( ROUTER_POINT a, ROUTER_POINT b,
-                                                ROUTER_POINT c, ROUTER_POINT d )
+/** Exact finite intersection of two closed integer line segments. */
+inline std::optional<PLANAR::POINT> ExactIntersection( ROUTER_POINT a, ROUTER_POINT b,
+                                                       ROUTER_POINT c, ROUTER_POINT d )
 {
     if( a == b || c == d ) return {};
     const auto exact = PLANAR::LINE( a, b ).Intersection( PLANAR::LINE( c, d ) );
+    if( !exact || !ExactOnSegment( a, b, *exact )
+        || !ExactOnSegment( c, d, *exact ) )
+        return {};
+    return exact;
+}
+
+inline std::optional<ROUTER_POINT> Intersection( ROUTER_POINT a, ROUTER_POINT b,
+                                                ROUTER_POINT c, ROUTER_POINT d )
+{
+    const auto exact = ExactIntersection( a, b, c, d );
     if( !exact ) return {};
     const auto p = exact->Integral();
     // Host copper still has integral vertices. The rational intersection is
     // preserved by the planar kernel; never round it into a false junction.
-    return p && OnSegment( a, b, *p ) && OnSegment( c, d, *p ) ? p : std::nullopt;
+    return p;
 }
 } // namespace KICAD_AUTOROUTER::CONTACT_GEOMETRY

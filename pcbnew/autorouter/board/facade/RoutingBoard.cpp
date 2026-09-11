@@ -20,6 +20,7 @@
 #include "../../rules/ViaRule.h"
 #include "../model/items/NormalContacts.h"
 #include "../../geometry/planar/ContactGeometry.h"
+#include "../../geometry/planar/Polyline.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -99,6 +100,9 @@ struct ROUTING_BOARD::IMPL
         std::vector<LAYER_SHAPE> shapes;
         std::set<ITEM_ID> contacts;
         ITEM_ID_SET normalContacts;
+        // Exact non-endpoint contacts retained when the source RationalPoint
+        // cannot be represented as a KiCad integer trace vertex.
+        std::map<ITEM_ID, PLANAR::POINT> exactContactPoints;
         NORMAL_CONTACT_ITEM normal;
         std::optional<ROUTING_OBSTACLE> trace;
         std::vector<ROUTER_POINT> traceCorners;
@@ -210,6 +214,7 @@ struct ROUTING_BOARD::IMPL
         {
             item.contacts.clear();
             item.normalContacts.clear();
+            item.exactContactPoints.clear();
         }
         for( auto& [id, item] : items )
             indexItem( item );
@@ -243,7 +248,10 @@ struct ROUTING_BOARD::IMPL
         for( ITEM_ID contact : it->second.contacts )
             items.at( contact ).contacts.erase( id );
         for( ITEM_ID contact : it->second.normalContacts )
+        {
             items.at( contact ).normalContacts.erase( id );
+            items.at( contact ).exactContactPoints.erase( id );
+        }
         for( const auto& part : it->second.shapes )
             index.at( part.layer )->Remove( &part );
         items.erase( it );
@@ -287,12 +295,15 @@ struct ROUTING_BOARD::IMPL
         return result;
     }
 
-    std::optional<ROUTER_POINT> normalContactPoint( ITEM_ID first, ITEM_ID second ) const
+    std::optional<PLANAR::POINT> normalContactPoint( ITEM_ID first, ITEM_ID second ) const
     {
         const auto left = items.find( first ), right = items.find( second );
         if( left == items.end() || right == items.end() || first == second )
             return {};
-        return left->second.normal.Point( right->second.normal );
+        const auto exact = left->second.exactContactPoints.find( second );
+        if( exact != left->second.exactContactPoints.end() )
+            return exact->second;
+        return left->second.normal.ExactPoint( right->second.normal );
     }
 
     int firstCommonLayer( ITEM_ID first, ITEM_ID second ) const
@@ -403,13 +414,14 @@ struct ROUTING_BOARD::IMPL
             result.insert( id );
         for( ITEM_ID currentId : source->second.normalContacts )
         {
-            std::optional<ROUTER_POINT> previousPoint = normalContactPoint( id, currentId );
+            std::optional<PLANAR::POINT> previousPoint = normalContactPoint( id, currentId );
             if( !previousPoint )
                 continue;
 
             int previousLayer = firstCommonLayer( id, currentId );
             if( source->second.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE
-                && normalContactsAt( id, *previousPoint ).size() != 1 )
+                && ( !previousPoint->Integral()
+                     || normalContactsAt( id, *previousPoint->Integral() ).size() != 1 ) )
             {
                 continue;
             }
@@ -435,7 +447,7 @@ struct ROUTING_BOARD::IMPL
                 result.insert( currentId );
                 visited.insert( currentId );
                 std::optional<ITEM_ID> next;
-                std::optional<ROUTER_POINT> nextPoint;
+                std::optional<PLANAR::POINT> nextPoint;
                 int nextLayer = -1;
                 bool forkFound = false;
 
@@ -452,7 +464,7 @@ struct ROUTING_BOARD::IMPL
                         break;
                     }
 
-                    if( contactLayer != previousLayer || *contactPoint != *previousPoint )
+                    if( contactLayer != previousLayer || !( *contactPoint == *previousPoint ) )
                     {
                         if( next )
                         {
@@ -512,6 +524,7 @@ struct ROUTING_BOARD::IMPL
         item.normal.last = item.traceCorners.back();
         item.contacts.clear();
         item.normalContacts.clear();
+        item.exactContactPoints.clear();
         item.shapes.clear();
         item.terminals.clear();
 
@@ -853,7 +866,14 @@ struct ROUTING_BOARD::IMPL
     void normalizeJunctions( const std::vector<ITEM_ID>& added )
     {
         using namespace CONTACT_GEOMETRY;
+        struct EXACT_JUNCTION
+        {
+            int net = 0;
+            int layer = -1;
+            PLANAR::POINT point;
+        };
         std::map<ITEM_ID, std::vector<ROUTER_POINT>> cuts;
+        std::vector<EXACT_JUNCTION> exactJunctions;
         auto cut = [&]( const ITEM& item, ROUTER_POINT p )
         {
             if( !item.trace || p == item.normal.first || p == item.normal.last )
@@ -900,14 +920,30 @@ struct ROUTING_BOARD::IMPL
                         for( std::size_t otherSegment = 1;
                              otherSegment < other.traceCorners.size(); ++otherSegment )
                         {
-                            if( auto p = Intersection(
+                            if( auto p = ExactIntersection(
                                         item.traceCorners[itemSegment - 1],
                                         item.traceCorners[itemSegment],
                                         other.traceCorners[otherSegment - 1],
                                         other.traceCorners[otherSegment] ) )
                             {
-                                cut( item, *p );
-                                cut( other, *p );
+                                if( const auto integral = p->Integral() )
+                                {
+                                    cut( item, *integral );
+                                    cut( other, *integral );
+                                }
+                                else
+                                {
+                                    for( int layer : item.normal.layers )
+                                    {
+                                        if( std::find( other.normal.layers.begin(),
+                                                       other.normal.layers.end(), layer )
+                                            != other.normal.layers.end() )
+                                        {
+                                            exactJunctions.push_back(
+                                                    { item.net, layer, *p } );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -955,6 +991,46 @@ struct ROUTING_BOARD::IMPL
         for( ITEM_ID id : normalizationOrder )
             if( items.contains( id ) )
                 combine( id );
+
+        // KiCad's board API has integral trace vertices. Preserve a source
+        // RationalPoint crossing as an exact worker-graph contact instead of
+        // rounding it or dropping electrical connectivity. The corresponding
+        // traces remain unsplit host-emission items; connection-chain walks
+        // stop at this virtual interior fork.
+        for( const EXACT_JUNCTION& junction : exactJunctions )
+        {
+            std::vector<ITEM_ID> touching;
+            for( const auto& [id, candidate] : items )
+            {
+                if( candidate.net != junction.net
+                    || candidate.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
+                    || std::find( candidate.normal.layers.begin(),
+                                  candidate.normal.layers.end(), junction.layer )
+                               == candidate.normal.layers.end()
+                    || candidate.traceCorners.size() < 2 )
+                {
+                    continue;
+                }
+
+                const PLANAR::POLYLINE polyline =
+                        PLANAR::POLYLINE::FromPoints( candidate.traceCorners );
+                if( polyline.Contains( junction.point ) )
+                    touching.push_back( id );
+            }
+
+            for( std::size_t left = 0; left < touching.size(); ++left )
+            {
+                for( std::size_t right = left + 1; right < touching.size(); ++right )
+                {
+                    ITEM& first = items.at( touching[left] );
+                    ITEM& second = items.at( touching[right] );
+                    first.normalContacts.insert( second.id );
+                    second.normalContacts.insert( first.id );
+                    first.exactContactPoints.insert_or_assign( second.id, junction.point );
+                    second.exactContactPoints.insert_or_assign( first.id, junction.point );
+                }
+            }
+        }
     }
 
     void updateComponents() const
@@ -1611,6 +1687,14 @@ ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetNormalContacts( ITEM_ID id ) const
 }
 
 std::optional<ROUTER_POINT> ROUTING_BOARD::NormalContactPoint( ITEM_ID first, ITEM_ID second ) const
+{
+    const auto exact = ExactNormalContactPoint( first, second );
+    return exact ? exact->Integral() : std::nullopt;
+}
+
+
+std::optional<PLANAR::POINT> ROUTING_BOARD::ExactNormalContactPoint(
+        ITEM_ID first, ITEM_ID second ) const
 {
     return m_impl->normalContactPoint( first, second );
 }

@@ -454,8 +454,6 @@ double POLYLINE::Distance( double aX, double aY ) const
 
 bool POLYLINE::Contains( const POINT& aPoint ) const
 {
-    if( !aPoint.Integral() )
-        return false;
     for( std::size_t index = 1; index + 1 < lines.size(); ++index )
     {
         if( lines[index].SideOf( aPoint ) != 0 )
