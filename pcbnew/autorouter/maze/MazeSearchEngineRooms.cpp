@@ -400,12 +400,16 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     0, m_board.holeClearance - candidateCompensation );
         }
 
-        const std::int64_t clearance = aObstacle.netCode != 0
-                                                && aObstacle.netCode != net
-                ? std::max( edgePairClearance( net, aObstacle.netCode,
-                                               aLayer, 0, aObstacle.clearance ),
-                            aObstacle.clearance )
-                : std::max( netClearance( net ), aObstacle.clearance );
+        const auto contextual = ContextualObstacleClearance(
+                aObstacle, net, aLayer );
+        const std::int64_t clearance = contextual
+                ? *contextual
+                : aObstacle.netCode != 0 && aObstacle.netCode != net
+                        ? std::max( edgePairClearance( net, aObstacle.netCode,
+                                                      aLayer, 0,
+                                                      aObstacle.clearance ),
+                                    aObstacle.clearance )
+                        : std::max( netClearance( net ), aObstacle.clearance );
         return aObstacle.radius + std::max<std::int64_t>(
                 0, clearance - candidateCompensation );
     };

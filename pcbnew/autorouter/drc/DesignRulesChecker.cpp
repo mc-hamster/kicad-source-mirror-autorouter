@@ -285,8 +285,7 @@ std::int64_t pairClearance( const BOARD_SNAPSHOT& aBoard, int aFirstNetCode,
     if( aFirstNetCode == aSecondNetCode )
         return 0;
 
-    std::int64_t result = std::max( netClearance( aBoard, aFirstNetCode ),
-                                    netClearance( aBoard, aSecondNetCode ) );
+    std::optional<std::int64_t> resolved;
 
     for( const ROUTING_CLEARANCE_RULE& rule : aBoard.clearanceRules )
     {
@@ -296,10 +295,14 @@ std::int64_t pairClearance( const BOARD_SNAPSHOT& aBoard, int aFirstNetCode,
                      && rule.secondNetCode == aFirstNetCode );
 
         if( samePair && ( rule.layer < 0 || aLayer < 0 || rule.layer == aLayer ) )
-            result = std::max( result, std::max<std::int64_t>( 0, rule.clearance ) );
+        {
+            const std::int64_t value = std::max<std::int64_t>( 0, rule.clearance );
+            resolved = resolved ? std::max( *resolved, value ) : value;
+        }
     }
 
-    return result;
+    return resolved.value_or( std::max( netClearance( aBoard, aFirstNetCode ),
+                                        netClearance( aBoard, aSecondNetCode ) ) );
 }
 
 
@@ -308,6 +311,12 @@ std::int64_t obstacleClearance( const BOARD_SNAPSHOT& aBoard, int aNetCode,
                                 std::int64_t aEdgeClearance = 0 )
 {
     const std::int64_t edgeClearance = std::max<std::int64_t>( 0, aEdgeClearance );
+    if( const auto contextual = ContextualObstacleClearance(
+                aObstacle, aNetCode, aLayer ) )
+    {
+        return std::max( *contextual, edgeClearance );
+    }
+
     if( aObstacle.netCode != 0 && aObstacle.netCode != aNetCode )
         return std::max( pairClearance( aBoard, aNetCode, aObstacle.netCode, aLayer ),
                          std::max( aObstacle.clearance, edgeClearance ) );

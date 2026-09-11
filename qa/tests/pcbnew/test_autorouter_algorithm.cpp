@@ -30,6 +30,8 @@
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
 #include <drc/drc_item.h>
+#include <drc/drc_rule.h>
+#include <drc/drc_rule_condition.h>
 #include <zone.h>
 #include <pcb_shape.h>
 #include <autorouter/board/KicadBoardAdapter.h>
@@ -1675,6 +1677,140 @@ BOOST_AUTO_TEST_CASE( PairClearanceIsAppliedOnce )
     result.segments.push_back( { 2, 0, { 1000000, 1150000 }, { 5000000, 1150000 }, 100000 } );
 
     BOOST_CHECK_EQUAL( DESIGN_RULES_CHECKER::CountViolations( board, makeSettings(), result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( CapturedPairClearanceOverridesRatherThanInflatesNetclassDefaults )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.nets.front().clearance = 500000;
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    foreign.clearance = 500000;
+    board.nets.push_back( foreign );
+    board.clearanceRules.push_back( { 1, 2, 0, 100000 } );
+
+    ROUTING_RESULT result;
+    result.segments.push_back(
+            { 1, 0, { 1000000, 1500000 }, { 5000000, 1500000 }, 100000 } );
+    result.segments.push_back(
+            { 2, 0, { 1000000, 1150000 }, { 5000000, 1150000 }, 100000 } );
+
+    // EvalClearanceBatch is authoritative.  A priority custom rule may lower
+    // the 500000 IU netclass fallback to 100000 IU for this exact pair.
+    BOOST_CHECK_EQUAL(
+            DESIGN_RULES_CHECKER::CountViolations( board, makeSettings(), result ), 0 );
+    board.clearanceRules.front().clearance = 300000;
+    BOOST_CHECK_GT(
+            DESIGN_RULES_CHECKER::CountViolations( board, makeSettings(), result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ContextualObstacleClearanceOverridesGenericNetPairByLayer )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.nets.front().clearance = 500000;
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    foreign.clearance = 500000;
+    board.nets.push_back( foreign );
+
+    ROUTING_OBSTACLE obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    obstacle.netCode = 2;
+    obstacle.layers = { 0 };
+    obstacle.start = { 1000000, 1150000 };
+    obstacle.end = { 5000000, 1150000 };
+    obstacle.radius = 50000;
+    obstacle.blocksTracks = true;
+    obstacle.blocksVias = true;
+    obstacle.contextualClearances = {
+        { 1, 1, 700000 }, { 1, 0, 100000 }
+    };
+    board.obstacles.push_back( obstacle );
+
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    const ROUTER_NODE start{ { 1000000, 1500000 }, 0 };
+    const ROUTER_NODE end{ { 5000000, 1500000 }, 0 };
+    BOOST_CHECK( search.CanUseSegment( 1, start, end ) );
+
+    ROUTING_RESULT result;
+    result.segments.push_back(
+            { 1, 0, start.point, end.point, 100000 } );
+    BOOST_CHECK_EQUAL(
+            DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+
+    board.obstacles.front().contextualClearances.back().clearance = 300000;
+    ROUTING_OCCUPANCY blockedOccupancy( settings.gridStepIU );
+    blockedOccupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE blockedSearch( board, settings, blockedOccupancy );
+    BOOST_CHECK( !blockedSearch.CanUseSegment( 1, start, end ) );
+    BOOST_CHECK_GT(
+            DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( KiCadAdapterCapturesActualItemClearanceRuleContext )
+{
+    BOARD board;
+    board.SetCopperLayerCount( 2 );
+    auto* routedNet = new NETINFO_ITEM( &board, "ROUTED", 1 );
+    auto* obstacleNet = new NETINFO_ITEM( &board, "OBSTACLE", 2 );
+    board.Add( routedNet );
+    board.Add( obstacleNet );
+    auto* footprint = new FOOTPRINT( &board );
+    footprint->SetReference( "CTX1" );
+    board.Add( footprint );
+
+    const auto addPad = [&]( VECTOR2I aPosition, NETINFO_ITEM* aNet,
+                             const wxString& aNumber )
+    {
+        auto* pad = new PAD( footprint );
+        pad->SetAttribute( PAD_ATTRIB::SMD );
+        pad->SetLayerSet( LSET( { F_Cu } ) );
+        pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
+        pad->SetSize( PADSTACK::ALL_LAYERS, { 500000, 500000 } );
+        pad->SetPosition( aPosition );
+        pad->SetNumber( aNumber );
+        pad->SetNet( aNet );
+        footprint->Add( pad );
+        return pad;
+    };
+
+    addPad( { 1000000, 1000000 }, routedNet, "1" );
+    addPad( { 5000000, 1000000 }, routedNet, "2" );
+    PAD* contextualPad = addPad( { 3000000, 2000000 }, obstacleNet, "3" );
+    board.BuildConnectivity();
+
+    auto rule = std::make_shared<DRC_RULE>( "Pad-specific clearance" );
+    rule->m_Condition = new DRC_RULE_CONDITION( "B.Type == 'Pad'" );
+    DRC_CONSTRAINT constraint( CLEARANCE_CONSTRAINT );
+    constraint.Value().SetMin( 700000 );
+    rule->AddConstraint( constraint );
+    auto drc = std::make_shared<DRC_ENGINE>( &board, &board.GetDesignSettings() );
+    drc->InitEngine( rule );
+    BOOST_REQUIRE( drc->HasExplicitClearanceRules() );
+    board.GetDesignSettings().m_DRCEngine = drc;
+
+    KICAD_BOARD_ADAPTER adapter( &board );
+    const auto settings = adapter.CreateDefaultSettings();
+    const auto snapshot = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+    const std::string padId = contextualPad->m_Uuid.AsString().ToStdString();
+    const auto obstacle = std::find_if(
+            snapshot->obstacles.begin(), snapshot->obstacles.end(),
+            [&]( const ROUTING_OBSTACLE& aObstacle )
+            {
+                return aObstacle.boardItemId == padId && !aObstacle.isHole;
+            } );
+    BOOST_REQUIRE( obstacle != snapshot->obstacles.end() );
+    const auto captured = ContextualObstacleClearance(
+            *obstacle, routedNet->GetNetCode(), F_Cu );
+    BOOST_REQUIRE( captured );
+    BOOST_CHECK_EQUAL( *captured, 700000 );
 }
 
 

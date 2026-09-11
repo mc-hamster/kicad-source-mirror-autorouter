@@ -153,6 +153,12 @@ std::vector<ROUTER_NODE> EXPANSION_GRAPH::BuildLandmarks(
 
     auto clearanceFor = [&]( const ROUTING_OBSTACLE& aObstacle )
     {
+        if( const auto contextual = ContextualObstacleClearance(
+                    aObstacle, aNetCode, -1 ) )
+        {
+            return *contextual;
+        }
+
         const std::int64_t activeClearance = netClearances.contains( aNetCode )
                                                       ? netClearances[aNetCode]
                                                       : 0;

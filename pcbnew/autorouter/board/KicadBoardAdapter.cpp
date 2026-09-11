@@ -1674,6 +1674,7 @@ void KICAD_BOARD_ADAPTER::addKeepouts( BOARD_SNAPSHOT& aSnapshot ) const
                 ROUTING_OBSTACLE obstacle;
                 obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
                 obstacle.netCode = zone->GetNetCode();
+                obstacle.boardItemId = toStdString( zone->m_Uuid.AsString() );
                 appendLayers( obstacle.layers, zone->GetLayerSet() );
                 appendPolygon( obstacle.polygon, outline.Outline( polygonIndex ) );
                 for( int hole = 0; hole < outline.HoleCount( polygonIndex ); ++hole )
@@ -1707,7 +1708,7 @@ void KICAD_BOARD_ADAPTER::addKeepouts( BOARD_SNAPSHOT& aSnapshot ) const
 void KICAD_BOARD_ADAPTER::addClearanceRules( BOARD_SNAPSHOT& aSnapshot,
                                              const AUTOROUTER_SETTINGS& aSettings ) const
 {
-    if( !m_board || aSnapshot.nets.size() < 2 )
+    if( !m_board )
         return;
 
     DRC_ENGINE* drcEngine = m_board->GetDesignSettings().m_DRCEngine.get();
@@ -1788,6 +1789,65 @@ void KICAD_BOARD_ADAPTER::addClearanceRules( BOARD_SNAPSHOT& aSnapshot,
         const auto codes = std::minmax( aFirst.netCode, aSecond.netCode );
         return CLEARANCE_CACHE_KEY{ codes.first, codes.second, aLayer };
     };
+
+    // A net-pair dummy cannot represent a custom rule which selects the
+    // actual obstacle (for example B.Type == 'Pad', B.Reference, a footprint
+    // property, or an explicit item).  Freerouting carries an item clearance
+    // class into its search tree; resolve the KiCad equivalent against the
+    // live source BOARD_ITEM while it is still available.  This potentially
+    // expensive matrix is only needed when the engine found an explicit
+    // clearance rule.  Cache by source UUID because one pad, arc, custom via,
+    // or keepout may be decomposed into several detached obstacle contours.
+    if( drcEngine->HasExplicitClearanceRules() )
+    {
+        using ITEM_CLEARANCE_KEY = std::tuple<std::string, int, int>;
+        std::map<ITEM_CLEARANCE_KEY, int> itemClearanceCache;
+
+        for( ROUTING_OBSTACLE& obstacle : aSnapshot.obstacles )
+        {
+            if( obstacle.boardItemId.empty() || obstacle.isHole )
+                continue;
+
+            const BOARD_ITEM* sourceItem = FindBoardItem( obstacle.boardItemId );
+            if( !sourceItem )
+                continue;
+
+            std::vector<int> obstacleLayers = obstacle.layers;
+            if( obstacleLayers.empty() )
+                obstacleLayers = layers;
+
+            for( std::size_t netIndex = 0; netIndex < aSnapshot.nets.size(); ++netIndex )
+            {
+                const ROUTING_NET& net = aSnapshot.nets[netIndex];
+                if( !net.routable
+                    || ( obstacle.netCode == net.netCode && !obstacle.isKeepout ) )
+                {
+                    continue;
+                }
+
+                for( int layer : obstacleLayers )
+                {
+                    if( std::find( layers.begin(), layers.end(), layer ) == layers.end() )
+                        continue;
+
+                    const ITEM_CLEARANCE_KEY key{ obstacle.boardItemId, net.netCode, layer };
+                    auto cached = itemClearanceCache.find( key );
+                    if( cached == itemClearanceCache.end() )
+                    {
+                        const PCB_LAYER_ID layerId = static_cast<PCB_LAYER_ID>( layer );
+                        dummyTracks[netIndex]->SetLayer( layerId );
+                        const DRC_CLEARANCE_BATCH batch = drcEngine->EvalClearanceBatch(
+                                dummyTracks[netIndex].get(), sourceItem, layerId );
+                        cached = itemClearanceCache.emplace(
+                                key, std::max( 0, batch.clearance ) ).first;
+                    }
+
+                    obstacle.contextualClearances.push_back(
+                            { net.netCode, layer, cached->second } );
+                }
+            }
+        }
+    }
 
     for( std::size_t first = 0; first < aSnapshot.nets.size(); ++first )
     {

@@ -914,6 +914,12 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
         // the exact collision predicate gets a chance to inspect it.
         maximumObstacleInflation = std::max( maximumObstacleInflation,
                                              obstacle.radius + obstacle.clearance );
+        for( const ROUTING_CONTEXTUAL_CLEARANCE& rule : obstacle.contextualClearances )
+        {
+            maximumObstacleInflation = std::max(
+                    maximumObstacleInflation,
+                    obstacle.radius + std::max<std::int64_t>( 0, rule.clearance ) );
+        }
     }
 
     // This is only an index query margin.  The exact per-obstacle expansion
@@ -1238,8 +1244,7 @@ std::int64_t MAZE_SEARCH_ENGINE::pairClearance( int aFirstNetCode,
     if( const auto cached = m_pairClearances.find( key ); cached != m_pairClearances.end() )
         return cached->second;
 
-    std::int64_t result = std::max( netClearance( aFirstNetCode ),
-                                    netClearance( aSecondNetCode ) );
+    std::optional<std::int64_t> resolved;
 
     for( const ROUTING_CLEARANCE_RULE& rule : m_board.clearanceRules )
     {
@@ -1250,10 +1255,18 @@ std::int64_t MAZE_SEARCH_ENGINE::pairClearance( int aFirstNetCode,
 
         if( samePair && ( rule.layer < 0 || aLayer < 0 || rule.layer == aLayer ) )
         {
-            result = std::max( result, std::max<std::int64_t>( 0, rule.clearance ) );
+            const std::int64_t value = std::max<std::int64_t>( 0, rule.clearance );
+            resolved = resolved ? std::max( *resolved, value ) : value;
         }
     }
 
+    // EvalClearanceBatch is the final KiCad rule resolver, including custom
+    // rule priority.  Its result is authoritative and may intentionally be
+    // lower than a netclass default.  Fall back only for data-only snapshots
+    // which have no captured pair entry.
+    const std::int64_t result = resolved.value_or(
+            std::max( netClearance( aFirstNetCode ),
+                      netClearance( aSecondNetCode ) ) );
     m_pairClearances.emplace( key, result );
     return result;
 }
@@ -1291,15 +1304,18 @@ std::int64_t MAZE_SEARCH_ENGINE::obstacleExpansionRadius(
                                                                 : netTrackRadius( aNetCode );
         const std::int64_t styleClearance = std::max<std::int64_t>( 0,
                                                                      aCandidateEdgeClearance );
-        const std::int64_t clearance = aObstacle.netCode != 0
-                                                && aObstacle.netCode != aNetCode
-                                        ? std::max( edgePairClearance( aNetCode,
-                                                                      aObstacle.netCode, aLayer,
-                                                                      styleClearance ),
-                                                    aObstacle.clearance )
-                                        : std::max( { netClearance( aNetCode ),
-                                                      aObstacle.clearance,
-                                                      styleClearance } );
+        const auto contextual = ContextualObstacleClearance(
+                aObstacle, aNetCode, aLayer );
+        const std::int64_t clearance = contextual
+                ? std::max( *contextual, styleClearance )
+                : aObstacle.netCode != 0 && aObstacle.netCode != aNetCode
+                        ? std::max( edgePairClearance( aNetCode,
+                                                      aObstacle.netCode, aLayer,
+                                                      styleClearance ),
+                                    aObstacle.clearance )
+                        : std::max( { netClearance( aNetCode ),
+                                      aObstacle.clearance,
+                                      styleClearance } );
         return aObstacle.radius + candidateRadius + clearance;
     }
 

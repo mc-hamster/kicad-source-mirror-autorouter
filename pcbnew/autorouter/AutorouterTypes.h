@@ -392,6 +392,28 @@ enum class ROUTER_FIXED_STATE
 };
 
 
+/** Item-context clearance resolved by KiCad before the worker starts.
+ *
+ * Freerouting stores a clearance class on each board item and resolves the
+ * class pair by layer.  KiCad rules can additionally depend on the actual
+ * item, footprint, net, or another host-only property.  The adapter resolves
+ * that complete pair while the live BOARD_ITEM is available and carries the
+ * resulting matrix entry with each detached obstacle.
+ */
+struct ROUTING_CONTEXTUAL_CLEARANCE
+{
+    int          candidateNetCode = 0;
+    int          layer = -1;
+    std::int64_t clearance = 0;
+
+    bool operator==( const ROUTING_CONTEXTUAL_CLEARANCE& aOther ) const
+    {
+        return candidateNetCode == aOther.candidateNetCode && layer == aOther.layer
+               && clearance == aOther.clearance;
+    }
+};
+
+
 struct ROUTING_OBSTACLE
 {
     ROUTER_OBSTACLE_KIND   kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
@@ -456,7 +478,31 @@ struct ROUTING_OBSTACLE
     // SYSTEM_FIXED explicitly.  Keeping this independent from `isMovable`
     // prevents host replacement policy from changing source item topology.
     ROUTER_FIXED_STATE      fixedState = ROUTER_FIXED_STATE::USER_FIXED;
+    // Present only when KiCad has explicit clearance rules.  An entry is the
+    // authoritative live DRC result for this exact source BOARD_ITEM against
+    // new copper of candidateNetCode on layer; it may be lower than either
+    // netclass default because custom rules are priority ordered.
+    std::vector<ROUTING_CONTEXTUAL_CLEARANCE> contextualClearances;
 };
+
+
+inline std::optional<std::int64_t> ContextualObstacleClearance(
+        const ROUTING_OBSTACLE& aObstacle, int aCandidateNetCode, int aLayer )
+{
+    std::optional<std::int64_t> result;
+    for( const ROUTING_CONTEXTUAL_CLEARANCE& rule : aObstacle.contextualClearances )
+    {
+        if( rule.candidateNetCode != aCandidateNetCode
+            || ( rule.layer >= 0 && aLayer >= 0 && rule.layer != aLayer ) )
+        {
+            continue;
+        }
+
+        const std::int64_t clearance = std::max<std::int64_t>( 0, rule.clearance );
+        result = result ? std::max( *result, clearance ) : clearance;
+    }
+    return result;
+}
 
 
 /** One ordered entry in a net's Freerouting-style ViaRule.

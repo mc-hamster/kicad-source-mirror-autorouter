@@ -291,6 +291,14 @@ public:
 
     bool RulesValid() { return m_rulesValid; }
 
+    /** True when the loaded ruleset contains a user-authored clearance rule.
+     *
+     * Callers which normally rely on the fast netclass cache can use this to
+     * decide whether item-pair evaluation is required.  It deliberately does
+     * not expose the engine's private compiled-rule representation.
+     */
+    bool HasExplicitClearanceRules() const { return m_hasExplicitClearanceRules; }
+
     void ReportViolation( const std::shared_ptr<DRC_ITEM>& aItem, const VECTOR2I& aPos,
                           int aMarkerLayer, const std::function<void( PCB_MARKER* )>& aPathGenerator = {} );
 
