@@ -7,6 +7,7 @@
 
 #include "../board/searchtree/ShapeSearchTree90Degree.h"
 #include "../drill/DrillPage.h"
+#include "MazeTraceShover.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -41,6 +42,10 @@ struct ROOM_RIPUP_OBSTACLE
     // separate from group: one source Connection may contain multiple trace
     // and via items with independently paid obstacle rooms.
     std::size_t      connectionIndex = std::numeric_limits<std::size_t>::max();
+    // Present only for a source PolylineTrace-style item.  Drill rooms and
+    // unsupported mutable geometry deliberately retain an empty pointer and
+    // fall through to ordinary paid rip-up.
+    std::shared_ptr<const MAZE_TRACE_ROOM_INFO> traceInfo;
 };
 
 struct ROOM_TERMINAL

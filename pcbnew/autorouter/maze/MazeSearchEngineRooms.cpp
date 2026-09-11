@@ -13,6 +13,7 @@
 #include "MazeTraceShover.h"
 #include "../board/searchtree/ShapeSearchTree45Degree.h"
 #include "../path/Connection.h"
+#include "../path/FoundConnectionInserter.h"
 #include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
@@ -600,6 +601,165 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
             edgeGroups.push_back( nextItemGroup - 1 );
             edgeItemOrdinals.push_back( routeItemCount - 1 );
         }
+
+        // Rebuild the source PolylineTrace item boundary.  KiCad stores a
+        // routed connection as one node chain, while Freerouting creates one
+        // PolylineTrace for each uninterrupted same-layer/same-style run.
+        // Every tree shape of that item must share the same corner sequence
+        // and transactional shove predicate.
+        std::vector<std::shared_ptr<const MAZE_TRACE_ROOM_INFO>> edgeTraceInfo(
+                edgeGroups.size() );
+        for( std::size_t firstEdge = 0; firstEdge < edgeGroups.size(); )
+        {
+            const ROUTER_NODE& first = connection.nodes[firstEdge];
+            const ROUTER_NODE& second = connection.nodes[firstEdge + 1];
+            if( first.layer != second.layer )
+            {
+                ++firstEdge;
+                continue;
+            }
+
+            const ROUTING_EDGE_STYLE style = EdgeStyle( connection, firstEdge );
+            std::size_t lastEdge = firstEdge;
+            while( lastEdge + 1 < edgeGroups.size()
+                   && connection.nodes[lastEdge + 1].layer
+                              == connection.nodes[lastEdge + 2].layer
+                   && EdgeStyle( connection, lastEdge + 1 ) == style )
+            {
+                ++lastEdge;
+            }
+
+            auto info = std::make_shared<MAZE_TRACE_ROOM_INFO>();
+            info->firstShapeIndex = firstEdge;
+            info->halfWidth = style.trackWidth > 0
+                                      ? style.trackWidth / 2
+                                      : netTrackRadius( connection.netCode );
+            info->clearance = style.clearance > 0
+                                      ? style.clearance
+                                      : netClearance( connection.netCode );
+            info->sourceStyleMatches =
+                    info->halfWidth == radius
+                    && info->clearance == netClearance( net );
+            info->corners.reserve( lastEdge - firstEdge + 2 );
+            for( std::size_t node = firstEdge; node <= lastEdge + 1; ++node )
+                info->corners.push_back( connection.nodes[node].point );
+
+            if( info->sourceStyleMatches )
+            {
+                ROUTING_EDGE_STYLE candidateStyle;
+                candidateStyle.trackWidth = 2 * radius;
+                candidateStyle.clearance = netClearance( net );
+                info->maxShoveLength =
+                        [this, net, aLayer, candidateStyle, aCancel](
+                                const FLOAT_LINE& aLine,
+                                bool aShoveToTheLeft ) -> double
+                {
+                    if( aCancel && aCancel() )
+                        return 0;
+
+                    const double fullLength = aLine.a.Distance( aLine.b );
+                    if( fullLength < 0.1 )
+                        return std::numeric_limits<double>::infinity();
+
+                    const auto canShovePrefix = [&]( double aLength )
+                    {
+                        if( aCancel && aCancel() )
+                            return false;
+
+                        const FLOAT_POINT end = aLength + 0.5 >= fullLength
+                                ? aLine.b
+                                : aLine.a.ChangeLength( aLine.b, aLength );
+                        ROUTING_CONNECTION candidate;
+                        candidate.netCode = net;
+                        candidate.nodes = { { aLine.a.Round(), aLayer },
+                                            { end.Round(), aLayer } };
+                        candidate.complete = true;
+                        candidate.edgeStyles = { candidateStyle };
+                        if( candidate.nodes.front() == candidate.nodes.back() )
+                            return false;
+
+                        const std::vector<ROUTING_CONNECTION> conflicts =
+                                FindConflictingConnections( candidate );
+                        if( conflicts.empty() )
+                            return false;
+
+                        // checkTraceSegment(..., onlyNotShovable=true) first
+                        // verifies the straight candidate against immutable
+                        // geometry while ignoring the mutable conflict set.
+                        {
+                            ROUTING_OCCUPANCY::TRANSACTION restore( m_occupancy );
+                            for( const ROUTING_CONNECTION& conflict : conflicts )
+                                m_occupancy.Remove( conflict );
+                            if( !CanInsertSegment(
+                                        net, candidate.nodes.front(),
+                                        candidate.nodes.back(), &candidateStyle ) )
+                            {
+                                return false;
+                            }
+                        }
+
+                        ROUTING_OCCUPANCY::TRANSACTION restore( m_occupancy );
+                        const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
+                                candidate, conflicts, m_occupancy, *this,
+                                aCancel, false );
+                        if( inserted.state
+                            != FOUND_CONNECTION_INSERTER::STATE::INSERTED )
+                        {
+                            return false;
+                        }
+
+                        // TraceShover.check is directional.  The current
+                        // forced-insertion primitive evaluates both contours;
+                        // accept it for this side only when every displaced
+                        // item stays on that requested side of the oriented
+                        // shove line.
+                        const int requestedSide = aShoveToTheLeft ? 1 : -1;
+                        for( const auto& shoved : inserted.shoved )
+                        {
+                            bool reachesRequestedSide = false;
+                            for( const ROUTER_NODE& node : shoved.replacement.nodes )
+                            {
+                                const FLOAT_POINT point{
+                                        static_cast<double>( node.point.x ),
+                                        static_cast<double>( node.point.y ) };
+                                const int side = point.SideOf( aLine.a, aLine.b );
+                                if( side == -requestedSide )
+                                    return false;
+                                reachesRequestedSide = reachesRequestedSide
+                                                       || side == requestedSide;
+                            }
+                            if( !reachesRequestedSide )
+                                return false;
+                        }
+                        return !inserted.shoved.empty();
+                    };
+
+                    if( canShovePrefix( fullLength ) )
+                        return std::numeric_limits<double>::infinity();
+
+                    // Both source checks return the longest usable prefix.
+                    // Preserve that partial-progress contract with a bounded
+                    // integral binary search rather than collapsing every
+                    // blocked endpoint into an all-or-nothing result.
+                    double low = 0;
+                    double high = fullLength;
+                    for( int iteration = 0; iteration < 24 && high - low > 1; ++iteration )
+                    {
+                        const double middle = std::floor( ( low + high ) / 2 );
+                        if( canShovePrefix( middle ) )
+                            low = middle;
+                        else
+                            high = middle;
+                    }
+                    return low;
+                };
+            }
+
+            for( std::size_t edge = firstEdge; edge <= lastEdge; ++edge )
+                edgeTraceInfo[edge] = info;
+            firstEdge = lastEdge + 1;
+        }
+
         const std::vector<ROUTING_BOARD::ITEM_ID> routeItems = m_occupancy.Board()
                 ? m_occupancy.Board()->RouteItems( connection )
                 : std::vector<ROUTING_BOARD::ITEM_ID>{};
@@ -770,7 +930,7 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     topologyConnection ? &*topologyConnection : nullptr );
             if( ripupCost >= 0 )
                 result.push_back( { std::move( entry ), edgeGroups[edge], ripupCost,
-                                    routeIndex } );
+                                    routeIndex, edgeTraceInfo[edge] } );
         }
     }
     return result;

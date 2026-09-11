@@ -54,6 +54,7 @@
 #include <autorouter/geometry/planar/PolylineArea.h>
 #include <autorouter/maze/MazeListElement.h>
 #include <autorouter/maze/MazeRipupResolver.h>
+#include <autorouter/maze/MazeTraceShover.h>
 #include <autorouter/path/FoundConnectionLocator45Degree.h>
 #include <autorouter/path/FoundConnectionLocatorAnyAngle.h>
 #include <autorouter/expansion/ExpansionGraph.h>
@@ -749,6 +750,81 @@ BOOST_AUTO_TEST_CASE( AngleSpecificSmallDoorGatesMatchSourceGeometry )
     BOOST_REQUIRE_EQUAL( obstacleDoor.GetDimension(), 2 );
     BOOST_CHECK( !obstacleDoor.IsSmallFor90DegreeTrace( 1000 ) );
     BOOST_CHECK( !obstacleDoor.IsSmallForAnyAngleTrace( 1000 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( MazeTraceShoverSelectsReachableSameSideDoor )
+{
+    auto info = std::make_shared<MAZE_TRACE_ROOM_INFO>();
+    info->corners = { { 100, 100 }, { 300, 100 } };
+    info->halfWidth = 10;
+    info->clearance = 10;
+    info->sourceStyleMatches = true;
+    info->maxShoveLength = []( const FLOAT_LINE&, bool )
+    { return std::numeric_limits<double>::infinity(); };
+
+    OBSTACLE_EXPANSION_ROOM obstacle(
+            1, 0, PLANAR::INT_OCTAGON::FromBox( { 100, 80, 300, 120 } ),
+            42, 100, 0, info );
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM fromRoom(
+            2, 0, PLANAR::INT_OCTAGON::FromBox( { 100, 120, 180, 220 } ) );
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM toRoom(
+            3, 0, PLANAR::INT_OCTAGON::FromBox( { 220, 120, 300, 220 } ) );
+    EXPANSION_DOOR fromDoor( &obstacle, &fromRoom );
+    EXPANSION_DOOR toDoor( &obstacle, &toRoom );
+    const auto sections = fromDoor.GetSectionSegments( 10 );
+    BOOST_REQUIRE( !sections.empty() );
+
+    bool found = false;
+    for( const std::size_t section : { std::size_t{ 0 }, sections.size() - 1 } )
+    {
+        for( const bool shoveLeft : { false, true } )
+        {
+            std::vector<MAZE_SHOVE_DOOR_SECTION> doors;
+            const bool completed = MAZE_TRACE_SHOVER::CheckShoveTraceLine(
+                    fromDoor, section, sections[section], obstacle,
+                    10, shoveLeft, doors );
+            BOOST_CHECK( completed );
+            found = found || std::any_of(
+                    doors.begin(), doors.end(),
+                    [&]( const MAZE_SHOVE_DOOR_SECTION& aDoor )
+                    { return aDoor.door == &toDoor; } );
+        }
+    }
+    BOOST_CHECK( found );
+}
+
+
+BOOST_AUTO_TEST_CASE( MazeTraceShoverFailsClosedAndRequestsOnlySourceDelay )
+{
+    auto info = std::make_shared<MAZE_TRACE_ROOM_INFO>();
+    info->corners = { { 100, 100 }, { 300, 100 } };
+    info->sourceStyleMatches = false;
+    bool checked = false;
+    info->maxShoveLength = [&]( const FLOAT_LINE&, bool )
+    {
+        checked = true;
+        return std::numeric_limits<double>::infinity();
+    };
+
+    OBSTACLE_EXPANSION_ROOM obstacle(
+            1, 0, PLANAR::INT_OCTAGON::FromBox( { 100, 80, 300, 120 } ),
+            42, 100, 0, info );
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM fromRoom(
+            2, 0, PLANAR::INT_OCTAGON::FromBox( { 100, 120, 180, 220 } ) );
+    EXPANSION_DOOR fromDoor( &obstacle, &fromRoom );
+    const auto sections = fromDoor.GetSectionSegments( 10 );
+    BOOST_REQUIRE( !sections.empty() );
+    std::vector<MAZE_SHOVE_DOOR_SECTION> doors;
+    BOOST_CHECK( MAZE_TRACE_SHOVER::CheckShoveTraceLine(
+            fromDoor, 0, sections.front(), obstacle, 10, false, doors ) );
+    BOOST_CHECK( doors.empty() );
+    BOOST_CHECK( !checked );
+
+    info->sourceStyleMatches = true;
+    info->firstShapeIndex = 1;
+    BOOST_CHECK( !MAZE_TRACE_SHOVER::CheckShoveTraceLine(
+            fromDoor, 0, sections.front(), obstacle, 10, false, doors ) );
 }
 
 

@@ -58,7 +58,8 @@ public:
             auto room = std::make_unique<ROOM>();
             room->shape = std::make_unique<OBSTACLE_EXPANSION_ROOM>(
                     id, layer, shape, obstacle.group,
-                    std::max( obstacle.ripupCost, 1 ), obstacle.shape.shapeIndex );
+                    std::max( obstacle.ripupCost, 1 ), obstacle.shape.shapeIndex,
+                    obstacle.traceInfo );
             room->complete = true;
             ROOM* raw = room.get();
             byId.emplace( id, raw );
