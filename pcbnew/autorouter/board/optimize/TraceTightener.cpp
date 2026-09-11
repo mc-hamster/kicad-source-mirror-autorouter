@@ -13,6 +13,7 @@
 
 #include "ViaOptimizer.h"
 #include "../facade/RoutingBoard.h"
+#include "../model/items/Pin.h"
 #include "../../geometry/planar/IntBox.h"
 #include "../../maze/MazeSearchEngine.h"
 #include "../../maze/MazeTraceShover.h"
@@ -58,6 +59,91 @@ std::int64_t resolvedTrackWidth( const BOARD_SNAPSHOT& aBoard,
     }
 
     return 150000;
+}
+
+
+std::int64_t resolvedPinClearance( const BOARD_SNAPSHOT& aBoard,
+                                   const ROUTING_CONNECTION& aConnection,
+                                   std::size_t aEdge, const ROUTING_PAD& aPin,
+                                   int aLayer )
+{
+    std::int64_t result = std::max<std::int64_t>(
+            0, EdgeStyle( aConnection, aEdge ).clearance );
+    if( const ROUTING_NET* net = findNet( aBoard, aConnection.netCode ) )
+        result = std::max( result, net->clearance );
+    if( const auto* geometry = PIN::LayerGeometry( aPin, aLayer ) )
+        result = std::max( result, geometry->clearance );
+    return result;
+}
+
+
+std::int64_t pinEdgeToTurnDistance( const BOARD_SNAPSHOT& aBoard )
+{
+    std::int64_t result = std::numeric_limits<std::int64_t>::max();
+    for( const ROUTING_PAD& pad : aBoard.pads )
+        if( pad.netCode > 0 && pad.trackWidth > 0 )
+            result = std::min( result, pad.trackWidth / 2 );
+    return result == std::numeric_limits<std::int64_t>::max() ? 0 : result;
+}
+
+
+int pinConnectionViolationCount( const BOARD_SNAPSHOT& aBoard,
+                                 const ROUTING_CONNECTION& aConnection )
+{
+    if( aConnection.nodes.size() < 2 || !HasValidEdgeStyles( aConnection ) )
+        return 0;
+
+    int result = 0;
+    const std::int64_t edgeToTurn = pinEdgeToTurnDistance( aBoard );
+    const auto check = [&]( std::size_t aPadIndex, bool aAtStart )
+    {
+        if( aPadIndex >= aBoard.pads.size() )
+            return;
+        const std::size_t edge = aAtStart ? 0 : aConnection.nodes.size() - 2;
+        const ROUTER_NODE& pinNode = aAtStart ? aConnection.nodes.front()
+                                              : aConnection.nodes.back();
+        const ROUTING_PAD& pin = aBoard.pads[aPadIndex];
+        const std::int64_t width = resolvedTrackWidth( aBoard, aConnection, edge );
+        const std::int64_t clearance = resolvedPinClearance(
+                aBoard, aConnection, edge, pin, pinNode.layer );
+        if( !PIN::CheckConnectionToPin( aConnection, pin, aAtStart, width,
+                                        clearance, edgeToTurn ) )
+        {
+            ++result;
+        }
+    };
+    check( aConnection.fromPadIndex, true );
+    check( aConnection.toPadIndex, false );
+    return result;
+}
+
+
+std::optional<ROUTING_CONNECTION> correctPinConnections(
+        const BOARD_SNAPSHOT& aBoard, const ROUTING_CONNECTION& aConnection )
+{
+    ROUTING_CONNECTION result = aConnection;
+    bool changed = false;
+    const std::int64_t edgeToTurn = pinEdgeToTurnDistance( aBoard );
+    const auto correct = [&]( std::size_t aPadIndex, bool aAtStart )
+    {
+        if( aPadIndex >= aBoard.pads.size() || result.nodes.size() < 2 )
+            return;
+        const std::size_t edge = aAtStart ? 0 : result.nodes.size() - 2;
+        const ROUTER_NODE& pinNode = aAtStart ? result.nodes.front()
+                                              : result.nodes.back();
+        const ROUTING_PAD& pin = aBoard.pads[aPadIndex];
+        const std::int64_t width = resolvedTrackWidth( aBoard, result, edge );
+        const std::int64_t clearance = resolvedPinClearance(
+                aBoard, result, edge, pin, pinNode.layer );
+        changed = PIN::CorrectConnectionToPin(
+                          result, pin, aAtStart, width, clearance, edgeToTurn )
+                  || changed;
+    };
+
+    correct( result.fromPadIndex, true );
+    correct( result.toPadIndex, false );
+    return changed ? std::optional<ROUTING_CONNECTION>( std::move( result ) )
+                   : std::nullopt;
 }
 
 
@@ -378,11 +464,21 @@ bool TRACE_TIGHTENER::OptChangedArea(
                 MAZE_SEARCH_ENGINE search( m_board, m_settings, m_occupancy );
 
                 std::vector<ROUTING_CONNECTION> candidates;
+                const int originalPinViolations =
+                        pinConnectionViolationCount( m_board, original );
                 ROUTING_CONNECTION pulled = original;
                 if( MAZE_TRACE_SHOVER::Shorten( pulled, search )
                     && betterGeometry( pulled, original ) )
                 {
                     candidates.push_back( std::move( pulled ) );
+                }
+
+                if( auto corrected = correctPinConnections( m_board, original );
+                    corrected
+                    && pinConnectionViolationCount( m_board, *corrected )
+                               < originalPinViolations )
+                {
+                    candidates.push_back( std::move( *corrected ) );
                 }
 
                 for( ROUTING_CONNECTION viaCandidate : VIA_OPTIMIZER::Candidates(
@@ -396,16 +492,26 @@ bool TRACE_TIGHTENER::OptChangedArea(
 
                 const auto best = std::min_element(
                         candidates.begin(), candidates.end(),
-                        []( const ROUTING_CONNECTION& aLeft,
-                            const ROUTING_CONNECTION& aRight )
+                        [&]( const ROUTING_CONNECTION& aLeft,
+                             const ROUTING_CONNECTION& aRight )
                         {
+                            const int leftPinViolations =
+                                    pinConnectionViolationCount( m_board, aLeft );
+                            const int rightPinViolations =
+                                    pinConnectionViolationCount( m_board, aRight );
+                            if( leftPinViolations != rightPinViolations )
+                                return leftPinViolations < rightPinViolations;
                             const int leftVias = routeViaCount( aLeft );
                             const int rightVias = routeViaCount( aRight );
                             return leftVias != rightVias ? leftVias < rightVias
                                                         : routeLength( aLeft )
                                                                   < routeLength( aRight );
                         } );
-                if( best == candidates.end() || !insertable( *best, search ) )
+                if( best == candidates.end()
+                    || ( pinConnectionViolationCount( m_board, *best )
+                                 >= originalPinViolations
+                         && !betterGeometry( *best, original ) )
+                    || !insertable( *best, search ) )
                     continue;
 
                 m_occupancy.Add( *best );

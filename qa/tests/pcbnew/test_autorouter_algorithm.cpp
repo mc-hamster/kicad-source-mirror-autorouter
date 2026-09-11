@@ -3305,6 +3305,77 @@ BOOST_AUTO_TEST_CASE( PinTraceExitHelpersMatchSourceDirectionAndNearestCorner )
 }
 
 
+BOOST_AUTO_TEST_CASE( PinTraceExitChecksSourceDirectionAndPreservationLength )
+{
+    ROUTING_PAD pin;
+    pin.position = { 1000, 2000 };
+    pin.layers = { 0 };
+    ROUTING_PAD::LAYER_GEOMETRY geometry;
+    geometry.layer = 0;
+    geometry.traceExitRestrictions = {
+        { { 1, 0 }, 100.0 }, { { -1, 0 }, 100.0 }
+    };
+    pin.layerGeometry.push_back( geometry );
+
+    ROUTING_CONNECTION connection;
+    connection.complete = true;
+    connection.nodes = { { pin.position, 0 }, { { 1124, 2000 }, 0 } };
+    connection.edgeStyles.resize( 1 );
+    connection.edgeStyles.front().trackWidth = 20;
+
+    // 100 border distance + 10 half width + max(15 edge gap, 11 clearance gap).
+    BOOST_CHECK( !PIN::CheckConnectionToPin( connection, pin, true, 20, 10, 15 ) );
+    connection.nodes.back().point.x = 1125;
+    BOOST_CHECK( PIN::CheckConnectionToPin( connection, pin, true, 20, 10, 15 ) );
+    connection.nodes.back().point = { 1000, 2125 };
+    BOOST_CHECK( !PIN::CheckConnectionToPin( connection, pin, true, 20, 10, 15 ) );
+    connection.nodes.back().point = { 1125, 2000 };
+    BOOST_CHECK( !PIN::CheckConnectionToPin( connection, pin, true, 20, 10, -1 ) );
+    connection.nodes.back().point = pin.position;
+    BOOST_CHECK( PIN::CheckConnectionToPin( connection, pin, true, 20, 10, 15 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( PinTraceExitCorrectionEmitsSourceShoveFixedStubsAtBothEnds )
+{
+    ROUTING_PAD pin;
+    pin.position = { 1000, 2000 };
+    pin.layers = { 0 };
+    ROUTING_PAD::LAYER_GEOMETRY geometry;
+    geometry.layer = 0;
+    geometry.traceExitRestrictions = {
+        { { 1, 0 }, 100.0 }, { { -1, 0 }, 100.0 }
+    };
+    pin.layerGeometry.push_back( geometry );
+
+    ROUTING_CONNECTION fromPin;
+    fromPin.complete = true;
+    fromPin.nodes = { { pin.position, 0 }, { { 1300, 2100 }, 0 } };
+    fromPin.edgeStyles.resize( 1 );
+    BOOST_REQUIRE( PIN::CorrectConnectionToPin(
+            fromPin, pin, true, 20, 10, 15 ) );
+    BOOST_REQUIRE_EQUAL( fromPin.nodes.size(), 3U );
+    BOOST_REQUIRE_EQUAL( fromPin.edgeStyles.size(), 2U );
+    BOOST_CHECK( fromPin.nodes[1].point == ( ROUTER_POINT{ 1125, 2000 } ) );
+    BOOST_CHECK( fromPin.edgeStyles.front().fixedState
+                 == ROUTER_FIXED_STATE::SHOVE_FIXED );
+    BOOST_CHECK( PIN::CheckConnectionToPin( fromPin, pin, true, 20, 10, 15 ) );
+
+    ROUTING_CONNECTION toPin;
+    toPin.complete = true;
+    toPin.nodes = { { { 700, 2100 }, 0 }, { pin.position, 0 } };
+    toPin.edgeStyles.resize( 1 );
+    BOOST_REQUIRE( PIN::CorrectConnectionToPin(
+            toPin, pin, false, 20, 10, 15 ) );
+    BOOST_REQUIRE_EQUAL( toPin.nodes.size(), 3U );
+    BOOST_REQUIRE_EQUAL( toPin.edgeStyles.size(), 2U );
+    BOOST_CHECK( toPin.nodes[1].point == ( ROUTER_POINT{ 875, 2000 } ) );
+    BOOST_CHECK( toPin.edgeStyles.back().fixedState
+                 == ROUTER_FIXED_STATE::SHOVE_FIXED );
+    BOOST_CHECK( PIN::CheckConnectionToPin( toPin, pin, false, 20, 10, 15 ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( RectangularPadExitAspectPolicyMatchesPackagePinCount )
 {
     const auto restrictionCount = []( int aPinCount )
@@ -9975,6 +10046,56 @@ BOOST_AUTO_TEST_CASE( TraceTightenerOnlyPullsRoutesInsideTheChangedArea )
     BOOST_REQUIRE_EQUAL( routes.front().nodes.size(), 2U );
     BOOST_CHECK( routes.front().nodes.front() == route.nodes.front() );
     BOOST_CHECK( routes.front().nodes.back() == route.nodes.back() );
+    BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.front() ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( TraceTightenerAcceptsLongerSourceRequiredPinExitCorrection )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = false;
+    board.pads[1].position = { 1000000, 2700000 };
+    ROUTING_PAD::LAYER_GEOMETRY geometry;
+    geometry.layer = 0;
+    geometry.clearance = 25000;
+    geometry.traceExitRestrictions = { { { 1, 0 }, 100000.0 } };
+    board.pads[0].layerGeometry.push_back( geometry );
+
+    ROUTING_CONNECTION route;
+    route.complete = true;
+    route.netCode = 1;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 },
+                    { { 2000000, 2200000 }, 0 },
+                    { board.pads[1].position, 0 } };
+    route.edgeStyles.resize( 2 );
+    for( ROUTING_EDGE_STYLE& style : route.edgeStyles )
+    {
+        style.trackWidth = 100000;
+        style.clearance = 25000;
+    }
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    occupancy.Add( route );
+    std::vector<ROUTING_CONNECTION> routes{ route };
+    TRACE_TIGHTENER tightener( board, settings, occupancy );
+    CHANGED_AREA changed( TRACE_TIGHTENER::LayerCount( board, settings ) );
+    TRACE_TIGHTENER::MarkConnection( changed, route, board, settings );
+
+    BOOST_REQUIRE( tightener.OptChangedArea( changed, routes, 1, {}, 1000 ) );
+    BOOST_REQUIRE_EQUAL( routes.size(), 1U );
+    BOOST_REQUIRE_GE( routes.front().nodes.size(), 3U );
+    BOOST_REQUIRE_EQUAL( routes.front().edgeStyles.size(),
+                         routes.front().nodes.size() - 1 );
+    BOOST_CHECK( routes.front().nodes[1].point
+                 == ( ROUTER_POINT{ 1200000, 1500000 } ) );
+    BOOST_CHECK( routes.front().edgeStyles.front().fixedState
+                 == ROUTER_FIXED_STATE::SHOVE_FIXED );
+    BOOST_CHECK( PIN::CheckConnectionToPin(
+            routes.front(), board.pads[0], true, 100000, 25000, 50000 ) );
     BOOST_CHECK_EQUAL( occupancy.Board()->CountMissing( board.nets.front() ), 0 );
 }
 
