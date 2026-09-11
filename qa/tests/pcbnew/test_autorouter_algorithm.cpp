@@ -3564,6 +3564,7 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesRotatedCopperAndInactiveLayerObstacle
     pad->SetSize( PADSTACK::ALL_LAYERS, { 3000000, 400000 } );
     pad->SetPosition( { 3000000, 3000000 } );
     pad->SetOrientation( EDA_ANGLE( 45, DEGREES_T ) );
+    pad->SetOffset( PADSTACK::ALL_LAYERS, { 400000, 0 } );
     pad->SetNet( net );
     footprint->Add( pad );
     board.BuildConnectivity();
@@ -3587,6 +3588,14 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesRotatedCopperAndInactiveLayerObstacle
     BOOST_CHECK_EQUAL( std::llabs( firstExit.x ), std::llabs( firstExit.y ) );
     BOOST_CHECK_EQUAL( secondExit.x, -firstExit.x );
     BOOST_CHECK_EQUAL( secondExit.y, -firstExit.y );
+    // Shape offset is rotated with the pad.  Pin.getTraceExitRestrictions()
+    // measures each ray from the electrical anchor, not from copper centre.
+    BOOST_CHECK_SMALL(
+            std::abs( padGeometry.traceExitRestrictions[0].minLength - 1900000.0 ),
+            2.0 );
+    BOOST_CHECK_SMALL(
+            std::abs( padGeometry.traceExitRestrictions[1].minLength - 1100000.0 ),
+            2.0 );
     BOARD_SNAPSHOT routingBoard = *snapshot;
     routingBoard.bounds = { 0, 0, 6000000, 6000000 };
     routingBoard.boardOutline.clear();
@@ -3660,11 +3669,20 @@ BOOST_AUTO_TEST_CASE( PinTraceExitChecksSourceDirectionAndPreservationLength )
 
 BOOST_AUTO_TEST_CASE( PinTraceExitCorrectionEmitsSourceShoveFixedStubsAtBothEnds )
 {
+    BOARD_SNAPSHOT board;
+    ROUTING_OBSTACLE copper;
+    copper.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    copper.layers = { 0 };
+    copper.isPad = true;
+    copper.box = { 900, 1900, 1100, 2100 };
+    board.obstacles.push_back( copper );
+
     ROUTING_PAD pin;
     pin.position = { 1000, 2000 };
     pin.layers = { 0 };
     ROUTING_PAD::LAYER_GEOMETRY geometry;
     geometry.layer = 0;
+    geometry.copperShapeIndices = { 0 };
     geometry.traceExitRestrictions = {
         { { 1, 0 }, 100.0 }, { { -1, 0 }, 100.0 }
     };
@@ -3672,29 +3690,112 @@ BOOST_AUTO_TEST_CASE( PinTraceExitCorrectionEmitsSourceShoveFixedStubsAtBothEnds
 
     ROUTING_CONNECTION fromPin;
     fromPin.complete = true;
-    fromPin.nodes = { { pin.position, 0 }, { { 1300, 2100 }, 0 } };
+    fromPin.nodes = { { pin.position, 0 }, { { 1300, 2120 }, 0 } };
     fromPin.edgeStyles.resize( 1 );
     BOOST_REQUIRE( PIN::CorrectConnectionToPin(
-            fromPin, pin, true, 20, 10, 15 ) );
-    BOOST_REQUIRE_EQUAL( fromPin.nodes.size(), 3U );
-    BOOST_REQUIRE_EQUAL( fromPin.edgeStyles.size(), 2U );
+            fromPin, pin, board, true, 20, 10, 15 ) );
+    BOOST_REQUIRE_EQUAL( fromPin.nodes.size(), 4U );
+    BOOST_REQUIRE_EQUAL( fromPin.edgeStyles.size(), 3U );
     BOOST_CHECK( fromPin.nodes[1].point == ( ROUTER_POINT{ 1125, 2000 } ) );
+    BOOST_CHECK( fromPin.nodes[2].point == ( ROUTER_POINT{ 1125, 2050 } ) );
     BOOST_CHECK( fromPin.edgeStyles.front().fixedState
                  == ROUTER_FIXED_STATE::SHOVE_FIXED );
     BOOST_CHECK( PIN::CheckConnectionToPin( fromPin, pin, true, 20, 10, 15 ) );
 
     ROUTING_CONNECTION toPin;
     toPin.complete = true;
-    toPin.nodes = { { { 700, 2100 }, 0 }, { pin.position, 0 } };
+    toPin.nodes = { { { 700, 2120 }, 0 }, { pin.position, 0 } };
     toPin.edgeStyles.resize( 1 );
     BOOST_REQUIRE( PIN::CorrectConnectionToPin(
-            toPin, pin, false, 20, 10, 15 ) );
-    BOOST_REQUIRE_EQUAL( toPin.nodes.size(), 3U );
-    BOOST_REQUIRE_EQUAL( toPin.edgeStyles.size(), 2U );
-    BOOST_CHECK( toPin.nodes[1].point == ( ROUTER_POINT{ 875, 2000 } ) );
+            toPin, pin, board, false, 20, 10, 15 ) );
+    BOOST_REQUIRE_EQUAL( toPin.nodes.size(), 4U );
+    BOOST_REQUIRE_EQUAL( toPin.edgeStyles.size(), 3U );
+    BOOST_CHECK( toPin.nodes[1].point == ( ROUTER_POINT{ 875, 2050 } ) );
+    BOOST_CHECK( toPin.nodes[2].point == ( ROUTER_POINT{ 875, 2000 } ) );
     BOOST_CHECK( toPin.edgeStyles.back().fixedState
                  == ROUTER_FIXED_STATE::SHOVE_FIXED );
     BOOST_CHECK( PIN::CheckConnectionToPin( toPin, pin, false, 20, 10, 15 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( PinTraceExitCorrectionWalksAnOffsetPadBorderAndFailsClosedOnRationals )
+{
+    BOARD_SNAPSHOT board;
+    ROUTING_OBSTACLE copper;
+    copper.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    copper.layers = { 0 };
+    copper.isPad = true;
+    // Copper is offset 50 IU to the right of the electrical pin anchor.
+    copper.box = { 950, 1900, 1150, 2100 };
+    board.obstacles.push_back( copper );
+
+    ROUTING_PAD pin;
+    pin.position = { 1000, 2000 };
+    pin.layers = { 0 };
+    ROUTING_PAD::LAYER_GEOMETRY geometry;
+    geometry.layer = 0;
+    geometry.copperShapeIndices = { 0 };
+    geometry.traceExitRestrictions = {
+        { { 1, 0 }, 150.0 }, { { -1, 0 }, 50.0 }
+    };
+    pin.layerGeometry.push_back( geometry );
+
+    ROUTING_CONNECTION integral;
+    integral.complete = true;
+    integral.nodes = { { pin.position, 0 }, { { 1400, 2160 }, 0 } };
+    integral.edgeStyles.resize( 1 );
+    BOOST_REQUIRE( PIN::CorrectConnectionToPin(
+            integral, pin, board, true, 20, 10, 15 ) );
+    BOOST_REQUIRE_EQUAL( integral.nodes.size(), 4U );
+    BOOST_CHECK( integral.nodes[1].point == ( ROUTER_POINT{ 1175, 2000 } ) );
+    BOOST_CHECK( integral.nodes[2].point == ( ROUTER_POINT{ 1175, 2070 } ) );
+    BOOST_CHECK( integral.nodes[3].point == ( ROUTER_POINT{ 1400, 2160 } ) );
+
+    ROUTING_CONNECTION rational;
+    rational.complete = true;
+    rational.nodes = { { pin.position, 0 }, { { 1400, 2140 }, 0 } };
+    rational.edgeStyles.resize( 1 );
+    const ROUTING_CONNECTION original = rational;
+    BOOST_CHECK( !PIN::CorrectConnectionToPin(
+            rational, pin, board, true, 20, 10, 15 ) );
+    BOOST_CHECK( SameRouteGeometry( rational, original ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( PinTraceExitCorrectionRetainsRotatedConvexSupports )
+{
+    BOARD_SNAPSHOT board;
+    ROUTING_OBSTACLE copper;
+    copper.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    copper.layers = { 0 };
+    copper.isPad = true;
+    copper.polygon = { { 1000, 1900 }, { 1100, 2000 },
+                       { 1000, 2100 }, { 900, 2000 } };
+    board.obstacles.push_back( copper );
+
+    ROUTING_PAD pin;
+    pin.position = { 1000, 2000 };
+    pin.layers = { 0 };
+    ROUTING_PAD::LAYER_GEOMETRY geometry;
+    geometry.layer = 0;
+    geometry.copperShapeIndices = { 0 };
+    geometry.traceExitRestrictions = {
+        { { 1, 1 }, std::sqrt( 5000.0 ) },
+        { { -1, -1 }, std::sqrt( 5000.0 ) }
+    };
+    pin.layerGeometry.push_back( geometry );
+
+    ROUTING_CONNECTION route;
+    route.complete = true;
+    route.nodes = { { pin.position, 0 }, { { 1300, 2000 }, 0 } };
+    route.edgeStyles.resize( 1 );
+    BOOST_REQUIRE( PIN::CorrectConnectionToPin(
+            route, pin, board, true, 20, 10, 14 ) );
+    BOOST_REQUIRE_EQUAL( route.nodes.size(), 4U );
+    BOOST_CHECK( route.nodes[1].point == ( ROUTER_POINT{ 1067, 2067 } ) );
+    BOOST_CHECK( route.nodes[2].point == ( ROUTER_POINT{ 1134, 2000 } ) );
+    BOOST_CHECK( route.nodes[3].point == ( ROUTER_POINT{ 1300, 2000 } ) );
+    BOOST_CHECK( PIN::CheckConnectionToPin( route, pin, true, 20, 10, 14 ) );
 }
 
 
@@ -10378,9 +10479,17 @@ BOOST_AUTO_TEST_CASE( TraceTightenerAcceptsLongerSourceRequiredPinExitCorrection
     AUTOROUTER_SETTINGS settings = makeSettings();
     settings.enableFanout = false;
     board.pads[1].position = { 1000000, 2700000 };
+    ROUTING_OBSTACLE pinCopper;
+    pinCopper.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    pinCopper.netCode = 1;
+    pinCopper.layers = { 0 };
+    pinCopper.box = { 900000, 1400000, 1100000, 1600000 };
+    pinCopper.isPad = true;
+    board.obstacles.push_back( pinCopper );
     ROUTING_PAD::LAYER_GEOMETRY geometry;
     geometry.layer = 0;
     geometry.clearance = 25000;
+    geometry.copperShapeIndices = { board.obstacles.size() - 1 };
     geometry.traceExitRestrictions = { { { 1, 0 }, 100000.0 } };
     board.pads[0].layerGeometry.push_back( geometry );
 

@@ -136,7 +136,8 @@ std::optional<ROUTING_CONNECTION> correctPinConnections(
         const std::int64_t clearance = resolvedPinClearance(
                 aBoard, result, edge, pin, pinNode.layer );
         changed = PIN::CorrectConnectionToPin(
-                          result, pin, aAtStart, width, clearance, edgeToTurn )
+                          result, pin, aBoard, aAtStart, width, clearance,
+                          edgeToTurn )
                   || changed;
     };
 
