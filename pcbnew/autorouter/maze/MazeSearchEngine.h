@@ -176,6 +176,16 @@ public:
      */
     bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
                            const ROUTING_EDGE_STYLE* aStyle = nullptr ) const;
+    /** Source RoutingBoard.checkTraceSegment() adapter.
+     *
+     * Returns the physical length, in KiCad IU, of the longest ordinary-width
+     * prefix that can be inserted before a non-shovable obstacle.  A completely
+     * clear segment returns numeric_limits<double>::max(), matching the source's
+     * Integer.MAX_VALUE sentinel.  The query never changes occupancy.
+     */
+    double CheckTraceSegmentLength( int aNetCode, const ROUTER_NODE& aStart,
+                                    const ROUTER_NODE& aEnd,
+                                    const ROUTING_EDGE_STYLE* aStyle = nullptr ) const;
     /** Select the first legal ViaInfo in the net's ordered ViaRule.
      *
      * The returned style contains the complete manufactured padstack span,
@@ -279,12 +289,14 @@ private:
     bool isPointAllowed( const ROUTER_POINT& aPoint, int aLayer, int aNetCode,
                          bool aForVia, std::int64_t aEndpointRadius = -1,
                          std::int64_t aDrillRadius = -1,
-                         std::int64_t aEdgeClearance = 0 ) const;
+                         std::int64_t aEdgeClearance = 0,
+                         bool aOnlyNotShovableObstacles = false ) const;
     bool isSegmentAllowed( const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd, int aLayer,
                            int aNetCode, bool aForVia, std::int64_t aStartRadius = -1,
                            std::int64_t aEndRadius = -1,
                            std::int64_t aSegmentRadius = -1,
-                           std::int64_t aEdgeClearance = 0 ) const;
+                           std::int64_t aEdgeClearance = 0,
+                           bool aOnlyNotShovableObstacles = false ) const;
     // A frontier node has already passed the point legality check when it is
     // expanded.  Avoid rechecking that same point for every outgoing edge;
     // the destination is still checked with the complete endpoint radius.
@@ -292,7 +304,8 @@ private:
                                          const ROUTER_POINT& aEnd, int aLayer, int aNetCode,
                                          bool aForVia, std::int64_t aEndRadius = -1,
                                          std::int64_t aSegmentRadius = -1,
-                                         std::int64_t aEdgeClearance = 0 ) const;
+                                         std::int64_t aEdgeClearance = 0,
+                                         bool aOnlyNotShovableObstacles = false ) const;
     bool isInsideBoard( const ROUTER_POINT& aPoint, std::int64_t aMargin ) const;
     bool isInsideOutline( const ROUTER_POINT& aPoint ) const;
     bool isInsidePolygon( const ROUTER_POINT& aPoint,

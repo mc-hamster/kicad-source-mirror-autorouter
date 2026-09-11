@@ -18,10 +18,14 @@
  */
 
 #include "FoundConnectionInserter.h"
+#include "FoundConnectionLocator45Degree.h"
+#include "../AutorouterDebug.h"
 #include "../maze/MazeSearchEngine.h"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -31,25 +35,6 @@ namespace KICAD_AUTOROUTER
 
 namespace
 {
-
-ROUTER_POINT pointAlong( const ROUTER_POINT& aFrom, const ROUTER_POINT& aTo,
-                         std::int64_t aNumerator, std::int64_t aDenominator )
-{
-    if( aDenominator <= 0 || aNumerator <= 0 )
-        return aFrom;
-
-    if( aNumerator >= aDenominator )
-        return aTo;
-
-    const long double ratio = static_cast<long double>( aNumerator ) / aDenominator;
-    return { static_cast<std::int64_t>( std::llround(
-                     static_cast<long double>( aFrom.x )
-                     + ( static_cast<long double>( aTo.x ) - aFrom.x ) * ratio ) ),
-             static_cast<std::int64_t>( std::llround(
-                     static_cast<long double>( aFrom.y )
-                     + ( static_cast<long double>( aTo.y ) - aFrom.y ) * ratio ) ) };
-}
-
 
 bool strictlyInsertable( const ROUTING_CONNECTION& aConnection,
                          const MAZE_SEARCH_ENGINE& aEngine )
@@ -134,78 +119,104 @@ std::optional<ROUTING_CONNECTION> tryTerminalNeckdown(
     if( narrowStyles.empty() )
         return {};
 
-    // RoutingBoard.checkTraceSegment() in the source reports the longest
-    // legal full-width prefix.  The worker has no mutable partial insertion,
-    // so find that same prefix by monotonic bisection from the non-pin end,
-    // then preflight the reconstructed connection atomically below.
-    const std::int64_t span = std::max( std::llabs( pin.point.x - far.point.x ),
-                                        std::llabs( pin.point.y - far.point.y ) );
-    if( span <= 0 )
-        return {};
-
     const ROUTING_EDGE_STYLE* normalStyle = aConnection.edgeStyles.empty()
             ? nullptr : &aConnection.edgeStyles[aBlockedEdge - 1];
-    if( !aEngine.CanInsertSegment( aConnection.netCode, far, far, normalStyle ) )
+    double okLength = aEngine.CheckTraceSegmentLength(
+            aConnection.netCode, far, pin, normalStyle );
+    if( okLength == std::numeric_limits<double>::max() )
         return {};
 
-    std::int64_t legal = 0;
-    std::int64_t blocked = span;
+    // tryNeckDown() uses two Freerouting coordinates, not two KiCad internal
+    // units. Keep this second source tolerance after checkTraceSegment's own
+    // one-coordinate projection guard.
+    constexpr double neckdownTolerance =
+            2.0 * FREEROUTING_COORDINATE_UNIT_IU;
+    okLength -= neckdownTolerance;
 
-    while( legal + 1 < blocked )
-    {
-        const std::int64_t probe = legal + ( blocked - legal ) / 2;
-        const ROUTER_NODE candidate{ pointAlong( far.point, pin.point, probe, span ), far.layer };
-
-        if( aEngine.CanInsertSegment( aConnection.netCode, far, candidate, normalStyle ) )
-            legal = probe;
-        else
-            blocked = probe;
-    }
-
-    // Pin.getTraceNeckdownHalfwidth() keeps a two-coordinate tolerance from
-    // the collision boundary before it emits the ordinary-width segment.
-    // The worker coordinate is KiCad IU, so this is intentionally only an
-    // integer rounding guard, not a copied physical clearance.
-    constexpr std::int64_t neckdownTolerance = 2;
-    legal = legal > neckdownTolerance ? legal - neckdownTolerance : 0;
-    const ROUTER_POINT splitPoint = pointAlong( far.point, pin.point, legal, span );
-
-    if( splitPoint == pin.point )
-        return {};
+    const FLOAT_POINT floatFar{ static_cast<double>( far.point.x ),
+                                static_cast<double>( far.point.y ) };
+    const FLOAT_POINT floatPin{ static_cast<double>( pin.point.x ),
+                                static_cast<double>( pin.point.y ) };
 
     for( const ROUTING_EDGE_STYLE& narrowStyle : narrowStyles )
     {
-        ROUTING_CONNECTION result = aConnection;
-        EnsureEdgeStyles( result );
-        const ROUTING_EDGE_STYLE ordinaryStyle = result.edgeStyles[aBlockedEdge - 1];
-
-        if( splitPoint == far.point )
+        std::vector<ROUTER_NODE> orientedNodes{ far };
+        std::vector<ROUTING_EDGE_STYLE> orientedStyles;
+        const auto append = [&]( const ROUTER_POINT& aPoint,
+                                 const ROUTING_EDGE_STYLE& aStyle )
         {
-            result.edgeStyles[aBlockedEdge - 1] = narrowStyle;
-            if( strictlyInsertable( result, aEngine ) )
-                return result;
-            continue;
+            if( orientedNodes.back().point == aPoint )
+                return;
+            orientedNodes.push_back( { aPoint, pin.layer } );
+            orientedStyles.push_back( aStyle );
+        };
+
+        if( okLength > neckdownTolerance )
+        {
+            const FLOAT_POINT floatSplit = floatFar.ChangeLength( floatPin, okLength );
+            const ROUTER_POINT split = floatSplit.Round();
+            const bool horizontalFirst = std::abs( floatFar.x - floatSplit.x )
+                                         >= std::abs( floatFar.y - floatSplit.y );
+            const ROUTER_POINT approachCorner =
+                    FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
+                            floatFar, floatSplit, horizontalFirst, false ).Round();
+            append( approachCorner, oldStyle );
+            append( split, oldStyle );
+
+            const ROUTER_POINT exitCorner =
+                    FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
+                            floatSplit, floatPin, !horizontalFirst, false ).Round();
+            if( exitCorner != pin.point )
+                append( exitCorner, oldStyle );
         }
 
-        result.nodes.insert( result.nodes.begin() + static_cast<std::ptrdiff_t>( aBlockedEdge ),
-                             { splitPoint, pin.layer } );
+        append( pin.point, narrowStyle );
+        if( orientedStyles.empty() )
+            continue;
+
         if( aAtStart )
         {
-            result.edgeStyles[aBlockedEdge - 1] = narrowStyle;
-            result.edgeStyles.insert( result.edgeStyles.begin()
-                                              + static_cast<std::ptrdiff_t>( aBlockedEdge ),
-                                      ordinaryStyle );
+            std::reverse( orientedNodes.begin(), orientedNodes.end() );
+            std::reverse( orientedStyles.begin(), orientedStyles.end() );
         }
-        else
-        {
-            result.edgeStyles[aBlockedEdge - 1] = ordinaryStyle;
-            result.edgeStyles.insert( result.edgeStyles.begin()
-                                              + static_cast<std::ptrdiff_t>( aBlockedEdge ),
-                                      narrowStyle );
-        }
+
+        ROUTING_CONNECTION result = aConnection;
+        EnsureEdgeStyles( result );
+        result.nodes.erase( result.nodes.begin()
+                                    + static_cast<std::ptrdiff_t>( aBlockedEdge - 1 ),
+                            result.nodes.begin()
+                                    + static_cast<std::ptrdiff_t>( aBlockedEdge + 1 ) );
+        result.nodes.insert( result.nodes.begin()
+                                     + static_cast<std::ptrdiff_t>( aBlockedEdge - 1 ),
+                             orientedNodes.begin(), orientedNodes.end() );
+        result.edgeStyles.erase( result.edgeStyles.begin()
+                                         + static_cast<std::ptrdiff_t>( aBlockedEdge - 1 ) );
+        result.edgeStyles.insert( result.edgeStyles.begin()
+                                          + static_cast<std::ptrdiff_t>( aBlockedEdge - 1 ),
+                                  orientedStyles.begin(), orientedStyles.end() );
 
         if( strictlyInsertable( result, aEngine ) )
             return result;
+
+        if( autorouterDebugEnabled() )
+        {
+            std::ostringstream log;
+            log << "NECKDOWN_REJECTED net=" << result.netCode << " at_start=" << aAtStart
+                << " ok_length=" << okLength << " nodes=" << result.nodes.size();
+            for( std::size_t edge = 1; edge < result.nodes.size(); ++edge )
+            {
+                const ROUTING_EDGE_STYLE& style = EdgeStyle( result, edge - 1 );
+                log << " {(" << result.nodes[edge - 1].point.x << ','
+                    << result.nodes[edge - 1].point.y << ",L"
+                    << result.nodes[edge - 1].layer << ")->("
+                    << result.nodes[edge].point.x << ',' << result.nodes[edge].point.y
+                    << ",L" << result.nodes[edge].layer << "),w="
+                    << style.trackWidth << ",c=" << style.clearance << ",ok="
+                    << aEngine.CanInsertSegment( result.netCode, result.nodes[edge - 1],
+                                                 result.nodes[edge], &style ) << '}';
+            }
+            autorouterDebugLog( log.str() );
+        }
     }
 
     return {};

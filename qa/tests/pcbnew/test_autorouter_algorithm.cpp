@@ -98,6 +98,7 @@
 #include <bit>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <random>
@@ -5239,6 +5240,103 @@ BOOST_AUTO_TEST_CASE( ForcedTerminalNeckdownUsesSourceStartPinForLongTerminalEdg
     BOOST_REQUIRE_EQUAL( emitted.segments.size(), 2U );
     BOOST_CHECK_EQUAL( emitted.segments[0].width, 39998 );
     BOOST_CHECK_EQUAL( emitted.segments[1].width, 100000 );
+}
+
+
+BOOST_AUTO_TEST_CASE( TraceSegmentLengthIgnoresShovableCopper )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+
+    ROUTING_CONNECTION crossing;
+    crossing.netCode = 2;
+    crossing.complete = true;
+    crossing.isExistingBoardRoute = true;
+    crossing.isShoveMovable = true;
+    crossing.sourceBoardItemIds = { "movable-crossing" };
+    crossing.nodes = { { { 3000000, 500000 }, 0 }, { { 3000000, 2500000 }, 0 } };
+    crossing.edgeStyles = { { 100000 } };
+    occupancy.AddStatic( crossing );
+
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    const ROUTER_NODE start{ board.pads[0].position, 0 };
+    const ROUTER_NODE end{ board.pads[1].position, 0 };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, start, end ) );
+    BOOST_CHECK_EQUAL( engine.CheckTraceSegmentLength( 1, start, end ),
+                       std::numeric_limits<double>::max() );
+
+    occupancy.Remove( crossing );
+    crossing.edgeStyles.front().fixedState = ROUTER_FIXED_STATE::SHOVE_FIXED;
+    occupancy.AddStatic( crossing );
+    BOOST_CHECK_LT( engine.CheckTraceSegmentLength( 1, start, end ), 2000000.0 );
+
+    occupancy.Remove( crossing );
+    crossing.edgeStyles.front().fixedState = ROUTER_FIXED_STATE::UNFIXED;
+    crossing.isShoveMovable = false;
+    occupancy.AddStatic( crossing );
+    const double fixedLength = engine.CheckTraceSegmentLength( 1, start, end );
+    BOOST_CHECK_GT( fixedLength, 0.0 );
+    BOOST_CHECK_LT( fixedLength, 2000000.0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ForcedObliqueNeckdownReconstructsSourceFortyFiveDegreeCorners )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    board.bounds = { 0, 0, 6000000, 4000000 };
+    board.minimumTrackWidth = 0;
+    board.pads[0].position = { 1000000, 1000000 };
+    board.pads[1].position = { 5000000, 3000000 };
+    board.pads[1].layerGeometry.push_back( { 0, 40000, 100000, 0 } );
+
+    ROUTING_OBSTACLE nearPin;
+    nearPin.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    nearPin.netCode = 2;
+    nearPin.layers = { 0 };
+    // This box is 49,900 IU below the oblique centreline at x=4,600,000.
+    // The ordinary 100,000-IU trace intersects it, while the 39,998-IU pin
+    // segment and source 45-degree reconstruction remain legal.
+    nearPin.box = { 4600000, 2400000, 4750000, 2750100 };
+    board.obstacles.push_back( nearPin );
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.fromPadIndex = 0;
+    route.toPadIndex = 1;
+    route.nodes = { { board.pads[0].position, 0 }, { board.pads[1].position, 0 } };
+    BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
+
+    const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
+    BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
+    BOOST_REQUIRE( inserted.connection );
+    BOOST_REQUIRE_GE( inserted.connection->nodes.size(), 5U );
+    BOOST_REQUIRE_EQUAL( inserted.connection->edgeStyles.size() + 1,
+                         inserted.connection->nodes.size() );
+    BOOST_CHECK( inserted.connection->nodes.front() == route.nodes.front() );
+    BOOST_CHECK( inserted.connection->nodes.back() == route.nodes.back() );
+
+    for( std::size_t edge = 1; edge < inserted.connection->nodes.size(); ++edge )
+    {
+        const ROUTER_NODE& from = inserted.connection->nodes[edge - 1];
+        const ROUTER_NODE& to = inserted.connection->nodes[edge];
+        const std::int64_t dx = std::llabs( to.point.x - from.point.x );
+        const std::int64_t dy = std::llabs( to.point.y - from.point.y );
+        // Source FloatPoint.round() can leave a one-IU residual on a nominal
+        // 45-degree leg; the additional corner bounds it to that rounding unit.
+        BOOST_CHECK( dx == 0 || dy == 0 || std::llabs( dx - dy ) <= 1 );
+        BOOST_CHECK( engine.CanInsertSegment( route.netCode, from, to,
+                                              &inserted.connection->edgeStyles[edge - 1] ) );
+        if( edge + 1 < inserted.connection->nodes.size() )
+            BOOST_CHECK_EQUAL( inserted.connection->edgeStyles[edge - 1].trackWidth, 0 );
+    }
+    BOOST_CHECK_EQUAL( inserted.connection->edgeStyles.back().trackWidth, 39998 );
 }
 
 

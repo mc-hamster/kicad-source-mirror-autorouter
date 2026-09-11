@@ -57,7 +57,7 @@ same change.
 | `autoroute/pipeline/OptimizeRouteTask.java` | `pcbnew/autorouter/pipeline/OptimizeRouteTask.h` | Data-only optimization candidate task; never deep-copies a live KiCad `BOARD`. |
 | `autoroute/pipeline/RoutingPipeline.java` | `pcbnew/autorouter/pipeline/RoutingPipeline.h/.cpp` | Stable orchestration seam for future fanout and diagnostics. |
 | `autoroute/path/Connection.java` | `pcbnew/autorouter/path/Connection.h/.cpp` plus `ROUTING_CONNECTION` | Direct reverse-ID normal-contact chain/fork traversal over mutable source-shaped polyline/via items, including terminal layers, item set, trace length and detour. Exact rational contact identity is retained without host rounding; non-integral virtual-piece traversal, curved contacts and source connection caching remain open. |
-| `autoroute/path/FoundConnectionInserter.java` | `pcbnew/autorouter/path/FoundConnectionInserter.h/.cpp` | Active checked insertion. Same-layer/style items use the reference corner advance/extend/one-corner-rewind loop; terminal neckdown, fixed spring-over, bounded recursive trace/via shove and whole-operation rollback are active. Exact sampled partial-segment progress, per-span mutable item combination/normalization, arbitrary contact graphs and general geometry remain incomplete. Host materialization remains in the KiCad adapter/session. |
+| `autoroute/path/FoundConnectionInserter.java` | `pcbnew/autorouter/path/FoundConnectionInserter.h/.cpp` | Active checked insertion. Same-layer/style items use the reference corner advance/extend/one-corner-rewind loop. Terminal neckdown now uses a source-coordinate Euclidean usable-prefix query, ignores only routable non-shove-fixed copper, applies both source safety tolerances, and reconstructs the normal/narrow transition with `calculateAdditionalCorner` before atomic preflight. Fixed spring-over, bounded recursive trace/via shove and whole-operation rollback are active. Per-span mutable item publication/combination, arbitrary contact graphs and general shove geometry remain incomplete. Host materialization remains in the KiCad adapter/session. |
 | `autoroute/path/FoundConnectionLocator.java` | `pcbnew/autorouter/path/FoundConnectionLocator.h/.cpp` | Host entry seam; the active path is reconstructed from retained door-section parent state by the angle-specific locators. |
 | `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h/.cpp` | Active octagonal ordinary/fanout single- and multilayer corridor locator. Full source shrink/acute/thin-room and pin-exit behavior remain incomplete. |
 | `autoroute/path/FoundConnectionLocatorAnyAngle.java` | `pcbnew/autorouter/path/FoundConnectionLocatorAnyAngle.h/.cpp` | Active exact-simplex locator with source left/right visibility-range closure and integral KiCad materialization. Finite target regions and normalized decision-stream proof remain open. |
@@ -187,7 +187,8 @@ See [the implementation and remaining-gap report](CORE-CONTACT-INSERTION-PARITY.
 for the same `a11c0a42` source pin. Added QA-only normal-contact and fanout-order
 oracles; no Java or network router was introduced into production. Normal
 contacts, integer splitting, checked atomic insertion and ordering are partial
-core capabilities, not completed forced shove, neckdown or full batch parity.
+core capabilities. Source-shaped pin neckdown and bounded forced shove are active;
+general mutable item/contact shove and full batch parity remain incomplete.
 
 ### Exact geometry / fixed-obstacle contour insertion
 

@@ -1436,7 +1436,8 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                                          bool aForVia,
                                          std::int64_t aEndpointRadius,
                                          std::int64_t aDrillRadius,
-                                         std::int64_t aEdgeClearance ) const
+                                         std::int64_t aEdgeClearance,
+                                         bool aOnlyNotShovableObstacles ) const
 {
     if( autorouterDebugEnabled() )
         ++m_debugPointChecks;
@@ -1490,6 +1491,11 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
     for( std::size_t obstacleIndex : candidateObstacles )
     {
         const ROUTING_OBSTACLE& obstacle = m_board.obstacles[obstacleIndex];
+        if( aOnlyNotShovableObstacles && obstacle.isExistingRoute
+            && obstacle.fixedState < ROUTER_FIXED_STATE::SHOVE_FIXED )
+        {
+            continue;
+        }
         const bool sameNetPadHole =
                 obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
                 && endpointRadius( aNetCode, obstacle.start ) >= 0;
@@ -1685,27 +1691,29 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowed( const ROUTER_POINT& aStart, const ROU
                                             std::int64_t aStartRadius,
                                             std::int64_t aEndRadius,
                                             std::int64_t aSegmentRadius,
-                                            std::int64_t aEdgeClearance ) const
+                                            std::int64_t aEdgeClearance,
+                                            bool aOnlyNotShovableObstacles ) const
 {
     if( !isPointAllowed( aStart, aLayer, aNetCode, aForVia, aStartRadius, -1,
-                         aEdgeClearance ) )
+                         aEdgeClearance, aOnlyNotShovableObstacles ) )
         return false;
 
     return isSegmentAllowedFromKnownStart( aStart, aEnd, aLayer, aNetCode, aForVia,
-                                           aEndRadius, aSegmentRadius, aEdgeClearance );
+                                           aEndRadius, aSegmentRadius, aEdgeClearance,
+                                           aOnlyNotShovableObstacles );
 }
 
 
 bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
         const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd, int aLayer, int aNetCode,
         bool aForVia, std::int64_t aEndRadius, std::int64_t aSegmentRadius,
-        std::int64_t aEdgeClearance ) const
+        std::int64_t aEdgeClearance, bool aOnlyNotShovableObstacles ) const
 {
     if( autorouterDebugEnabled() )
         ++m_debugSegmentChecks;
 
     if( !isPointAllowed( aEnd, aLayer, aNetCode, aForVia, aEndRadius, -1,
-                         aEdgeClearance ) )
+                         aEdgeClearance, aOnlyNotShovableObstacles ) )
         return false;
 
     const std::int64_t defaultRadius = aForVia ? netViaRadius( aNetCode )
@@ -1753,6 +1761,11 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
     for( std::size_t obstacleIndex : candidateObstacles )
     {
         const ROUTING_OBSTACLE& obstacle = m_board.obstacles[obstacleIndex];
+        if( aOnlyNotShovableObstacles && obstacle.isExistingRoute
+            && obstacle.fixedState < ROUTER_FIXED_STATE::SHOVE_FIXED )
+        {
+            continue;
+        }
         // A same-net through-hole pad is an electrical connection surface, so
         // a trace may pass through its centre.  A same-net drill that is not
         // represented by a pad remains a manufacturing obstacle.
@@ -1861,6 +1874,11 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
                 const ROUTER_NODE& current = connection.nodes[i];
                 const bool otherIsVia = previous.layer != current.layer;
                 const ROUTING_EDGE_STYLE& otherStyle = EdgeStyle( connection, i - 1 );
+                if( aOnlyNotShovableObstacles && connection.isShoveMovable
+                    && otherStyle.fixedState < ROUTER_FIXED_STATE::SHOVE_FIXED )
+                {
+                    continue;
+                }
                 const std::int64_t        otherCopperRadius =
                         otherIsVia ? std::max<std::int64_t>(
                                              1, ViaStyleDiameterOnLayer( otherStyle, aLayer,
@@ -1977,6 +1995,68 @@ bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
     const auto clearance = style ? std::max<std::int64_t>( 0, style->clearance ) : 0;
     return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius,
                              radius, clearance );
+}
+
+
+double MAZE_SEARCH_ENGINE::CheckTraceSegmentLength(
+        int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
+        const ROUTING_EDGE_STYLE* aStyle ) const
+{
+    if( aStart.layer != aEnd.layer )
+        return 0.0;
+
+    const FLOAT_POINT from{ static_cast<double>( aStart.point.x ),
+                            static_cast<double>( aStart.point.y ) };
+    const FLOAT_POINT to{ static_cast<double>( aEnd.point.x ),
+                          static_cast<double>( aEnd.point.y ) };
+    const double fullLength = from.Distance( to );
+    if( fullLength <= 0.0 )
+        return 0.0;
+
+    struct RESTORE
+    {
+        bool& flag;
+        bool value;
+        ~RESTORE() { flag = value; }
+    } restore{ m_allowRipupOccupancy, m_allowRipupOccupancy };
+    m_allowRipupOccupancy = false;
+
+    const std::int64_t radius = aStyle && aStyle->trackWidth > 0
+            ? aStyle->trackWidth / 2 : netTrackRadius( aNetCode );
+    const std::int64_t clearance = aStyle
+            ? std::max<std::int64_t>( 0, aStyle->clearance ) : 0;
+    const auto allowed = [&]( const ROUTER_POINT& aPoint )
+    {
+        return isSegmentAllowed( aStart.point, aPoint, aStart.layer, aNetCode,
+                                 false, radius, radius, radius, clearance, true );
+    };
+
+    if( !allowed( aStart.point ) )
+        return 0.0;
+
+    if( allowed( aEnd.point ) )
+        return std::numeric_limits<double>::max();
+
+    // The source computes a continuous projection onto the candidate line.
+    // Worker geometry is integral, so bisect physical (Euclidean) distance and
+    // apply source FloatPoint.round() at every predicate probe. The remaining
+    // sub-IU interval is negligible beside the two-coordinate insertion guard.
+    double legal = 0.0;
+    double blocked = fullLength;
+    for( int iteration = 0; iteration < 64 && blocked - legal > 0.125; ++iteration )
+    {
+        const double probe = legal + ( blocked - legal ) / 2.0;
+        const ROUTER_POINT candidate = from.ChangeLength( to, probe ).Round();
+        if( allowed( candidate ) )
+            legal = probe;
+        else
+            blocked = probe;
+    }
+
+    // RoutingBoardSearchFacade.checkTraceSegment subtracts one source
+    // coordinate beyond the half-width/clearance projection. The predicate's
+    // expanded obstacle already accounts for the half-width and clearance.
+    return std::max( 0.0, legal - FREEROUTING_COORDINATE_UNIT_IU );
 }
 
 
