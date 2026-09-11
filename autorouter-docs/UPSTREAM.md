@@ -26,7 +26,7 @@ the corresponding Freerouting class names.
 | Reference commit | `a11c0a42d1b3827e5126429c5c9820c4ab5bec7c` |
 | Reference checkout | `/Users/jmcasler/Documents/GitHub/mchamster/freerouting` (read-only) |
 | KiCad source baseline | `b22bb49234` |
-| Current native measurement base | `47392bdb76b56ce62a7a05e524d763496bea5f18` plus the archived working-tree patch |
+| Current native measurement base | `023fdd342cbc8c20c4837428f01b95e1ffa4b930` |
 | Native port root | `pcbnew/autorouter/` |
 
 The reference commit is deliberately recorded as a commit rather than a release tag.  Any
@@ -62,6 +62,7 @@ same change.
 | `autoroute/path/FoundConnectionLocator45Degree.java` | `pcbnew/autorouter/path/FoundConnectionLocator45Degree.h/.cpp` | Active octagonal ordinary/fanout single- and multilayer corridor locator. Full source shrink/acute/thin-room and pin-exit behavior remain incomplete. |
 | `autoroute/path/FoundConnectionLocatorAnyAngle.java` | `pcbnew/autorouter/path/FoundConnectionLocatorAnyAngle.h/.cpp` | Active exact-simplex locator with source left/right visibility-range closure and integral KiCad materialization. Finite target regions and normalized decision-stream proof remain open. |
 | `autoroute/expansion/*.java` | `pcbnew/autorouter/expansion/*.h/.cpp` | Active ordinary and fanout single- and multilayer frontiers use exact octagonal and rational-simplex free-room completion, neighbour ordering, edge removal, free/obstacle gaps, doors, sections, target attachment and exact free-drill decomposition. The 45-degree lifecycle reflects KiCad y-down input plus the complete original entry set into the source y-up side cycle, reflects edge flags/gaps back, and clips nominally unbounded removed supports to the actual board instead of applying the unscaled source `Limits.CRIT_INT` sentinel to finer KiCad IU. Concave polygons and holes are split into solid convex leaves. Those primitives are checked by pinned source oracles. Several finite-width/acute-corner locator semantics remain partial. `ExpansionGraph` is retained only for historical QA and is not referenced by production search. |
+| `board/model/structure/BoardOutline.java` | `pcbnew/autorouter/board/model/structure/BoardOutline.h` | Active source-shaped routing-tree obstacle. Exact outer and hole contour segments share one item identity and stable shape order, are inserted before ordinary board items, use the source 10 um half width plus candidate-class compensation, and use the geometric contour plus 100 um only as the finite room-search bound. KiCad Edge.Cuts display stroke width does not alter routing geometry. |
 | `board/searchtree/ShapeSearchTree45Degree.java` | `pcbnew/autorouter/board/searchtree/ShapeSearchTree45Degree.h/.cpp` | Source octagonal leaf filtering, completion, divide-large-room and recursive restraint are production-built, oracle-tested and selected by active ordinary and fanout single-/multilayer room frontiers. Drill-page free-region decomposition is exact octagonal. |
 | `autoroute/drill/DrillPage.java` | `pcbnew/autorouter/drill/DrillPage.h/.cpp` | Lazy exact-octagonal free-drill cutouts with source piece order, source corner-average centre/pin-centre selection, net/policy cache and separate reset/invalidate semantics. |
 | `autoroute/drill/DrillPageArray.java` | `pcbnew/autorouter/drill/DrillPageArray.h/.cpp` | Active, attempt-owned, resource-bounded row-major page array. Area-only overlap queries use the source bounding-page range. Fanout annulus candidates remain exact free-shape/drill/ViaRule candidates rather than path-grid samples. |
@@ -84,7 +85,7 @@ same change.
 | Freerouting concept | KiCad equivalent | Native file |
 |---|---|---|
 | `board.facade.RoutingBoard` | Partial mutable copper/contact graph with R-tree queries, source-order exact rational normal contacts, integral polyline junction splitting and transactions; non-integral piece materialization, forced insertion and room mutation are still incomplete | `board/facade/RoutingBoard.h/.cpp`; input capture remains in `KicadBoardAdapter` |
-| `RoutingBoardSearchFacade` / shape search tree | Snapshot obstacles, outline and keepouts | `board/KicadBoardAdapter.cpp`, `maze/MazeSearchEngine.cpp` |
+| `RoutingBoardSearchFacade` / shape search tree | Snapshot obstacles and keepouts plus first-class exact geometric `BoardOutline` contour/hole entries | `board/KicadBoardAdapter.cpp`, `board/model/structure/BoardOutline.h`, `maze/MazeSearchEngine.cpp` |
 | `RoutingBoardOperations` | Live edits use `BOARD_COMMIT` on the editor thread; a private `BOARD` is used by host validation on the worker. Neither implements reference forced insertion | `AutorouterTool.cpp`, `board/KicadRoutingSession.cpp` |
 | `RoutingBoardUndoFacade` / board history | `BOARD_COMMIT` | KiCad-provided API; one accepted proposal is one commit |
 | `board.trace.PolylineTrace*` | `PCB_TRACK` segments | `KicadBoardAdapter::CreatePreviewItems` |
