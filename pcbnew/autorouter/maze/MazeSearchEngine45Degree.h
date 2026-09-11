@@ -28,20 +28,5 @@ public:
             const ROOM_VIA_SETTINGS& aVia, int aMaxExpanded, int& aExpanded,
             ROOM_SEARCH_METRICS& aMetrics, const ROUTER_CANCEL_CALLBACK& aCancel = {},
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {} );
-
-private:
-    /** Direct translations of MazeSearchEngine.segmentProjection and the
-     * fixed-direction parts of expandToRoomDoors.  They live on the shared
-     * engine type so the single- and multilayer frontiers cannot drift. */
-    static std::optional<FLOAT_LINE> SegmentProjection(
-            const FLOAT_LINE& aFromSegment, const FLOAT_LINE& aToSegment );
-    static bool RoomIsThick( const EXPANSION_ROOM& aRoom,
-                             double aCompensatedTraceHalfWidth,
-                             const EXPANSION_DOOR* aEntryDoor,
-                             FLOAT_POINT aEntryMiddle );
-    static bool DoorEntryIsThick( const EXPANSION_ROOM& aRoom,
-                                  const EXPANSION_DOOR& aDoor,
-                                  const std::vector<FLOAT_LINE>& aSections,
-                                  double aCompensatedTraceHalfWidth );
 };
 } // namespace KICAD_AUTOROUTER

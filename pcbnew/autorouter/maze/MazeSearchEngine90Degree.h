@@ -121,6 +121,23 @@ struct ROOM_MULTILAYER_PATH
     std::vector<ROUTING_EDGE_STYLE> edgeStyles;
 };
 
+
+namespace DETAIL
+{
+/** Shared, angle-independent translations of the thin-room portion of
+ * MazeSearchEngine.expandToRoomDoors(). */
+std::optional<FLOAT_LINE> SegmentProjection(
+        const FLOAT_LINE& aFromSegment, const FLOAT_LINE& aToSegment );
+bool RoomIsThick( const EXPANSION_ROOM& aRoom,
+                  double aCompensatedTraceHalfWidth,
+                  const EXPANSION_DOOR* aEntryDoor,
+                  FLOAT_POINT aEntryMiddle, bool aCurrentDoorIsSmall );
+bool DoorEntryIsThick( const EXPANSION_ROOM& aRoom,
+                       const EXPANSION_DOOR& aDoor,
+                       const std::vector<FLOAT_LINE>& aSections,
+                       double aCompensatedTraceHalfWidth );
+} // namespace DETAIL
+
 /**
  * Active rectangular room/door search, with a full-stack through-drill
  * frontier for multilayer attempts. Movable rectangular trace/via shapes are

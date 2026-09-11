@@ -497,11 +497,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 continue;
         }
 
-        const ROUTER_BOX roomShape = current.room->shape->GetShape();
-        const bool nextRoomIsThick =
-                std::min( static_cast<double>( roomShape.maxX ) - roomShape.minX,
-                          static_cast<double>( roomShape.maxY ) - roomShape.minY )
-                >= 2 * sectionOffset;
+        const bool nextRoomIsThick = DETAIL::RoomIsThick(
+                *current.room->shape, sectionOffset, current.door, from,
+                currentDoorIsSmall );
         bool somethingExpanded = false;
         int targetId = targetIdBase;
         for( std::size_t i = 0; i < current.layer; ++i )
@@ -536,11 +534,35 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 continue;
             const auto sections = door->GetSectionSegments( 0, 0, 10 * sectionOffset,
                     static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
+            if( nextRoomIsThick
+                && !DETAIL::DoorEntryIsThick(
+                        *current.room->shape, *door, sections,
+                        sectionOffset ) )
+            {
+                continue;
+            }
             for( std::size_t section = 0; section < sections.size(); ++section )
             {
                 if( occupied.contains( { door, section } ) )
                     continue;
-                const auto to = sections[section].Middle();
+                FLOAT_LINE shapeEntry = sections[section];
+                if( !nextRoomIsThick )
+                {
+                    if( door->GetDimension() == 1 && section == 0
+                        && sections.size() == 1
+                        && sections.front().a.DistanceSquared(
+                                   sections.front().b ) < 1 )
+                    {
+                        continue;
+                    }
+
+                    const auto projected = DETAIL::SegmentProjection(
+                            current.entry, sections[section] );
+                    if( !projected )
+                        continue;
+                    shapeEntry = *projected;
+                }
+                const auto to = shapeEntry.Middle();
                 double bend = 0;
                 if( current.parent != NONE && states[current.parent].layer == current.layer )
                     bend = MAZE_LIST_ELEMENT::BendPenalty( states[current.parent].entry.Middle(), from, to, layer.bendCost );
@@ -558,7 +580,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 }
                 STATE state;
                 state.room = next; state.layer = current.layer; state.door = door; state.section = section;
-                state.entry = sections[section]; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend + ripupCost;
+                state.entry = shapeEntry; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend + ripupCost;
                 state.f = state.g + remaining( to, current.layer ); state.parent = index; state.owner = current.owner;
                 state.ripupCost = ripupCost;
                 const ROUTER_BOX doorBounds = door->GetShape();

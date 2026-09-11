@@ -716,8 +716,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         }
 
         bool somethingExpanded = false;
-        const bool nextRoomIsThick = RoomIsThick(
-                *current.room->shape, sectionOffset, current.door, from );
+        const bool nextRoomIsThick = DETAIL::RoomIsThick(
+                *current.room->shape, sectionOffset, current.door, from,
+                currentDoorIsSmall );
         int targetId = targetIdBase;
         for( std::size_t i = 0; i < current.layer; ++i )
             targetId += layers[i].targets.size();
@@ -792,8 +793,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                     sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
                     static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
             if( nextRoomIsThick
-                && !DoorEntryIsThick( *current.room->shape, *door, sections,
-                                      sectionOffset ) )
+                && !DETAIL::DoorEntryIsThick(
+                        *current.room->shape, *door, sections,
+                        sectionOffset ) )
             {
                 continue;
             }
@@ -812,7 +814,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                         continue;
                     }
 
-                    const auto projected = SegmentProjection(
+                    const auto projected = DETAIL::SegmentProjection(
                             current.entry, sections[section] );
                     if( !projected )
                         continue;

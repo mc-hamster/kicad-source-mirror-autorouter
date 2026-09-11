@@ -272,6 +272,9 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
 
         bool somethingExpanded = false;
         const FLOAT_POINT from = current.entry.Middle();
+        const bool nextRoomIsThick = DETAIL::RoomIsThick(
+                *current.room->shape, aSectionOffset, current.door, from,
+                currentDoorIsSmall );
         for( std::size_t targetIndex = 0; targetIndex < aTargets.size(); ++targetIndex )
         {
             const ROOM_TERMINAL& target = aTargets[targetIndex];
@@ -301,11 +304,35 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
                     0, 0, 10 * aSectionOffset,
                     static_cast<std::size_t>(
                             std::max( 0, aMaxExpanded - aExpanded ) ) );
+            if( nextRoomIsThick
+                && !DETAIL::DoorEntryIsThick(
+                        *current.room->shape, *door, sections,
+                        aSectionOffset ) )
+            {
+                continue;
+            }
             for( std::size_t section = 0; section < sections.size(); ++section )
             {
                 if( occupied.contains( { door, section } ) )
                     continue;
-                const FLOAT_POINT to = sections[section].Middle();
+                FLOAT_LINE shapeEntry = sections[section];
+                if( !nextRoomIsThick )
+                {
+                    if( door->GetDimension() == 1 && section == 0
+                        && sections.size() == 1
+                        && sections.front().a.DistanceSquared(
+                                   sections.front().b ) < 1 )
+                    {
+                        continue;
+                    }
+
+                    const auto projected = DETAIL::SegmentProjection(
+                            current.entry, sections[section] );
+                    if( !projected )
+                        continue;
+                    shapeEntry = *projected;
+                }
+                const FLOAT_POINT to = shapeEntry.Middle();
                 double bend = 0;
                 if( current.parent != NONE )
                 {
@@ -357,7 +384,7 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
                             current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
                           { "expansion_value", std::to_string( g ) },
                           { "sorting_value", std::to_string( g + distance( to ) ) } } );
-                push( { next, door, section, sections[section], g,
+                push( { next, door, section, shapeEntry, g,
                         g + distance( to ), index, current.owner, {}, 0, ripupCost } );
                 somethingExpanded = true;
             }
