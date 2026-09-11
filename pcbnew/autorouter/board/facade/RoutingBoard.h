@@ -112,6 +112,8 @@ public:
      */
     bool RemoveItems( const ITEM_ID_SET& aItems );
     std::vector<ITEM_ID> RouteItems( const ROUTING_CONNECTION& aRoute ) const;
+    /** Number of host insertion records naming one normalized source item. */
+    std::size_t RouteReferenceCount( ITEM_ID aItem ) const;
     std::optional<ITEM_ID> PadItem( std::size_t aPad ) const;
     std::size_t ItemCount() const;
     std::uint64_t Revision() const;

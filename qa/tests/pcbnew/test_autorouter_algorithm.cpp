@@ -3633,6 +3633,122 @@ BOOST_AUTO_TEST_CASE( NormalContactsSplitGeneratedBranchesAndRollbackIdentity )
 }
 
 
+BOOST_AUTO_TEST_CASE( TraceNormalizationSplitsCyclesCombinesAndRebuildsAliases )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    ROUTING_BOARD copper( board, settings );
+    const auto fixedItems = copper.ItemCount();
+
+    ROUTING_CONNECTION left;
+    left.netCode = 1;
+    left.complete = true;
+    left.nodes = { { board.pads[0].position, 0 }, { { 4000000, 1500000 }, 0 } };
+    ROUTING_CONNECTION right = left;
+    right.nodes = { { { 2000000, 1500000 }, 0 }, { board.pads[1].position, 0 } };
+
+    copper.AddRoute( left );
+    const auto originalLeft = copper.RouteItems( left );
+    BOOST_REQUIRE_EQUAL( originalLeft.size(), 1U );
+    copper.AddRoute( right );
+
+    // PolylineTrace.split() cuts both overlap boundaries, removeIfCycle()
+    // removes one coincident middle piece, then combine() rejoins the three
+    // serial survivors into the selected existing item.
+    const auto normalizedLeft = copper.RouteItems( left );
+    const auto normalizedRight = copper.RouteItems( right );
+    BOOST_REQUIRE_EQUAL( normalizedLeft.size(), 1U );
+    BOOST_CHECK( normalizedLeft == normalizedRight );
+    BOOST_CHECK_EQUAL( normalizedLeft.front(), originalLeft.front() );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), fixedItems + 1 );
+    const auto combined = copper.ItemRoute( normalizedLeft.front() );
+    BOOST_REQUIRE( combined );
+    BOOST_CHECK( combined->nodes.front() == left.nodes.front() );
+    BOOST_CHECK( combined->nodes.back() == right.nodes.back() );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+
+    // Rolling back an alias-cluster removal restores the exact item identity,
+    // contact graph and both host insertion mappings.
+    {
+        ROUTING_BOARD::TRANSACTION transaction( copper );
+        copper.RemoveRoute( right );
+        BOOST_CHECK( copper.RouteItems( right ).empty() );
+        const auto survivor = copper.RouteItems( left );
+        BOOST_REQUIRE_EQUAL( survivor.size(), 1U );
+        BOOST_REQUIRE( copper.ItemRoute( survivor.front() ) );
+        BOOST_CHECK( copper.ItemRoute( survivor.front() )->nodes == left.nodes );
+        BOOST_CHECK( !copper.Connected( 0, 1 ) );
+    }
+    BOOST_CHECK( copper.RouteItems( left ) == normalizedLeft );
+    BOOST_CHECK( copper.RouteItems( right ) == normalizedRight );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+
+    copper.RemoveRoute( right );
+    BOOST_CHECK( copper.RouteItems( right ).empty() );
+    const auto survivor = copper.RouteItems( left );
+    BOOST_REQUIRE_EQUAL( survivor.size(), 1U );
+    BOOST_REQUIRE( copper.ItemRoute( survivor.front() ) );
+    BOOST_CHECK( copper.ItemRoute( survivor.front() )->nodes == left.nodes );
+    BOOST_CHECK( !copper.Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( TraceCombineRequiresSourceCompatibleManufacturingStyle )
+{
+    auto board = makeBoard();
+    ROUTING_BOARD copper( board, makeSettings() );
+    ROUTING_CONNECTION left;
+    left.netCode = 1;
+    left.complete = true;
+    left.nodes = { { board.pads[0].position, 0 }, { { 3000000, 1500000 }, 0 } };
+    left.edgeStyles = { ROUTING_EDGE_STYLE{} };
+    left.edgeStyles.front().trackWidth = 100000;
+    ROUTING_CONNECTION right = left;
+    right.nodes = { { { 3000000, 1500000 }, 0 }, { board.pads[1].position, 0 } };
+    right.edgeStyles.front().trackWidth = 200000;
+
+    copper.AddRoute( left );
+    copper.AddRoute( right );
+    const auto leftItems = copper.RouteItems( left );
+    const auto rightItems = copper.RouteItems( right );
+    BOOST_REQUIRE_EQUAL( leftItems.size(), 1U );
+    BOOST_REQUIRE_EQUAL( rightItems.size(), 1U );
+    BOOST_CHECK_NE( leftItems.front(), rightItems.front() );
+    BOOST_CHECK( copper.GetNormalContacts( leftItems.front() ).contains( rightItems.front() ) );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( TraceCombineUsesAddedTraceIdentityAndStartBeforeEndOrder )
+{
+    auto board = makeBoard();
+    ROUTING_BOARD copper( board, makeSettings() );
+    ROUTING_CONNECTION left;
+    left.netCode = 1;
+    left.complete = true;
+    left.nodes = { { board.pads[0].position, 0 }, { { 3000000, 1500000 }, 0 } };
+    ROUTING_CONNECTION right = left;
+    // Reverse the added trace so combineAtEnd() has to reverse its contact.
+    right.nodes = { { board.pads[1].position, 0 }, { { 3000000, 1500000 }, 0 } };
+
+    copper.AddRoute( left );
+    const auto leftBefore = copper.RouteItems( left );
+    BOOST_REQUIRE_EQUAL( leftBefore.size(), 1U );
+    copper.AddRoute( right );
+    const auto leftAfter = copper.RouteItems( left );
+    const auto rightAfter = copper.RouteItems( right );
+    BOOST_REQUIRE_EQUAL( leftAfter.size(), 1U );
+    BOOST_REQUIRE_EQUAL( rightAfter.size(), 1U );
+    BOOST_CHECK( leftAfter == rightAfter );
+    BOOST_CHECK_NE( leftAfter.front(), leftBefore.front() );
+    const auto joined = copper.ItemRoute( rightAfter.front() );
+    BOOST_REQUIRE( joined );
+    BOOST_CHECK( joined->nodes.front() == right.nodes.front() );
+    BOOST_CHECK( joined->nodes.back() == left.nodes.front() );
+    BOOST_CHECK( copper.Connected( 0, 1 ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( ConnectionGetUsesSourcePolylineItemsForksAndReverseIdOrder )
 {
     auto board = makeBoard();

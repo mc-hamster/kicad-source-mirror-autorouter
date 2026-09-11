@@ -14,6 +14,36 @@ latter. Never modify the protected reference checkout or build inside it.
 
 ## Latest core milestone — unrestricted-angle source geometry and shove lifecycle
 
+The worker board now also ports the pinned `PolylineTrace.split`,
+`PolylineTrace.combine`, `PolylineTrace.isCycle`,
+`PolylineTraceNormalization.normalize`, and `BasicBoard.removeIfCycle`
+mutation order for the exact integral subset which KiCad can materialize.
+Same-net crossings and collinear overlap boundaries split both traces while
+preserving the first native item identity; normal-contact-at-point queries keep
+the source distinction from `normalContactPoint`, so two coincident traces are
+visible at both endpoints even though they do not have one unique contact
+point. Found split pieces are cycle-tested before the newly inserted pieces,
+then each survivor repeatedly combines at its start before its end. Combination
+requires the source-compatible layer, net, width, clearance and mutable fixed
+state, ignores conduction areas when counting the one allowed endpoint contact,
+updates the item search index incrementally, and exposes a shared normalized
+item to optimizer enumeration only once.
+
+KiCad's proposal layer still retains host insertion records. When source-style
+combination makes several records aliases of one `PolylineTrace`, removal now
+rebuilds only the transitive alias cluster from the surviving requests inside
+the same worker transaction; unrelated item identities and index entries remain
+stable, and rollback restores the exact pre-edit graph. The optimizer selects
+the combined item-local geometry only for such an alias, retaining the complete
+compound route for ordinary trace/via and fanout records. This checkpoint
+passes **224/224 native autorouter cases** and all **26 Python parity-harness
+tests**. The BJT A/B gate remains 16/16 with zero new KiCad DRC violations; the
+stripped 555 gate remains 12/12 with zero native DRC violations and is red only
+because the pinned reference output introduces ten KiCad DRC violations.
+Rational, non-integral trace junction materialization, fixed host-item
+normalization, and complete connection-tail removal remain explicit open parts
+of the mutable-board phase.
+
 The active unrestricted-angle single-layer frontier now uses Freerouting's
 source obstacle-side compensation model instead of the former native shortcut
 which inflated obstacles by the complete candidate radius and then realized a

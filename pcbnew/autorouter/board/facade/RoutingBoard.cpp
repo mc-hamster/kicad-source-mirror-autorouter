@@ -241,6 +241,353 @@ struct ROUTING_BOARD::IMPL
         items.erase( it );
     }
 
+    ITEM_ID_SET normalContactsAt( ITEM_ID traceId, ROUTER_POINT point,
+                                  bool ignoreAreas = false ) const
+    {
+        const auto source = items.find( traceId );
+        if( source == items.end()
+            || source->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
+            || ( point != source->second.normal.first
+                 && point != source->second.normal.last ) )
+        {
+            return {};
+        }
+
+        ITEM_ID_SET result;
+        for( ITEM_ID id : source->second.normalContacts )
+        {
+            const auto& contact = items.at( id );
+            if( contact.normal.kind == NORMAL_CONTACT_ITEM::KIND::AREA )
+            {
+                if( !ignoreAreas && contact.area
+                    && CONTACT_GEOMETRY::ContainsArea( *contact.area, point ) )
+                {
+                    result.insert( id );
+                }
+            }
+            else if( point == contact.normal.first
+                     || ( contact.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE
+                          && point == contact.normal.last ) )
+            {
+                // Trace.normalContactPoint() intentionally returns null when
+                // two traces share both endpoints.  Trace.getNormalContacts(
+                // point), used by combine/isCycle, intentionally includes the
+                // same overlap.  Keep those source APIs distinct.
+                result.insert( id );
+            }
+        }
+        return result;
+    }
+
+    void removeItemFromRoutes( ITEM_ID id )
+    {
+        for( auto& route : routes )
+            std::erase( route.items, id );
+    }
+
+    void rebuildTraceGeometry( ITEM& item, std::vector<ROUTER_POINT> corners )
+    {
+        if( !item.trace || corners.size() < 2 )
+            throw std::invalid_argument( "Cannot rebuild invalid routing trace" );
+
+        corners.erase( std::unique( corners.begin(), corners.end() ), corners.end() );
+        item.traceCorners = std::move( corners );
+        item.normal.first = item.traceCorners.front();
+        item.normal.last = item.traceCorners.back();
+        item.contacts.clear();
+        item.normalContacts.clear();
+        item.shapes.clear();
+        item.terminals.clear();
+
+        ROUTING_EDGE_STYLE style;
+        int layer = item.normal.layers.empty() ? -1 : item.normal.layers.front();
+        if( item.route )
+        {
+            layer = item.route->nodes.empty() ? layer : item.route->nodes.front().layer;
+            style = item.route->edgeStyles.empty()
+                    ? ROUTING_EDGE_STYLE{} : item.route->edgeStyles.front();
+            item.route->nodes.clear();
+            item.route->edgeStyles.clear();
+            for( ROUTER_POINT corner : item.traceCorners )
+                item.route->nodes.push_back( { corner, layer } );
+            if( item.route->nodes.size() > 1 )
+                item.route->edgeStyles.assign( item.route->nodes.size() - 1, style );
+        }
+
+        for( std::size_t segment = 1; segment < item.traceCorners.size(); ++segment )
+        {
+            ROUTING_OBSTACLE trace = *item.trace;
+            trace.start = item.traceCorners[segment - 1];
+            trace.end = item.traceCorners[segment];
+            if( segment == 1 )
+                item.trace = trace;
+            addShape( item, trace );
+
+            ROUTING_PAD terminal;
+            terminal.netCode = item.net;
+            terminal.position = trace.start;
+            terminal.layers = trace.layers;
+            terminal.trackWidth = 2 * trace.radius;
+            item.terminals.push_back( { terminal, NO_PAD, trace.end } );
+        }
+    }
+
+    std::vector<ITEM_ID> splitTrace( ITEM_ID id,
+                                     const std::vector<ROUTER_POINT>& points )
+    {
+        using namespace CONTACT_GEOMETRY;
+        const auto found = items.find( id );
+        if( found == items.end() || !found->second.trace
+            || found->second.traceCorners.size() < 2 )
+        {
+            return {};
+        }
+
+        const ITEM original = found->second;
+        std::vector<ROUTER_POINT> expanded;
+        expanded.push_back( original.traceCorners.front() );
+        for( std::size_t segment = 1; segment < original.traceCorners.size(); ++segment )
+        {
+            const ROUTER_POINT start = original.traceCorners[segment - 1];
+            const ROUTER_POINT end = original.traceCorners[segment];
+            std::vector<ROUTER_POINT> segmentCuts;
+            for( ROUTER_POINT splitPoint : points )
+            {
+                if( splitPoint != start && splitPoint != end
+                    && OnSegment( start, end, splitPoint ) )
+                {
+                    segmentCuts.push_back( splitPoint );
+                }
+            }
+
+            const bool sortByX = std::abs( end.x - start.x )
+                                 >= std::abs( end.y - start.y );
+            std::sort( segmentCuts.begin(), segmentCuts.end(), [&]( auto left, auto right )
+            {
+                if( sortByX )
+                    return start.x < end.x ? left.x < right.x : left.x > right.x;
+                return start.y < end.y ? left.y < right.y : left.y > right.y;
+            } );
+            segmentCuts.erase( std::unique( segmentCuts.begin(), segmentCuts.end() ),
+                               segmentCuts.end() );
+            expanded.insert( expanded.end(), segmentCuts.begin(), segmentCuts.end() );
+            expanded.push_back( end );
+        }
+
+        std::vector<ROUTER_POINT> actualCuts;
+        for( std::size_t i = 1; i + 1 < expanded.size(); ++i )
+            if( std::find( points.begin(), points.end(), expanded[i] ) != points.end() )
+                actualCuts.push_back( expanded[i] );
+        std::sort( actualCuts.begin(), actualCuts.end(), []( auto left, auto right )
+                   { return left.x != right.x ? left.x < right.x : left.y < right.y; } );
+        actualCuts.erase( std::unique( actualCuts.begin(), actualCuts.end() ),
+                          actualCuts.end() );
+        if( actualCuts.empty() )
+            return { id };
+
+        removeItem( id );
+        std::vector<ITEM_ID> replacements;
+        std::size_t pieceStart = 0;
+        for( std::size_t i = 1; i < expanded.size(); ++i )
+        {
+            const bool splitHere = i + 1 == expanded.size()
+                                   || std::find( actualCuts.begin(), actualCuts.end(), expanded[i] )
+                                              != actualCuts.end();
+            if( !splitHere )
+                continue;
+
+            ITEM piece = original;
+            piece.id = replacements.empty() ? id : nextId++;
+            rebuildTraceGeometry(
+                    piece,
+                    std::vector<ROUTER_POINT>(
+                            expanded.begin() + static_cast<std::ptrdiff_t>( pieceStart ),
+                            expanded.begin() + static_cast<std::ptrdiff_t>( i + 1 ) ) );
+            auto [it, inserted] = items.emplace( piece.id, std::move( piece ) );
+            if( !inserted )
+                throw std::logic_error( "Duplicate routing trace identity after split" );
+            indexItem( it->second );
+            replacements.push_back( it->first );
+            pieceStart = i;
+        }
+
+        for( auto& route : routes )
+        {
+            for( auto it = route.items.begin(); it != route.items.end(); )
+            {
+                if( *it != id )
+                {
+                    ++it;
+                    continue;
+                }
+                const auto offset = it - route.items.begin();
+                it = route.items.erase( it );
+                route.items.insert( route.items.begin() + offset,
+                                    replacements.begin(), replacements.end() );
+                it = route.items.begin() + offset
+                     + static_cast<std::ptrdiff_t>( replacements.size() );
+            }
+        }
+        return replacements;
+    }
+
+    bool traceIsCycle( ITEM_ID id ) const
+    {
+        const auto trace = items.find( id );
+        if( trace == items.end() || trace->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE )
+            return false;
+
+        const ITEM_ID_SET starts = normalContactsAt( id, trace->second.normal.first );
+        const ITEM_ID_SET ends = normalContactsAt( id, trace->second.normal.last );
+        if( std::any_of( starts.begin(), starts.end(),
+                         [&]( ITEM_ID contact ) { return ends.contains( contact ); } ) )
+        {
+            return true;
+        }
+
+        ITEM_ID_SET visited = starts;
+        std::vector<ITEM_ID> pending( starts.begin(), starts.end() );
+        while( !pending.empty() )
+        {
+            const ITEM_ID current = pending.back();
+            pending.pop_back();
+            for( ITEM_ID contact : items.at( current ).normalContacts )
+            {
+                if( contact == id )
+                    continue;
+                if( ends.contains( contact ) )
+                    return true;
+                if( visited.insert( contact ).second )
+                    pending.push_back( contact );
+            }
+        }
+        return false;
+    }
+
+    bool removeIfCycle( ITEM_ID id )
+    {
+        const auto trace = items.find( id );
+        if( trace == items.end() || !trace->second.dynamic || !trace->second.routable
+            || !trace->second.route || !traceIsCycle( id ) )
+        {
+            return false;
+        }
+        removeItem( id );
+        removeItemFromRoutes( id );
+        return true;
+    }
+
+    bool traceStylesEqual( const ITEM& left, const ITEM& right ) const
+    {
+        if( !left.trace || !right.trace || left.net != right.net
+            || left.normal.layers != right.normal.layers
+            || left.trace->radius != right.trace->radius
+            || left.trace->clearance != right.trace->clearance
+            || !left.dynamic || !right.dynamic || !left.routable || !right.routable
+            || !left.route || !right.route )
+        {
+            return false;
+        }
+
+        const ROUTING_EDGE_STYLE leftStyle = left.route->edgeStyles.empty()
+                ? ROUTING_EDGE_STYLE{} : left.route->edgeStyles.front();
+        const ROUTING_EDGE_STYLE rightStyle = right.route->edgeStyles.empty()
+                ? ROUTING_EDGE_STYLE{} : right.route->edgeStyles.front();
+        return leftStyle.trackWidth == rightStyle.trackWidth
+               && leftStyle.clearance == rightStyle.clearance;
+    }
+
+    bool combineAt( ITEM_ID id, bool atStart )
+    {
+        const auto current = items.find( id );
+        if( current == items.end() || current->second.normal.kind
+                                     != NORMAL_CONTACT_ITEM::KIND::TRACE )
+        {
+            return false;
+        }
+
+        const ROUTER_POINT join = atStart ? current->second.normal.first
+                                          : current->second.normal.last;
+        const ITEM_ID_SET contacts = normalContactsAt( id, join, true );
+        if( contacts.size() != 1 )
+            return false;
+
+        const ITEM_ID otherId = *contacts.begin();
+        const auto other = items.find( otherId );
+        if( other == items.end()
+            || other->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
+            || !traceStylesEqual( current->second, other->second ) )
+        {
+            return false;
+        }
+
+        std::vector<ROUTER_POINT> thisCorners = current->second.traceCorners;
+        std::vector<ROUTER_POINT> otherCorners = other->second.traceCorners;
+        if( atStart )
+        {
+            if( otherCorners.back() != join )
+                std::reverse( otherCorners.begin(), otherCorners.end() );
+            if( otherCorners.back() != join )
+                return false;
+            otherCorners.pop_back();
+            otherCorners.insert( otherCorners.end(), thisCorners.begin(), thisCorners.end() );
+            thisCorners = std::move( otherCorners );
+        }
+        else
+        {
+            if( otherCorners.front() != join )
+                std::reverse( otherCorners.begin(), otherCorners.end() );
+            if( otherCorners.front() != join )
+                return false;
+            thisCorners.insert( thisCorners.end(), std::next( otherCorners.begin() ),
+                                otherCorners.end() );
+        }
+
+        ITEM combined = current->second;
+        const ITEM absorbed = other->second;
+        combined.route->cost += absorbed.route->cost;
+        combined.route->isPlaneConnection = combined.route->isPlaneConnection
+                                            || absorbed.route->isPlaneConnection;
+        combined.route->isFanoutConnection = combined.route->isFanoutConnection
+                                             || absorbed.route->isFanoutConnection;
+        for( const std::string& sourceId : absorbed.route->sourceBoardItemIds )
+        {
+            if( std::find( combined.route->sourceBoardItemIds.begin(),
+                           combined.route->sourceBoardItemIds.end(), sourceId )
+                == combined.route->sourceBoardItemIds.end() )
+            {
+                combined.route->sourceBoardItemIds.push_back( sourceId );
+            }
+        }
+
+        removeItem( id );
+        removeItem( otherId );
+        rebuildTraceGeometry( combined, std::move( thisCorners ) );
+        auto [inserted, unique] = items.emplace( id, std::move( combined ) );
+        if( !unique )
+            throw std::logic_error( "Duplicate routing trace identity after combine" );
+        indexItem( inserted->second );
+
+        for( auto& route : routes )
+        {
+            for( ITEM_ID& itemId : route.items )
+                if( itemId == otherId )
+                    itemId = id;
+            std::set<ITEM_ID> seen;
+            std::erase_if( route.items, [&]( ITEM_ID itemId )
+                           { return !seen.insert( itemId ).second; } );
+        }
+        return true;
+    }
+
+    bool combine( ITEM_ID id )
+    {
+        bool changed = false;
+        while( items.contains( id ) && ( combineAt( id, true ) || combineAt( id, false ) ) )
+            changed = true;
+        return changed;
+    }
+
     // Split polyline copper in the WORKER graph at exact centre-line contacts.
     // Retained copper is split virtually only: the original host item is not
     // edited/deleted, and these pieces never become result-emitter output.
@@ -312,103 +659,43 @@ struct ROUTING_BOARD::IMPL
                     cut( item, c );
             }
         }
+        std::set<ITEM_ID> addedPieces( added.begin(), added.end() );
+        std::vector<ITEM_ID> normalizationOrder;
         for( auto& [id, points] : cuts )
         {
-            const auto original = items.at( id );
             std::sort( points.begin(), points.end(), []( auto left, auto right )
             { return left.x != right.x ? left.x < right.x : left.y < right.y; } );
             points.erase( std::unique( points.begin(), points.end() ), points.end() );
-
-            std::vector<ROUTER_POINT> expanded;
-            expanded.push_back( original.traceCorners.front() );
-            for( std::size_t segment = 1; segment < original.traceCorners.size(); ++segment )
-            {
-                const ROUTER_POINT start = original.traceCorners[segment - 1];
-                const ROUTER_POINT end = original.traceCorners[segment];
-                std::vector<ROUTER_POINT> segmentCuts;
-                for( ROUTER_POINT point : points )
-                    if( point != start && point != end && OnSegment( start, end, point ) )
-                        segmentCuts.push_back( point );
-
-                const bool sortByX = std::abs( end.x - start.x ) >= std::abs( end.y - start.y );
-                std::sort( segmentCuts.begin(), segmentCuts.end(), [&]( auto left, auto right )
-                {
-                    if( sortByX )
-                        return start.x < end.x ? left.x < right.x : left.x > right.x;
-                    return start.y < end.y ? left.y < right.y : left.y > right.y;
-                } );
-                expanded.insert( expanded.end(), segmentCuts.begin(), segmentCuts.end() );
-                expanded.push_back( end );
-            }
-
-            removeItem( id );
-            std::vector<ITEM_ID> replacements;
-            std::size_t pieceStart = 0;
-            for( std::size_t i = 1; i < expanded.size(); ++i )
-            {
-                const bool splitHere = i + 1 == expanded.size()
-                        || std::find( points.begin(), points.end(), expanded[i] ) != points.end();
-                if( !splitHere )
-                    continue;
-
-                // Preserve the original identity on the first half. Only the
-                // additional halves allocate IDs; unrelated items never move.
-                ITEM piece = original;
-                piece.id = replacements.empty() ? id : nextId++;
-                piece.contacts.clear();
-                piece.normalContacts.clear();
-                piece.shapes.clear();
-                piece.terminals.clear();
-                piece.traceCorners.assign( expanded.begin() + pieceStart,
-                                           expanded.begin() + i + 1 );
-                piece.normal.first = piece.traceCorners.front();
-                piece.normal.last = piece.traceCorners.back();
-                if( piece.route )
-                {
-                    const int layer = piece.route->nodes.empty()
-                            ? ( piece.normal.layers.empty() ? -1 : piece.normal.layers.front() )
-                            : piece.route->nodes.front().layer;
-                    const ROUTING_EDGE_STYLE style = piece.route->edgeStyles.empty()
-                            ? ROUTING_EDGE_STYLE{} : piece.route->edgeStyles.front();
-                    piece.route->nodes.clear();
-                    piece.route->edgeStyles.clear();
-                    for( ROUTER_POINT corner : piece.traceCorners )
-                        piece.route->nodes.push_back( { corner, layer } );
-                    if( piece.route->nodes.size() > 1 )
-                        piece.route->edgeStyles.assign( piece.route->nodes.size() - 1, style );
-                }
-                for( std::size_t segment = 1; segment < piece.traceCorners.size(); ++segment )
-                {
-                    ROUTING_OBSTACLE trace = *piece.trace;
-                    trace.start = piece.traceCorners[segment - 1];
-                    trace.end = piece.traceCorners[segment];
-                    if( segment == 1 )
-                        piece.trace = trace;
-                    addShape( piece, trace );
-
-                    ROUTING_PAD terminal;
-                    terminal.netCode = piece.net;
-                    terminal.position = trace.start;
-                    terminal.layers = trace.layers;
-                    terminal.trackWidth = 2 * trace.radius;
-                    piece.terminals.push_back( { terminal, NO_PAD, trace.end } );
-                }
-                auto [it, inserted] = items.emplace( piece.id, std::move( piece ) );
-                indexItem( it->second );
-                replacements.push_back( it->first );
-                pieceStart = i;
-            }
-            for( auto& route : routes )
-            {
-                auto it = std::find( route.items.begin(), route.items.end(), id );
-                if( it == route.items.end() )
-                    continue;
-                const auto offset = it - route.items.begin();
-                route.items.erase( it );
-                route.items.insert( route.items.begin() + offset, replacements.begin(), replacements.end() );
-                break;
-            }
+            const bool own = addedPieces.contains( id );
+            const std::vector<ITEM_ID> replacements = splitTrace( id, points );
+            normalizationOrder.insert( normalizationOrder.end(), replacements.begin(),
+                                       replacements.end() );
+            if( own )
+                addedPieces.insert( replacements.begin(), replacements.end() );
         }
+        for( ITEM_ID id : added )
+            if( items.contains( id ) )
+                normalizationOrder.push_back( id );
+
+        // PolylineTrace.split() removes cycles in the found pieces first and
+        // in the trace being normalized last.  Preserve that preference so a
+        // newly inserted trace wins deterministic coincident-overlap ties.
+        std::stable_sort( normalizationOrder.begin(), normalizationOrder.end(),
+                          [&]( ITEM_ID left, ITEM_ID right )
+                          { return addedPieces.contains( left )
+                                   < addedPieces.contains( right ); } );
+        std::set<ITEM_ID> scheduled;
+        std::erase_if( normalizationOrder, [&]( ITEM_ID id )
+                       { return !scheduled.insert( id ).second; } );
+        for( ITEM_ID id : normalizationOrder )
+            removeIfCycle( id );
+
+        // Source PolylineTraceNormalization combines each surviving split
+        // piece and recursively retries its start before its end.  The item
+        // identity of the selected piece survives every successful combine.
+        for( ITEM_ID id : normalizationOrder )
+            if( items.contains( id ) )
+                combine( id );
     }
 
     void updateComponents() const
@@ -736,14 +1023,57 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
 void ROUTING_BOARD::RemoveRoute( const ROUTING_CONNECTION& route )
 {
     auto& state = *m_impl;
-    const auto it = std::find_if( state.routes.begin(), state.routes.end(), [&]( const auto& existing )
-    { return SameRouteGeometry( existing.connection, route ); } );
-    if( it == state.routes.end() )
+    const auto target = std::find_if( state.routes.begin(), state.routes.end(),
+                                      [&]( const auto& existing )
+                                      { return SameRouteGeometry( existing.connection, route ); } );
+    if( target == state.routes.end() )
         return;
-    for( ITEM_ID id : it->items )
+
+    TRANSACTION transaction( *this );
+    const std::size_t targetIndex = static_cast<std::size_t>( target - state.routes.begin() );
+    std::set<std::size_t> affectedRoutes{ targetIndex };
+    std::set<ITEM_ID> affectedItems( target->items.begin(), target->items.end() );
+
+    // A source combine deletes one PolylineTrace and leaves the selected
+    // item's identity.  The native host bridge still remembers the original
+    // insertion requests, so more than one request may name that one item.
+    // Removing any request rebuilds only this transitive alias cluster from
+    // the surviving requests.  Unrelated item identities and tree entries do
+    // not move.
+    bool expanded = true;
+    while( expanded )
+    {
+        expanded = false;
+        for( std::size_t index = 0; index < state.routes.size(); ++index )
+        {
+            if( affectedRoutes.contains( index ) )
+                continue;
+            const auto& candidate = state.routes[index];
+            if( std::none_of( candidate.items.begin(), candidate.items.end(),
+                              [&]( ITEM_ID id ) { return affectedItems.contains( id ); } ) )
+            {
+                continue;
+            }
+            affectedRoutes.insert( index );
+            affectedItems.insert( candidate.items.begin(), candidate.items.end() );
+            expanded = true;
+        }
+    }
+
+    std::vector<ROUTING_CONNECTION> survivors;
+    for( std::size_t index : affectedRoutes )
+        if( index != targetIndex )
+            survivors.push_back( state.routes[index].connection );
+
+    for( ITEM_ID id : affectedItems )
         state.removeItem( id );
-    state.routes.erase( it );
+    for( auto it = affectedRoutes.rbegin(); it != affectedRoutes.rend(); ++it )
+        state.routes.erase( state.routes.begin() + static_cast<std::ptrdiff_t>( *it ) );
+
+    for( const ROUTING_CONNECTION& survivor : survivors )
+        AddRoute( survivor );
     ++state.revision;
+    transaction.Commit();
 }
 
 void ROUTING_BOARD::ClearRoutes()
@@ -995,30 +1325,7 @@ int ROUTING_BOARD::FirstCommonLayer( ITEM_ID first, ITEM_ID second ) const
 ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalContactsAt( ITEM_ID trace,
                                                              ROUTER_POINT point ) const
 {
-    const auto source = m_impl->items.find( trace );
-    if( source == m_impl->items.end()
-        || source->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
-        || ( point != source->second.normal.first && point != source->second.normal.last ) )
-    {
-        return {};
-    }
-
-    ITEM_ID_SET result;
-    for( ITEM_ID id : source->second.normalContacts )
-    {
-        const auto& contact = m_impl->items.at( id );
-        if( contact.normal.kind == NORMAL_CONTACT_ITEM::KIND::AREA )
-        {
-            if( contact.area && CONTACT_GEOMETRY::ContainsArea( *contact.area, point ) )
-                result.insert( id );
-        }
-        else if( const auto contactPoint = source->second.normal.Point( contact.normal );
-                 contactPoint && *contactPoint == point )
-        {
-            result.insert( id );
-        }
-    }
-    return result;
+    return m_impl->normalContactsAt( trace, point );
 }
 
 
@@ -1238,6 +1545,17 @@ std::vector<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::RouteItems( const ROUTING_CON
         if( SameRouteGeometry( record.connection, route ) )
             return record.items;
     return {};
+}
+
+
+std::size_t ROUTING_BOARD::RouteReferenceCount( ITEM_ID item ) const
+{
+    return static_cast<std::size_t>( std::count_if(
+            m_impl->routes.begin(), m_impl->routes.end(), [&]( const auto& route )
+            {
+                return std::find( route.items.begin(), route.items.end(), item )
+                       != route.items.end();
+            } ) );
 }
 
 std::optional<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::PadItem( std::size_t pad ) const

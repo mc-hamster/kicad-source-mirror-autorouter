@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <tuple>
 
 
@@ -65,12 +66,18 @@ std::optional<READ_SORTED_ROUTE_ITEMS::ENTRY> READ_SORTED_ROUTE_ITEMS::Next(
     };
 
     std::vector<CANDIDATE> candidates;
+    std::set<ROUTING_BOARD::ITEM_ID> seenItems;
     for( std::size_t connectionIndex = 0; connectionIndex < aConnections.size();
          ++connectionIndex )
     {
         for( ROUTING_BOARD::ITEM_ID itemId :
              aBoard.RouteItems( aConnections[connectionIndex] ) )
         {
+            // Several host insertion records can name the one surviving
+            // PolylineTrace after source-style combine.  UndoableObjects has
+            // only that item, so expose it to the optimizer exactly once.
+            if( !seenItems.insert( itemId ).second )
+                continue;
             const auto item = aBoard.GetItemInfo( itemId );
             if( !item || !item->routable )
                 continue;

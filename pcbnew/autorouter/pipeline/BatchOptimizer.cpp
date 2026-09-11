@@ -635,7 +635,14 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             const std::size_t connectionIndex = next->connectionIndex;
             if( connectionIndex >= aConnections.size() )
                 continue;
-            const ROUTING_CONNECTION original = aConnections[connectionIndex];
+            // A source combine can leave one PolylineTrace representing
+            // several host insertion records.  Optimize the selected board
+            // item geometry, not an arbitrary pre-combine alias record.
+            const ROUTING_CONNECTION original =
+                    m_occupancy.Board()->RouteReferenceCount( next->key.item ) > 1
+                            ? m_occupancy.Board()->ItemRoute( next->key.item )
+                                      .value_or( aConnections[connectionIndex] )
+                            : aConnections[connectionIndex];
 
             AUTOROUTER_SETTINGS itemOptimizationSettings = optimizationSettings;
             if( next->key.kind == 1 )
