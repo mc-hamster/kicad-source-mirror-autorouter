@@ -476,12 +476,33 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             }
             continue;
         }
-        if( current.door && !occupied.emplace( current.door, current.section ).second )
+        // Source occupation is committed only after room expansion produces
+        // work.  This preserves alternate entries into small/thin rooms.
+        if( current.door && occupied.contains( { current.door, current.section } ) )
             continue;
         ++metrics.sections;
         space.completeNeighbours( current.room );
         if( stopped() )
             return std::nullopt;
+
+        const bool currentDoorIsSmall = current.door
+                && current.door->IsSmallFor90DegreeTrace(
+                        2 * ( sectionOffset
+                              + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) );
+        if( currentDoorIsSmall )
+        {
+            EXPANSION_ROOM* fromRoom =
+                    current.door->OtherRoom( current.room->shape.get() );
+            if( !dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( fromRoom ) )
+                continue;
+        }
+
+        const ROUTER_BOX roomShape = current.room->shape->GetShape();
+        const bool nextRoomIsThick =
+                std::min( static_cast<double>( roomShape.maxX ) - roomShape.minX,
+                          static_cast<double>( roomShape.maxY ) - roomShape.minY )
+                >= 2 * sectionOffset;
+        bool somethingExpanded = false;
         int targetId = targetIdBase;
         for( std::size_t i = 0; i < current.layer; ++i )
             targetId += layers[i].targets.size();
@@ -503,9 +524,13 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             state.f = state.g; state.parent = index; state.owner = current.owner;
             state.targetOwner = target.owner; state.itemId = targetId;
             push( state );
+            somethingExpanded = true;
         }
         for( auto* door : current.room->shape->GetDoors() )
         {
+            if( door == current.door )
+                continue;
+
             ROOM* next = space.byShape.at( door->OtherRoom( current.room->shape.get() ) );
             if( !next->complete || !next->active )
                 continue;
@@ -562,6 +587,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                           { "expansion_value", std::to_string( state.g ) },
                           { "sorting_value", std::to_string( state.f ) } } );
                 push( state );
+                somethingExpanded = true;
             }
         }
         // The reference normally reaches the next page through a room door.
@@ -569,7 +595,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         // there too, otherwise a legitimate two-via crossing is unreachable.
         // Per-drill/per-layer occupation still prevents cycling back through it.
         if( via.transitionsEnabled
-            && ( !current.drill || current.room->shape->GetDoors().empty() ) )
+            && ( !current.drill || current.room->shape->GetDoors().empty() )
+            && current.room->shape->IsCompleteFreeSpace()
+            && ( somethingExpanded || nextRoomIsThick ) )
             for( auto* page : pages.OverlappingPages( current.room->shape->GetShape() ) )
             {
                 const auto nearest = MAZE_EXPANSION_ENGINE::Nearest( page->Shape(), from );
@@ -580,7 +608,11 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 state.page = page; state.section = current.layer; state.entry = current.entry;
                 state.g = cost.expansion; state.f = cost.sorting; state.parent = index; state.owner = current.owner;
                 push( state );
+                somethingExpanded = true;
             }
+
+        if( current.door && somethingExpanded )
+            occupied.emplace( current.door, current.section );
     }
     return std::nullopt;
 }

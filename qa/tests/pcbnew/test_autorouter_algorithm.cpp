@@ -720,6 +720,38 @@ BOOST_AUTO_TEST_CASE( FortyFiveDegreeSmallDoorMatchesSourceWidthGate )
 }
 
 
+BOOST_AUTO_TEST_CASE( AngleSpecificSmallDoorGatesMatchSourceGeometry )
+{
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM left(
+            1, 0, PLANAR::INT_OCTAGON::FromBox( { 0, 0, 100, 100 } ) );
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM right(
+            2, 0, PLANAR::INT_OCTAGON::FromBox( { 100, 20, 200, 80 } ) );
+    EXPANSION_DOOR lineDoor( &left, &right );
+    BOOST_REQUIRE_EQUAL( lineDoor.GetDimension(), 1 );
+    BOOST_CHECK( lineDoor.IsSmallFor90DegreeTrace( 61 ) );
+    BOOST_CHECK( !lineDoor.IsSmallFor90DegreeTrace( 60 ) );
+    BOOST_CHECK( lineDoor.IsSmallForAnyAngleTrace( 61 ) );
+    BOOST_CHECK( !lineDoor.IsSmallForAnyAngleTrace( 60 ) );
+
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM overlap(
+            3, 0, PLANAR::INT_OCTAGON::FromBox( { 90, 0, 200, 100 } ) );
+    EXPANSION_DOOR overlapDoor( &left, &overlap );
+    BOOST_REQUIRE_EQUAL( overlapDoor.GetDimension(), 2 );
+    BOOST_CHECK( overlapDoor.IsSmallFor90DegreeTrace( 101 ) );
+    BOOST_CHECK( !overlapDoor.IsSmallFor90DegreeTrace( 100 ) );
+    BOOST_CHECK( overlapDoor.IsSmallForAnyAngleTrace( 101 ) );
+    BOOST_CHECK( !overlapDoor.IsSmallForAnyAngleTrace( 100 ) );
+
+    OBSTACLE_EXPANSION_ROOM obstacle(
+            4, 0, PLANAR::INT_OCTAGON::FromBox( { 90, 0, 200, 100 } ),
+            1, 1 );
+    EXPANSION_DOOR obstacleDoor( &left, &obstacle );
+    BOOST_REQUIRE_EQUAL( obstacleDoor.GetDimension(), 2 );
+    BOOST_CHECK( !obstacleDoor.IsSmallFor90DegreeTrace( 1000 ) );
+    BOOST_CHECK( !obstacleDoor.IsSmallForAnyAngleTrace( 1000 ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( GeneralExpansionDoorMatchesPinnedFreerouting )
 {
     using PLANAR::LINE;
@@ -7984,9 +8016,11 @@ BOOST_AUTO_TEST_CASE( AnyAngleRoomFrontierRoutesThroughExactGeneralConvexRooms )
 {
     using PLANAR::POINT;
     using PLANAR::SIMPLEX;
-    const ROUTER_BOX bounds{ 0, 0, 1000, 1000 };
+    constexpr std::int64_t scale = 1000;
+    const ROUTER_BOX bounds{ 0, 0, 1000 * scale, 1000 * scale };
     const auto obstacle = SIMPLEX::FromConvexPolygon(
-            { { 350, 220 }, { 760, 410 }, { 650, 790 }, { 290, 650 } } );
+            { { 350 * scale, 220 * scale }, { 760 * scale, 410 * scale },
+              { 650 * scale, 790 * scale }, { 290 * scale, 650 * scale } } );
     BOOST_REQUIRE( obstacle );
     const std::vector<SHAPE_TREE_ENTRY> obstacles{
         { obstacle->BoundingBox().value(), 1, 0, 0, 0, false, true, {}, *obstacle }
@@ -7996,16 +8030,20 @@ BOOST_AUTO_TEST_CASE( AnyAngleRoomFrontierRoutesThroughExactGeneralConvexRooms )
     ROOM_SEARCH_METRICS metrics;
     const auto path = MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
             bounds, obstacles, 0, 1,
-            { { { 100, 500 }, { 100, 500 }, 11 } },
-            { { { 900, 500 }, { 900, 500 }, 20 } },
-            10, 1, 1, 10000, expanded, metrics );
+            { { { 100 * scale, 500 * scale },
+                { 100 * scale, 500 * scale }, 11 } },
+            { { { 900 * scale, 500 * scale },
+                { 900 * scale, 500 * scale }, 20 } },
+            10 * scale, 1, 1, 10000, expanded, metrics );
 
     BOOST_REQUIRE( path );
     BOOST_REQUIRE_GE( path->points.size(), 3U );
     BOOST_CHECK_EQUAL( path->startOwner, 11U );
     BOOST_CHECK_EQUAL( path->targetOwner, 20U );
-    BOOST_CHECK( path->points.front() == ROUTER_POINT( { 100, 500 } ) );
-    BOOST_CHECK( path->points.back() == ROUTER_POINT( { 900, 500 } ) );
+    BOOST_CHECK( path->points.front()
+                 == ROUTER_POINT( { 100 * scale, 500 * scale } ) );
+    BOOST_CHECK( path->points.back()
+                 == ROUTER_POINT( { 900 * scale, 500 * scale } ) );
     BOOST_CHECK_GT( metrics.rooms, 0 );
     BOOST_CHECK_GT( metrics.doors, 0 );
     BOOST_CHECK_GT( metrics.sections, 0 );
@@ -8016,7 +8054,10 @@ BOOST_AUTO_TEST_CASE( AnyAngleRoomFrontierRoutesThroughExactGeneralConvexRooms )
     }
     BOOST_CHECK( std::any_of(
             path->points.begin() + 1, path->points.end() - 1,
-            []( const ROUTER_POINT& point ) { return point.y != 500; } ) );
+            []( const ROUTER_POINT& point )
+            {
+                return point.y != 500 * scale;
+            } ) );
 }
 
 
@@ -8351,7 +8392,8 @@ BOOST_AUTO_TEST_CASE( RoomLocatorRespectsAnglesAndBendThreshold )
 BOOST_AUTO_TEST_CASE( RoomSearchFindsIndependentlyCertifiedRectangularPaths )
 {
     std::mt19937 random( 230090 );
-    const ROUTER_BOX bounds{ 0, 0, 100, 100 };
+    constexpr std::int64_t scale = 1000;
+    const ROUTER_BOX bounds{ 0, 0, 100 * scale, 100 * scale };
     int reachable = 0;
     for( int test = 0; test < 300; ++test )
     {
@@ -8360,10 +8402,13 @@ BOOST_AUTO_TEST_CASE( RoomSearchFindsIndependentlyCertifiedRectangularPaths )
             std::vector<SHAPE_TREE_ENTRY> obstacles;
             for( int i = 0; i < 12; ++i )
             {
-                const std::int64_t x = 10 + random() % 75;
-                const std::int64_t y = 10 + random() % 75;
-                obstacles.push_back( { { x, y, x + 1 + static_cast<std::int64_t>( random() % 14 ),
-                                         y + 1 + static_cast<std::int64_t>( random() % 14 ) }, i + 1 } );
+                const std::int64_t x = ( 10 + random() % 75 ) * scale;
+                const std::int64_t y = ( 10 + random() % 75 ) * scale;
+                obstacles.push_back( {
+                        { x, y,
+                          x + ( 1 + static_cast<std::int64_t>( random() % 14 ) ) * scale,
+                          y + ( 1 + static_cast<std::int64_t>( random() % 14 ) ) * scale },
+                        i + 1 } );
             }
             auto allowed = [&]( ROUTER_POINT a, ROUTER_POINT b )
             {
@@ -8394,7 +8439,8 @@ BOOST_AUTO_TEST_CASE( RoomSearchFindsIndependentlyCertifiedRectangularPaths )
                 {
                     const int nx = x + dx, ny = y + dy;
                     if( nx < 0 || ny < 0 || nx > 20 || ny > 20 || seen[nx][ny]
-                        || !allowed( { x * 5, y * 5 }, { nx * 5, ny * 5 } ) )
+                        || !allowed( { x * 5 * scale, y * 5 * scale },
+                                     { nx * 5 * scale, ny * 5 * scale } ) )
                         continue;
                     seen[nx][ny] = true;
                     queue.emplace( nx, ny );
@@ -8406,11 +8452,17 @@ BOOST_AUTO_TEST_CASE( RoomSearchFindsIndependentlyCertifiedRectangularPaths )
             int expanded = 0;
             ROOM_SEARCH_METRICS metrics;
             const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
-                    bounds, obstacles, 0, 1, { { { 5, 5 }, { 5, 5 }, 0 } },
-                    { { { 95, 95 }, { 95, 95 }, 1 } }, 1, 1, 1, 10000, expanded, metrics );
+                    bounds, obstacles, 0, 1,
+                    { { { 5 * scale, 5 * scale },
+                        { 5 * scale, 5 * scale }, 0 } },
+                    { { { 95 * scale, 95 * scale },
+                        { 95 * scale, 95 * scale }, 1 } },
+                    scale / 10, 1, 1, 10000, expanded, metrics );
             BOOST_REQUIRE( path );
-            BOOST_CHECK( path->points.front() == ROUTER_POINT( { 5, 5 } ) );
-            BOOST_CHECK( path->points.back() == ROUTER_POINT( { 95, 95 } ) );
+            BOOST_CHECK( path->points.front()
+                         == ROUTER_POINT( { 5 * scale, 5 * scale } ) );
+            BOOST_CHECK( path->points.back()
+                         == ROUTER_POINT( { 95 * scale, 95 * scale } ) );
             for( std::size_t i = 1; i < path->points.size(); ++i )
             {
                 const auto a = path->points[i - 1], b = path->points[i];

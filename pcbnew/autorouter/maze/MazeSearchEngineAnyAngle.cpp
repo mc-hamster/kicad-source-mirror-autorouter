@@ -249,12 +249,28 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
             return path;
         }
 
-        if( current.door && !occupied.emplace( current.door, current.section ).second )
+        // Match MazeSearchEngine.occupyNextElement(): an entry becomes
+        // occupied only after room expansion actually produces work.
+        if( current.door && occupied.contains( { current.door, current.section } ) )
             continue;
         ++aMetrics.sections;
         search.completeNeighbours( current.room );
         if( search.stopped() )
             return std::nullopt;
+
+        const bool currentDoorIsSmall = current.door
+                && current.door->IsSmallForAnyAngleTrace(
+                        2 * ( aSectionOffset
+                              + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) );
+        if( currentDoorIsSmall )
+        {
+            EXPANSION_ROOM* fromRoom =
+                    current.door->OtherRoom( current.room->shape.get() );
+            if( !dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( fromRoom ) )
+                continue;
+        }
+
+        bool somethingExpanded = false;
         const FLOAT_POINT from = current.entry.Middle();
         for( std::size_t targetIndex = 0; targetIndex < aTargets.size(); ++targetIndex )
         {
@@ -269,10 +285,14 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
             push( { nullptr, nullptr, 0, { to, to }, g, g, index,
                     current.owner, target.owner,
                     static_cast<std::uint32_t>( aStarts.size() + targetIndex + 1 ) } );
+            somethingExpanded = true;
         }
 
         for( EXPANSION_DOOR* door : current.room->shape->GetDoors() )
         {
+            if( door == current.door )
+                continue;
+
             ROOM* next = search.byShape.at(
                     door->OtherRoom( current.room->shape.get() ) );
             if( !next->complete || !next->active )
@@ -339,8 +359,12 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
                           { "sorting_value", std::to_string( g + distance( to ) ) } } );
                 push( { next, door, section, sections[section], g,
                         g + distance( to ), index, current.owner, {}, 0, ripupCost } );
+                somethingExpanded = true;
             }
         }
+
+        if( current.door && somethingExpanded )
+            occupied.emplace( current.door, current.section );
     }
 
     if( autorouterDebugEnabled() )

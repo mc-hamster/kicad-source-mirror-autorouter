@@ -93,19 +93,61 @@ PLANAR::SIMPLEX EXPANSION_DOOR::GetSimplexShape() const
 }
 
 
+namespace
+{
+bool widthMustBeChecked( const EXPANSION_ROOM* aFirstRoom,
+                         const EXPANSION_ROOM* aSecondRoom, int aDimension )
+{
+    return aDimension == 1
+           || ( aFirstRoom && aSecondRoom
+                && aFirstRoom->IsCompleteFreeSpace()
+                && aSecondRoom->IsCompleteFreeSpace() );
+}
+} // namespace
+
+
+bool EXPANSION_DOOR::IsSmallFor90DegreeTrace( double aTraceWidth ) const
+{
+    if( !std::isfinite( aTraceWidth ) || aTraceWidth < 0 )
+        return true;
+
+    if( !widthMustBeChecked( m_firstRoom, m_secondRoom, m_dimension ) )
+        return false;
+
+    const ROUTER_BOX shape = GetShape();
+    if( INT_BOX::Dimension( shape ) < 0 )
+        return true;
+
+    const double width = std::max(
+            static_cast<double>( shape.maxX ) - shape.minX,
+            static_cast<double>( shape.maxY ) - shape.minY );
+    return width < aTraceWidth;
+}
+
+
 bool EXPANSION_DOOR::IsSmallFor45DegreeTrace( double aTraceWidth ) const
 {
     if( !std::isfinite( aTraceWidth ) || aTraceWidth < 0 )
         return true;
 
-    const bool freeSpaceOverlap = m_firstRoom && m_secondRoom
-                                  && m_firstRoom->IsCompleteFreeSpace()
-                                  && m_secondRoom->IsCompleteFreeSpace();
-    if( m_dimension != 1 && !freeSpaceOverlap )
+    if( !widthMustBeChecked( m_firstRoom, m_secondRoom, m_dimension ) )
         return false;
 
     const PLANAR::INT_OCTAGON shape = GetOctagonShape();
     return shape.IsEmpty() || shape.MaxWidth() < aTraceWidth;
+}
+
+
+bool EXPANSION_DOOR::IsSmallForAnyAngleTrace( double aTraceWidth ) const
+{
+    if( !std::isfinite( aTraceWidth ) || aTraceWidth < 0 )
+        return true;
+
+    if( !widthMustBeChecked( m_firstRoom, m_secondRoom, m_dimension ) )
+        return false;
+
+    const auto diagonal = GetSimplexShape().DiagonalCornerSegment();
+    return !diagonal || diagonal->a.Distance( diagonal->b ) < aTraceWidth;
 }
 
 
