@@ -12,7 +12,43 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — source board-outline room geometry
+## Latest core milestone — source bend cost and y-up door-section order
+
+The maze default now uses Freerouting's independent routing bend cost of zero;
+the board-history bend penalty remains ten.  Nonzero-cost 45-degree and
+90-degree searches also measure the incoming direction from the centre of the
+previous door, drill, or drill page instead of from the previous clipped entry
+segment.  These are separate source settings and operations and must not be
+collapsed into one native penalty.
+
+Fixed-direction production doors now perform the corner-order-sensitive
+`ExpansionDoor.calcDoorLineSegment` and section division in Freerouting's y-up
+coordinate system, then reflect the source-ordered result back to KiCad's
+y-down system.  The direct 2,048-record door oracle still runs in source
+coordinates; every record now additionally verifies the reflected production
+adapter.  This removes the prior false vertical section on an oblique BJT room
+door.
+
+On the stripped BJT gate, the first connection's synchronized raw room-frontier
+stream now agrees through all 54 source room/door pops before reaching its
+destination.  The normalized section-assignment mismatch moved from 125 to
+182.  A new source-side item-selection trace also proved that the subsequent
+pass work list is already aligned: source item ids
+`202,201,75,74,63,62,51,50,44,43,37,36,30,29,23,...` correspond exactly to
+native pad representatives `21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,...`.
+The next divergence is therefore the mutable copper/path produced by the first
+insertion and pull-tight operation, not batch ordering.
+
+This checkpoint passes **251/251 native autorouter cases** and all **26 Python
+parity-harness tests**; `pcbnew` and the parity executable link successfully.
+The BJT result remains 16/16 complete, DRC-clean, via-free, and uses 144.339 mm
+of track versus Freerouting's 152.435 mm.  The stripped 555 host result remains
+12/12 complete and DRC-clean after one repair pass, using 97.831 mm and 12 vias;
+its core worker reports 11/12 before host repair.  Freerouting uses 184.248 mm
+and seven vias but introduces ten KiCad DRC violations.  Fanout/via sharing and
+first-route insertion/pull-tight identity remain the active quality gaps.
+
+## Previous core milestone — source board-outline room geometry
 
 The active room tree now has a first-class `board/model/structure/BoardOutline.h`
 translation instead of deriving a rectangular edge obstacle from KiCad's
