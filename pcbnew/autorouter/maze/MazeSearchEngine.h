@@ -163,7 +163,7 @@ public:
                                                        const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
                                                        const std::vector<ROUTING_TERMINAL>& aStarts = {},
                                                        const std::vector<ROUTING_TERMINAL>& aTargets = {},
-                                                       bool aAllowLegacyFallback = true ) const;
+                                                       bool aAllowLegacyFallback = false ) const;
 
     // Retry searches may temporarily cross committed routes.  Resolve those
     // crossings with the same netclass, layer-span, copper, and drill rules

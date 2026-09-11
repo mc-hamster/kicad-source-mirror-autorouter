@@ -94,6 +94,7 @@ struct ROOM_VIA_SETTINGS
     // pin's one-layer connected set. These fields keep that state inside the
     // same room/drill frontier instead of falling back to a second grid maze.
     bool stopAtFirstDrill = false;
+    bool allowDirectFanoutTarget = false;
     int fanoutSourceLayer = -1;
     ROUTER_POINT fanoutCenter;
     std::int64_t fanoutMinDistance = 0;

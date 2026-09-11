@@ -103,6 +103,56 @@ std::vector<DRILL_PAGE*> DRILL_PAGE_ARRAY::OverlappingPages( const ROUTER_BOX& a
 }
 
 
+void DRILL_PAGE_ARRAY::AddFanoutCandidates( ROUTER_POINT aCenter,
+                                             std::int64_t aMinimumDistance,
+                                             std::int64_t aMaximumDistance )
+{
+    const std::int64_t minimum = std::max<std::int64_t>( 0, aMinimumDistance );
+    const std::int64_t maximum = std::max( minimum, aMaximumDistance );
+    if( maximum <= 0 )
+        return;
+
+    // A Freerouting fanout runs against a live board and its drill-page
+    // centroids. The native worker instead uses an immutable control pad; on
+    // a page wider than the requested escape annulus, every centroid can lie
+    // outside that annulus and the room frontier has no drill state to test.
+    // Seed exact annulus points into the same page/free-shape pipeline rather
+    // than falling back to the retired grid search. The final canDrill and
+    // ordered ViaRule checks remain authoritative.
+    std::vector<std::int64_t> distances{ maximum };
+    if( minimum > 0 && minimum != maximum )
+        distances.push_back( minimum );
+
+    // Cardinal and 45-degree exits are the source router's fixed-direction
+    // fanout basis. General-convex routing may subsequently bend between
+    // room doors; these are drill seeds, not a path discretization.
+    constexpr long double DIAGONAL = 0.7071067811865475244L;
+    constexpr std::pair<long double, long double> directions[] = {
+        { 1, 0 }, { DIAGONAL, DIAGONAL }, { 0, 1 }, { -DIAGONAL, DIAGONAL },
+        { -1, 0 }, { -DIAGONAL, -DIAGONAL }, { 0, -1 }, { DIAGONAL, -DIAGONAL }
+    };
+
+    for( std::int64_t distance : distances )
+    {
+        for( const auto& [dx, dy] : directions )
+        {
+            const ROUTER_POINT candidate{
+                aCenter.x + static_cast<std::int64_t>( std::llround( distance * dx ) ),
+                aCenter.y + static_cast<std::int64_t>( std::llround( distance * dy ) ) };
+            if( !m_bounds.Contains( candidate ) )
+                continue;
+
+            const std::int64_t column = std::min<std::int64_t>(
+                    m_columns - 1, ( candidate.x - m_bounds.minX ) / m_pageWidth );
+            const std::int64_t row = std::min<std::int64_t>(
+                    m_rows - 1, ( candidate.y - m_bounds.minY ) / m_pageHeight );
+            m_pages[static_cast<std::size_t>( row ) * m_columns + column]
+                    .AddCandidate( candidate );
+        }
+    }
+}
+
+
 std::vector<ROUTER_POINT> DRILL_PAGE_ARRAY::LandmarkCenters() const
 {
     std::vector<ROUTER_POINT> result;

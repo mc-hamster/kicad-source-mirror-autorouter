@@ -1380,9 +1380,71 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                     ROUTING_PAD searchTarget = target;
                     if( !requestedFanoutTask )
                         searchTarget.isFanoutTarget = false;
-                    connection = aEngine.AutorouteConnection(
-                            source, searchTarget, aRetry, expanded, aCancel,
-                            searchProgress, starts, searchDestinations );
+                    if( requestedFanoutTask && !aNet.viaProfiles.empty() )
+                    {
+                        // The combined fanout ViaRule is ordered, but each
+                        // ViaInfo owns a different clearance envelope. Using
+                        // the largest annulus as one shared drill-page broad
+                        // phase can erase a legal landing for a later,
+                        // smaller profile before SelectViaStyle gets to test
+                        // it. Run the same room frontier once per declared
+                        // profile, preserving rule order and keeping the
+                        // selected padstack local to this pin attempt.
+                        for( const ROUTING_VIA_PROFILE& profile : aNet.viaProfiles )
+                        {
+                            int profileExpanded = 0;
+                            const ROUTER_SEARCH_PROGRESS_CALLBACK profileProgress =
+                                    [&]( int aProfileExpanded )
+                            {
+                                if( aSearchProgress )
+                                    aSearchProgress( expandedBeforeSearch + expanded
+                                                     + aProfileExpanded );
+                            };
+                            AUTOROUTE_ENGINE profileEngine(
+                                    aBoard, aSettings, aOccupancy, aNet.netCode, profile );
+                            connection = profileEngine.AutorouteConnection(
+                                    source, searchTarget, aRetry, profileExpanded, aCancel,
+                                    profileProgress, starts, searchDestinations );
+                            expanded += profileExpanded;
+                            if( connection || ( aCancel && aCancel() ) )
+                                break;
+                        }
+                    }
+                    else
+                    {
+                        const bool hasProtectedFanout = !requestedFanoutTask
+                                && std::any_of(
+                                        aConnections.begin(), aConnections.end(),
+                                        [&]( const ROUTING_CONNECTION& aConnection )
+                                        {
+                                            return aConnection.netCode == aNet.netCode
+                                                   && aConnection.isFanoutConnection;
+                                        } );
+                        if( hasProtectedFanout )
+                        {
+                            // A completed fanout has already paid for the
+                            // layer transition and exposes trace terminals on
+                            // its exit layer. Prefer connecting to that copper
+                            // without another drill. This is the native
+                            // equivalent of removeTails(FANOUT_VIA): the
+                            // protected escape remains useful rather than
+                            // being bypassed by a cheaper microscopic test via
+                            // and then deleted as a redundant tail.
+                            AUTOROUTER_SETTINGS sameLayerSettings = aSettings;
+                            sameLayerSettings.allowVias = false;
+                            AUTOROUTE_ENGINE sameLayerEngine(
+                                    aBoard, sameLayerSettings, aOccupancy );
+                            connection = sameLayerEngine.AutorouteConnection(
+                                    source, searchTarget, aRetry, expanded, aCancel,
+                                    searchProgress, starts, searchDestinations );
+                        }
+                        if( !connection && !( aCancel && aCancel() ) )
+                        {
+                            connection = aEngine.AutorouteConnection(
+                                    source, searchTarget, aRetry, expanded, aCancel,
+                                    searchProgress, starts, searchDestinations );
+                        }
+                    }
                     aExpandedNodes += expanded;
 
                     // This is distinct from a pin-entry neckdown.  Freerouting's

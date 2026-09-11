@@ -134,18 +134,34 @@ std::vector<EXPANSION_DRILL>* DRILL_PAGE::GetDrills(
                 }
             }
 
-            EXPANSION_DRILL drill;
-            drill.generalFreeShape = shape;
-            drill.freeShape = shape.BoundingOctagon().value_or(
-                    PLANAR::INT_OCTAGON::Empty() );
             const auto center = shape.CentreOfGravity();
-            drill.location = pinCenter.value_or(
-                    FLOAT_POINT{ center.first, center.second }.Round() );
-            drill.firstLayer = 0;
-            drill.lastLayer = aLayerCount - 1;
-            drill.rooms.resize( aLayerCount, nullptr );
-            drill.occupied.resize( aLayerCount, false );
-            drills.push_back( std::move( drill ) );
+            std::vector<ROUTER_POINT> locations;
+            for( const ROUTER_POINT& candidate : m_candidates )
+                if( shape.ContainsInside( PLANAR::POINT( candidate ) ) )
+                    locations.push_back( candidate );
+            locations.push_back( pinCenter.value_or(
+                    FLOAT_POINT{ center.first, center.second }.Round() ) );
+
+            for( const ROUTER_POINT& location : locations )
+            {
+                if( std::any_of( drills.begin(), drills.end(),
+                                 [&]( const EXPANSION_DRILL& aDrill )
+                                 { return aDrill.location == location; } ) )
+                {
+                    continue;
+                }
+
+                EXPANSION_DRILL drill;
+                drill.generalFreeShape = shape;
+                drill.freeShape = shape.BoundingOctagon().value_or(
+                        PLANAR::INT_OCTAGON::Empty() );
+                drill.location = location;
+                drill.firstLayer = 0;
+                drill.lastLayer = aLayerCount - 1;
+                drill.rooms.resize( aLayerCount, nullptr );
+                drill.occupied.resize( aLayerCount, false );
+                drills.push_back( std::move( drill ) );
+            }
         }
 
         m_drills = std::move( drills );
@@ -194,16 +210,32 @@ std::vector<EXPANSION_DRILL>* DRILL_PAGE::GetDrills(
                 if( pinCenter )
                     break;
             }
-        EXPANSION_DRILL drill;
-        drill.freeShape = shape;
         const auto center = shape.CentreOfGravity();
-        drill.location = pinCenter.value_or(
-                FLOAT_POINT{ center.first, center.second }.Round() );
-        drill.firstLayer = 0;
-        drill.lastLayer = aLayerCount - 1;
-        drill.rooms.resize( aLayerCount, nullptr );
-        drill.occupied.resize( aLayerCount, false );
-        drills.push_back( std::move( drill ) );
+        std::vector<ROUTER_POINT> locations;
+        for( const ROUTER_POINT& candidate : m_candidates )
+            if( shape.ContainsInside( candidate ) )
+                locations.push_back( candidate );
+        locations.push_back( pinCenter.value_or(
+                FLOAT_POINT{ center.first, center.second }.Round() ) );
+
+        for( const ROUTER_POINT& location : locations )
+        {
+            if( std::any_of( drills.begin(), drills.end(),
+                             [&]( const EXPANSION_DRILL& aDrill )
+                             { return aDrill.location == location; } ) )
+            {
+                continue;
+            }
+
+            EXPANSION_DRILL drill;
+            drill.freeShape = shape;
+            drill.location = location;
+            drill.firstLayer = 0;
+            drill.lastLayer = aLayerCount - 1;
+            drill.rooms.resize( aLayerCount, nullptr );
+            drill.occupied.resize( aLayerCount, false );
+            drills.push_back( std::move( drill ) );
+        }
     }
     m_drills = std::move( drills );
     m_valid = true;

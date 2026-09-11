@@ -15,6 +15,7 @@
 #include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
+#include <geometry/shape_poly_set.h>
 #include <algorithm>
 #include <sstream>
 
@@ -114,6 +115,74 @@ bool isGeneralConvexRoomObstacle( const ROUTING_OBSTACLE& aObstacle, int aNet,
 }
 
 
+bool isGeneralPolygonRoomObstacle( const ROUTING_OBSTACLE& aObstacle, int aNet,
+                                   bool aForVia )
+{
+    return aObstacle.kind == ROUTER_OBSTACLE_KIND::POLYGON && !aObstacle.isHole
+           && ( aForVia ? aObstacle.blocksVias : aObstacle.blocksTracks )
+           && aObstacle.radius == 0 && aObstacle.polygon.size() >= 3
+           && ( aObstacle.netCode != aNet || aObstacle.isKeepout );
+}
+
+
+std::optional<std::vector<PLANAR::SIMPLEX>> splitPolygonAreaToConvex(
+        const ROUTING_OBSTACLE& aObstacle, std::int64_t aExpansion )
+{
+    const auto fitsHostCoordinate = []( const ROUTER_POINT& aPoint )
+    {
+        return aPoint.x >= std::numeric_limits<int>::min()
+               && aPoint.x <= std::numeric_limits<int>::max()
+               && aPoint.y >= std::numeric_limits<int>::min()
+               && aPoint.y <= std::numeric_limits<int>::max();
+    };
+    if( !std::all_of( aObstacle.polygon.begin(), aObstacle.polygon.end(),
+                      fitsHostCoordinate ) )
+    {
+        return std::nullopt;
+    }
+    for( const auto& hole : aObstacle.polygonHoles )
+        if( hole.size() < 3
+            || !std::all_of( hole.begin(), hole.end(), fitsHostCoordinate ) )
+        {
+            return std::nullopt;
+        }
+
+    SHAPE_POLY_SET area;
+    const int outline = area.NewOutline();
+    for( const ROUTER_POINT& point : aObstacle.polygon )
+        area.Append( static_cast<int>( point.x ), static_cast<int>( point.y ), outline, -1 );
+    for( const auto& hole : aObstacle.polygonHoles )
+    {
+        const int holeIndex = area.NewHole( outline );
+        for( const ROUTER_POINT& point : hole )
+            area.Append( static_cast<int>( point.x ), static_cast<int>( point.y ),
+                         outline, holeIndex );
+    }
+
+    area.CacheTriangulation( false );
+    std::vector<PLANAR::SIMPLEX> result;
+    for( unsigned int polygon = 0; polygon < area.TriangulatedPolyCount(); ++polygon )
+    {
+        const auto* triangulated = area.TriangulatedPolygon( polygon );
+        if( !triangulated )
+            return std::nullopt;
+        for( std::size_t triangle = 0; triangle < triangulated->GetTriangleCount(); ++triangle )
+        {
+            VECTOR2I a, b, c;
+            triangulated->GetTriangle( static_cast<int>( triangle ), a, b, c );
+            auto simplex = PLANAR::SIMPLEX::FromConvexPolygon(
+                    { { a.x, a.y }, { b.x, b.y }, { c.x, c.y } }, aExpansion );
+            if( !simplex || simplex->Dimension() != 2 )
+                return std::nullopt;
+            result.push_back( std::move( *simplex ) );
+        }
+    }
+    return result.empty() ? std::nullopt
+                          : std::optional<std::vector<PLANAR::SIMPLEX>>(
+                                    std::move( result ) );
+}
+
+
 bool areaTouchesVia( const ROUTING_OBSTACLE& aArea, ROUTER_POINT aCenter,
                      std::int64_t aViaRadius )
 {
@@ -189,7 +258,7 @@ bool MAZE_SEARCH_ENGINE::hasGeneralConvexRoomGeometry( int aNet, int aLayer ) co
     for( const std::size_t index : obstacleIndices( aLayer ) )
     {
         const ROUTING_OBSTACLE& obstacle = m_board.obstacles[index];
-        if( isGeneralConvexRoomObstacle( obstacle, aNet, false ) )
+        if( isGeneralPolygonRoomObstacle( obstacle, aNet, false ) )
             return true;
     }
 
@@ -257,12 +326,29 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         // The drill-page tree remains rectangular.  The 45-degree room tree
         // retains this exact eight-support envelope instead of treating a
         // diagonal convex contour as its axis-aligned bounding box.
-        if( aSkipGeneralConvex && isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
+        if( aSkipGeneralConvex && isGeneralPolygonRoomObstacle( obstacle, net, aForVia ) )
             continue;
         // One extra IU makes the room boundary legal under the host's
         // inclusive collision predicates; do not apply clearance twice.
         const std::int64_t expansion = obstacleExpansionRadius(
                 obstacle, net, aLayer, aForVia, radius, drillRadius ) + 1;
+        if( isGeneralPolygonRoomObstacle( obstacle, net, aForVia )
+            && !isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
+        {
+            if( const auto pieces = splitPolygonAreaToConvex( obstacle, expansion ) )
+            {
+                for( const PLANAR::SIMPLEX& piece : *pieces )
+                {
+                    if( const auto octagon = piece.BoundingOctagon() )
+                        addOctagon( *octagon, piece );
+                }
+                continue;
+            }
+            // Malformed or out-of-range polygon data must fail closed.
+            addOctagon( octagonalEnvelope( obstacle, expansion ) );
+            continue;
+        }
+
         std::optional<PLANAR::SIMPLEX> simplex;
         if( isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
             simplex = PLANAR::SIMPLEX::FromConvexPolygon(
@@ -928,6 +1014,45 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         via.fanoutCenter = starts.front().pad.position;
         if( fanoutTarget->fanoutSourcePadIndex < m_board.pads.size() )
             via.fanoutCenter = m_board.pads[fanoutTarget->fanoutSourcePadIndex].position;
+
+        const auto targetWithinFanoutEnvelope = [&]( const ROUTING_TERMINAL& aTarget )
+        {
+            if( aTarget.pad.isSmd || aTarget.pad.isPlaneTarget
+                || via.fanoutMaxDistance <= 0 )
+            {
+                return true;
+            }
+
+            const ROUTER_POINT end = aTarget.segmentEnd.value_or( aTarget.pad.position );
+            const long double dx = static_cast<long double>( end.x )
+                                   - aTarget.pad.position.x;
+            const long double dy = static_cast<long double>( end.y )
+                                   - aTarget.pad.position.y;
+            const long double lengthSquared = dx * dx + dy * dy;
+            long double t = 0;
+            if( lengthSquared > 0 )
+            {
+                t = ( ( static_cast<long double>( via.fanoutCenter.x )
+                        - aTarget.pad.position.x ) * dx
+                      + ( static_cast<long double>( via.fanoutCenter.y )
+                          - aTarget.pad.position.y ) * dy ) / lengthSquared;
+                t = std::clamp( t, 0.0L, 1.0L );
+            }
+            const long double x = aTarget.pad.position.x + t * dx;
+            const long double y = aTarget.pad.position.y + t * dy;
+            const long double fromCenterX = x - via.fanoutCenter.x;
+            const long double fromCenterY = y - via.fanoutCenter.y;
+            return std::hypotl( fromCenterX, fromCenterY )
+                   <= static_cast<long double>( via.fanoutMaxDistance );
+        };
+        via.allowDirectFanoutTarget = !targets.empty()
+                && std::all_of(
+                        targets.begin(), targets.end(),
+                        [&]( const ROUTING_TERMINAL& aTarget )
+                        {
+                            return isOnPadLayer( aTarget.pad, via.fanoutSourceLayer )
+                                   && targetWithinFanoutEnvelope( aTarget );
+                        } );
     }
     const auto started = std::chrono::steady_clock::now();
     // RoutingBoard.fanout() uses the same 45-degree room/door/drill frontier

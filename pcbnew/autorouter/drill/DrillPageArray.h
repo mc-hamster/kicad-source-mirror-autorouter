@@ -41,6 +41,9 @@ public:
 
     const std::vector<DRILL_PAGE>& Pages() const { return m_pages; }
     std::vector<DRILL_PAGE*>       OverlappingPages( const ROUTER_BOX& aShape );
+    void                           AddFanoutCandidates( ROUTER_POINT aCenter,
+                                                       std::int64_t aMinimumDistance,
+                                                       std::int64_t aMaximumDistance );
     std::vector<ROUTER_POINT>      LandmarkCenters() const;
     void                           Invalidate( const ROUTER_BOX& aShape );
     void                           Reset();

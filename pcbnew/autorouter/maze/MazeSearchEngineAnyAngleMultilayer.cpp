@@ -78,6 +78,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayer
     if( columns * rows > maxExpanded )
         return std::nullopt;
     DRILL_PAGE_ARRAY pages( via.bounds, via.pageWidth );
+    if( via.stopAtFirstDrill )
+        pages.AddFanoutCandidates( via.fanoutCenter, via.fanoutMinDistance,
+                                   via.fanoutMaxDistance );
     std::vector<std::unique_ptr<ROOM_SEARCH_ANY_ANGLE>> spaces;
     int nextRoomId = 1;
     for( const auto& layer : layers )
@@ -183,27 +186,12 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayer
     bool allocationLimit = false;
     auto push = [&]( STATE state )
     {
-        // The reference queue bounds source-layer elements only when they
-        // still have a next expansion room. A TargetItemExpansionDoor has
-        // nextRoom == null and remains a legal completion even when the
-        // contacted item's centre lies beyond the fanout escape envelope.
-        // Applying the envelope to TARGET here rejected an already-routed via
-        // that Freerouting reaches directly and forced an unnecessary drill.
-        if( state.kind != KIND::TARGET && state.kind != KIND::FANOUT_TARGET
-            && via.stopAtFirstDrill && layers[state.layer].id == via.fanoutSourceLayer
-            && via.fanoutMaxDistance > 0 )
-        {
-            const FLOAT_POINT point = state.entry.Middle();
-            const long double dx = static_cast<long double>( point.x )
-                                           - via.fanoutCenter.x;
-            const long double dy = static_cast<long double>( point.y )
-                                           - via.fanoutCenter.y;
-            if( std::hypotl( dx, dy )
-                > static_cast<long double>( via.fanoutMaxDistance ) )
-            {
-                return;
-            }
-        }
+        // A completed free room may be divided into source-mandated page-size
+        // sections. Rejecting the artificial inter-section door by its
+        // midpoint can hide a real same-layer TargetItemExpansionDoor beyond
+        // the fanout envelope. The envelope constrains the physical drill,
+        // not decomposition-only room travel, so it is applied below when
+        // concrete drill candidates are enumerated.
 
         const int id = state.door ? state.door->GetId() : state.page ? state.page->GetId()
                       : state.drill ? state.drill->GetId()
@@ -584,6 +572,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayer
         int targetId = targetIdBase;
         for( std::size_t i = 0; i < current.layer; ++i )
             targetId += layers[i].targets.size();
+        if( !via.stopAtFirstDrill || via.allowDirectFanoutTarget )
         for( const auto& target : layer.targets )
         {
             ++targetId;

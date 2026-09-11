@@ -3988,9 +3988,15 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
             ? std::vector<ROUTING_TERMINAL>{ defaultStart } : aStarts;
     const std::vector<ROUTING_TERMINAL> targets = aTargets.empty()
             ? std::vector<ROUTING_TERMINAL>{ defaultTarget } : aTargets;
+    // Explicit terminal sets normally describe a non-fanout caller's real
+    // destinations.  BatchFanout is the exception: its synthetic control has
+    // a valid source-pad identity and names a stop-at-first-drill search whose
+    // actual item targets are supplied separately.
     const bool fanoutSearch = aTarget.isFanoutTarget
                               && aTarget.fanoutSourceLayer >= 0
-                              && aTarget.fanoutTargetLayer >= 0;
+                              && aTarget.fanoutTargetLayer >= 0
+                              && ( aTargets.empty()
+                                   || aTarget.fanoutSourcePadIndex < m_board.pads.size() );
     for( const auto& terminal : starts )
         if( terminal.pad.netCode != aStart.netCode )
             return std::nullopt;
@@ -4046,8 +4052,9 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     // The rectangular room frontier now compares same-layer routes and
     // through-drill alternatives in one queue. A fanout attempt uses the same
     // room/drill frontier but terminates at its first layer transition, just
-    // like AutorouteEngine with is_fanout. Unsupported/rejected geometry
-    // retains the legacy fallback with the same work budget and cancellation.
+    // like AutorouteEngine with is_fanout. Production callers stop when this
+    // translated room search rejects a route; they do not substitute the
+    // older raster/visibility implementation.
     const auto enabledLayers = std::count_if( m_settings.layers.begin(), m_settings.layers.end(),
                                              []( const auto& layer ) { return layer.enabled; } );
     m_useRoutableObstacleRooms = m_allowRipupOccupancy;
