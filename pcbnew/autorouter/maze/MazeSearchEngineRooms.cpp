@@ -1359,7 +1359,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     // Fanout and plane termination still depend on their existing complete-
     // centre room envelopes.  Ordinary fixed-direction routing is now paired
     // with the source-width locator and therefore uses source tree semantics.
-    const bool sourceTraceRooms = !anyAngleFrontier && !plane && fanoutTarget == nullptr;
+    const bool sourceTraceRooms = !plane && fanoutTarget == nullptr;
     int nextObstacleId = 1;
     for( int id : physical )
     {
@@ -1429,7 +1429,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayerConnection(
                       layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
-                      cancel, progress )
+                      cancel, progress, sourceTraceRooms )
             : exactFrontier
             ? MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
                       layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,

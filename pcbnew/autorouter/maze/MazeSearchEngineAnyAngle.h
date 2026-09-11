@@ -31,7 +31,8 @@ public:
             double aSectionOffset, const ROOM_VIA_SETTINGS& aVia,
             int aMaxExpanded, int& aExpanded, ROOM_SEARCH_METRICS& aMetrics,
             const ROUTER_CANCEL_CALLBACK& aCancel = {},
-            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {} );
+            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
+            bool aSourceTraceRooms = false );
 };
 
 } // namespace KICAD_AUTOROUTER
