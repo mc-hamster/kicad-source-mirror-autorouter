@@ -8,6 +8,7 @@
 #include "MazeExpansionEngine.h"
 #include "MazeListElement.h"
 #include "RoomCostSpace.h"
+#include "../AutorouterDebug.h"
 #include "../drill/DrillPageArray.h"
 #include "../expansion/TargetItemExpansionDoor.h"
 #include "../path/FoundConnectionLocator45Degree.h"
@@ -25,7 +26,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
 {
     using DETAIL::ROOM;
     using DETAIL::ROOM_SEARCH;
-    if( layers.size() < 2 || !via.canDrill || !std::isfinite( via.normalCost ) || via.normalCost < 0
+    if( layers.size() < 2 || ( via.transitionsEnabled && !via.canDrill )
+        || !std::isfinite( via.normalCost ) || via.normalCost < 0
         || !std::isfinite( sectionOffset ) || sectionOffset <= 0 || via.pageWidth <= 0
         || INT_BOX::Dimension( via.bounds ) != 2 || maxExpanded <= expanded )
         return std::nullopt;
@@ -65,9 +67,15 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     // layerActive affects the estimate, not destination-box collection.
     for( std::size_t layer = 0; layer < layers.size(); ++layer )
         for( const auto& target : layers[layer].targets )
-            destinationDistance.Join( costSpace.ToReference( ROUTER_BOX{
-                    std::min( target.start.x, target.end.x ), std::min( target.start.y, target.end.y ),
-                    std::max( target.start.x, target.end.x ), std::max( target.start.y, target.end.y ) } ), layer );
+        {
+            const ROUTER_BOX targetBounds = INT_BOX::Dimension( target.treeBounds ) >= 0
+                    ? target.treeBounds
+                    : ROUTER_BOX{ std::min( target.start.x, target.end.x ),
+                                  std::min( target.start.y, target.end.y ),
+                                  std::max( target.start.x, target.end.x ),
+                                  std::max( target.start.y, target.end.y ) };
+            destinationDistance.Join( costSpace.ToReference( targetBounds ), layer );
+        }
     // Bound page allocation before construction, not after a potentially huge
     // array has already been allocated. This is an explicit resource failure.
     const double columns = std::ceil( ( static_cast<double>( via.bounds.maxX ) - via.bounds.minX ) / via.pageWidth );
@@ -287,7 +295,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         auto& space = *spaces[current.layer];
         const auto& layer = layers[current.layer];
         const auto from = current.entry.Middle();
-        if( current.kind == KIND::PAGE )
+        if( via.transitionsEnabled && current.kind == KIND::PAGE )
         {
             ++metrics.drillPages;
             const bool wasCached = current.page->IsValid();
@@ -528,6 +536,31 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 state.entry = sections[section]; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend + ripupCost;
                 state.f = state.g + remaining( to, current.layer ); state.parent = index; state.owner = current.owner;
                 state.ripupCost = ripupCost;
+                const ROUTER_BOX doorBounds = door->GetShape();
+                const ROUTER_BOX fromDoorBounds = current.door
+                                                        ? current.door->GetShape()
+                                                        : ROUTER_BOX{};
+                autorouterDecisionLog(
+                        "RAW_SECTION_ASSIGN",
+                        { { "net", std::to_string( net ) },
+                          { "layer", std::to_string( current.layer ) },
+                          { "selected_section", std::to_string( section ) },
+                          { "from_section", std::to_string( current.section ) },
+                          { "backtrack_section",
+                            current.parent == NONE
+                                    ? "0"
+                                    : std::to_string( states[current.parent].section ) },
+                          { "add_costs", std::to_string( ripupCost ) },
+                          { "adjustment", "NONE" },
+                          { "room_ripped", ripupCost > 0 ? "true" : "false" },
+                          { "door_dimension", std::to_string( door->GetDimension() ) },
+                          { "door_bounds", autorouterDecisionBounds( doorBounds ) },
+                          { "from_door_dimension",
+                            current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
+                          { "from_door_bounds",
+                            current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
+                          { "expansion_value", std::to_string( state.g ) },
+                          { "sorting_value", std::to_string( state.f ) } } );
                 push( state );
             }
         }
@@ -535,7 +568,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         // A completely empty alternate layer has no such door: permit pages
         // there too, otherwise a legitimate two-via crossing is unreachable.
         // Per-drill/per-layer occupation still prevents cycling back through it.
-        if( !current.drill || current.room->shape->GetDoors().empty() )
+        if( via.transitionsEnabled
+            && ( !current.drill || current.room->shape->GetDoors().empty() ) )
             for( auto* page : pages.OverlappingPages( current.room->shape->GetShape() ) )
             {
                 const auto nearest = MAZE_EXPANSION_ENGINE::Nearest( page->Shape(), from );

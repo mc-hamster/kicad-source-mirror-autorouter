@@ -316,6 +316,7 @@ private:
     std::int64_t netViaRadius( int aNetCode ) const;
     std::int64_t netViaDrillRadius( int aNetCode ) const;
     std::int64_t netClearance( int aNetCode ) const;
+    std::int64_t traceClearanceCompensation( int aNetCode ) const;
     std::int64_t endpointRadius( int aNetCode, const ROUTER_POINT& aPoint ) const;
     std::int64_t pairClearance( int aFirstNetCode, int aSecondNetCode,
                                 int aLayer = -1 ) const;

@@ -16,6 +16,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 namespace KICAD_AUTOROUTER
 {
@@ -28,7 +29,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
     using DETAIL::ROOM;
     using DETAIL::ROOM_SEARCH_45_DEGREE;
     using PLANAR::INT_OCTAGON;
-    if( layers.size() < 2 || !via.canDrill || !std::isfinite( via.normalCost ) || via.normalCost < 0
+    if( layers.size() < 2 || ( via.transitionsEnabled && !via.canDrill )
+        || !std::isfinite( via.normalCost ) || via.normalCost < 0
         || !std::isfinite( sectionOffset ) || sectionOffset <= 0 || via.pageWidth <= 0
         || INT_BOX::Dimension( via.bounds ) != 2 || maxExpanded <= expanded )
         return std::nullopt;
@@ -68,9 +70,15 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
     // layerActive affects the estimate, not destination-box collection.
     for( std::size_t layer = 0; layer < layers.size(); ++layer )
         for( const auto& target : layers[layer].targets )
-            destinationDistance.Join( costSpace.ToReference( ROUTER_BOX{
-                    std::min( target.start.x, target.end.x ), std::min( target.start.y, target.end.y ),
-                    std::max( target.start.x, target.end.x ), std::max( target.start.y, target.end.y ) } ), layer );
+        {
+            const ROUTER_BOX targetBounds = INT_BOX::Dimension( target.treeBounds ) >= 0
+                    ? target.treeBounds
+                    : ROUTER_BOX{ std::min( target.start.x, target.end.x ),
+                                  std::min( target.start.y, target.end.y ),
+                                  std::max( target.start.x, target.end.x ),
+                                  std::max( target.start.y, target.end.y ) };
+            destinationDistance.Join( costSpace.ToReference( targetBounds ), layer );
+        }
     // Bound page allocation before construction, not after a potentially huge
     // array has already been allocated. This is an explicit resource failure.
     const double columns = std::ceil( ( static_cast<double>( via.bounds.maxX ) - via.bounds.minX ) / via.pageWidth );
@@ -210,90 +218,139 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         open.emplace( key.SortKey(), states.size() );
         states.push_back( state );
     };
-    int nextItemId = 1;
-    for( std::size_t layer = 0; layer < layers.size(); ++layer )
+    struct START_ITEM_SHAPE
     {
-        if( !layers[layer].active )
-            continue;
-        auto& space = *spaces[layer];
-        for( const auto& start : layers[layer].starts )
+        std::size_t          layer = 0;
+        const ROOM_TERMINAL* terminal = nullptr;
+        int                  itemId = 0;
+    };
+    std::vector<START_ITEM_SHAPE> startShapes;
+    for( std::size_t layer = 0; layer < layers.size(); ++layer )
+        if( layers[layer].active )
+            for( const ROOM_TERMINAL& terminal : layers[layer].starts )
+                startShapes.push_back( { layer, &terminal, 0 } );
+
+    // Item.compareTo() orders Freerouting's board items by descending
+    // insertion ID.  Each item's tree shapes are then visited in physical
+    // layer order.  Completing layer-first changed room IDs and, more
+    // importantly, which already-complete room supplies the first 2-D door.
+    const auto itemKey = []( const ROOM_TERMINAL& aTerminal )
+    {
+        return std::tuple{ aTerminal.owner, aTerminal.start.x, aTerminal.start.y,
+                           aTerminal.end.x, aTerminal.end.y };
+    };
+    std::stable_sort( startShapes.begin(), startShapes.end(),
+                      [&]( const START_ITEM_SHAPE& aLeft,
+                           const START_ITEM_SHAPE& aRight )
+                      {
+                          const auto left = itemKey( *aLeft.terminal );
+                          const auto right = itemKey( *aRight.terminal );
+                          if( left != right )
+                              return left > right;
+                          return aLeft.layer < aRight.layer;
+                      } );
+
+    int nextItemId = 1;
+    std::optional<decltype( itemKey( ROOM_TERMINAL{} ) )> previousItem;
+    for( START_ITEM_SHAPE& shape : startShapes )
+    {
+        const auto key = itemKey( *shape.terminal );
+        if( !previousItem || key != *previousItem )
         {
-            if( stopped() )
-                return std::nullopt;
-            std::vector<INT_OCTAGON> cuts;
-            cuts.reserve( layers[layer].obstacles.size() + 1 );
-            cuts.push_back( INT_OCTAGON::FromBox( layers[layer].bounds ) );
-            for( const SHAPE_TREE_ENTRY& obstacle : layers[layer].obstacles )
-            {
-                if( obstacle.layer == layers[layer].id
-                    && obstacle.IsTraceObstacle( net ) )
-                {
-                    cuts.push_back( obstacle.BoundingOctagon() );
-                }
-            }
+            shape.itemId = nextItemId++;
+            previousItem = key;
+        }
+        else
+        {
+            shape.itemId = nextItemId - 1;
+        }
 
-            for( const ROUTER_POINT& seedPoint :
-                 TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
-                         start.start, start.end, cuts ) )
-            {
-                const bool covered = std::any_of(
-                        space.byId.begin(), space.byId.end(),
-                        [&]( const auto& entry )
-                        {
-                            const ROOM* room = entry.second;
-                            return !room->shape->IsObstacle()
-                                   && room->shape->GetOctagon().Contains( seedPoint );
-                        } );
-                if( covered )
-                    continue;
+        if( stopped() )
+            return std::nullopt;
+        auto& space = *spaces[shape.layer];
+        const ROOM_TERMINAL& start = *shape.terminal;
+        std::vector<INT_OCTAGON> cuts;
+        cuts.reserve( layers[shape.layer].obstacles.size() + 1 );
+        cuts.push_back( INT_OCTAGON::FromBox( layers[shape.layer].bounds ) );
+        for( const SHAPE_TREE_ENTRY& obstacle : layers[shape.layer].obstacles )
+            if( obstacle.layer == layers[shape.layer].id
+                && obstacle.IsTraceObstacle( net ) )
+                cuts.push_back( obstacle.BoundingOctagon() );
 
-                const INT_OCTAGON seed = INT_OCTAGON::FromBox(
-                        { seedPoint.x, seedPoint.y, seedPoint.x, seedPoint.y } );
-                space.complete( space.incomplete( {
-                        INT_OCTAGON::FromBox( layers[layer].bounds ),
-                        layers[layer].id, seed } ) );
-            }
-            const int itemId = nextItemId++;
-            for( const auto& [id, room] : space.byId )
-            {
-                if( room->shape->IsObstacle() )
-                    continue;
-
-                std::optional<ROUTER_POINT> attachment;
-                double bestDistance = std::numeric_limits<double>::infinity();
-                for( const ROOM_LAYER& targetLayer : layers )
-                {
-                    for( const ROOM_TERMINAL& target : targetLayer.targets )
+        for( const ROUTER_POINT& seedPoint :
+             TARGET_ITEM_EXPANSION_DOOR::IntegralRoomSeedPoints(
+                     start.start, start.end, cuts ) )
+        {
+            const bool covered = std::any_of(
+                    space.byId.begin(), space.byId.end(),
+                    [&]( const auto& entry )
                     {
-                        for( const ROUTER_POINT& toward : { target.start, target.end } )
+                        const ROOM* room = entry.second;
+                        return !room->shape->IsObstacle()
+                               && room->shape->GetOctagon().Contains( seedPoint );
+                    } );
+            if( covered )
+                continue;
+
+            const INT_OCTAGON seed = INT_OCTAGON::FromBox(
+                    { seedPoint.x, seedPoint.y, seedPoint.x, seedPoint.y } );
+            space.complete( space.incomplete( {
+                    INT_OCTAGON::FromBox( layers[shape.layer].bounds ),
+                    layers[shape.layer].id, seed } ) );
+        }
+    }
+
+    // The source creates every start room before it inserts any target-item
+    // door into the queue.  Keep attachment/queue seeding as a distinct pass.
+    for( const START_ITEM_SHAPE& shape : startShapes )
+    {
+        auto& space = *spaces[shape.layer];
+        const ROOM_TERMINAL& start = *shape.terminal;
+        for( const auto& [id, room] : space.byId )
+        {
+            if( room->shape->IsObstacle() )
+                continue;
+
+            std::optional<ROUTER_POINT> attachment;
+            double bestDistance = std::numeric_limits<double>::infinity();
+            for( const ROOM_LAYER& targetLayer : layers )
+                for( const ROOM_TERMINAL& target : targetLayer.targets )
+                    for( const ROUTER_POINT& toward : { target.start, target.end } )
+                    {
+                        const auto candidate =
+                                TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                                        start.start, start.end, toward,
+                                        room->shape->GetOctagon() );
+                        if( !candidate )
+                            continue;
+                        const FLOAT_POINT point{ static_cast<double>( candidate->x ),
+                                                 static_cast<double>( candidate->y ) };
+                        const double candidateDistance = remaining( point, shape.layer );
+                        if( !attachment || candidateDistance < bestDistance )
                         {
-                            const auto candidate =
-                                    TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
-                                            start.start, start.end, toward,
-                                            room->shape->GetOctagon() );
-                            if( !candidate )
-                                continue;
-                            const FLOAT_POINT point{
-                                    static_cast<double>( candidate->x ),
-                                    static_cast<double>( candidate->y ) };
-                            const double candidateDistance = remaining( point, layer );
-                            if( !attachment || candidateDistance < bestDistance )
-                            {
-                                attachment = candidate;
-                                bestDistance = candidateDistance;
-                            }
+                            attachment = candidate;
+                            bestDistance = candidateDistance;
                         }
                     }
-                }
-                if( !attachment )
-                    continue;
-                const FLOAT_POINT p{ static_cast<double>( attachment->x ),
-                                     static_cast<double>( attachment->y ) };
-                STATE state;
-                state.room = room; state.layer = layer; state.entry = { p, p };
-                state.f = bestDistance; state.owner = start.owner; state.itemId = itemId;
-                push( state );
-            }
+            if( !attachment )
+                continue;
+            const FLOAT_POINT p{ static_cast<double>( attachment->x ),
+                                 static_cast<double>( attachment->y ) };
+            STATE state;
+            state.room = room; state.layer = shape.layer; state.entry = { p, p };
+            state.f = bestDistance; state.owner = start.owner; state.itemId = shape.itemId;
+            const ROUTER_BOX roomBounds = room->shape->GetShape();
+            autorouterDecisionLog(
+                    "START_ROOM_SEED",
+                    { { "layer", std::to_string( shape.layer ) },
+                      { "owner", std::to_string( start.owner ) },
+                      { "item_id", std::to_string( shape.itemId ) },
+                      { "room_id", std::to_string( room->shape->GetId() ) },
+                      { "room_bounds", autorouterDecisionBounds( roomBounds ) },
+                      { "attachment", std::to_string( attachment->x ) + ','
+                                              + std::to_string( attachment->y ) },
+                      { "sorting_value", std::to_string( bestDistance ) } } );
+            push( state );
         }
     }
     const int targetIdBase = nextItemId;
@@ -310,7 +367,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         auto& space = *spaces[current.layer];
         const auto& layer = layers[current.layer];
         const auto from = current.entry.Middle();
-        if( current.kind == KIND::PAGE )
+        if( via.transitionsEnabled && current.kind == KIND::PAGE )
         {
             ++metrics.drillPages;
             const bool wasCached = current.page->IsValid();
@@ -555,7 +612,35 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         if( current.door && !occupied.emplace( current.door, current.section ).second )
             continue;
         ++metrics.sections;
+        const std::size_t doorsBeforeCompletion =
+                current.room->shape->GetDoors().size();
+        autorouterDecisionLog(
+                "ROOM_ENTRY_POP",
+                { { "net", std::to_string( net ) },
+                  { "layer", std::to_string( current.layer ) },
+                  { "section", std::to_string( current.section ) },
+                  { "room_id", std::to_string( current.room->shape->GetId() ) },
+                  { "room_bounds",
+                    autorouterDecisionBounds( current.room->shape->GetShape() ) },
+                  { "door_dimension",
+                    current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
+                  { "door_bounds",
+                    current.door ? autorouterDecisionBounds( current.door->GetShape() ) : "" },
+                  { "doors_before", std::to_string( doorsBeforeCompletion ) },
+                  { "expansion_value", std::to_string( current.g ) },
+                  { "sorting_value", std::to_string( current.f ) } } );
         space.completeNeighbours( current.room );
+        autorouterDecisionLog(
+                "ROOM_COMPLETE_SYNC",
+                { { "net", std::to_string( net ) },
+                  { "layer", std::to_string( current.layer ) },
+                  { "section", std::to_string( current.section ) },
+                  { "room_id", std::to_string( current.room->shape->GetId() ) },
+                  { "room_bounds",
+                    autorouterDecisionBounds( current.room->shape->GetShape() ) },
+                  { "doors_before", std::to_string( doorsBeforeCompletion ) },
+                  { "doors_after",
+                    std::to_string( current.room->shape->GetDoors().size() ) } } );
         if( stopped() )
             return std::nullopt;
         int targetId = targetIdBase;
@@ -596,11 +681,39 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             state.targetOwner = target.owner; state.itemId = targetId;
             push( state );
         }
-        for( auto* door : current.room->shape->GetDoors() )
+        // Freerouting evaluates the counter-clockwise neighbour list in its
+        // y-up board coordinates.  KiCad's native board coordinates are
+        // y-down, so the directly translated room builder stores the same
+        // geometric cycle in reverse.  Traverse it backwards to preserve the
+        // source door/section insertion order and queue tie-breaks.
+        const auto& roomDoors = current.room->shape->GetDoors();
+        for( auto doorIt = roomDoors.rbegin(); doorIt != roomDoors.rend(); ++doorIt )
         {
+            auto* door = *doorIt;
+            // AutorouteEngine.occupyNextElement() never expands the door by
+            // which the current room was entered.  Apart from being redundant,
+            // putting that door back into the queue changes equal-cost ordering
+            // and can create search cycles before its sections become occupied.
+            if( door == current.door )
+                continue;
+
             ROOM* next = space.byShape.at( door->OtherRoom( current.room->shape.get() ) );
             if( !next->complete || !next->active )
                 continue;
+            autorouterDecisionLog(
+                    "ROOM_DOOR_CANDIDATE",
+                    { { "net", std::to_string( net ) },
+                      { "layer", std::to_string( current.layer ) },
+                      { "from_section", std::to_string( current.section ) },
+                      { "room_id", std::to_string( current.room->shape->GetId() ) },
+                      { "room_bounds",
+                        autorouterDecisionBounds( current.room->shape->GetShape() ) },
+                      { "door_dimension", std::to_string( door->GetDimension() ) },
+                      { "door_bounds", autorouterDecisionBounds( door->GetShape() ) },
+                      { "next_room_id", std::to_string( next->shape->GetId() ) },
+                      { "next_room_bounds",
+                        autorouterDecisionBounds( next->shape->GetShape() ) },
+                      { "is_backtrack", door == current.door ? "true" : "false" } } );
             const auto sections = door->GetSectionSegments( 0, 0, 10 * sectionOffset,
                     static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
             for( std::size_t section = 0; section < sections.size(); ++section )
@@ -628,6 +741,31 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                 state.entry = sections[section]; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend + ripupCost;
                 state.f = state.g + remaining( to, current.layer ); state.parent = index; state.owner = current.owner;
                 state.ripupCost = ripupCost;
+                const ROUTER_BOX doorBounds = door->GetShape();
+                const ROUTER_BOX fromDoorBounds = current.door
+                                                        ? current.door->GetShape()
+                                                        : ROUTER_BOX{};
+                autorouterDecisionLog(
+                        "RAW_SECTION_ASSIGN",
+                        { { "net", std::to_string( net ) },
+                          { "layer", std::to_string( current.layer ) },
+                          { "selected_section", std::to_string( section ) },
+                          { "from_section", std::to_string( current.section ) },
+                          { "backtrack_section",
+                            current.parent == NONE
+                                    ? "0"
+                                    : std::to_string( states[current.parent].section ) },
+                          { "add_costs", std::to_string( ripupCost ) },
+                          { "adjustment", "NONE" },
+                          { "room_ripped", ripupCost > 0 ? "true" : "false" },
+                          { "door_dimension", std::to_string( door->GetDimension() ) },
+                          { "door_bounds", autorouterDecisionBounds( doorBounds ) },
+                          { "from_door_dimension",
+                            current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
+                          { "from_door_bounds",
+                            current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
+                          { "expansion_value", std::to_string( state.g ) },
+                          { "sorting_value", std::to_string( state.f ) } } );
                 push( state );
             }
         }
@@ -635,7 +773,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         // A completely empty alternate layer has no such door: permit pages
         // there too, otherwise a legitimate two-via crossing is unreachable.
         // Per-drill/per-layer occupation still prevents cycling back through it.
-        if( !current.drill || current.room->shape->GetDoors().empty() )
+        if( via.transitionsEnabled
+            && ( !current.drill || current.room->shape->GetDoors().empty() ) )
             for( auto* page : pages.OverlappingPages(
                          current.room->shape->GetOctagon().BoundingBox() ) )
             {

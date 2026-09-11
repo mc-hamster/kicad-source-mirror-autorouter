@@ -41,13 +41,14 @@ COST_FACTOR traceCosts( const AUTOROUTER_SETTINGS& aSettings, int aLayer )
             aSettings.layers.begin(), aSettings.layers.end(),
             [&]( const ROUTER_LAYER_SETTINGS& aCandidate )
             { return aCandidate.layerId == aLayer; } );
-    const double preferred = std::max( 1, aSettings.traceLengthCost );
     if( layer == aSettings.layers.end() || layer->preferredDirection == 0 )
+    {
+        const double preferred = std::max( 0, aSettings.traceLengthCost );
         return { preferred, preferred };
+    }
 
-    const double against = preferred + std::max( 0, layer->directionCost ) / 10.0;
-    return { layer->preferredDirection == 2 ? against : preferred,
-             layer->preferredDirection == 1 ? against : preferred };
+    const auto [horizontal, vertical] = layer->TraceCosts( aSettings.traceLengthCost );
+    return { horizontal, vertical };
 }
 
 

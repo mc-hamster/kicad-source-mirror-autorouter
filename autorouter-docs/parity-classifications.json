@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "reference_repository": "https://github.com/freerouting/freerouting.git",
+  "reference_commit": "a11c0a42d1b3827e5126429c5c9820c4ab5bec7c",
+  "quality_baseline_commit": "2d4de019aa89e9fa3dc1dc44e09bf509760cafc1",
+  "source_roots": [
+    "autoroute",
+    "board",
+    "drc",
+    "geometry",
+    "rules",
+    "core/library/Padstack.java",
+    "core/library/Padstacks.java",
+    "core/scoring",
+    "core/RouterCounters.java",
+    "settings/FanoutSettings.java",
+    "settings/LayerSettings.java",
+    "settings/OptimizerSettings.java",
+    "settings/RouterSettings.java",
+    "settings/ScoringSettings.java",
+    "settings/sources/DefaultSettings.java"
+  ],
+  "excluded_application_roots": [
+    "analytics",
+    "api",
+    "gui",
+    "logger",
+    "management",
+    "mcp"
+  ],
+  "exact_classes": {
+    "app.freerouting.geometry.planar.FloatLine": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/FloatLine.h", "pcbnew/autorouter/geometry/planar/FloatLine.cpp"],
+      "evidence": "FloatGeometryOracle.java"
+    },
+    "app.freerouting.geometry.planar.FloatPoint": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/FloatPoint.h", "pcbnew/autorouter/geometry/planar/FloatPoint.cpp"],
+      "evidence": "FloatGeometryOracle.java"
+    },
+    "app.freerouting.geometry.planar.IntOctagon": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/IntOctagon.h", "pcbnew/autorouter/geometry/planar/IntOctagon.cpp"],
+      "evidence": "IntOctagonOracle.java"
+    },
+    "app.freerouting.geometry.planar.Line": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/Line.h", "pcbnew/autorouter/geometry/planar/Line.cpp"],
+      "evidence": "PolylineGeometryOracle.java; PolylineTransformOracle.java"
+    },
+    "app.freerouting.geometry.planar.LineSegment": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/LineSegment.h", "pcbnew/autorouter/geometry/planar/LineSegment.cpp"],
+      "evidence": "LineSegmentOracle.java"
+    },
+    "app.freerouting.geometry.planar.Polyline": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/Polyline.h", "pcbnew/autorouter/geometry/planar/Polyline.cpp"],
+      "evidence": "PolylineGeometryOracle.java; PolylineTransformOracle.java"
+    },
+    "app.freerouting.geometry.planar.PolylineShape": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/PolylineShape.h", "pcbnew/autorouter/geometry/planar/PolylineShape.cpp"],
+      "evidence": "TileShapeOracle.java; TileTransformOracle.java"
+    },
+    "app.freerouting.geometry.planar.Simplex": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/Simplex.h", "pcbnew/autorouter/geometry/planar/Simplex.cpp"],
+      "evidence": "SimplexGeometryOracle.java; ConvexGeometryOracle.java"
+    },
+    "app.freerouting.geometry.planar.TileShape": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/TileShape.h", "pcbnew/autorouter/geometry/planar/TileShape.cpp"],
+      "evidence": "TileShapeOracle.java; TileTransformOracle.java"
+    }
+  },
+  "adapted_classes": {
+    "app.freerouting.geometry.planar.IntBox": {
+      "native_files": ["pcbnew/autorouter/geometry/planar/IntBox.h"],
+      "reason": "KiCad worker uses ROUTER_BOX as the integral box value while preserving the source operations."
+    }
+  },
+  "native_aliases": {
+    "app.freerouting.autoroute.BoardUpdateStrategy": ["pcbnew/autorouter/AutorouterTypes.h"],
+    "app.freerouting.autoroute.ItemSelectionStrategy": ["pcbnew/autorouter/AutorouterTypes.h"],
+    "app.freerouting.board.actions.ForcedPadRouter": ["pcbnew/autorouter/path/FoundConnectionInserter.cpp"],
+    "app.freerouting.board.actions.ForcedViaInserter": ["pcbnew/autorouter/path/FoundConnectionInserter.cpp"],
+    "app.freerouting.board.actions.DrillItemMover": ["pcbnew/autorouter/maze/MazeSearchEngine.cpp"],
+    "app.freerouting.board.facade.BasicBoard": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.facade.RoutingBoard": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.model.items.ConductionArea": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp", "pcbnew/autorouter/board/KicadBoardAdapter.cpp"],
+    "app.freerouting.board.model.items.DrillItem": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.model.items.Item": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.model.items.Pin": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp", "pcbnew/autorouter/board/KicadBoardAdapter.cpp"],
+    "app.freerouting.board.model.items.Trace": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.model.items.Via": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.trace.PolylineTrace": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.trace.PolylineTraceGeometry": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.board.trace.PolylineTraceNormalization": ["pcbnew/autorouter/board/facade/RoutingBoard.cpp"],
+    "app.freerouting.core.library.Padstack": ["pcbnew/autorouter/AutorouterTypes.h", "pcbnew/autorouter/board/KicadBoardAdapter.cpp"],
+    "app.freerouting.drc.ClearanceViolation": ["pcbnew/autorouter/drc/DesignRulesChecker.cpp"],
+    "app.freerouting.geometry.planar.IntPoint": ["pcbnew/autorouter/AutorouterTypes.h"],
+    "app.freerouting.geometry.planar.RationalPoint": ["pcbnew/autorouter/geometry/planar/Point.h"],
+    "app.freerouting.rules.BoardRules": ["pcbnew/autorouter/AutorouterTypes.h", "pcbnew/autorouter/board/KicadBoardAdapter.cpp"],
+    "app.freerouting.rules.ClearanceMatrix": ["pcbnew/autorouter/AutorouterTypes.h", "pcbnew/autorouter/board/KicadBoardAdapter.cpp"],
+    "app.freerouting.rules.Net": ["pcbnew/autorouter/AutorouterTypes.h"],
+    "app.freerouting.rules.NetClass": ["pcbnew/autorouter/AutorouterTypes.h", "pcbnew/autorouter/board/KicadBoardAdapter.cpp"],
+    "app.freerouting.rules.ViaInfo": ["pcbnew/autorouter/rules/ViaRule.cpp", "pcbnew/autorouter/AutorouterTypes.h"]
+  },
+  "method_overrides": {}
+}

@@ -51,6 +51,7 @@
 #include <pcb_track.h>
 #include <project/net_settings.h>
 #include <ratsnest/ratsnest_data.h>
+#include <specctra_import_export/specctra.h>
 #include <zone.h>
 #include <trigo.h>
 
@@ -381,6 +382,17 @@ AUTOROUTER_SETTINGS KICAD_BOARD_ADAPTER::CreateDefaultSettings() const
     if( !m_board )
         return settings;
 
+    BOX2I bounds = m_board->GetBoardEdgesBoundingBox();
+
+    if( bounds.GetWidth() <= 0 || bounds.GetHeight() <= 0 )
+        bounds = m_board->GetBoundingBox();
+
+    const double width = std::max<double>( 1.0, bounds.GetWidth() );
+    const double height = std::max<double>( 1.0, bounds.GetHeight() );
+    const double horizontalExtra = 0.1 * std::round( 10.0 * width / height );
+    const double verticalExtra = 0.1 * std::round( 10.0 * height / width );
+    bool preferredHorizontal = width < height;
+
     m_board->GetEnabledLayers().RunOnLayers(
             [&]( PCB_LAYER_ID aLayer )
             {
@@ -388,15 +400,54 @@ AUTOROUTER_SETTINGS KICAD_BOARD_ADAPTER::CreateDefaultSettings() const
                     return;
 
                 const int ordinal = static_cast<int>( CopperLayerToOrdinal( aLayer ) );
-                settings.layers.push_back( { static_cast<int>( aLayer ), true,
-                                             ordinal % 2 == 0 ? 1 : 2, 20, ordinal } );
+                // RouterSettings.applyBoardSpecificOptimizations toggles
+                // before assigning every signal layer.  Keep that order: on
+                // a tall two-layer board F.Cu is vertical and B.Cu horizontal.
+                preferredHorizontal = !preferredHorizontal;
+
+                ROUTER_LAYER_SETTINGS layer;
+                layer.layerId = static_cast<int>( aLayer );
+                layer.enabled = true;
+                layer.preferredDirection = preferredHorizontal ? 1 : 2;
+                layer.layerOrdinal = ordinal;
+                layer.preferredDirectionTraceCost = 1.0;
+                layer.undesiredDirectionTraceCost =
+                        1.0 + ( preferredHorizontal ? horizontalExtra : verticalExtra );
+                layer.directionCost = static_cast<int>( std::llround(
+                        10.0 * ( layer.undesiredDirectionTraceCost
+                                 - layer.preferredDirectionTraceCost ) ) );
+                settings.layers.push_back( layer );
             } );
 
     if( settings.layers.empty() )
     {
-        settings.layers.push_back( { static_cast<int>( F_Cu ), true, 1, 20, 0 } );
-        settings.layers.push_back( { static_cast<int>( B_Cu ), true, 2, 20,
-                                     static_cast<int>( CopperLayerToOrdinal( B_Cu ) ) } );
+        ROUTER_LAYER_SETTINGS front;
+        front.layerId = static_cast<int>( F_Cu );
+        front.layerOrdinal = 0;
+        front.preferredDirection = 2;
+        front.preferredDirectionTraceCost = 1.0;
+        front.undesiredDirectionTraceCost = 2.0;
+        front.directionCost = 10;
+        settings.layers.push_back( front );
+
+        ROUTER_LAYER_SETTINGS back = front;
+        back.layerId = static_cast<int>( B_Cu );
+        back.layerOrdinal = static_cast<int>( CopperLayerToOrdinal( B_Cu ) );
+        back.preferredDirection = 1;
+        settings.layers.push_back( back );
+    }
+
+    // Freerouting adds 0.2 * signal-layer-count to both costs on the two
+    // outer layers when the board has more than two signal layers.
+    if( settings.layers.size() > 2 )
+    {
+        const double outerExtra = 0.2 * settings.layers.size();
+        for( ROUTER_LAYER_SETTINGS* layer : { &settings.layers.front(),
+                                              &settings.layers.back() } )
+        {
+            layer->preferredDirectionTraceCost += outerExtra;
+            layer->undesiredDirectionTraceCost += outerExtra;
+        }
     }
 
     return settings;
@@ -494,15 +545,30 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         return;
 
     std::map<const PAD*, std::pair<int, int>> packagePins;
+    std::vector<PAD*> sourceOrderedPads;
+    DSN::SPECCTRA_DB  orderDatabase;
+    const std::vector<FOOTPRINT*> sourceOrderedComponents =
+            orderDatabase.GetDsnComponentOrder( m_board );
     int component = 0;
-    // Match the footprint traversal used by the host DSN exporter. Duplicate
-    // pad numbers are distinct package pins; never use the displayed number.
-    for( const auto* footprint : m_board->Footprints() )
+
+    // Network.insertComponents() creates Freerouting pins in DSN placement
+    // order: equivalent IMAGEs are grouped, PLACE order is retained within a
+    // group, and package pins retain their declared order.  BOARD::GetPads()
+    // uses a different host traversal and changed the very first batch item.
+    // Keep this adapter-only translation coupled to the host DSN exporter so
+    // both the direct native path and the Java oracle see the same item order.
+    for( FOOTPRINT* footprint : sourceOrderedComponents )
     {
         ++component;
         int pin = 0;
-        for( const auto* pad : footprint->Pads() )
+        for( PAD* pad : footprint->Pads() )
+        {
+            if( !( pad->GetLayerSet() & LSET::AllCuMask() ).any() )
+                continue;
+
             packagePins.emplace( pad, std::pair{ component, pin++ } );
+            sourceOrderedPads.push_back( pad );
+        }
     }
     std::map<const BOARD_CONNECTED_ITEM*, std::size_t> padIndices;
     std::set<int> autorouterOwnedNetCodes;
@@ -719,7 +785,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         }
     }
 
-    for( PAD* pad : m_board->GetPads() )
+    for( PAD* pad : sourceOrderedPads )
     {
         if( !pad )
             continue;
@@ -793,8 +859,15 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             const std::int64_t maxShapeWidth = std::max<std::int64_t>(
                     minShapeWidth,
                     std::max( std::abs( shapeSize.x ), std::abs( shapeSize.y ) ) );
-            layerGeometry.push_back( { layer, minShapeWidth, maxShapeWidth,
-                                       std::max<std::int64_t>( 0, clearance ) } );
+            const std::int64_t compensation =
+                    ( std::max<std::int64_t>( 0, clearance ) + 1 ) / 2;
+            layerGeometry.push_back(
+                    { layer, minShapeWidth, maxShapeWidth,
+                      std::max<std::int64_t>( 0, clearance ),
+                      { static_cast<std::int64_t>( padBox.GetLeft() ) - compensation,
+                        static_cast<std::int64_t>( padBox.GetTop() ) - compensation,
+                        static_cast<std::int64_t>( padBox.GetRight() ) + compensation,
+                        static_cast<std::int64_t>( padBox.GetBottom() ) + compensation } } );
             largestRadius = std::max<std::int64_t>(
                     largestRadius,
                     static_cast<std::int64_t>(
@@ -843,11 +916,21 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             }
             else if( pad->GetShape( layerId ) == PAD_SHAPE::ROUNDRECT )
             {
-                // A rounded rectangle is a rectangular core swept by a disk.
-                // The worker already represents polygon + radius exactly;
-                // avoid testing dozens of tessellated arc edges at every probe.
-                const int radius = pad->GetRoundRectCornerRadius( layerId );
-                const VECTOR2I halfCore = shapeSize / 2 - VECTOR2I( radius, radius );
+                // Match the geometry which the KiCad Specctra exporter sends
+                // to Freerouting.  Specctra has no rounded-rectangle primitive,
+                // so export uses a 36-segment polygon and first grows the
+                // radius enough to compensate its inward chord error.  Using
+                // KiCad's exact swept rectangle here changed room borders by
+                // roughly one micrometre; adjacent pads then acquired spurious
+                // zero-dimensional contacts and the room/door graph diverged.
+                constexpr int segmentCount = 36;
+                int radius = pad->GetRoundRectCornerRadius( layerId );
+                const double correction = std::cos( M_PI / segmentCount );
+                const int extra = KiROUND( radius * ( 1.0 - correction ) );
+                VECTOR2I exportSize = shapeSize + VECTOR2I( 2 * extra, 2 * extra );
+                radius += extra;
+
+                const VECTOR2I halfCore = exportSize / 2 - VECTOR2I( radius, radius );
                 obstacle.radius = radius;
                 if( halfCore.x <= 0 || halfCore.y <= 0 )
                 {
@@ -979,6 +1062,17 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         const std::size_t padIndex = aSnapshot.pads.size();
         aSnapshot.pads.push_back( std::move( routingPad ) );
         padIndices.emplace( pad, padIndex );
+
+        if( autorouterDebugEnabled() )
+        {
+            const FOOTPRINT* footprint = pad->GetParentFootprint();
+            autorouterDebugLog( "SNAPSHOT_PAD_ORDER index=" + std::to_string( padIndex )
+                    + " component=" + std::to_string( aSnapshot.pads.back().componentId )
+                    + " pin=" + std::to_string( aSnapshot.pads.back().pinIndex )
+                    + " ref=" + ( footprint ? toStdString( footprint->GetReference() ) : "" )
+                    + " number=" + toStdString( pad->GetNumber() )
+                    + " net=" + std::to_string( pad->GetNetCode() ) );
+        }
 
         auto netIt = std::find_if( aSnapshot.nets.begin(), aSnapshot.nets.end(),
                                    [pad]( const ROUTING_NET& aNet )

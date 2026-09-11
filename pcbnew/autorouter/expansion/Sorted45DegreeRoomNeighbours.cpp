@@ -19,7 +19,13 @@ SORTED_45_DEGREE_ROOM_NEIGHBOURS::SORTED_45_DEGREE_ROOM_NEIGHBOURS(
     {
         const INT_OCTAGON shape = entry.BoundingOctagon();
         const INT_OCTAGON intersection = m_room.Intersection( shape );
-        if( intersection.Dimension() < 0 || intersection.Dimension() > 1 )
+        // A completed free-space room deliberately overlaps its predecessor
+        // through a two-dimensional door.  Freerouting keeps that room in the
+        // sorted boundary-neighbour cycle; omitting it merges the two gaps on
+        // either side into one oversized incomplete room.  Obstacle-room
+        // callers already remove illegal 2-D obstacle overlaps before this
+        // constructor, so only empty intersections are discarded here.
+        if( intersection.Dimension() < 0 )
             continue;
         addNeighbour( entry, shape, intersection );
     }

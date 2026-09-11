@@ -1008,6 +1008,18 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                                  int aMaximumNewConnections ) const
 {
     const auto netStarted = std::chrono::steady_clock::now();
+    const std::string preferredSourceId =
+            aPreferredPad < aBoard.pads.size() ? aBoard.pads[aPreferredPad].sourceId
+                                               : std::string();
+    AUTOROUTER_DECISION_CONTEXT_SCOPE decisionContext(
+            { { "net", std::to_string( aNet.netCode ) },
+              { "net_name", aNet.name },
+              { "preferred_pad", std::to_string( aPreferredPad ) },
+              { "source_id", preferredSourceId } } );
+    autorouterDecisionLog(
+            "ROUTE_ITEM_SELECTED",
+            { { "retry", std::to_string( aRetry ) },
+              { "maximum_new_connections", std::to_string( aMaximumNewConnections ) } } );
 
     if( autorouterDebugEnabled() )
     {

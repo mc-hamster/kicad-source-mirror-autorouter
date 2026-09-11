@@ -1148,6 +1148,17 @@ std::int64_t MAZE_SEARCH_ENGINE::netClearance( int aNetCode ) const
 }
 
 
+std::int64_t MAZE_SEARCH_ENGINE::traceClearanceCompensation( int aNetCode ) const
+{
+    // ClearanceMatrix.clearanceCompensationValue assigns the candidate
+    // trace class ceil(self-clearance / 2).  The autoroute search tree puts
+    // only the remaining part of each pair clearance on the obstacle; the
+    // candidate share travels with compensatedTraceHalfWidth at every door.
+    const std::int64_t clearance = std::max<std::int64_t>( 0, netClearance( aNetCode ) );
+    return ( clearance + 1 ) / 2;
+}
+
+
 std::int64_t MAZE_SEARCH_ENGINE::ResolveTrackWidth( int aNetCode,
                                                      const ROUTING_EDGE_STYLE& aStyle ) const
 {
@@ -3519,7 +3530,7 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
                 m_settings.layers.begin(), m_settings.layers.end(),
                 []( const auto& aLayer ) { return aLayer.enabled; } );
         m_useRoutableObstacleRooms = m_allowRipupOccupancy;
-        auto roomPath = !m_settings.allowVias || enabledLayers == 1
+        auto roomPath = enabledLayers <= 1
                                 ? findRoomConnection( starts, targets, aRetry,
                                                       aExpandedNodes, aCancel, aProgress )
                                 : findMultilayerRoomConnection(

@@ -1287,8 +1287,8 @@ BOOST_AUTO_TEST_CASE( AutoroutePassItemsFollowNaturalConnectedSetOrder )
 
     auto items = AUTOROUTE_PASS_RUNNER::GetAutorouteItems( board, *occupancy.Board() );
     BOOST_REQUIRE_EQUAL( items.size(), 2U );
-    BOOST_CHECK_EQUAL( items[0].pad, 0U );
-    BOOST_CHECK_EQUAL( items[1].pad, 2U );
+    BOOST_CHECK_EQUAL( items[0].pad, 2U );
+    BOOST_CHECK_EQUAL( items[1].pad, 1U );
 
     ROUTING_CONNECTION planeComponent;
     planeComponent.netCode = 1;
@@ -1302,7 +1302,7 @@ BOOST_AUTO_TEST_CASE( AutoroutePassItemsFollowNaturalConnectedSetOrder )
 
     items = AUTOROUTE_PASS_RUNNER::GetAutorouteItems( board, *occupancy.Board() );
     BOOST_REQUIRE_EQUAL( items.size(), 1U );
-    BOOST_CHECK_EQUAL( items.front().pad, 0U );
+    BOOST_CHECK_EQUAL( items.front().pad, 1U );
 
     ROUTING_CONNECTION bridge;
     bridge.netCode = 1;
@@ -3120,6 +3120,23 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesRotatedCopperAndInactiveLayerObstacle
 }
 
 
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeNeighboursRetainTwoDimensionalFromRoomDoor )
+{
+    using PLANAR::INT_OCTAGON;
+
+    const INT_OCTAGON room = INT_OCTAGON::FromBox( { 0, 0, 100, 100 } );
+    const INT_OCTAGON predecessor = INT_OCTAGON::FromBox( { 40, -20, 120, 30 } );
+    const std::vector<SHAPE_TREE_ENTRY> entries = {
+        { predecessor.BoundingBox(), 17, 0, 2, 0, true, true, predecessor }
+    };
+
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS actual( room, entries );
+    BOOST_REQUIRE_EQUAL( actual.Neighbours().size(), 1 );
+    BOOST_CHECK_EQUAL( actual.Neighbours().front().entry.objectId, 17 );
+    BOOST_CHECK_EQUAL( actual.Neighbours().front().intersection.Dimension(), 2 );
+}
+
+
 BOOST_AUTO_TEST_CASE( KiCadAdapterUsesExactOvalCapsules )
 {
     BOARD board;
@@ -3162,7 +3179,7 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterUsesExactOvalCapsules )
 }
 
 
-BOOST_AUTO_TEST_CASE( KiCadAdapterUsesRoundedRectangleCoreWithoutArcTessellation )
+BOOST_AUTO_TEST_CASE( KiCadAdapterUsesSpecctraCompensatedRoundedRectangleCore )
 {
     BOARD board;
     auto* footprint = new FOOTPRINT( &board );
@@ -3182,7 +3199,9 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterUsesRoundedRectangleCoreWithoutArcTessellation
     const auto& rounded = snapshot->obstacles.front();
     BOOST_CHECK( rounded.kind == ROUTER_OBSTACLE_KIND::POLYGON );
     BOOST_REQUIRE_EQUAL( rounded.polygon.size(), 4 );
-    BOOST_CHECK_EQUAL( rounded.radius, 100000 );
+    // Match specctra_export.cpp: a 36-segment export polygon is grown by
+    // r * (1 - cos(pi / 36)) before its inward arc approximation is emitted.
+    BOOST_CHECK_EQUAL( rounded.radius, 100381 );
     BOOST_CHECK_EQUAL( rounded.polygon[0].x, 1600000 );
     BOOST_CHECK_EQUAL( rounded.polygon[0].y, 2900000 );
     BOOST_CHECK_EQUAL( rounded.polygon[2].x, 4400000 );
@@ -8506,6 +8525,39 @@ BOOST_AUTO_TEST_CASE( MultilayerRoomSearchUsesDrillSectionsAndFullPhysicalStack 
     via.canDrill = []( auto ) { return false; }; expanded = 0;
     BOOST_CHECK( !MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
             { a, b }, 1, 100, via, 10000, expanded, metrics ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( MultilayerRoomSearchKeepsGlobalQueueWhenViasAreDisabled )
+{
+    ROOM_LAYER top, bottom;
+    top.id = 0;
+    bottom.id = 31;
+    top.bounds = bottom.bounds = { 0, 0, 10000, 10000 };
+    top.starts = { { { 1000, 1000 }, { 1000, 1000 }, 7 } };
+    top.targets = { { { 9000, 1000 }, { 9000, 1000 }, 8 } };
+    bottom.starts = { { { 1000, 9000 }, { 1000, 9000 }, 9 } };
+    bottom.targets = { { { 2000, 9000 }, { 2000, 9000 }, 10 } };
+
+    ROOM_VIA_SETTINGS via;
+    via.bounds = top.bounds;
+    via.pageWidth = 2000;
+    via.transitionsEnabled = false;
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto found = MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
+            { top, bottom }, 1, 100, via, 10000, expanded, metrics );
+
+    BOOST_REQUIRE( found );
+    BOOST_CHECK_EQUAL( found->startOwner, 9U );
+    BOOST_CHECK_EQUAL( found->targetOwner, 10U );
+    BOOST_CHECK( std::all_of( found->nodes.begin(), found->nodes.end(),
+                              []( const ROUTER_NODE& node )
+                              { return node.layer == 31; } ) );
+    BOOST_CHECK_EQUAL( metrics.drillPages, 0 );
+    BOOST_CHECK_EQUAL( metrics.drills, 0 );
+    BOOST_CHECK_EQUAL( metrics.layerTransitions, 0 );
 }
 
 

@@ -75,9 +75,15 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
     // to source ordinal zero, not the arbitrary KiCad layer ID.
     DESTINATION_DISTANCE destinationDistance( { { aHorizontalCost, aVerticalCost } }, { true }, 0, 0 );
     for( const auto& target : aTargets )
-        destinationDistance.Join( costSpace.ToReference( ROUTER_BOX{
-                std::min( target.start.x, target.end.x ), std::min( target.start.y, target.end.y ),
-                std::max( target.start.x, target.end.x ), std::max( target.start.y, target.end.y ) } ), 0 );
+    {
+        const ROUTER_BOX targetBounds = INT_BOX::Dimension( target.treeBounds ) >= 0
+                ? target.treeBounds
+                : ROUTER_BOX{ std::min( target.start.x, target.end.x ),
+                              std::min( target.start.y, target.end.y ),
+                              std::max( target.start.x, target.end.x ),
+                              std::max( target.start.y, target.end.y ) };
+        destinationDistance.Join( costSpace.ToReference( targetBounds ), 0 );
+    }
     ROOM_SEARCH search( aBounds, aObstacles, aLayer, aNet, aSectionOffset,
                         aMaxExpanded, aExpanded, aMetrics, aCancel, aProgress, nullptr,
                         aRipupObstacles );
@@ -319,6 +325,31 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                                         ? 1 : obstacle->GetRipupCost();
                 }
                 const double g = current.g + cost( from, to ) + bend + ripupCost;
+                const ROUTER_BOX doorBounds = door->GetShape();
+                const ROUTER_BOX fromDoorBounds = current.door
+                                                        ? current.door->GetShape()
+                                                        : ROUTER_BOX{};
+                autorouterDecisionLog(
+                        "RAW_SECTION_ASSIGN",
+                        { { "net", std::to_string( aNet ) },
+                          { "layer", "0" },
+                          { "selected_section", std::to_string( section ) },
+                          { "from_section", std::to_string( current.section ) },
+                          { "backtrack_section",
+                            current.parent == NONE
+                                    ? "0"
+                                    : std::to_string( states[current.parent].section ) },
+                          { "add_costs", std::to_string( ripupCost ) },
+                          { "adjustment", "NONE" },
+                          { "room_ripped", ripupCost > 0 ? "true" : "false" },
+                          { "door_dimension", std::to_string( door->GetDimension() ) },
+                          { "door_bounds", autorouterDecisionBounds( doorBounds ) },
+                          { "from_door_dimension",
+                            current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
+                          { "from_door_bounds",
+                            current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
+                          { "expansion_value", std::to_string( g ) },
+                          { "sorting_value", std::to_string( g + distance( to ) ) } } );
                 push( { next, door, section, sections[section], g, g + distance( to ),
                         index, current.owner, {}, 0, ripupCost } );
             }

@@ -56,6 +56,15 @@ def main() -> int:
     parser.add_argument("--max-iterations", type=int, default=8)
     parser.add_argument("--max-expanded-nodes", type=int, default=250000)
     parser.add_argument("--timeout-seconds", type=int, default=600)
+    parser.add_argument("--decision-trace", action="store_true",
+                        help="capture source/native room-door decisions and report first divergence")
+    parser.add_argument("--decision-net", type=int,
+                        help="compare only this numeric net in the decision stream")
+    parser.add_argument("--decision-net-name",
+                        help="compare only this stable net name in the decision stream")
+    parser.add_argument("--decision-geometry", action="store_true",
+                        help="also compare transformed room-door bounds")
+    parser.add_argument("--decision-max-events", type=int, default=0)
     args = parser.parse_args()
     board, binary, jar = args.board.resolve(), args.binary.resolve(), args.reference_jar.resolve()
     output = args.output_dir.resolve()
@@ -82,7 +91,8 @@ def main() -> int:
     provenance["routing_constraints"] = constraints
     provenance["native_debug"] = os.environ.get("KICAD_AUTOROUTER_DEBUG", "0")
 
-    def run(name: str, command: list[str], *, reference: bool = False) -> float:
+    def run(name: str, command: list[str], *, reference: bool = False,
+            extra_environment: dict[str, str] | None = None) -> float:
         print(name, flush=True)
         measurement = {"stage": name, "argv": command}
         provenance["commands"].append(measurement)
@@ -90,11 +100,13 @@ def main() -> int:
         start = time.monotonic()
         try:
             with (output / f"{name}.log").open("w") as log:
-                environment = None
+                environment = os.environ.copy()
                 if reference:
                     environment = {key: value for key, value in os.environ.items()
                                    if not key.upper().startswith("FREEROUTING__")
                                    and key not in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")}
+                if extra_environment:
+                    environment.update(extra_environment)
                 subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
                                timeout=args.timeout_seconds, check=True, env=environment,
                                cwd=output if reference else None)
@@ -145,28 +157,63 @@ def main() -> int:
     try:
         run("export", common + ["--export-dsn", str(dsn)] + save_board("unrouted"))
         save_companions("unrouted")
-        reference_ms = run("reference-route", [args.java, "-jar", str(jar), "-de", str(dsn),
+        reference_command = [args.java, "-jar", str(jar), "-de", str(dsn),
                  "-do", str(ses), "-mp", str(args.max_passes), "-mt", "1",
                  f"--user_data_path={output / 'reference-user-data'}",
                  "--usage_and_diagnostic_data.disable_analytics=true",
                  "--gui.enabled=false", "--router.optimizer.enabled=false",
                  "--router.automatic_neckdown=false"]
-                 + (["--router.allowed_via_types=false", "--router.fanout.enabled=false"]
-                    if args.no_vias else []), reference=True)
+        if args.decision_trace:
+            reference_command += ["--debug.enable_detailed_logging=true",
+                                  "--logging.console.level=TRACE",
+                                  "--logging.file.enabled=false"]
+        reference_command += (["--router.allowed_via_types=false", "--router.fanout.enabled=false"]
+                              if args.no_vias else [])
+        reference_ms = run("reference-route", reference_command, reference=True)
         if not ses.is_file():
             raise RuntimeError("reference returned without producing a session")
         run("reference-validate", common + ["--import-ses", str(ses),
                                            "--out", str(output / "reference.json")]
                                            + save_board("reference"))
         annotate("reference")
+        native_environment = None
+        if args.decision_trace:
+            native_environment = {
+                "KICAD_AUTOROUTER_DECISION_TRACE": str(output / "native-decisions.jsonl")
+            }
+            if args.decision_max_events > 0:
+                # Context records share the same cap with RAW_SECTION_ASSIGN.
+                native_environment["KICAD_AUTOROUTER_DECISION_MAX_EVENTS"] = str(
+                    args.decision_max_events * 4)
         run("native", common + ["--out", str(output / "native.json"), "--max-passes",
               str(args.max_passes), "--max-iterations", str(args.max_iterations),
               "--max-expanded-nodes", str(args.max_expanded_nodes), "--optimization-passes", "0"]
-              + save_board("native"))
+              + save_board("native"), extra_environment=native_environment)
         annotate("native")
+        decision_status = 0
+        if args.decision_trace:
+            decision_comparator = Path(__file__).with_name("compare_decision_traces.py")
+            decision_command = [sys.executable, str(decision_comparator),
+                                str(output / "reference-route.log"),
+                                str(output / "native-decisions.jsonl"), "--json-report",
+                                str(output / "decision-divergence.json")]
+            if args.decision_net is not None:
+                decision_command += ["--net", str(args.decision_net)]
+            if args.decision_net_name is not None:
+                decision_command += ["--net-name", args.decision_net_name]
+            if args.decision_geometry:
+                decision_command.append("--geometry")
+            if args.decision_max_events > 0:
+                decision_command += ["--max-events", str(args.decision_max_events)]
+            with (output / "decision-comparison.log").open("w") as log:
+                decision_status = subprocess.run(decision_command, stdout=log,
+                                                 stderr=subprocess.STDOUT,
+                                                 check=False).returncode
         comparator = Path(__file__).with_name("compare_results.py")
-        return subprocess.run([sys.executable, str(comparator), str(output / "reference.json"),
-                               str(output / "native.json")], check=False).returncode
+        metrics_status = subprocess.run(
+            [sys.executable, str(comparator), str(output / "reference.json"),
+             str(output / "native.json")], check=False).returncode
+        return metrics_status or decision_status
     finally:
         if input_hashes() != original_inputs:
             raise RuntimeError("input board, project, or custom rules changed during parity run")

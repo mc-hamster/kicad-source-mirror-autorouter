@@ -62,8 +62,13 @@ public:
         std::vector<AUTOROUTE_ITEM> result;
         result.reserve( aBoard.pads.size() );
 
-        for( std::size_t padIndex = 0; padIndex < aBoard.pads.size(); ++padIndex )
+        // Item.compareTo() sorts Freerouting board items by descending
+        // insertion id.  The adapter stores real pads in their DSN creation
+        // order, so reverse traversal is the exact natural pass order.  The
+        // synthetic terminals appended after real pads are not source Items.
+        for( std::size_t next = aBoard.pads.size(); next > 0; --next )
         {
+            const std::size_t padIndex = next - 1;
             const ROUTING_PAD& pad = aBoard.pads[padIndex];
             if( pad.isFanoutTarget || pad.isPlaneTarget || handledPads.contains( padIndex ) )
                 continue;

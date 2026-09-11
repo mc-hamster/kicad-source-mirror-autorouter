@@ -30,6 +30,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -91,6 +92,28 @@ struct ROUTER_LAYER_SETTINGS
     // KiCad layer IDs are not ordered by physical stack position.  Keep the
     // copper ordinal explicitly so via spans never rely on enum arithmetic.
     int  layerOrdinal = -1;
+
+    // Direct counterparts of RouterSettings.scoring's per-layer arrays.
+    // NaN retains compatibility with older data-only callers, which set only
+    // directionCost (in tenths above the global traceLengthCost).
+    double preferredDirectionTraceCost = std::numeric_limits<double>::quiet_NaN();
+    double undesiredDirectionTraceCost = std::numeric_limits<double>::quiet_NaN();
+
+    std::pair<double, double> TraceCosts( double aFallbackPreferred ) const
+    {
+        const double preferred = std::isfinite( preferredDirectionTraceCost )
+                                         ? std::max( 0.0, preferredDirectionTraceCost )
+                                         : std::max( 0.0, aFallbackPreferred );
+        const double undesired = std::isfinite( undesiredDirectionTraceCost )
+                                         ? std::max( 0.0, undesiredDirectionTraceCost )
+                                         : preferred + std::max( 0, directionCost ) / 10.0;
+
+        if( preferredDirection == 0 )
+            return { preferred, preferred };
+
+        return { preferredDirection == 2 ? undesired : preferred,
+                 preferredDirection == 1 ? undesired : preferred };
+    }
 };
 
 
@@ -263,11 +286,20 @@ struct ROUTING_PAD
         std::int64_t minWidth = 0;
         std::int64_t maxWidth = 0;
         std::int64_t clearance = 0;
+        // Bounding box of the source ShapeSearchTree shape: physical pad
+        // copper enlarged by ClearanceMatrix.clearanceCompensationValue().
+        // An inverted box means that a data-only caller supplied only the
+        // legacy width metadata.
+        ROUTER_BOX   treeBounds{ 1, 1, 0, 0 };
 
         bool operator==( const LAYER_GEOMETRY& aOther ) const
         {
             return layer == aOther.layer && minWidth == aOther.minWidth
-                   && maxWidth == aOther.maxWidth && clearance == aOther.clearance;
+                   && maxWidth == aOther.maxWidth && clearance == aOther.clearance
+                   && treeBounds.minX == aOther.treeBounds.minX
+                   && treeBounds.minY == aOther.treeBounds.minY
+                   && treeBounds.maxX == aOther.treeBounds.maxX
+                   && treeBounds.maxY == aOther.treeBounds.maxY;
         }
     };
 

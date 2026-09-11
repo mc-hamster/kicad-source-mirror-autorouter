@@ -3705,6 +3705,21 @@ public:
     void FromBOARD( BOARD* aBoard );
 
     /**
+     * Return the component traversal emitted by FromBOARD's placement scope.
+     *
+     * Specctra groups equivalent footprint IMAGEs and then emits every PLACE
+     * in that group's encounter order.  Freerouting creates pins in precisely
+     * this order and its Item comparator later visits them in reverse creation
+     * order.  Native routing needs the same stable order without serializing a
+     * temporary DSN or mutating the live board.
+     *
+     * The returned pointers belong to @a aBoard.  This function only clones
+     * footprints while calculating IMAGE identity; it does not flip or edit
+     * the supplied board.
+     */
+    std::vector<FOOTPRINT*> GetDsnComponentOrder( BOARD* aBoard );
+
+    /**
      * Add the entire #SESSION info to a #BOARD but does not write it out.
      *
      * The #BOARD given to this function will have all its tracks and via's replaced, and all

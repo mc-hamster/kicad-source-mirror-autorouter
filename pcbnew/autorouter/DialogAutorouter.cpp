@@ -311,6 +311,12 @@ AUTOROUTER_SETTINGS DIALOG_AUTOROUTER_SETTINGS::GetSettings() const
             it != m_settings.layers.end() )
         {
             layer.layerOrdinal = it->layerOrdinal;
+            layer.preferredDirectionTraceCost = it->preferredDirectionTraceCost;
+            const double preferred = std::isfinite( layer.preferredDirectionTraceCost )
+                                             ? layer.preferredDirectionTraceCost
+                                             : std::max( 0, result.traceLengthCost );
+            layer.undesiredDirectionTraceCost =
+                    preferred + static_cast<double>( layer.directionCost ) / 10.0;
         }
 
         result.layers.push_back( layer );

@@ -1758,6 +1758,73 @@ void SPECCTRA_DB::FromBOARD( BOARD* aBoard )
 }
 
 
+std::vector<FOOTPRINT*> SPECCTRA_DB::GetDsnComponentOrder( BOARD* aBoard )
+{
+    std::vector<FOOTPRINT*> result;
+
+    if( !aBoard )
+        return result;
+
+    if( !m_pcb )
+        SetPCB( MakePCB() );
+
+    buildLayerMaps( aBoard );
+    m_pcb->m_unit->units = T_um;
+    m_pcb->m_resolution->units = T_um;
+    m_pcb->m_resolution->value = 10;
+
+    struct IMAGE_GROUP
+    {
+        IMAGE*                  image = nullptr;
+        std::vector<FOOTPRINT*> footprints;
+    };
+
+    std::vector<IMAGE_GROUP> groups;
+
+    for( FOOTPRINT* footprint : aBoard->Footprints() )
+    {
+        if( !footprint )
+            continue;
+
+        // ExportBoardToSpecctraFile temporarily presents bottom-side
+        // footprints from the top.  Perform that transform on a private clone
+        // so inspecting routing order never changes the editor board or its
+        // modification timestamp.
+        std::unique_ptr<FOOTPRINT> imageFootprint(
+                static_cast<FOOTPRINT*>( footprint->Clone() ) );
+
+        if( imageFootprint->GetLayer() == B_Cu )
+            imageFootprint->Flip( imageFootprint->GetPosition(),
+                                  FLIP_DIRECTION::TOP_BOTTOM );
+
+        IMAGE* candidate = makeIMAGE( aBoard, imageFootprint.get() );
+        IMAGE* registered = m_pcb->m_library->LookupIMAGE( candidate );
+
+        if( registered != candidate )
+            delete candidate;
+
+        auto group = std::find_if( groups.begin(), groups.end(),
+                                   [registered]( const IMAGE_GROUP& aGroup )
+                                   {
+                                       return aGroup.image == registered;
+                                   } );
+
+        if( group == groups.end() )
+        {
+            groups.push_back( { registered, {} } );
+            group = std::prev( groups.end() );
+        }
+
+        group->footprints.push_back( footprint );
+    }
+
+    for( const IMAGE_GROUP& group : groups )
+        result.insert( result.end(), group.footprints.begin(), group.footprints.end() );
+
+    return result;
+}
+
+
 void SPECCTRA_DB::exportNETCLASS( const NETCLASS* aNetClass, const BOARD* aBoard )
 {
     /*  From page 11 of specctra spec:

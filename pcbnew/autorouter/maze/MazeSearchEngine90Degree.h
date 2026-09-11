@@ -48,6 +48,10 @@ struct ROOM_TERMINAL
     ROUTER_POINT start;
     ROUTER_POINT end;
     std::size_t owner = std::numeric_limits<std::size_t>::max();
+    // Exact bounding region joined into DestinationDistance.  The routeable
+    // connection shape remains start..end; Freerouting deliberately uses the
+    // larger search-tree shape only for its admissible destination bound.
+    ROUTER_BOX treeBounds{ 1, 1, 0, 0 };
 };
 
 struct ROOM_PATH
@@ -79,6 +83,10 @@ struct ROOM_VIA_SETTINGS
     std::vector<SHAPE_TREE_ENTRY> obstacles;
     std::int64_t pageWidth = 10000;
     double normalCost = 0;
+    // Freerouting keeps one global room queue across all enabled layers even
+    // when the ViaRule is empty.  Disable only drill-page transitions; do not
+    // fall back to independent per-layer searches with different ordering.
+    bool transitionsEnabled = true;
     bool attachSmd = false;
     std::vector<DRILL_PIN> pins; // Physical layer ordinals, not host layer IDs.
     // Must validate the entire manufactured via, not only entry/exit layers.

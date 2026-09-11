@@ -59,17 +59,14 @@ double AUTOROUTE_CONTROL::WeightedTraceCost( int aLayer, const ROUTER_POINT& aSt
             m_settings.layers.begin(), m_settings.layers.end(),
             [aLayer]( const ROUTER_LAYER_SETTINGS& aLayerSetting )
             { return aLayerSetting.layerId == aLayer; } );
-    const double preferred = std::max( 0, m_settings.traceLengthCost );
-    double horizontal = preferred;
-    double vertical = preferred;
-    if( layerIt != m_settings.layers.end() && layerIt->preferredDirection != 0 )
-    {
-        const double against = preferred + std::max( 0, layerIt->directionCost ) / 10.0;
-        if( layerIt->preferredDirection == 1 )
-            vertical = against;
-        else if( layerIt->preferredDirection == 2 )
-            horizontal = against;
-    }
+    const auto [horizontal, vertical] = layerIt != m_settings.layers.end()
+                                                ? layerIt->TraceCosts(
+                                                          m_settings.traceLengthCost )
+                                                : std::pair<double, double>{
+                                                          std::max( 0,
+                                                                    m_settings.traceLengthCost ),
+                                                          std::max( 0,
+                                                                    m_settings.traceLengthCost ) };
     const double dx = static_cast<double>( aEnd.x ) - aStart.x;
     const double dy = static_cast<double>( aEnd.y ) - aStart.y;
     return std::hypot( dx * horizontal, dy * vertical );
@@ -105,14 +102,18 @@ double AUTOROUTE_CONTROL::DirectionCost( int aLayer, const ROUTER_POINT& aStart,
     if( layerIt == m_settings.layers.end() || layerIt->preferredDirection == 0 )
         return 0.0;
 
-    const bool horizontal = std::llabs( aEnd.x - aStart.x ) >= std::llabs( aEnd.y - aStart.y );
-    const bool preferred = ( layerIt->preferredDirection == 1 && horizontal )
-                           || ( layerIt->preferredDirection == 2 && !horizontal );
+    const bool horizontalMove =
+            std::llabs( aEnd.x - aStart.x ) >= std::llabs( aEnd.y - aStart.y );
+    const bool preferred = ( layerIt->preferredDirection == 1 && horizontalMove )
+                           || ( layerIt->preferredDirection == 2 && !horizontalMove );
+    const auto [horizontalCost, verticalCost] =
+            layerIt->TraceCosts( m_settings.traceLengthCost );
+    const double preferredCost = std::min( horizontalCost, verticalCost );
+    const double undesiredCost = std::max( horizontalCost, verticalCost );
 
-    return preferred
-                   ? 0.0
-                   : static_cast<double>( std::max( 0, layerIt->directionCost ) )
-                                     * ( 1.0 + 0.05 * std::max( 0, m_retry ) );
+    return preferred ? 0.0
+                     : 10.0 * ( undesiredCost - preferredCost )
+                               * ( 1.0 + 0.05 * std::max( 0, m_retry ) );
 }
 
 } // namespace KICAD_AUTOROUTER

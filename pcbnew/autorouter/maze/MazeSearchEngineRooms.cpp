@@ -27,6 +27,45 @@ namespace
 
 using PLANAR::INT_OCTAGON;
 
+ROUTER_BOX terminalTreeBounds( const ROUTING_TERMINAL& aTerminal, int aLayer,
+                               std::int64_t aClearanceCompensation )
+{
+    // PolylineTrace.calculateTreeShapes() enlarges each trace segment by its
+    // half-width plus the trace clearance compensation.  Pin tree shapes are
+    // supplied by the host adapter because their actual copper need not be a
+    // circle or even axis aligned.
+    if( aTerminal.segmentEnd )
+    {
+        const ROUTER_POINT end = *aTerminal.segmentEnd;
+        const std::int64_t expansion =
+                std::max<std::int64_t>( 0, aTerminal.pad.trackWidth / 2 )
+                + aClearanceCompensation;
+        return { std::min( aTerminal.pad.position.x, end.x ) - expansion,
+                 std::min( aTerminal.pad.position.y, end.y ) - expansion,
+                 std::max( aTerminal.pad.position.x, end.x ) + expansion,
+                 std::max( aTerminal.pad.position.y, end.y ) + expansion };
+    }
+
+    const auto geometry = std::find_if(
+            aTerminal.pad.layerGeometry.begin(), aTerminal.pad.layerGeometry.end(),
+            [&]( const ROUTING_PAD::LAYER_GEOMETRY& aGeometry )
+            {
+                return aGeometry.layer == aLayer
+                       && aGeometry.treeBounds.minX <= aGeometry.treeBounds.maxX
+                       && aGeometry.treeBounds.minY <= aGeometry.treeBounds.maxY;
+            } );
+    if( geometry != aTerminal.pad.layerGeometry.end() )
+        return geometry->treeBounds;
+
+    const std::int64_t expansion =
+            std::max<std::int64_t>( 0, aTerminal.pad.radius )
+            + aClearanceCompensation;
+    return { aTerminal.pad.position.x - expansion,
+             aTerminal.pad.position.y - expansion,
+             aTerminal.pad.position.x + expansion,
+             aTerminal.pad.position.y + expansion };
+}
+
 INT_OCTAGON octagonalEnvelope( const std::vector<ROUTER_POINT>& aPoints,
                                std::int64_t aExpansion )
 {
@@ -316,6 +355,17 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         const auto& obstacle = m_board.obstacles[index];
         if( !( aForVia ? obstacle.blocksVias : obstacle.blocksTracks ) )
             continue;
+
+        // Freerouting's ShapeSearchTree stores a Pin or Via by its copper
+        // shapes.  The Specctra model has no second trace-routing obstacle for
+        // that item's plated drill.  The KiCad adapter retains drilled holes
+        // for via-to-hole and final host DRC, but putting a net-assigned hole
+        // into the trace room tree double-counts a through pad/via and changes
+        // the very first completed room.  Unassigned mechanical holes remain
+        // real trace obstacles.
+        if( !aForVia && obstacle.isHole && obstacle.netCode != 0 )
+            continue;
+
         if( obstacle.netCode == net && !obstacle.isKeepout )
         {
             const bool ownHole = obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
@@ -328,8 +378,10 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         // diagonal convex contour as its axis-aligned bounding box.
         if( aSkipGeneralConvex && isGeneralPolygonRoomObstacle( obstacle, net, aForVia ) )
             continue;
-        // One extra IU makes the room boundary legal under the host's
-        // inclusive collision predicates; do not apply clearance twice.
+        // The current native locator consumes trace-centre rooms.  Until its
+        // source room-shrink phase is complete, retain the candidate radius
+        // in the room obstacle so every reconstructed segment is legal under
+        // KiCad's inclusive collision predicates.
         const std::int64_t expansion = obstacleExpansionRadius(
                 obstacle, net, aLayer, aForVia, radius, drillRadius ) + 1;
         if( isGeneralPolygonRoomObstacle( obstacle, net, aForVia )
@@ -684,7 +736,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
     const int net = aStarts.front().pad.netCode;
 
     const auto radius = netTrackRadius( net );
-    const auto margin = m_board.edgeClearance + radius + 1;
+    const auto compensation = traceClearanceCompensation( net );
+    const auto margin = std::max<std::int64_t>(
+                                0, m_board.edgeClearance - compensation ) + 1;
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
                              m_board.bounds.maxX - margin, m_board.bounds.maxY - margin };
     std::optional<ROUTING_CONNECTION> best;
@@ -703,7 +757,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                     continue;
                 const auto start = terminal.pad.position;
                 const auto end = terminal.segmentEnd.value_or( start );
-                result.push_back( { start, end, terminal.padIndex } );
+                result.push_back( { start, end, terminal.padIndex,
+                                    terminalTreeBounds( terminal, layer.layerId,
+                                                        compensation ) } );
             }
             return result;
         };
@@ -718,22 +774,21 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         // Geometric per-axis costs for the isolated no-via frontier. The
         // existing dialog's direction penalty is mapped here, not substituted
         // into the legacy queue's incompatible grid-normalized heuristic.
-        const double preferred = std::max( 1, m_settings.traceLengthCost );
-        const double against = preferred + std::max( 0, layer.directionCost ) / 10.0;
-        const double horizontal = layer.preferredDirection == 2 ? against : preferred;
-        const double vertical = layer.preferredDirection == 1 ? against : preferred;
+        const auto [horizontal, vertical] = layer.TraceCosts( m_settings.traceLengthCost );
         const bool anyAngle = hasGeneralConvexRoomGeometry( net, layer.layerId );
         auto path = anyAngle
                 ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
                         bounds, entries, layer.layerId, net, starts, targets,
-                        std::max<std::int64_t>( 1, radius ), horizontal, vertical,
+                        std::max<std::int64_t>( 1, radius + compensation ),
+                        horizontal, vertical,
                         m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
                         aCancel, aProgress,
                         static_cast<double>( std::max( 0, m_settings.bendCost ) )
                                 * std::max( 1, m_settings.gridStepIU ), ripupEntries )
                 : MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                         bounds, entries, layer.layerId, net, starts, targets,
-                        std::max<std::int64_t>( 1, radius ), horizontal, vertical,
+                        std::max<std::int64_t>( 1, radius + compensation ),
+                        horizontal, vertical,
                         m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
                         aCancel, aProgress,
                         static_cast<double>( std::max( 0, m_settings.bendCost ) )
@@ -746,7 +801,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         {
             path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                     bounds, entries, layer.layerId, net, starts, targets,
-                    std::max<std::int64_t>( 1, radius ), horizontal, vertical,
+                    std::max<std::int64_t>( 1, radius + compensation ),
+                    horizontal, vertical,
                     m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
                     aCancel, aProgress, false,
                     static_cast<double>( std::max( 0, m_settings.bendCost ) )
@@ -842,7 +898,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     const int net = starts.front().pad.netCode;
 
     const auto radius = netTrackRadius( net );
-    const auto margin = m_board.edgeClearance + radius + 1;
+    const auto compensation = traceClearanceCompensation( net );
+    const auto margin = std::max<std::int64_t>(
+                                0, m_board.edgeClearance - compensation ) + 1;
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
                              m_board.bounds.maxX - margin, m_board.bounds.maxY - margin };
     const auto physical = VIA_RULE::ThroughLayers( m_settings );
@@ -850,6 +908,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         return std::nullopt;
     std::vector<ROOM_LAYER> layers;
     ROOM_VIA_SETTINGS via;
+    via.transitionsEnabled = m_settings.allowVias;
     via.attachSmd = m_settings.allowViaInSmdPad;
     const auto netRule = std::find_if( m_board.nets.begin(), m_board.nets.end(),
                                       [net]( const ROUTING_NET& aNet )
@@ -942,7 +1001,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                                                      profileDrillRadius );
         }
     }
-    if( viaLayers.empty() )
+    if( via.transitionsEnabled && viaLayers.empty() )
         return std::nullopt;
 
     const auto viaMargin = m_board.edgeClearance + maximumViaRadius + 1;
@@ -1085,10 +1144,10 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             layer.obstacles = roomObstacles( net, id, false, false, cancel,
                                              &layer.ripupObstacles );
         }
-        const double preferred = std::max( 1, m_settings.traceLengthCost );
-        const double against = preferred + std::max( 0, setting->directionCost ) / 10.0;
-        layer.horizontalCost = setting->preferredDirection == 2 ? against : preferred;
-        layer.verticalCost = setting->preferredDirection == 1 ? against : preferred;
+        const auto [horizontalCost, verticalCost] =
+                setting->TraceCosts( m_settings.traceLengthCost );
+        layer.horizontalCost = horizontalCost;
+        layer.verticalCost = verticalCost;
         layer.bendCost = static_cast<double>( std::max( 0, m_settings.bendCost ) )
                          * std::max( 1, m_settings.gridStepIU );
         auto append = [&]( const auto& terminals, auto& output, bool aTarget )
@@ -1099,17 +1158,25 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                     continue;
                 const auto a = t.pad.position, b = t.segmentEnd.value_or( a );
                 if( exactFrontier || aTarget || a.x == b.x || a.y == b.y )
-                    output.push_back( { a, b, t.padIndex } );
+                    output.push_back( { a, b, t.padIndex,
+                                        terminalTreeBounds( t, id, compensation ) } );
                 else
                 {
-                    output.push_back( { a, a, t.padIndex } );
-                    output.push_back( { b, b, t.padIndex } );
+                    ROUTING_TERMINAL first = t;
+                    first.segmentEnd.reset();
+                    first.pad.position = a;
+                    ROUTING_TERMINAL second = first;
+                    second.pad.position = b;
+                    output.push_back( { a, a, t.padIndex,
+                                        terminalTreeBounds( first, id, compensation ) } );
+                    output.push_back( { b, b, t.padIndex,
+                                        terminalTreeBounds( second, id, compensation ) } );
                 }
             }
         };
         append( starts, layer.starts, false );
         append( targets, layer.targets, true );
-        if( viaLayers.contains( id ) )
+        if( via.transitionsEnabled && viaLayers.contains( id ) )
         {
             for( auto obstacle : roomObstacles(
                          net, id, true, true, cancel, nullptr,
@@ -1123,16 +1190,16 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     }
     const auto path = anyAngleFrontier
             ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayerConnection(
-                      layers, net, std::max<std::int64_t>( 1, radius ), via,
+                      layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
                       cancel, progress )
             : exactFrontier
             ? MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
-                      layers, net, std::max<std::int64_t>( 1, radius ), via,
+                      layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
                       cancel, progress )
             : MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
-                      layers, net, std::max<std::int64_t>( 1, radius ), via,
+                      layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
                       cancel, progress );
     std::optional<ROUTING_CONNECTION> result;
