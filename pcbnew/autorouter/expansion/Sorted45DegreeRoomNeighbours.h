@@ -35,9 +35,25 @@ public:
     const std::vector<NEIGHBOUR>& Neighbours() const { return m_neighbours; }
     const std::array<bool, 8>& EdgeInteriorTouchesObstacle() const { return m_edgeTouches; }
 
+    /** Return the source edge-touch flags for geometry expressed in KiCad's
+     * y-down coordinates.  Freerouting's octagon side cycle is y-up, so the
+     * input entries must be reflected before neighbour classification and the
+     * resulting side numbers reflected back before they constrain the native
+     * room. */
+    std::array<bool, 8> EdgeInteriorTouchesObstacleForYDownCoordinates() const;
+
     static PLANAR::INT_OCTAGON RemoveNotTouchingBorderLines(
             const PLANAR::INT_OCTAGON& aRoom,
             const std::array<bool, 8>& aEdgeTouches );
+
+    /** Source-equivalent edge removal after completeShape clips the nominally
+     * unbounded result to the board.  Supplying the actual board supports is
+     * required for KiCad IU, whose coordinates can exceed Freerouting's
+     * Limits.CRIT_INT sentinel after unit conversion. */
+    static PLANAR::INT_OCTAGON RemoveNotTouchingBorderLinesWithinBounds(
+            const PLANAR::INT_OCTAGON& aRoom,
+            const std::array<bool, 8>& aEdgeTouches,
+            const PLANAR::INT_OCTAGON& aBounds );
 
     /** Source calculateNewIncompleteRooms branches, without room/door object
      * allocation.  Returned shapes are ready for the caller's ownership
@@ -83,6 +99,7 @@ private:
             const NEIGHBOUR& aPrevious, const NEIGHBOUR& aNext ) const;
 
     PLANAR::INT_OCTAGON m_room;
+    std::vector<SHAPE_TREE_ENTRY> m_inputEntries;
     std::array<bool, 8> m_edgeTouches{};
     std::vector<NEIGHBOUR> m_neighbours;
 };

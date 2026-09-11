@@ -12,7 +12,37 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — first-class start target-item doors
+## Latest core milestone — y-down 45-degree room lifecycle
+
+The native 45-degree room lifecycle now reflects KiCad y-down octagons and
+every original overlapping tree entry into Freerouting's y-up side cycle before
+classifying neighbour order, touched edge interiors and incomplete-room gaps.
+The resulting edge flags are reflected back before constraining the native
+room.  The earlier adapter classified the y-down shape directly and then tried
+to rebuild y-up gaps from only the neighbours that happened to survive that
+incorrect classification; valid room-room doors could therefore disappear.
+
+Edge removal also no longer applies Freerouting's unscaled
+`Limits.CRIT_INT` sentinel directly to KiCad IU.  Ordinary board coordinates
+can exceed that sentinel after DSN-to-IU conversion, turning an intended
+unbounded support into an invalid octagon.  The native operation now produces
+the exact shape that the source obtains after `completeShape` clips the
+nominally unbounded result to the board supports.  The source-named unbounded
+primitive remains unchanged for direct oracle comparisons.
+
+A focused regression covers side-index reflection, gap reflection and a
+scaled board whose KiCad coordinates exceed the source sentinel.  This
+checkpoint passes **249/249 native autorouter cases** and all **26 Python
+parity-harness tests**; the parity executable and PCB editor module link
+successfully.  On the stripped BJT A/B gate, native remains 16/16 complete,
+uses 148.712 mm of track, zero vias and introduces zero KiCad DRC violations.
+The normalized room-section stream now agrees through 124 assignments instead
+of 110.  The next mismatch is a fifth native section on a board-edge door whose
+left bound still lacks the source's compensated inset.  The stripped 555 gate
+remains 12/12 and DRC-clean with 85.530 mm and 12 vias; Freerouting uses seven
+vias and introduces ten KiCad DRC violations, so that quality gate remains red.
+
+## Previous core milestone — first-class start target-item doors
 
 The three multilayer room frontiers no longer seed a source room with a
 synthetic `door == nullptr` queue state.  Every completed source room now owns

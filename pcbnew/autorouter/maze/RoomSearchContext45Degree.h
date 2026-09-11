@@ -201,7 +201,19 @@ public:
             const auto entries = neighbours( aSeed.shape );
             SORTED_45_DEGREE_ROOM_NEIGHBOURS sorted( aSeed.shape, entries );
             bool enlarge = false;
-            const auto& touches = sorted.EdgeInteriorTouchesObstacle();
+            const auto touches =
+                    sorted.EdgeInteriorTouchesObstacleForYDownCoordinates();
+            std::string touchBits;
+            touchBits.reserve( touches.size() );
+            for( bool touch : touches )
+                touchBits.push_back( touch ? '1' : '0' );
+            autorouterDecisionLog(
+                    "ROOM_EDGE_TOUCHES",
+                    { { "layer", std::to_string( layer ) },
+                      { "room_bounds", autorouterDecisionBounds(
+                                                aSeed.shape.BoundingBox() ) },
+                      { "entry_count", std::to_string( entries.size() ) },
+                      { "touches", touchBits } } );
             for( int edge = 0; edge < 8; ++edge )
             {
                 if( touches[edge] )
@@ -219,8 +231,11 @@ public:
             if( enlarge )
             {
                 const PLANAR::INT_OCTAGON enlarged =
-                        SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
-                                aSeed.shape, touches );
+                        SORTED_45_DEGREE_ROOM_NEIGHBOURS::
+                                RemoveNotTouchingBorderLinesWithinBounds(
+                                        aSeed.shape, touches,
+                                        PLANAR::INT_OCTAGON::FromBox(
+                                                tree.Bounds() ) );
                 std::optional<int> ignored;
                 std::optional<PLANAR::INT_OCTAGON> ignoredShape;
                 double maxArea = 0;

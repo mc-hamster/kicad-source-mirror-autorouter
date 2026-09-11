@@ -13,7 +13,8 @@ using PLANAR::INT_OCTAGON;
 
 SORTED_45_DEGREE_ROOM_NEIGHBOURS::SORTED_45_DEGREE_ROOM_NEIGHBOURS(
         INT_OCTAGON aRoom, const std::vector<SHAPE_TREE_ENTRY>& aEntries ) :
-        m_room( std::move( aRoom ) )
+        m_room( std::move( aRoom ) ),
+        m_inputEntries( aEntries )
 {
     for( const SHAPE_TREE_ENTRY& entry : aEntries )
     {
@@ -66,26 +67,44 @@ std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> reflectY(
                             reflectY( room.containedShape ) } );
     return result;
 }
+
+
+std::vector<SHAPE_TREE_ENTRY> reflectedEntries(
+        const std::vector<SHAPE_TREE_ENTRY>& aEntries )
+{
+    std::vector<SHAPE_TREE_ENTRY> result;
+    result.reserve( aEntries.size() );
+    for( SHAPE_TREE_ENTRY entry : aEntries )
+    {
+        const INT_OCTAGON sourceShape = reflectY( entry.BoundingOctagon() );
+        entry.shape = sourceShape.BoundingBox();
+        entry.octagon = sourceShape;
+        result.push_back( std::move( entry ) );
+    }
+    return result;
+}
 } // namespace
+
+
+std::array<bool, 8>
+SORTED_45_DEGREE_ROOM_NEIGHBOURS::EdgeInteriorTouchesObstacleForYDownCoordinates() const
+{
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
+            reflectY( m_room ), reflectedEntries( m_inputEntries ) );
+    std::array<bool, 8> result{};
+    for( int sourceSide = 0; sourceSide < 8; ++sourceSide )
+        result[( 4 - sourceSide + 8 ) % 8] =
+                sourceOrder.EdgeInteriorTouchesObstacle()[sourceSide];
+    return result;
+}
 
 
 std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
 SORTED_45_DEGREE_ROOM_NEIGHBOURS::IncompleteRoomsForYDownCoordinates(
         const INT_OCTAGON& aBoardBounds, int aLayer ) const
 {
-    std::vector<SHAPE_TREE_ENTRY> sourceEntries;
-    sourceEntries.reserve( m_neighbours.size() );
-    for( const NEIGHBOUR& neighbour : m_neighbours )
-    {
-        SHAPE_TREE_ENTRY entry = neighbour.entry;
-        const INT_OCTAGON sourceShape = reflectY( neighbour.shape );
-        entry.shape = sourceShape.BoundingBox();
-        entry.octagon = sourceShape;
-        sourceEntries.push_back( std::move( entry ) );
-    }
-
     const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
-            reflectY( m_room ), sourceEntries );
+            reflectY( m_room ), reflectedEntries( m_inputEntries ) );
     return reflectY( sourceOrder.IncompleteRooms(
             reflectY( aBoardBounds ), aLayer ) );
 }
@@ -95,19 +114,8 @@ std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
 SORTED_45_DEGREE_ROOM_NEIGHBOURS::ObstacleIncompleteRoomsForYDownCoordinates(
         const INT_OCTAGON& aBoardBounds, int aLayer ) const
 {
-    std::vector<SHAPE_TREE_ENTRY> sourceEntries;
-    sourceEntries.reserve( m_neighbours.size() );
-    for( const NEIGHBOUR& neighbour : m_neighbours )
-    {
-        SHAPE_TREE_ENTRY entry = neighbour.entry;
-        const INT_OCTAGON sourceShape = reflectY( neighbour.shape );
-        entry.shape = sourceShape.BoundingBox();
-        entry.octagon = sourceShape;
-        sourceEntries.push_back( std::move( entry ) );
-    }
-
     const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
-            reflectY( m_room ), sourceEntries );
+            reflectY( m_room ), reflectedEntries( m_inputEntries ) );
     return reflectY( sourceOrder.ObstacleIncompleteRooms(
             reflectY( aBoardBounds ), aLayer ) );
 }
@@ -794,6 +802,27 @@ INT_OCTAGON SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
             aEdgeTouches[1] ? aRoom.lowerRightDiagonalX : critical,
             aEdgeTouches[7] ? aRoom.lowerLeftDiagonalX : -critical,
             aEdgeTouches[3] ? aRoom.upperRightDiagonalX : critical ).Normalize();
+}
+
+
+INT_OCTAGON
+SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLinesWithinBounds(
+        const INT_OCTAGON& aRoom, const std::array<bool, 8>& aEdgeTouches,
+        const INT_OCTAGON& aBounds )
+{
+    return INT_OCTAGON(
+            aEdgeTouches[6] ? aRoom.leftX : aBounds.leftX,
+            aEdgeTouches[0] ? aRoom.bottomY : aBounds.bottomY,
+            aEdgeTouches[2] ? aRoom.rightX : aBounds.rightX,
+            aEdgeTouches[4] ? aRoom.topY : aBounds.topY,
+            aEdgeTouches[5] ? aRoom.upperLeftDiagonalX
+                            : aBounds.upperLeftDiagonalX,
+            aEdgeTouches[1] ? aRoom.lowerRightDiagonalX
+                            : aBounds.lowerRightDiagonalX,
+            aEdgeTouches[7] ? aRoom.lowerLeftDiagonalX
+                            : aBounds.lowerLeftDiagonalX,
+            aEdgeTouches[3] ? aRoom.upperRightDiagonalX
+                            : aBounds.upperRightDiagonalX ).Normalize();
 }
 
 } // namespace KICAD_AUTOROUTER

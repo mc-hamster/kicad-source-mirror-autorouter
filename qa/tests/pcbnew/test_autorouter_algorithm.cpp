@@ -615,6 +615,126 @@ BOOST_AUTO_TEST_CASE( FortyFiveDegreeNeighbourOrderingMatchesPinnedFreerouting )
 }
 
 
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeYDownNeighbourLifecycleReflectsSourceSideCycle )
+{
+    using PLANAR::INT_OCTAGON;
+
+    const auto reflectY = []( const INT_OCTAGON& aShape )
+    {
+        return INT_OCTAGON(
+                aShape.leftX, -aShape.topY, aShape.rightX, -aShape.bottomY,
+                aShape.lowerLeftDiagonalX, aShape.upperRightDiagonalX,
+                aShape.upperLeftDiagonalX, aShape.lowerRightDiagonalX );
+    };
+    const auto entry = []( int aId, const ROUTER_BOX& aBox )
+    {
+        const INT_OCTAGON shape = INT_OCTAGON::FromBox( aBox );
+        return SHAPE_TREE_ENTRY( aBox, aId, 0, 2, 0, false, true, shape );
+    };
+
+    const INT_OCTAGON sourceRoom = INT_OCTAGON::FromBox( { 0, 0, 100, 100 } );
+    const INT_OCTAGON sourceBounds = INT_OCTAGON::FromBox( { -300, -300, 300, 300 } );
+    const std::vector<SHAPE_TREE_ENTRY> sourceEntries = {
+        entry( 1, { 10, -20, 80, 0 } ),
+        entry( 2, { 100, 20, 120, 80 } ),
+        entry( 3, { -20, 60, 0, 100 } )
+    };
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS source( sourceRoom, sourceEntries );
+
+    std::vector<SHAPE_TREE_ENTRY> nativeEntries;
+    for( SHAPE_TREE_ENTRY current : sourceEntries )
+    {
+        const INT_OCTAGON shape = reflectY( current.BoundingOctagon() );
+        current.shape = shape.BoundingBox();
+        current.octagon = shape;
+        nativeEntries.push_back( std::move( current ) );
+    }
+    const INT_OCTAGON nativeRoom = reflectY( sourceRoom );
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS native( nativeRoom, nativeEntries );
+    const auto nativeTouches =
+            native.EdgeInteriorTouchesObstacleForYDownCoordinates();
+    std::array<bool, 8> expectedTouches{};
+    for( int sourceSide = 0; sourceSide < 8; ++sourceSide )
+        expectedTouches[( 4 - sourceSide + 8 ) % 8] =
+                source.EdgeInteriorTouchesObstacle()[sourceSide];
+    BOOST_CHECK_EQUAL_COLLECTIONS( nativeTouches.begin(), nativeTouches.end(),
+                                   expectedTouches.begin(), expectedTouches.end() );
+    BOOST_CHECK( SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
+                         nativeRoom, nativeTouches )
+                 == reflectY(
+                         SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
+                                 sourceRoom,
+                                 source.EdgeInteriorTouchesObstacle() ) ) );
+
+    const auto sourceGaps = source.IncompleteRooms( sourceBounds, 2 );
+    const auto nativeGaps = native.IncompleteRoomsForYDownCoordinates(
+            reflectY( sourceBounds ), 2 );
+    BOOST_REQUIRE_EQUAL( nativeGaps.size(), sourceGaps.size() );
+    for( std::size_t i = 0; i < sourceGaps.size(); ++i )
+    {
+        BOOST_CHECK( nativeGaps[i].shape == reflectY( sourceGaps[i].shape ) );
+        BOOST_CHECK( nativeGaps[i].containedShape
+                     == reflectY( sourceGaps[i].containedShape ) );
+        BOOST_CHECK_EQUAL( nativeGaps[i].layer, sourceGaps[i].layer );
+    }
+
+    // KiCad IU are two orders of magnitude finer than the DSN resolution in
+    // this parity fixture, so ordinary board coordinates exceed the source
+    // Limits.CRIT_INT sentinel.  Clipping removed edges directly to the board
+    // must equal source edge removal followed by completeShape's board clip.
+    constexpr std::int64_t offsetX = 1400000;
+    constexpr std::int64_t offsetY = 600000;
+    constexpr std::int64_t scale = 100;
+    const auto scaleReflectY = []( const INT_OCTAGON& aShape )
+    {
+        return INT_OCTAGON(
+                scale * aShape.leftX, -scale * aShape.topY,
+                scale * aShape.rightX, -scale * aShape.bottomY,
+                scale * aShape.lowerLeftDiagonalX,
+                scale * aShape.upperRightDiagonalX,
+                scale * aShape.upperLeftDiagonalX,
+                scale * aShape.lowerRightDiagonalX );
+    };
+    const INT_OCTAGON largeSourceRoom = INT_OCTAGON::FromBox(
+            { offsetX, offsetY, offsetX + 100, offsetY + 100 } );
+    const INT_OCTAGON largeSourceBounds = INT_OCTAGON::FromBox(
+            { 1000000, 0, 2000000, 1000000 } );
+    const std::vector<SHAPE_TREE_ENTRY> largeSourceEntries = {
+        entry( 1, { offsetX + 10, offsetY - 20,
+                    offsetX + 80, offsetY } ),
+        entry( 2, { offsetX + 100, offsetY + 20,
+                    offsetX + 120, offsetY + 80 } ),
+        entry( 3, { offsetX - 20, offsetY + 60,
+                    offsetX, offsetY + 100 } )
+    };
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS largeSource(
+            largeSourceRoom, largeSourceEntries );
+    std::vector<SHAPE_TREE_ENTRY> largeNativeEntries;
+    for( SHAPE_TREE_ENTRY current : largeSourceEntries )
+    {
+        const INT_OCTAGON shape = scaleReflectY( current.BoundingOctagon() );
+        current.shape = shape.BoundingBox();
+        current.octagon = shape;
+        largeNativeEntries.push_back( std::move( current ) );
+    }
+    const INT_OCTAGON largeNativeRoom = scaleReflectY( largeSourceRoom );
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS largeNative(
+            largeNativeRoom, largeNativeEntries );
+    const auto largeNativeTouches =
+            largeNative.EdgeInteriorTouchesObstacleForYDownCoordinates();
+    const INT_OCTAGON expectedLarge =
+            SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
+                    largeSourceRoom,
+                    largeSource.EdgeInteriorTouchesObstacle() )
+                    .Intersection( largeSourceBounds );
+    BOOST_CHECK(
+            SORTED_45_DEGREE_ROOM_NEIGHBOURS::
+                    RemoveNotTouchingBorderLinesWithinBounds(
+                            largeNativeRoom, largeNativeTouches,
+                            scaleReflectY( largeSourceBounds ) )
+            == scaleReflectY( expectedLarge ) );
+}
+
 BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
 {
     using PLANAR::INT_OCTAGON;
