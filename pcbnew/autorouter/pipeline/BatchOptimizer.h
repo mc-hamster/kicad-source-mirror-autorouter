@@ -32,6 +32,13 @@
 namespace KICAD_AUTOROUTER
 {
 
+/** Source BoardStatistics.traces.totalWeightedLength contribution for one
+ * native connection.  Exposed so parity QA can pin the optimizer's otherwise
+ * easy-to-confuse weighted/pass-floor accounting. */
+double OptimizerWeightedTraceLength( const ROUTING_CONNECTION& aConnection,
+                                     const BOARD_SNAPSHOT& aBoard );
+
+
 class BATCH_OPTIMIZER
 {
 public:

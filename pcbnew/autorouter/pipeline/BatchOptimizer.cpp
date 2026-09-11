@@ -99,12 +99,67 @@ double traceLength( const ROUTING_CONNECTION& aConnection )
 }
 
 
+std::int64_t normalTrackWidth( const BOARD_SNAPSHOT& aBoard, int aNetCode );
+std::int64_t netClearance( const BOARD_SNAPSHOT& aBoard, int aNetCode );
+
+
+double weightedTraceLength( const ROUTING_CONNECTION& aConnection,
+                            const BOARD_SNAPSHOT& aBoard )
+{
+    // BoardStatistics.totalWeightedLength counts only mutable source traces.
+    // A native connection can contain several PolylineTrace-equivalent runs,
+    // so apply the same half-width-plus-default-clearance weight per edge and
+    // preserve the source's half weight for SHOVE_FIXED pin-exit stubs.
+    if( isProtectedSourceCopper( aConnection ) )
+        return 0.0;
+
+    const std::int64_t inheritedWidth = normalTrackWidth( aBoard,
+                                                          aConnection.netCode );
+    const std::int64_t inheritedClearance = netClearance( aBoard,
+                                                           aConnection.netCode );
+    double result = 0.0;
+
+    for( std::size_t index = 1; index < aConnection.nodes.size(); ++index )
+    {
+        const ROUTER_NODE& previous = aConnection.nodes[index - 1];
+        const ROUTER_NODE& current = aConnection.nodes[index];
+        if( previous.layer != current.layer )
+            continue;
+
+        const ROUTING_EDGE_STYLE& style = EdgeStyle( aConnection, index - 1 );
+        if( style.fixedState != ROUTER_FIXED_STATE::UNFIXED
+            && style.fixedState != ROUTER_FIXED_STATE::SHOVE_FIXED )
+        {
+            continue;
+        }
+
+        const std::int64_t width = style.trackWidth > 0
+                                           ? style.trackWidth : inheritedWidth;
+        const std::int64_t clearance = style.clearance > 0
+                                               ? style.clearance : inheritedClearance;
+        const long double dx = static_cast<long double>( current.point.x )
+                               - previous.point.x;
+        const long double dy = static_cast<long double>( current.point.y )
+                               - previous.point.y;
+        double weighted = std::sqrt( static_cast<double>( dx * dx + dy * dy ) )
+                          * static_cast<double>( std::max<std::int64_t>( 0, width / 2 )
+                                                 + std::max<std::int64_t>( 0, clearance ) );
+        if( style.fixedState == ROUTER_FIXED_STATE::SHOVE_FIXED )
+            weighted /= 2.0;
+        result += weighted;
+    }
+
+    return result;
+}
+
+
 struct ROUTE_QUALITY
 {
     int    incomplete = 0;
     int    vias = 0;
     int    bends = 0;
     double length = 0.0;
+    double weightedLength = 0.0;
 };
 
 
@@ -147,6 +202,7 @@ ROUTE_QUALITY routeQuality( const BOARD_SNAPSHOT& aBoard,
         result.vias += viaCount( aConnections[index] );
         result.bends += bendCount( aConnections[index] );
         result.length += traceLength( aConnections[index] );
+        result.weightedLength += weightedTraceLength( aConnections[index], aBoard );
     }
 
     if( aReplacement && aReplacement->complete )
@@ -154,6 +210,7 @@ ROUTE_QUALITY routeQuality( const BOARD_SNAPSHOT& aBoard,
         result.vias += viaCount( *aReplacement );
         result.bends += bendCount( *aReplacement );
         result.length += traceLength( *aReplacement );
+        result.weightedLength += weightedTraceLength( *aReplacement, aBoard );
     }
 
     return result;
@@ -183,9 +240,11 @@ double optimizerScore( const BOARD_SNAPSHOT& aBoard, const ROUTE_QUALITY& aQuali
 }
 
 
-bool isImprovement( const ROUTE_QUALITY& aBefore, const ROUTE_QUALITY& aAfter )
+bool isImprovement( const ROUTE_QUALITY& aBefore, const ROUTE_QUALITY& aAfter,
+                    double aMinimumCumulativeTraceLength )
 {
-    return ITEM_ROUTE_RESULT( 0, aBefore.vias, aAfter.vias, aBefore.length,
+    return ITEM_ROUTE_RESULT( 0, aBefore.vias, aAfter.vias,
+                              aMinimumCumulativeTraceLength,
                               aAfter.length, aBefore.incomplete,
                               aAfter.incomplete ).Improved();
 }
@@ -373,6 +432,13 @@ bool fanoutEscapeIsRedundant( const BOARD_SNAPSHOT& aBoard,
     // terminal drill is legitimate.
     return allConnected( net->padIndices ) && allConnected( net->planeTargetIndices );
 }
+}
+
+
+double OptimizerWeightedTraceLength( const ROUTING_CONNECTION& aConnection,
+                                     const BOARD_SNAPSHOT& aBoard )
+{
+    return weightedTraceLength( aConnection, aBoard );
 }
 
 void BATCH_OPTIMIZER::simplifyConnection( ROUTING_CONNECTION& aConnection,
@@ -594,6 +660,12 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
 
         const ROUTE_QUALITY passBefore = routeQuality( m_board, aConnections,
                                                        *m_occupancy.Board() );
+        // BatchOptimizer.optRoutePass initializes this from
+        // BoardStatistics.traces.totalWeightedLength and carries the lowest
+        // accepted weighted value through the complete pass.  Each item still
+        // compares its current via/incomplete counts, but its post-route plain
+        // length is measured against this source pass-level floor.
+        double minCumulativeTraceLength = passBefore.weightedLength;
         const double scoreBeforePass = optimizerScore( m_board, passBefore, m_settings );
         const double threshold = std::max( 0.0, m_settings.optimizationImprovementThreshold );
         if( threshold > 0.0 && scoreBeforePass * ( 1.0 + threshold ) >= 1000.0 )
@@ -745,7 +817,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             std::vector<ROUTING_CONNECTION> bestConnections;
             ROUTE_QUALITY bestQuality = routeQuality( m_board, m_occupancy.Connections(),
                                                        *m_occupancy.Board() );
-            bool bestIsDeletion = isImprovement( before, bestQuality )
+            bool bestIsDeletion = isImprovement( before, bestQuality,
+                                                  minCumulativeTraceLength )
                                   && preservesPadGroups( groups, *m_occupancy.Board() );
             bool haveBest = bestIsDeletion;
 
@@ -764,7 +837,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 const ROUTE_QUALITY quality = routeQuality(
                         m_board, m_occupancy.Connections(), *m_occupancy.Board() );
                 const bool preserves = preservesPadGroups( groups, *m_occupancy.Board() );
-                if( preserves && isImprovement( before, quality )
+                if( preserves && isImprovement( before, quality,
+                                                minCumulativeTraceLength )
                     && ( !haveBest || betterThan( quality, bestQuality ) ) )
                 {
                     bestConnections = aCandidate;
@@ -810,11 +884,14 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                         m_board, batchConnections, *m_occupancy.Board() );
                 if( !( aCancel && aCancel() )
                     && preservesPadGroups( groups, *m_occupancy.Board() )
-                    && isImprovement( before, batchQuality ) )
+                    && isImprovement( before, batchQuality,
+                                      minCumulativeTraceLength ) )
                 {
                     batchTransaction.Commit();
                     transaction.Commit();
                     aConnections = m_occupancy.Connections();
+                    minCumulativeTraceLength = std::min(
+                            minCumulativeTraceLength, batchQuality.weightedLength );
                     changedThisPass = true;
                     consecutiveFailures = 0;
                     acceptedBatchCandidate = true;
@@ -977,6 +1054,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 }
                 transaction.Commit();
                 aConnections = m_occupancy.Connections();
+                minCumulativeTraceLength = std::min(
+                        minCumulativeTraceLength, bestQuality.weightedLength );
                 changedThisPass = true;
                 consecutiveFailures = 0;
             }
@@ -984,6 +1063,8 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
             {
                 transaction.Commit();
                 aConnections = m_occupancy.Connections();
+                minCumulativeTraceLength = std::min(
+                        minCumulativeTraceLength, bestQuality.weightedLength );
                 changedThisPass = true;
                 consecutiveFailures = 0;
             }

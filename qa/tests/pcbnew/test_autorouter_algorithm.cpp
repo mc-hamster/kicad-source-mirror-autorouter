@@ -26,6 +26,7 @@
 
 #include <autorouter/AutorouterTypes.h>
 #include <autorouter/AutorouterJob.h>
+#include <autorouter/ItemRouteResult.h>
 #include <autorouter/board/KicadRoutingSession.h>
 #include <board_design_settings.h>
 #include <drc/drc_engine.h>
@@ -10866,6 +10867,45 @@ BOOST_AUTO_TEST_CASE( OptimizerUsesSourceScoreThresholdAndTwoRipupCostPhases )
     BOOST_CHECK_EQUAL( BATCH_OPTIMIZER( board, settings, incompleteOccupancy )
                                .Optimize( noRoutes, {} ),
                        2 );
+}
+
+
+BOOST_AUTO_TEST_CASE( OptimizerUsesSourceWeightedPassFloorAccounting )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.nets[0].clearance = 100000;
+
+    ROUTING_CONNECTION route;
+    route.complete = true;
+    route.netCode = 1;
+    route.nodes = { { { 0, 0 }, 0 }, { { 1000000, 0 }, 0 },
+                    { { 2000000, 0 }, 0 }, { { 2000000, 0 }, 1 } };
+    route.edgeStyles.resize( 3 );
+    route.edgeStyles[0].trackWidth = 200000;
+    route.edgeStyles[0].clearance = 50000;
+    route.edgeStyles[1] = route.edgeStyles[0];
+    route.edgeStyles[1].fixedState = ROUTER_FIXED_STATE::SHOVE_FIXED;
+
+    // Source weighting is length * (half width + clearance), with pin-exit
+    // SHOVE_FIXED traces contributing half and layer transitions contributing
+    // no trace length.
+    BOOST_CHECK_EQUAL( OptimizerWeightedTraceLength( route, board ),
+                       225000000000.0 );
+
+    route.edgeStyles[0].fixedState = ROUTER_FIXED_STATE::USER_FIXED;
+    BOOST_CHECK_EQUAL( OptimizerWeightedTraceLength( route, board ),
+                       75000000000.0 );
+
+    route.isExistingBoardRoute = true;
+    route.isAutorouterOwned = false;
+    BOOST_CHECK_EQUAL( OptimizerWeightedTraceLength( route, board ), 0.0 );
+
+    // ItemRouteResult receives the lowest weighted cumulative value reached
+    // in the pass, not the immediately previous unweighted route length.
+    const ITEM_ROUTE_RESULT localOnly( 1, 2, 2, 1000.0, 1100.0, 0, 0 );
+    const ITEM_ROUTE_RESULT sourcePassFloor( 1, 2, 2, 1200.0, 1100.0, 0, 0 );
+    BOOST_CHECK( !localOnly.Improved() );
+    BOOST_CHECK( sourcePassFloor.Improved() );
 }
 
 
