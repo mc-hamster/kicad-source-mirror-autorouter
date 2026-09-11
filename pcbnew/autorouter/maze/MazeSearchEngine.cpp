@@ -24,6 +24,7 @@
 #include "MazeSearchEngine.h"
 #include "../board/optimize/TraceShover.h"
 #include "../geometry/planar/ContactGeometry.h"
+#include "../geometry/planar/IntOctagon.h"
 #include "../geometry/planar/Simplex.h"
 #include "../rules/ViaRule.h"
 
@@ -330,6 +331,157 @@ std::int64_t saturatedAdd( std::int64_t aLeft, std::int64_t aRight )
         return std::numeric_limits<std::int64_t>::min();
 
     return aLeft + aRight;
+}
+
+
+std::optional<std::int64_t> checkedInt64( const PLANAR::INTEGER& aValue )
+{
+    if( aValue < std::numeric_limits<std::int64_t>::min()
+        || aValue > std::numeric_limits<std::int64_t>::max() )
+    {
+        return {};
+    }
+
+    return aValue.convert_to<std::int64_t>();
+}
+
+
+std::optional<PLANAR::SIMPLEX> sourceCircleTileShape( const ROUTER_POINT& aCentre,
+                                                       std::int64_t aRadius )
+{
+    if( aRadius <= 0 )
+        return {};
+
+    // Circle.boundingOctagon() is the source search-tree representation of a
+    // circular pad/via.  In particular, it is not the enclosing square used
+    // by the old bounded shove adapter.  Preserve Java's floor/ceil choice on
+    // the four diagonal supports before converting the octagon to a simplex.
+    const long double corner = ( std::sqrt( 2.0L ) - 1.0L ) * aRadius;
+    if( corner > static_cast<long double>( std::numeric_limits<std::int64_t>::max() ) )
+        return {};
+
+    const auto floorCorner = static_cast<std::int64_t>( std::floor( corner ) );
+    const auto ceilCorner = static_cast<std::int64_t>( std::ceil( corner ) );
+    using PLANAR::INTEGER;
+    const INTEGER left = INTEGER( aCentre.x ) - aRadius;
+    const INTEGER bottom = INTEGER( aCentre.y ) - aRadius;
+    const INTEGER right = INTEGER( aCentre.x ) + aRadius;
+    const INTEGER top = INTEGER( aCentre.y ) + aRadius;
+    const INTEGER upperLeft = left - ( INTEGER( aCentre.y ) + floorCorner );
+    const INTEGER lowerRight = right - ( INTEGER( aCentre.y ) - ceilCorner );
+    const INTEGER lowerLeft = left + ( INTEGER( aCentre.y ) - floorCorner );
+    const INTEGER upperRight = right + ( INTEGER( aCentre.y ) + ceilCorner );
+    const auto lx = checkedInt64( left );
+    const auto by = checkedInt64( bottom );
+    const auto rx = checkedInt64( right );
+    const auto ty = checkedInt64( top );
+    const auto ul = checkedInt64( upperLeft );
+    const auto lr = checkedInt64( lowerRight );
+    const auto ll = checkedInt64( lowerLeft );
+    const auto ur = checkedInt64( upperRight );
+    if( !lx || !by || !rx || !ty || !ul || !lr || !ll || !ur )
+        return {};
+
+    return PLANAR::INT_OCTAGON( *lx, *by, *rx, *ty, *ul, *lr, *ll, *ur ).ToSimplex();
+}
+
+
+std::optional<PLANAR::SIMPLEX> sourcePhysicalTileShape(
+        const ROUTING_OBSTACLE& aObstacle )
+{
+    using PLANAR::POLYLINE;
+    using PLANAR::SIMPLEX;
+
+    const std::int64_t physicalRadius = std::max<std::int64_t>( 0, aObstacle.radius );
+    std::optional<SIMPLEX> result;
+    if( aObstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+    {
+        if( aObstacle.box.minX >= aObstacle.box.maxX
+            || aObstacle.box.minY >= aObstacle.box.maxY )
+        {
+            return {};
+        }
+
+        try
+        {
+            result = SIMPLEX::Box( aObstacle.box );
+        }
+        catch( const std::exception& )
+        {
+            return {};
+        }
+    }
+    else if( aObstacle.kind == ROUTER_OBSTACLE_KIND::POLYGON )
+    {
+        if( !aObstacle.polygonHoles.empty() )
+            return {};
+        result = SIMPLEX::FromConvexPolygon( aObstacle.polygon );
+    }
+    else if( aObstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
+    {
+        if( aObstacle.start == aObstacle.end )
+            return sourceCircleTileShape( aObstacle.start, physicalRadius );
+        if( physicalRadius <= 0 || physicalRadius > std::numeric_limits<int>::max() )
+            return {};
+
+        const POLYLINE centreLine = POLYLINE::FromPoints(
+                { aObstacle.start, aObstacle.end } );
+        result = centreLine.OffsetShape( static_cast<int>( physicalRadius ), 0 );
+    }
+
+    if( !result || result->IsEmpty() )
+        return {};
+    if( physicalRadius <= 0
+        || aObstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
+    {
+        return result;
+    }
+
+    // Rounded rectangles are retained as a convex core plus radius by the
+    // detached KiCad snapshot.  Recreate the physical TileShape before adding
+    // the moving trace's own half-width and rule clearance.
+    return result->Enlarge( static_cast<double>( physicalRadius ) );
+}
+
+
+std::optional<std::pair<PLANAR::SIMPLEX, PLANAR::SIMPLEX>> sourceSpringOverShapes(
+        const PLANAR::SIMPLEX& aPhysicalShape, std::int64_t aMovingRadius,
+        std::int64_t aClearance )
+{
+    // TraceShover.springOver enlarges in two half-clearance steps when the
+    // search tree does not pre-compensate clearances.  The detached KiCad
+    // worker stores an exact resolved clearance instead of a compensated tree,
+    // so this is the applicable source branch.  The second result carries the
+    // source's additional one-coordinate wrap margin.
+    const double halfClearance = 0.5 * std::max<std::int64_t>( 0, aClearance );
+    const auto enlargeSymmetrically = [&]( double aMargin )
+            -> std::optional<PLANAR::SIMPLEX>
+    {
+        const auto first = aPhysicalShape.Enlarge( aMargin + halfClearance );
+        if( !first || first->IsEmpty() )
+            return {};
+        return first->Enlarge( halfClearance );
+    };
+
+    const auto check = enlargeSymmetrically(
+            static_cast<double>( std::max<std::int64_t>( 0, aMovingRadius ) ) );
+    const auto offset = enlargeSymmetrically(
+            static_cast<double>( std::max<std::int64_t>( 0, aMovingRadius ) ) + 1.0 );
+    if( !check || !offset || check->IsEmpty() || offset->IsEmpty() )
+        return {};
+    return std::pair{ *check, *offset };
+}
+
+
+ROUTER_BOX physicalObstacleBounds( const ROUTING_OBSTACLE& aObstacle )
+{
+    ROUTER_BOX result = obstacleBounds( aObstacle );
+    const std::int64_t radius = std::max<std::int64_t>( 0, aObstacle.radius );
+    result.minX = saturatedAdd( result.minX, -radius );
+    result.minY = saturatedAdd( result.minY, -radius );
+    result.maxX = saturatedAdd( result.maxX, radius );
+    result.maxY = saturatedAdd( result.maxY, radius );
+    return result;
 }
 
 
@@ -2497,111 +2649,35 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
             {
                 continue;
             }
+            const std::int64_t movingRadius = style.trackWidth > 0
+                    ? style.trackWidth / 2 : netTrackRadius( connection.netCode );
             const auto radius = obstacleExpansionRadius(
                     obstacle, connection.netCode, layer, false,
-                    style.trackWidth > 0 ? style.trackWidth / 2
-                                         : netTrackRadius( connection.netCode ),
+                    movingRadius,
                     -1, style.clearance );
             // Host rule evaluation already supplies clearance. No Java
             // class-0 broad-phase omission or hardcoded source-unit margin.
-            if( obstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+            if( radius < movingRadius || radius == std::numeric_limits<std::int64_t>::max() )
+                continue;
+
+            const std::int64_t physicalRadius =
+                    std::max<std::int64_t>( 0, obstacle.radius );
+            if( radius < physicalRadius
+                || radius - physicalRadius < movingRadius )
             {
-                // A rounded rectangle is not an exact box. Keep it for
-                // the general shape path below once an offset model for
-                // its arcs exists; do not silently square its corners.
-                if( obstacle.radius != 0 )
-                    continue;
-                const ROUTER_BOX box = obstacle.box;
-                if( box.minX >= box.maxX || box.minY >= box.maxY )
-                    continue;
-                const auto expanded = [&]( std::int64_t aExtra )
-                {
-                    return PLANAR::SIMPLEX::Box(
-                            { box.minX - radius - aExtra, box.minY - radius - aExtra,
-                              box.maxX + radius + aExtra, box.maxY + radius + aExtra } );
-                };
-                obstacles.push_back( { i, box, expanded( 0 ), expanded( 1 ) } );
+                continue;
             }
-            else if( obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
-            {
-                // KiCad represents circular and oval pads, vias and straight
-                // copper as a centre segment swept by its physical radius.
-                // The source TraceShover receives their compensated TileShape
-                // from the search tree, so excluding native SEGMENT snapshots
-                // made forced insertion give up on the most common fixed
-                // obstacles even though CanInsertSegment() could see them.
-                //
-                // Construct the same kind of convex support contour here: the
-                // L-infinity sweep contains the circular clearance envelope,
-                // retains exact integer/rational support intersections, and is
-                // checked again against KiCad's real capsule geometry before
-                // publication. A point segment (circle/via) needs a Box because
-                // FromExpandedSegment intentionally rejects zero-length input.
-                if( radius <= 0 || radius == std::numeric_limits<std::int64_t>::max() )
-                    continue;
+            const std::int64_t clearance = radius - physicalRadius - movingRadius;
+            const auto physicalShape = sourcePhysicalTileShape( obstacle );
+            if( !physicalShape )
+                continue;
+            const auto shapes = sourceSpringOverShapes(
+                    *physicalShape, movingRadius, clearance );
+            if( !shapes )
+                continue;
 
-                const auto expandedSegment = [&]( std::int64_t aRadius )
-                        -> std::optional<PLANAR::SIMPLEX>
-                {
-                    if( aRadius <= 0 || aRadius == std::numeric_limits<std::int64_t>::max() )
-                        return {};
-
-                    if( obstacle.start != obstacle.end )
-                    {
-                        return PLANAR::SIMPLEX::FromExpandedSegment(
-                                obstacle.start, obstacle.end, aRadius );
-                    }
-
-                    const ROUTER_BOX box{
-                            saturatedAdd( obstacle.start.x, -aRadius ),
-                            saturatedAdd( obstacle.start.y, -aRadius ),
-                            saturatedAdd( obstacle.start.x, aRadius ),
-                            saturatedAdd( obstacle.start.y, aRadius ) };
-                    if( box.minX >= box.maxX || box.minY >= box.maxY )
-                        return {};
-
-                    try
-                    {
-                        return PLANAR::SIMPLEX::Box( box );
-                    }
-                    catch( const std::exception& )
-                    {
-                        // A malformed/overflowing support contour must never
-                        // be rounded into a plausible forced route.
-                        return {};
-                    }
-                };
-
-                const auto check = expandedSegment( radius );
-                const auto offset = expandedSegment( saturatedAdd( radius, 1 ) );
-                if( !check || !offset )
-                    continue;
-
-                const std::int64_t physicalRadius = std::max<std::int64_t>( 0, obstacle.radius );
-                const ROUTER_BOX physicalBounds{
-                        saturatedAdd( std::min( obstacle.start.x, obstacle.end.x ), -physicalRadius ),
-                        saturatedAdd( std::min( obstacle.start.y, obstacle.end.y ), -physicalRadius ),
-                        saturatedAdd( std::max( obstacle.start.x, obstacle.end.x ), physicalRadius ),
-                        saturatedAdd( std::max( obstacle.start.y, obstacle.end.y ), physicalRadius ) };
-                obstacles.push_back( { i, physicalBounds, *check, *offset } );
-            }
-            else if( obstacle.kind == ROUTER_OBSTACLE_KIND::POLYGON )
-            {
-                // A source TileShape is convex at this operation. Accept
-                // only an explicitly convex snapshot contour and use an
-                // L-infinity offset, which conservatively contains the
-                // circular copper-clearance offset. Concave/holed shapes
-                // stay fail-closed until their decomposition is ported.
-                const auto check = PLANAR::SIMPLEX::FromConvexPolygon( obstacle.polygon,
-                                                                         radius );
-                const auto offset = radius == std::numeric_limits<std::int64_t>::max()
-                        ? std::optional<PLANAR::SIMPLEX>{}
-                        : PLANAR::SIMPLEX::FromConvexPolygon( obstacle.polygon,
-                                                               radius + 1 );
-                if( !check || !offset )
-                    continue;
-                obstacles.push_back( { i, m_obstacleBounds[i - 1], *check, *offset } );
-            }
+            obstacles.push_back( { i, physicalObstacleBounds( obstacle ),
+                                   shapes->first, shapes->second } );
         }
 
         // Generated routes are mutable worker objects, not immutable
@@ -2633,8 +2709,11 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
                 const bool via = first.layer != second.layer;
                 const std::uint64_t id = ( std::uint64_t{ 1 } << 63 )
                                          + ( routeIndex << 20 ) + transientEdge;
-                ROUTER_BOX raw;
-                std::int64_t expansion = 0;
+                ROUTING_OBSTACLE transientObstacle;
+                transientObstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+                transientObstacle.start = first.point;
+                transientObstacle.end = second.point;
+                std::int64_t clearance = 0;
 
                 if( !via )
                 {
@@ -2644,14 +2723,10 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
                     const std::int64_t transientRadius = transientStyle.trackWidth > 0
                             ? transientStyle.trackWidth / 2
                             : netTrackRadius( transient.netCode );
-                    expansion = movingRadius + transientRadius
-                                + edgePairClearance( connection.netCode, transient.netCode,
-                                                     layer, style.clearance,
-                                                     transientStyle.clearance );
-                    raw = { std::min( first.point.x, second.point.x ),
-                            std::min( first.point.y, second.point.y ),
-                            std::max( first.point.x, second.point.x ),
-                            std::max( first.point.y, second.point.y ) };
+                    transientObstacle.radius = transientRadius;
+                    clearance = edgePairClearance(
+                            connection.netCode, transient.netCode, layer,
+                            style.clearance, transientStyle.clearance );
                 }
                 else
                 {
@@ -2664,44 +2739,23 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
                     const std::int64_t transientRadius = std::max<std::int64_t>(
                             1, ViaStyleDiameterOnLayer( transientStyle, layer, 2 * netViaRadius( transient.netCode ) )
                                        / 2 );
-                    expansion = movingRadius + transientRadius
-                                + edgePairClearance( connection.netCode, transient.netCode, layer, style.clearance,
-                                                     ViaStyleClearanceOnLayer( transientStyle, layer ) );
-                    raw = { first.point.x, first.point.y, first.point.x, first.point.y };
+                    transientObstacle.end = first.point;
+                    transientObstacle.radius = transientRadius;
+                    clearance = edgePairClearance(
+                            connection.netCode, transient.netCode, layer,
+                            style.clearance,
+                            ViaStyleClearanceOnLayer( transientStyle, layer ) );
                 }
 
-                // Both width radii are non-negative and the source's
-                // closed collision semantics require a nonzero wrapped
-                // shape even for a point via.
-                expansion = std::max<std::int64_t>( 1, expansion );
-                if( via )
-                {
-                    const ROUTER_BOX check{ raw.minX - expansion, raw.minY - expansion,
-                                            raw.maxX + expansion, raw.maxY + expansion };
-                    const ROUTER_BOX offset{ check.minX - 1, check.minY - 1,
-                                             check.maxX + 1, check.maxY + 1 };
-                    obstacles.push_back( { id, raw, PLANAR::SIMPLEX::Box( check ),
-                                           PLANAR::SIMPLEX::Box( offset ) } );
-                }
-                else
-                {
-                    // A trace is a swept segment, not the rectangle that
-                    // encloses its two endpoints.  Using that enclosing
-                    // box made a forced shove treat the empty diagonal
-                    // wedges beside a trace as copper and could reject a
-                    // legal recursive move before strict insertion had a
-                    // chance to prove it.  The convex L-infinity sweep
-                    // keeps integer input vertices and source-style exact
-                    // support intersections; malformed/overflowing input
-                    // fails closed by declining this spring-over move.
-                    const auto check = PLANAR::SIMPLEX::FromExpandedSegment(
-                            first.point, second.point, expansion );
-                    const auto offset = PLANAR::SIMPLEX::FromExpandedSegment(
-                            first.point, second.point, saturatedAdd( expansion, 1 ) );
-                    if( !check || !offset )
-                        continue;
-                    obstacles.push_back( { id, raw, *check, *offset } );
-                }
+                const auto physicalShape = sourcePhysicalTileShape( transientObstacle );
+                if( !physicalShape )
+                    continue;
+                const auto shapes = sourceSpringOverShapes(
+                        *physicalShape, movingRadius, clearance );
+                if( !shapes )
+                    continue;
+                obstacles.push_back( { id, physicalObstacleBounds( transientObstacle ),
+                                       shapes->first, shapes->second } );
             }
         }
 

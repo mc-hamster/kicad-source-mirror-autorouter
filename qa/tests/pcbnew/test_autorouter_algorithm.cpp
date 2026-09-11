@@ -5078,12 +5078,26 @@ BOOST_AUTO_TEST_CASE( ForcedSpringOverHandlesFixedCircularAndOvalObstacles )
             BOOST_CHECK_GT( wrapped->nodes.size(), route.nodes.size() );
             BOOST_CHECK( wrapped->nodes.front() == route.nodes.front() );
             BOOST_CHECK( wrapped->nodes.back() == route.nodes.back() );
+            bool hasOctagonalChamfer = false;
             for( std::size_t index = 1; index < wrapped->nodes.size(); ++index )
             {
+                const std::int64_t dx = std::llabs(
+                        wrapped->nodes[index].point.x
+                        - wrapped->nodes[index - 1].point.x );
+                const std::int64_t dy = std::llabs(
+                        wrapped->nodes[index].point.y
+                        - wrapped->nodes[index - 1].point.y );
+                hasOctagonalChamfer = hasOctagonalChamfer
+                                      || ( dx > 0 && dy > 0
+                                           && std::llabs( dx - dy ) <= 1 );
                 BOOST_CHECK( engine.CanInsertSegment( wrapped->netCode,
                                                       wrapped->nodes[index - 1],
                                                       wrapped->nodes[index] ) );
             }
+            // Circle.boundingOctagon()/Polyline.offsetShape(), followed by
+            // source Simplex.enlarge(), leaves a 45-degree support.  The old
+            // square/Chebyshev wrapper had only orthogonal corners here.
+            BOOST_CHECK( hasOctagonalChamfer );
 
             const auto inserted = FOUND_CONNECTION_INSERTER::Insert( route, {}, occupancy, engine );
             BOOST_REQUIRE( inserted.state == FOUND_CONNECTION_INSERTER::STATE::INSERTED );
@@ -6609,6 +6623,49 @@ BOOST_AUTO_TEST_CASE( ForcedInsertionConsidersGeneratedTraceChainBeforeRipup )
     // recursion rather than relying on a hand-picked corner ordering.
     ROUTING_CONNECTION secondary;
     bool               foundSecondary = false;
+    const auto trySecondary = [&]( ROUTING_CONNECTION aProbe )
+    {
+        if( !engine.FindConflictingConnections( aProbe ).empty() )
+            return false;
+        {
+            ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+            occupancy.Add( candidate );
+            if( !engine.FindConflictingConnections( aProbe ).empty() )
+                return false;
+        }
+        {
+            ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
+            occupancy.Remove( primary );
+            occupancy.Add( *primaryReplacement );
+            if( engine.FindConflictingConnections( aProbe ).empty() )
+                return false;
+        }
+        secondary = std::move( aProbe );
+        return true;
+    };
+
+    // The exact source circle/trace contour can expose only a very short
+    // outermost vertical side.  Probe through its outermost point first;
+    // requiring a long horizontal contour edge was an artifact of the old
+    // square/Chebyshev expansion rather than a TraceShover contract.
+    const auto outermost = std::min_element(
+            primaryReplacement->nodes.begin(), primaryReplacement->nodes.end(),
+            []( const ROUTER_NODE& aLeft, const ROUTER_NODE& aRight )
+            { return aLeft.point.x < aRight.point.x; } );
+    if( outermost != primaryReplacement->nodes.end()
+        && outermost->point.x > board.bounds.minX
+        && outermost->point.x < board.bounds.maxX )
+    {
+        ROUTING_CONNECTION probe;
+        probe.netCode = 3;
+        probe.complete = true;
+        probe.nodes = { { { outermost->point.x, board.bounds.minY + 250000 },
+                            outermost->layer },
+                          { { outermost->point.x, board.bounds.maxY - 250000 },
+                            outermost->layer } };
+        foundSecondary = trySecondary( std::move( probe ) );
+    }
+
     for( std::size_t edge = 1; edge < primaryReplacement->nodes.size() && !foundSecondary;
          ++edge )
     {
@@ -6632,23 +6689,7 @@ BOOST_AUTO_TEST_CASE( ForcedInsertionConsidersGeneratedTraceChainBeforeRipup )
         probe.complete = true;
         probe.nodes = { { start, first.layer }, { end, first.layer } };
 
-        if( !engine.FindConflictingConnections( probe ).empty() )
-            continue;
-        {
-            ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
-            occupancy.Add( candidate );
-            if( !engine.FindConflictingConnections( probe ).empty() )
-                continue;
-        }
-        {
-            ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
-            occupancy.Remove( primary );
-            occupancy.Add( *primaryReplacement );
-            if( engine.FindConflictingConnections( probe ).empty() )
-                continue;
-        }
-        secondary = std::move( probe );
-        foundSecondary = true;
+        foundSecondary = trySecondary( std::move( probe ) );
     }
     BOOST_REQUIRE( foundSecondary );
     occupancy.Add( secondary );
@@ -7335,13 +7376,15 @@ BOOST_AUTO_TEST_CASE( ConvexPolygonSpringOverKeepsGeneralAngleRoutesExact )
                         { 5000000, 4000000 }, { 4000000, 3000000 } };
     board.obstacles.push_back( diamond );
 
-    const auto convex = PLANAR::SIMPLEX::FromConvexPolygon( diamond.polygon, 50000 );
+    const auto physical = PLANAR::SIMPLEX::FromConvexPolygon( diamond.polygon );
+    BOOST_REQUIRE( physical );
+    const auto convex = physical->Enlarge( 50000 );
     BOOST_REQUIRE( convex );
     const auto directPath = PLANAR::POLYLINE::FromPoints(
-            { { 2000000, 2699994 }, { 8000000, 3300006 } } );
+            { { 2000000, 3000000 }, { 8000000, 3000000 } } );
     BOOST_REQUIRE( !directPath.Empty() );
     BOOST_CHECK( convex->IntersectsSegment( directPath, 1 ) );
-    const auto offset = PLANAR::SIMPLEX::FromConvexPolygon( diamond.polygon, 50001 );
+    const auto offset = physical->Enlarge( 50001 );
     BOOST_REQUIRE( offset );
     const auto spring = TRACE_SHOVER::SpringOverObstacles(
             directPath, { { 1, { 4000000, 2000000, 6000000, 4000000 }, *convex, *offset } } );
@@ -7354,10 +7397,10 @@ BOOST_AUTO_TEST_CASE( ConvexPolygonSpringOverKeepsGeneralAngleRoutesExact )
     ROUTING_CONNECTION route;
     route.netCode = 1;
     route.complete = true;
-    // This diagonal crosses the convex diamond at integral entrance points;
-    // its replacement must use exact support-line intersections, not an
-    // axis-aligned obstacle box or a rounded vertex.
-    route.nodes = { { { 2000000, 2699994 }, 0 }, { { 8000000, 3300006 }, 0 } };
+    // This line crosses the convex diamond at integral entrance points; its
+    // replacement must use the source Euclidean Simplex.enlarge supports,
+    // not an axis-aligned obstacle box or a square/Chebyshev offset.
+    route.nodes = { { { 2000000, 3000000 }, 0 }, { { 8000000, 3000000 }, 0 } };
     BOOST_CHECK( !engine.CanInsertSegment( 1, route.nodes.front(), route.nodes.back() ) );
     const auto wrapped = engine.SpringOverConnection( route, {} );
     BOOST_REQUIRE( wrapped );

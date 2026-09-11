@@ -87,7 +87,7 @@ same change.
 | `RoutingBoardOperations` | Live edits use `BOARD_COMMIT` on the editor thread; a private `BOARD` is used by host validation on the worker. Neither implements reference forced insertion | `AutorouterTool.cpp`, `board/KicadRoutingSession.cpp` |
 | `RoutingBoardUndoFacade` / board history | `BOARD_COMMIT` | KiCad-provided API; one accepted proposal is one commit |
 | `board.trace.PolylineTrace*` | `PCB_TRACK` segments | `KicadBoardAdapter::CreatePreviewItems` |
-| `autoroute.maze.MazeTraceShover`, `board.optimize.TraceShover` / tighteners | Active expansion-time source trace-side shove plus bounded recursive straight-trace spring-over and path shortening; general convex/curved shove and full tightener mutation remain open | `maze/MazeTraceShover.cpp`, `board/optimize/TraceShover.cpp`, `board/optimize/TraceTightener.cpp` |
+| `autoroute.maze.MazeTraceShover`, `board.optimize.TraceShover` / tighteners | Active expansion-time source trace-side shove plus bounded recursive spring-over over source-shaped box, circle, capsule and convex support contours. Physical obstacle TileShapes receive the source two-half-clearance `Simplex.enlarge` sequence and one-coordinate wrap margin before checked mutation. Concave/holed contour mutation, direction-specific trace substitution, and full tightener mutation remain open. | `maze/MazeTraceShover.cpp`, `board/optimize/TraceShover.cpp`, `board/optimize/TraceTightener.cpp` |
 | `board.model.items.Pin`, `core.library.Padstack` trace exits | Layer-local exact pin contour indices, normalized integral exit directions, centre-to-border lengths, package aspect policy, direct pin-to-drill nearest-exit bias, endpoint direction/length checks, source offset-convex entrance search and shortest-border reconnection, followed by a strictly inserted `SHOVE_FIXED` centre stub. Offset and rotated shapes are retained; a rational-only replacement fails closed because KiCad copper vertices are integral. | `board/model/items/Pin.h`, `board/KicadBoardAdapter.cpp`, multilayer maze frontiers and `board/optimize/TraceTightener.cpp` |
 | `board/optimize/ViaOptimizer.java` | `pcbnew/autorouter/board/optimize/ViaOptimizer.h/.cpp` | Active weighted two-trace and bounded plane/fanout via-location candidates. Every replacement is strictly checked; arbitrary source item contact mutation and recursion remain partial. |
 | planar `IntPoint`, `RationalPoint`, `Line`, `IntBox`, `IntOctagon`, `Simplex`, `Polyline` | Source-named data-only types plus KiCad adapter conversion | `geometry/planar/`; exact rational lines, closed-segment/polyline containment, bounded simplex/polyline operations and core octagon operations are present. `IntOctagon` and 45-degree restraint have 4,096 direct source-oracle records. Full `TileShape`, polygon/circle offsets and cutout/projection APIs remain open. |
@@ -194,7 +194,8 @@ general mutable item/contact shove and full batch parity remain incomplete.
 
 `geometry/planar/{Point,Line,Polyline,Simplex}` and
 `board/optimize/TraceShover` retain source filenames and package boundaries.
-See [geometry/spring-over report](CONVEX-SPRING-OVER-PARITY.md) for the finite
-bounded geometry and production orthogonal/rectangle limits, the 2,432-record
-Java oracle, endpoint-loss guard and remaining full-port dependencies. This is
-not `TraceShover.check/insert`, neckdown, or general forced insertion.
+See [geometry/spring-over report](CONVEX-SPRING-OVER-PARITY.md) for the original
+finite bounded geometry milestone, the 2,432-record Java oracle and endpoint-loss
+guard. Later checkpoints added checked trace/via publication, terminal neckdown,
+and source-shaped circle/capsule/general-convex spring-over; the report is
+historical rather than the current capability boundary.

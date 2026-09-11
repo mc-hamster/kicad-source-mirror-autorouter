@@ -1,6 +1,6 @@
 /* KiCad, GPL-3.0-or-later. Freerouting board/optimize/TraceShover.java.
- * This slice implements recursive spring-over of fixed convex obstacles.
- * It does NOT implement check/insert of movable traces or via shoving.
+ * This class owns recursive source-TileShape contour selection. Transactional
+ * mutable trace/via publication remains in FoundConnectionInserter.
  */
 #pragma once
 #include "../../geometry/planar/Simplex.h"
