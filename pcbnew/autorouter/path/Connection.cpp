@@ -45,7 +45,8 @@ bool sameTraceItemStyle( const ROUTING_CONNECTION& aRoute, std::size_t aLeft,
 {
     const ROUTING_EDGE_STYLE& left = EdgeStyle( aRoute, aLeft );
     const ROUTING_EDGE_STYLE& right = EdgeStyle( aRoute, aRight );
-    return left.trackWidth == right.trackWidth && left.clearance == right.clearance;
+    return left.trackWidth == right.trackWidth && left.clearance == right.clearance
+           && left.fixedState == right.fixedState;
 }
 
 } // namespace

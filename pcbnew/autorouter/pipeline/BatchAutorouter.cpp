@@ -286,6 +286,12 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
             ROUTING_EDGE_STYLE traceStyle;
             traceStyle.trackWidth = 2 * trace.radius;
             traceStyle.clearance = std::max<std::int64_t>( 0, trace.clearance );
+            // Reaching this reconstruction path means the user selected a
+            // whole-net replacement and the adapter proved this host item is
+            // a candidate for transactional movement.  That operation is the
+            // native equivalent of unfixing a protected DSN wire before the
+            // source shove algorithm mutates it.
+            traceStyle.fixedState = ROUTER_FIXED_STATE::UNFIXED;
             connection.edgeStyles = { std::move( traceStyle ) };
             atoms.push_back( { EXISTING_ATOM::KIND::TRACE, std::move( connection ) } );
             continue;
@@ -334,6 +340,7 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
         viaStyle.viaDrill = 2 * hole->radius;
         viaStyle.viaLayers = layers;
         viaStyle.clearance = clearance;
+        viaStyle.fixedState = ROUTER_FIXED_STATE::UNFIXED;
         connection.nodes = { { position, layers.front() }, { position, layers.back() } };
         connection.edgeStyles = { std::move( viaStyle ) };
         atoms.push_back( { EXISTING_ATOM::KIND::VIA, std::move( connection ) } );

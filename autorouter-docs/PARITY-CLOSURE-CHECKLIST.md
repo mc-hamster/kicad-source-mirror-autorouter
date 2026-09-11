@@ -12,7 +12,37 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — finite conduction targets and connection stop options
+## Latest core milestone — fixed-state trace normalization
+
+The detached board now carries Freerouting's ordered `FixedState` semantics
+(`UNFIXED`, `SHOVE_FIXED`, `USER_FIXED`, `SYSTEM_FIXED`) independently from
+KiCad host replacement policy.  Fixed state is retained per trace edge and per
+worker item, participates in source `PolylineTrace` identity, and prevents a
+same-width/same-clearance run from being collapsed across a state boundary.
+`USER_FIXED` and `SYSTEM_FIXED` traces reject splitting and combination because
+their deletion is forbidden.  `SHOVE_FIXED` traces remain routable and may be
+split/recombined with only the same state and manufacturing style, while their
+state remains available to the fanout-via protection test.  This replaces the
+former inaccurate inference that every non-dynamic/non-routable straight trace
+was a shove-fixed pin exit.
+
+Retained straight host traces now have exact private route geometry and style,
+so permitted virtual split/combine operations preserve UUID provenance without
+materializing or editing the live KiCad item.  Ordinary pre-existing KiCad
+copper maps to protected `USER_FIXED`, a locked item maps to `SYSTEM_FIXED`,
+and copper created by an earlier stage of the same autorouter job maps to
+`UNFIXED`.  The independent `isMovable` flag continues to control the explicit
+whole-net replacement/shove transaction; selecting that host policy can no
+longer silently alter source contact normalization.
+
+This checkpoint passes **228/228 native autorouter cases**, both focused
+fixed-state/rollback regressions, and all **26 Python parity-harness tests**.
+The BJT A/B gate remains 16/16 with 146.150 mm of track, zero vias, and zero
+new KiCad DRC violations.  Exact rational/non-integral junction topology,
+component-owned deletion semantics, curved trace items and state-preserving
+general shove/change operations remain open.
+
+## Previous core milestone — finite conduction targets and connection stop options
 
 `ConductionArea.getTraceConnectionShape()` is now represented as one finite
 filled target item rather than a list of sampled synthetic pad coordinates.
@@ -655,7 +685,7 @@ Every row below is required or needs an explicit, justified host adaptation.
 | Area | Current state and what must still be implemented | Required proof |
 |---|---|---|
 | **1. Geometric primitives** | **Substantially ported, not yet production-complete.** Exact rational line intersections, line-array polylines and bounded convex entrance/polyline-cutout semantics are source-tested and used by fixed-obstacle spring-over. `Line`, `Polyline`, `LineSegment`, `FloatPoint`, `FloatLine`, `Simplex`, `IntOctagon` and the general `TileShape` query/transform surfaces now include the source operations needed by room search, path location and mutation, including exact/approximate corners, projections, transforms, offsets, cutouts, interior-segment tests, relative outside locations, polar/diagonal/ray queries and source-simplified sectioning. General `PolylineArea` cutout is cancellation-bounded. The orthogonal, octagonal and general-rational `ShapeSearchTree` restraint/completion kernels are ported; the general tree preserves exact `Simplex` supports and uses boxes only for broad phase. Arbitrary-convex single- and multilayer attempts now retain those supports through active rooms, doors, drill regions and path realization. Extra degenerate coverage and exact host contours for curved/custom copper and holes remain. KiMath shapes and conservative adapter contours are not yet full upstream semantics. | Extend the pinned differential corpus to degenerate/negative/large coordinates, tangencies, acute angles, narrow corridors, holes and any-angle cases; compare active room decisions against the source. |
-| **2. Mutable item model and contacts** | **Partial.** Physical and separate source-tested endpoint/centre normal-contact graphs now exist. A same-layer/same-style run is one polyline item; exact integer junctions split complete polylines with stable first-piece identity and transaction rollback. `Connection.get()` and `Item.getConnectionItems(NONE/FANOUT_VIA/VIA)` use source reverse-ID contact iteration and chain/fork/terminal traversal, including starts at non-routable terminals, fanout-via recognition, and exact item-set trace length/detour. Each mutable item retains exact standalone geometry and manufacturing style; exact item subsets can be removed atomically while occupancy is rebuilt from surviving item records. Retained straight copper can be split virtually without editing host items. Paid obstacle rooms distinguish native occupancy connections from source trace/via items. Need rational/curved contacts, fixed host-item split/combine normalization, entry restrictions, complete fixed-state semantics, and precise contact preservation during every general shove/change. Immutable host cluster unions and outward-approximated contacts are not a completed port. | Insert/split/join/remove/shove/rollback contact graphs compared to reference, plus independent KiCad connectivity. |
+| **2. Mutable item model and contacts** | **Partial.** Physical and separate source-tested endpoint/centre normal-contact graphs now exist. A same-layer/same-style/state run is one polyline item; exact integer junctions split complete polylines with stable first-piece identity and transaction rollback. `Connection.get()` and `Item.getConnectionItems(NONE/FANOUT_VIA/VIA)` use source reverse-ID contact iteration and chain/fork/terminal traversal, including starts at non-routable terminals, fanout-via recognition, and exact item-set trace length/detour. Each mutable item retains exact standalone geometry, manufacturing style and ordered `UNFIXED`/`SHOVE_FIXED`/`USER_FIXED`/`SYSTEM_FIXED` state; deletion-forbidden host traces reject normalization while shove-fixed retained traces can split/recombine virtually without editing host items. Exact mutable item subsets can be removed atomically while occupancy is rebuilt from surviving item records. Paid obstacle rooms distinguish native occupancy connections from source trace/via items. Need rational/curved contacts, component-owned deletion semantics, entry restrictions, and precise contact/state preservation during every general shove/change. Immutable host cluster unions and outward-approximated contacts are not a completed port. | Insert/split/join/remove/shove/rollback contact graphs compared to reference, plus independent KiCad connectivity. |
 | **3. Rules and clearance compensation** | **Partial.** Pair/layer clearances, widths, edge and hole constraints exist. Need complete clearance classes/compensation, item-specific and layer-specific padstack geometry and width rules. Dummy-track rule evaluation cannot fully represent rules conditional on actual item/footprint/geometry. Do not silently claim unsupported contextual rules are enforced by search. | Per-constraint adapter tests and matching host/reference DRC thresholds; deliberately conflicting and non-default rules. |
 | **4. Spatial search trees** | **Partial, now active.** `MinAreaTree` insertion/removal/traversal plus orthogonal, exact-octagonal and general-rational `completeShape`, restraint and ignore-object/overlap kernels are ported. General leaves preserve `Simplex` support lines while boxes remain only a broad phase; the pinned private source restraint is differentially tested over 2,048 cases. The host supplies compensated centre-space shapes and rebuilds them per attempt; the octagonal tree drives ordinary single- and multilayer room search and the arbitrary-angle tree drives single- and multilayer attempts containing general convex obstacles. Still need exact compensation-class indexing, incremental trace updates, full completion-stream differential proof, and source-equivalent room invalidation/reuse after edits. | Multi-obstacle completion sequences, stable visitation/tie order, insertion/removal invalidation and exact free-space coverage. |
 | **5. Rooms and doors** | **Active exact fixed- and unrestricted-angle subsets.** Free/incomplete/complete rooms, paid obstacle rooms, exact neighbour gaps, overlap doors, section geometry and neighbour completion run on `IntOctagon` shapes in ordinary and fanout single-/multilayer attempts and on rational `Simplex` shapes for general-convex single-/multilayer attempts. Concave polygons and polygons with holes are decomposed into solid exact convex room leaves, retaining holes as legal free space. Exact integral point/axis/oblique trace starts and targets attach through reached rooms; bounded seeds bracket every active support direction. `ConductionArea` is now one finite filled target region, intersected with the reached box/octagon/simplex and inset before convex decomposition. Pins and vias intentionally remain centre-point connection shapes as in the source. The box-only room variant is a source-shaped frontier, not a grid fallback. Still need complete thin-room/acute-corner locator behavior and exact curved/custom target contours. | Match normalized source room/door/frontier/backtrack decisions on constrained and multilayer fixtures, not only geometry helpers. |

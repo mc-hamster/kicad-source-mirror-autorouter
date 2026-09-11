@@ -353,6 +353,21 @@ struct ROUTING_TERMINAL
 };
 
 
+/** Freerouting board/model/structure/FixedState.
+ *
+ * Declaration order is semantic: USER_FIXED and SYSTEM_FIXED are not
+ * routable/deletable, while SHOVE_FIXED may still be split, joined and
+ * removed but is excluded from pull-tight/shove movement.
+ */
+enum class ROUTER_FIXED_STATE
+{
+    UNFIXED,
+    SHOVE_FIXED,
+    USER_FIXED,
+    SYSTEM_FIXED
+};
+
+
 struct ROUTING_OBSTACLE
 {
     ROUTER_OBSTACLE_KIND   kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
@@ -412,6 +427,11 @@ struct ROUTING_OBSTACLE
     // chamfered octagonal offset.  Preserve that source type distinction
     // after the KiCad adapter has detached the geometry from PAD.
     bool                    isPad = false;
+    // Existing KiCad copper normally corresponds to a protected DSN wire.
+    // The adapter sets job-owned copper to UNFIXED and locked copper to
+    // SYSTEM_FIXED explicitly.  Keeping this independent from `isMovable`
+    // prevents host replacement policy from changing source item topology.
+    ROUTER_FIXED_STATE      fixedState = ROUTER_FIXED_STATE::USER_FIXED;
 };
 
 
@@ -564,12 +584,16 @@ struct ROUTING_EDGE_STYLE
     std::int64_t     viaDrill = 0;
     std::vector<int> viaLayers;
     ROUTER_VIA_TYPE  viaType = ROUTER_VIA_TYPE::AUTO;
+    // A same-layer run changes source PolylineTrace identity at a fixed-state
+    // boundary even when width and clearance are unchanged.
+    ROUTER_FIXED_STATE fixedState = ROUTER_FIXED_STATE::UNFIXED;
 
     bool operator==( const ROUTING_EDGE_STYLE& aOther ) const
     {
         return trackWidth == aOther.trackWidth && clearance == aOther.clearance
                && viaDiameter == aOther.viaDiameter && viaDrill == aOther.viaDrill
-               && viaLayers == aOther.viaLayers && viaType == aOther.viaType;
+               && viaLayers == aOther.viaLayers && viaType == aOther.viaType
+               && fixedState == aOther.fixedState;
     }
 
     bool operator!=( const ROUTING_EDGE_STYLE& aOther ) const

@@ -4034,6 +4034,7 @@ BOOST_AUTO_TEST_CASE( RetainedTraceContactsSplitVirtuallyAndRestoreOnRejectedIns
     retained.start = board.pads[0].position; retained.end = board.pads[1].position;
     retained.layers = { 0 }; retained.radius = 50000;
     retained.boardItemId = "retained-host-uuid"; retained.isExistingRoute = true;
+    retained.fixedState = ROUTER_FIXED_STATE::SHOVE_FIXED;
     board.obstacles.push_back( retained );
     ROUTING_BOARD copper( board, settings );
     ROUTING_CONNECTION branch;
@@ -4055,6 +4056,130 @@ BOOST_AUTO_TEST_CASE( RetainedTraceContactsSplitVirtuallyAndRestoreOnRejectedIns
     BOOST_CHECK_EQUAL( board.obstacles[0].boardItemId, "retained-host-uuid" );
     BOOST_CHECK( board.obstacles[0].start == retained.start );
     BOOST_CHECK( board.obstacles[0].end == retained.end );
+}
+
+BOOST_AUTO_TEST_CASE( FixedStateControlsTraceNormalizationAndSourceItemBoundaries )
+{
+    auto settings = makeSettings();
+    auto retainedTrace = []( ROUTER_POINT aStart, ROUTER_POINT aEnd,
+                             const char* aId, ROUTER_FIXED_STATE aState )
+    {
+        ROUTING_OBSTACLE result;
+        result.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+        result.netCode = 1;
+        result.start = aStart;
+        result.end = aEnd;
+        result.layers = { 0 };
+        result.radius = 50000;
+        result.clearance = 25000;
+        result.boardItemId = aId;
+        result.isExistingRoute = true;
+        result.fixedState = aState;
+        return result;
+    };
+
+    // USER_FIXED/SYSTEM_FIXED are deletion-forbidden in Item and therefore
+    // cannot be split merely because newly inserted copper touches their
+    // interior.  The host UUID and original geometry stay one worker item.
+    {
+        auto board = makeBoard();
+        board.obstacles.push_back( retainedTrace(
+                board.pads[0].position, board.pads[1].position,
+                "protected-host-trace", ROUTER_FIXED_STATE::USER_FIXED ) );
+        ROUTING_BOARD copper( board, settings );
+        const auto before = copper.ItemCount();
+        ROUTING_CONNECTION branch;
+        branch.netCode = 1;
+        branch.complete = true;
+        branch.nodes = { { { 3000000, 1500000 }, 0 },
+                         { { 3000000, 2500000 }, 0 } };
+        copper.AddRoute( branch );
+        BOOST_CHECK_EQUAL( copper.ItemCount(), before + 1 );
+
+        const auto component = copper.NormalConnectedSet( *copper.PadItem( 0 ) );
+        const auto fixed = std::find_if(
+                component.begin(), component.end(), [&]( ROUTING_BOARD::ITEM_ID aId )
+                {
+                    const auto info = copper.GetItemInfo( aId );
+                    return info && info->kind == ROUTING_BOARD::ITEM_KIND::TRACE
+                           && info->first == board.pads[0].position
+                           && info->last == board.pads[1].position;
+                } );
+        BOOST_REQUIRE( fixed != component.end() );
+        const auto info = copper.GetItemInfo( *fixed );
+        BOOST_REQUIRE( info );
+        BOOST_CHECK( !info->routable );
+        BOOST_CHECK( info->fixedState == ROUTER_FIXED_STATE::USER_FIXED );
+    }
+
+    // SHOVE_FIXED remains routable and deletion-allowed.  Splitting the first
+    // host trace at a new branch creates two pieces; source normalization then
+    // joins its far piece to the same-state/style neighbour at the other end.
+    {
+        auto board = makeBoard();
+        const ROUTER_POINT split{ 2500000, 1500000 };
+        const ROUTER_POINT join{ 4000000, 1500000 };
+        board.obstacles.push_back( retainedTrace(
+                board.pads[0].position, join, "shove-host-a",
+                ROUTER_FIXED_STATE::SHOVE_FIXED ) );
+        board.obstacles.push_back( retainedTrace(
+                join, board.pads[1].position, "shove-host-b",
+                ROUTER_FIXED_STATE::SHOVE_FIXED ) );
+        ROUTING_BOARD copper( board, settings );
+        const auto before = copper.ItemCount();
+        ROUTING_CONNECTION branch;
+        branch.netCode = 1;
+        branch.complete = true;
+        branch.nodes = { { split, 0 }, { { split.x, 2500000 }, 0 } };
+        copper.AddRoute( branch );
+        BOOST_CHECK_EQUAL( copper.ItemCount(), before + 1 );
+
+        const auto component = copper.NormalConnectedSet( *copper.PadItem( 1 ) );
+        const auto combined = std::find_if(
+                component.begin(), component.end(), [&]( ROUTING_BOARD::ITEM_ID aId )
+                {
+                    const auto info = copper.GetItemInfo( aId );
+                    return info && info->kind == ROUTING_BOARD::ITEM_KIND::TRACE
+                           && ( ( info->first == split
+                                  && info->last == board.pads[1].position )
+                                || ( info->last == split
+                                     && info->first == board.pads[1].position ) );
+                } );
+        BOOST_REQUIRE( combined != component.end() );
+        const auto info = copper.GetItemInfo( *combined );
+        BOOST_REQUIRE( info );
+        BOOST_CHECK( info->routable );
+        BOOST_CHECK( info->fixedState == ROUTER_FIXED_STATE::SHOVE_FIXED );
+    }
+
+    // Fixed state is part of PolylineTrace identity even when layer, width,
+    // clearance and net are equal.
+    {
+        auto board = makeBoard();
+        ROUTING_CONNECTION route;
+        route.netCode = 1;
+        route.complete = true;
+        route.nodes = { { board.pads[0].position, 0 },
+                        { { 3000000, 1500000 }, 0 },
+                        { board.pads[1].position, 0 } };
+        route.edgeStyles.resize( 2 );
+        for( auto& style : route.edgeStyles )
+        {
+            style.trackWidth = 100000;
+            style.clearance = 25000;
+        }
+        route.edgeStyles[1].fixedState = ROUTER_FIXED_STATE::SHOVE_FIXED;
+
+        ROUTING_BOARD copper( board, settings );
+        copper.AddRoute( route );
+        const auto items = copper.RouteItems( route );
+        BOOST_REQUIRE_EQUAL( items.size(), 2U );
+        BOOST_CHECK_EQUAL( CONNECTION::FromRoute( route ).ItemCount(), 2U );
+        BOOST_REQUIRE( copper.GetItemInfo( items[0] ) );
+        BOOST_REQUIRE( copper.GetItemInfo( items[1] ) );
+        BOOST_CHECK( copper.GetItemInfo( items[0] )->fixedState
+                     != copper.GetItemInfo( items[1] )->fixedState );
+    }
 }
 
 BOOST_AUTO_TEST_CASE( InsertionNeverInheritsNegotiatedCrossingPermission )

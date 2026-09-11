@@ -1464,6 +1464,10 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
             obstacle.netCode = track->GetNetCode();
             obstacle.isExistingRoute = true;
             obstacle.isAutorouterOwned = isAutorouterOwned;
+            obstacle.fixedState = isAutorouterOwned
+                    ? ROUTER_FIXED_STATE::UNFIXED
+                    : track->IsLocked() ? ROUTER_FIXED_STATE::SYSTEM_FIXED
+                                        : ROUTER_FIXED_STATE::USER_FIXED;
             obstacle.boardItemId = boardItemId;
             appendLayers( obstacle.layers, track->GetLayerSet() );
             obstacle.blocksTracks = true;

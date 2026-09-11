@@ -47,6 +47,7 @@ public:
         std::size_t              padIndex = std::numeric_limits<std::size_t>::max();
         ITEM_KIND                kind = ITEM_KIND::UNKNOWN;
         bool                     routable = false;
+        ROUTER_FIXED_STATE       fixedState = ROUTER_FIXED_STATE::SYSTEM_FIXED;
         ROUTER_POINT             first;
         ROUTER_POINT             last;
         std::vector<int>         layers;

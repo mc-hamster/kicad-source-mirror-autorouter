@@ -94,6 +94,7 @@ struct ROUTING_BOARD::IMPL
         std::size_t pad = NO_PAD;
         bool dynamic = false;
         bool routable = false;
+        ROUTER_FIXED_STATE fixedState = ROUTER_FIXED_STATE::SYSTEM_FIXED;
         bool conductionArea = false;
         std::vector<LAYER_SHAPE> shapes;
         std::set<ITEM_ID> contacts;
@@ -147,7 +148,14 @@ struct ROUTING_BOARD::IMPL
         result.net = net;
         result.dynamic = dynamic;
         result.routable = dynamic;
+        result.fixedState = dynamic ? ROUTER_FIXED_STATE::UNFIXED
+                                    : ROUTER_FIXED_STATE::SYSTEM_FIXED;
         return result;
+    }
+
+    static bool deletionForbidden( const ITEM& item )
+    {
+        return item.fixedState >= ROUTER_FIXED_STATE::USER_FIXED;
     }
 
     void indexItem( ITEM& item )
@@ -368,15 +376,11 @@ struct ROUTING_BOARD::IMPL
                     return true;
 
                 const auto traceContact = items.find( traceContactId );
-                // KiCad has no SHOVE_FIXED intermediate state.  A fixed,
-                // straight source trace is its exact detached-board analogue;
-                // user-generated mutable traces and unlocked shove candidates
-                // are deliberately excluded.
                 if( traceContact != items.end()
                     && traceContact->second.normal.kind
                                == NORMAL_CONTACT_ITEM::KIND::TRACE
-                    && !traceContact->second.dynamic
-                    && !traceContact->second.routable
+                    && traceContact->second.fixedState
+                               == ROUTER_FIXED_STATE::SHOVE_FIXED
                     && traceContact->second.traceCorners.size() == 2 )
                 {
                     return true;
@@ -550,7 +554,8 @@ struct ROUTING_BOARD::IMPL
         using namespace CONTACT_GEOMETRY;
         const auto found = items.find( id );
         if( found == items.end() || !found->second.trace
-            || found->second.traceCorners.size() < 2 )
+            || found->second.traceCorners.size() < 2
+            || deletionForbidden( found->second ) )
         {
             return {};
         }
@@ -735,8 +740,9 @@ struct ROUTING_BOARD::IMPL
             || left.normal.layers != right.normal.layers
             || left.trace->radius != right.trace->radius
             || left.trace->clearance != right.trace->clearance
-            || !left.dynamic || !right.dynamic || !left.routable || !right.routable
-            || !left.route || !right.route )
+            || left.fixedState != right.fixedState
+            || deletionForbidden( left ) || deletionForbidden( right )
+            || !left.routable || !right.routable || !left.route || !right.route )
         {
             return false;
         }
@@ -746,7 +752,8 @@ struct ROUTING_BOARD::IMPL
         const ROUTING_EDGE_STYLE rightStyle = right.route->edgeStyles.empty()
                 ? ROUTING_EDGE_STYLE{} : right.route->edgeStyles.front();
         return leftStyle.trackWidth == rightStyle.trackWidth
-               && leftStyle.clearance == rightStyle.clearance;
+               && leftStyle.clearance == rightStyle.clearance
+               && leftStyle.fixedState == rightStyle.fixedState;
     }
 
     bool combineAt( ITEM_ID id, bool atStart )
@@ -1073,10 +1080,32 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
             {
                 item.trace = copper;
                 item.traceCorners = { copper.start, copper.end };
-                item.routable = copper.isMovable || copper.isAutorouterOwned;
+                item.fixedState = copper.fixedState;
+                item.routable = item.fixedState < ROUTER_FIXED_STATE::USER_FIXED;
+                ROUTING_CONNECTION sourceRoute;
+                sourceRoute.netCode = copper.netCode;
+                sourceRoute.nodes = { { copper.start, item.normal.layers.front() },
+                                      { copper.end, item.normal.layers.front() } };
+                sourceRoute.complete = true;
+                sourceRoute.isExistingBoardRoute = true;
+                sourceRoute.isAutorouterOwned = copper.isAutorouterOwned;
+                sourceRoute.isShoveMovable = copper.isMovable;
+                if( !copper.boardItemId.empty() )
+                    sourceRoute.sourceBoardItemIds = { copper.boardItemId };
+                ROUTING_EDGE_STYLE sourceStyle;
+                sourceStyle.trackWidth = 2 * copper.radius;
+                sourceStyle.clearance = std::max<std::int64_t>( 0, copper.clearance );
+                sourceStyle.fixedState = item.fixedState;
+                sourceRoute.edgeStyles = { sourceStyle };
+                item.route = std::move( sourceRoute );
             }
             else
+            {
                 item.trace.reset();
+                item.route.reset();
+                item.fixedState = copper.fixedState;
+                item.routable = item.fixedState < ROUTER_FIXED_STATE::USER_FIXED;
+            }
             for( int layer : copper.layers )
             {
                 ROUTING_PAD pad;
@@ -1204,6 +1233,8 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         ROUTING_EDGE_STYLE resolvedStyle = style;
         resolvedStyle.trackWidth = edgeWidth;
         resolvedStyle.clearance = std::max<std::int64_t>( 0, style.clearance );
+        item.fixedState = resolvedStyle.fixedState;
+        item.routable = item.fixedState < ROUTER_FIXED_STATE::USER_FIXED;
         if( via )
         {
             resolvedStyle.viaDiameter = edgeDiameter;
@@ -1250,7 +1281,8 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
             {
                 const ROUTING_EDGE_STYLE& nextStyle = EdgeStyle( route, lastEdge + 1 );
                 if( nextStyle.trackWidth != style.trackWidth
-                    || nextStyle.clearance != style.clearance )
+                    || nextStyle.clearance != style.clearance
+                    || nextStyle.fixedState != style.fixedState )
                 {
                     break;
                 }
@@ -1654,6 +1686,7 @@ std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id )
     result.netCode = item.net;
     result.padIndex = item.pad;
     result.routable = item.routable;
+    result.fixedState = item.fixedState;
     result.first = item.normal.first;
     result.last = item.normal.last;
     result.layers = item.normal.layers;
