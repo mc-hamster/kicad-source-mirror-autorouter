@@ -84,39 +84,4 @@ FLOAT_POINT MAZE_EXPANSION_ENGINE::Nearest(
     return { nearest.first, nearest.second };
 }
 
-std::vector<ROUTER_NODE> MAZE_EXPANSION_ENGINE::Neighbours(
-        const ROUTER_NODE& aNode, std::int64_t aGridStep,
-        const std::vector<ROUTER_LAYER_SETTINGS>& aLayers, bool aAllowVias )
-{
-    const std::int64_t step = std::max<std::int64_t>( 1, aGridStep );
-
-    // The order is deliberate.  It is stable across runs and follows the
-    // orthogonal/45-degree preference used by the Freerouting search engines.
-    static constexpr int directions[][2] = {
-        { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 },
-        { 1, 1 }, { -1, 1 }, { -1, -1 }, { 1, -1 }
-    };
-
-    std::vector<ROUTER_NODE> result;
-    result.reserve( 8 + aLayers.size() );
-
-    for( const auto& direction : directions )
-    {
-        result.push_back( { { aNode.point.x + direction[0] * step,
-                             aNode.point.y + direction[1] * step },
-                            aNode.layer } );
-    }
-
-    if( aAllowVias )
-    {
-        for( const ROUTER_LAYER_SETTINGS& layer : aLayers )
-        {
-            if( layer.enabled && layer.layerId != aNode.layer )
-                result.push_back( { aNode.point, layer.layerId } );
-        }
-    }
-
-    return result;
-}
-
 } // namespace KICAD_AUTOROUTER

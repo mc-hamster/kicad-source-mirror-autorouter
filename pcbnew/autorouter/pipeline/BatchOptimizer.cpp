@@ -913,7 +913,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                                                             width, clearance );
                         int expanded = 0;
                         auto rerouted = search.FindConnection( from, to, retry, expanded,
-                                                               aCancel, {}, {}, {}, false );
+                                                               aCancel, {}, {}, {} );
                         if( !rerouted )
                         {
                             routedAll = false;

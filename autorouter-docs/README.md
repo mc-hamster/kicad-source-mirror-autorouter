@@ -1,6 +1,6 @@
 # Native autorouter engineering notes
 
-Latest core work: [active exact-octagonal ordinary multilayer search](OCTAGONAL-MULTILAYER-SEARCH.md).
+Latest core work: [complete parity checklist and active closure status](PARITY-CLOSURE-CHECKLIST.md).
 This is still a partial implementation, not full Freerouting parity.
 
 **Status: experimental; Freerouting parity has not been achieved.** See
@@ -102,13 +102,14 @@ not enter the routing algorithm and therefore do not need a Freerouting GUI coun
 source tree intentionally includes corresponding Freerouting filenames even where KiCad's
 immutable snapshot/transaction model replaces a mutable Java board event or thread pool.
 
-Ordinary and fanout single-layer/multilayer attempts now use exact-octagonal
-room/door geometry, exact free-drill regions and 45-degree corridor location.
+Ordinary and fanout single-layer/multilayer attempts now use exact-octagonal or
+rational-simplex room/door geometry, exact free-drill regions and angle-specific
+corridor location.
 Multilayer search retains source-shaped rectangular page enumeration and exact
 full-stack host via preflight; fanout stops at the first exit drill.
 The source destination estimate is translated and used by both frontiers; the
-remaining legacy grid/visibility fallback has a separately named heuristic.
-General-convex non-45-degree free-drill regions, complete forced insertion/shove,
+legacy grid/visibility fallback has been removed from production search.
+Complete forced insertion/shove,
 synthetic-free fanout setup, and optimizer equivalence are still incomplete. See the
 [latest translation audit](DESTINATION-DISTANCE-PARITY.md): matching filenames
 or isolated numeric methods does not establish whole-engine parity.

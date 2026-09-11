@@ -28,18 +28,14 @@
 #include "../rules/ViaRule.h"
 
 #include "../AutorouterDebug.h"
-#include "../expansion/ExpansionGraph.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
 #include <limits>
-#include <numeric>
-#include <queue>
 #include <set>
 #include <sstream>
 #include <tuple>
@@ -62,39 +58,6 @@ std::int64_t squaredDistance( const ROUTER_POINT& aLeft, const ROUTER_POINT& aRi
     return value >= static_cast<long double>( std::numeric_limits<std::int64_t>::max() )
                    ? std::numeric_limits<std::int64_t>::max()
                    : static_cast<std::int64_t>( value );
-}
-
-
-// Project onto an exact integral point of the existing copper centreline, not
-// merely near that line and not onto the representative pad's centre.  KiCad
-// stores integral coordinates and requires an actual centreline junction for
-// connectivity.  Rounding x/y independently can produce a point a fraction
-// of an IU off an oblique trace, which later appears as a dangling route.
-ROUTER_POINT terminalPoint( const ROUTING_TERMINAL& aTerminal, const ROUTER_POINT& aFrom )
-{
-    if( !aTerminal.segmentEnd )
-        return aTerminal.pad.position;
-    const auto& start = aTerminal.pad.position;
-    const auto& end = *aTerminal.segmentEnd;
-    const long double dx = static_cast<long double>( end.x ) - start.x;
-    const long double dy = static_cast<long double>( end.y ) - start.y;
-    const long double lengthSquared = dx * dx + dy * dy;
-    const long double t = lengthSquared == 0 ? 0 : std::clamp(
-            ( ( static_cast<long double>( aFrom.x ) - start.x ) * dx
-              + ( static_cast<long double>( aFrom.y ) - start.y ) * dy ) / lengthSquared,
-            0.0L, 1.0L );
-    const std::int64_t integralDx = end.x - start.x;
-    const std::int64_t integralDy = end.y - start.y;
-    const std::int64_t latticeSteps = std::gcd( std::llabs( integralDx ),
-                                                std::llabs( integralDy ) );
-    if( latticeSteps == 0 )
-        return start;
-
-    const std::int64_t step = std::clamp<std::int64_t>(
-            std::llround( t * static_cast<long double>( latticeSteps ) ),
-            0, latticeSteps );
-    return { start.x + integralDx / latticeSteps * step,
-             start.y + integralDy / latticeSteps * step };
 }
 
 
@@ -788,13 +751,6 @@ std::vector<ROUTING_CONNECTION> ROUTING_OCCUPANCY::ConflictingConnections(
 }
 
 
-std::size_t MAZE_SEARCH_ENGINE::NODE_KEY_HASH::operator()( const ROUTER_NODE& aNode ) const noexcept
-{
-    ROUTER_CELL_HASH cellHash;
-    return cellHash( { aNode.point.x, aNode.point.y, aNode.layer } );
-}
-
-
 MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
                                         const AUTOROUTER_SETTINGS& aSettings,
                                         ROUTING_OCCUPANCY& aOccupancy,
@@ -805,7 +761,6 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
         m_board( aBoard ),
         m_settings( aSettings ),
         m_occupancy( aOccupancy ),
-        m_activeGridStep( std::max<std::int64_t>( 1, aSettings.gridStepIU ) ),
         m_viaOverrideNetCode( aViaOverrideNetCode ),
         m_viaOverride( aViaOverride )
 {
@@ -1014,51 +969,12 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
         }
     }
 
-    // Build the board-wide visibility landmarks once.  The exact net-pair
-    // clearance is still checked by isSegmentAllowed(); using the largest
-    // snapshot clearance for the landmark margin only makes this broad phase
-    // conservative and avoids a full obstacle/pad walk for every connection.
-    std::int64_t maximumTrackRadius = 1;
-    std::int64_t maximumViaRadius = 1;
-    for( const auto& [netCode, radius] : m_trackRadii )
-    {
-        (void) netCode;
-        maximumTrackRadius = std::max( maximumTrackRadius, radius );
-    }
-    for( const auto& [netCode, radius] : m_viaRadii )
-    {
-        (void) netCode;
-        maximumViaRadius = std::max( maximumViaRadius, radius );
-    }
-
-    ROUTING_PAD emptyTerminal;
-    maximumTrackRadius = saturatedAdd( maximumTrackRadius, maximumNetClearance );
-    m_baseLandmarks = EXPANSION_GRAPH::BuildLandmarks(
-            m_board, m_settings, emptyTerminal, emptyTerminal, maximumTrackRadius,
-            maximumViaRadius, 0 );
-
-    // Keep the board-wide landmark set, but index it spatially so the maze
-    // frontier can inspect nearby room features without scanning/sorting the
-    // complete set for every expanded node.  The bucket size is intentionally
-    // the same coarse size used by the obstacle index: it is independent of
-    // retry refinement and therefore cannot change the route's tie-breaking
-    // semantics when the active grid gets finer.
-    for( std::size_t index = 0; index < m_baseLandmarks.size(); ++index )
-    {
-        const ROUTER_NODE& landmark = m_baseLandmarks[index];
-        const ROUTER_CELL_KEY key{ floorDivide( landmark.point.x, m_obstacleBucketSize ),
-                                   floorDivide( landmark.point.y, m_obstacleBucketSize ),
-                                   landmark.layer };
-        m_landmarksBySpatialCell[key].push_back( index );
-    }
-
     if( autorouterDebugEnabled() )
     {
         std::ostringstream message;
         message << "search index ready pads=" << m_board.pads.size()
                 << " obstacles=" << m_board.obstacles.size()
                 << " layers=" << m_settings.layers.size()
-                << " landmarks=" << m_baseLandmarks.size()
                 << " obstacleBuckets=" << m_obstaclesBySpatialCell.size()
                 << " bucketSizeIU=" << m_obstacleBucketSize;
         autorouterDebugLog( message.str() );
@@ -3544,439 +3460,13 @@ std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::FindConflictingConnections(
 }
 
 
-std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::neighbours( const ROUTER_NODE& aNode ) const
-{
-    return MAZE_EXPANSION_ENGINE::Neighbours( aNode, m_activeGridStep,
-                                              m_settings.layers, m_settings.allowVias );
-}
-
-
-std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::buildLandmarks( const ROUTING_PAD& aStart,
-                                                             const ROUTING_PAD& aTarget,
-                                                             int aNetCode ) const
-{
-    std::vector<ROUTER_NODE> result;
-    result.reserve( aStart.layers.size() + aTarget.layers.size() + 512 );
-
-    auto add = [&]( const ROUTER_POINT& aPoint, int aLayer )
-    {
-        if( aLayer < 0 )
-            return;
-
-        const ROUTER_NODE node{ aPoint, aLayer };
-        if( std::find( result.begin(), result.end(), node ) == result.end() )
-            result.push_back( node );
-    };
-
-    // Terminal nodes must be present even when the bounded board-wide set is
-    // full.  This is also what makes a clear-board route take the direct
-    // visibility edge rather than falling back to the raster grid.
-    for( int layer : aStart.layers )
-        add( aStart.position, layer );
-    for( int layer : aTarget.layers )
-        add( aTarget.position, layer );
-
-    // A plane fanout target is deliberately represented on the destination
-    // layer, but its via must be reached from the source layer first.  Add a
-    // source-layer landmark at the same physical point so the search can make
-    // one legal visibility move followed by a via transition there.  This is
-    // the native equivalent of Freerouting's escaped SMD fanout stub.
-    if( aTarget.isFanoutTarget && aTarget.fanoutSourceLayer >= 0 )
-        add( aTarget.position, aTarget.fanoutSourceLayer );
-
-    // The immutable board-wide graph is indexed separately below. Add only
-    // connection-local exact convex corners here; otherwise copying the
-    // whole graph into this vector obscures the small set of per-net features
-    // from adaptiveNeighbours and makes every frontier expansion rescan it.
-    // A rectangle has an exact room representation already. For a strict
-    // convex contour, however, its L-infinity offset preserves free wedges
-    // that its axis-aligned bounding box would erase. A one-IU guard keeps
-    // an integral support intersection outside the host's closed collision
-    // boundary; rational intersections are deliberately not rounded.
-    //
-    // Do not stop at the first 512 corners in snapshot order. KiCad writes
-    // zones/tracks in board-item order, not in relation to this connection;
-    // on a dense board that made a late convex blocker invisible while an
-    // unrelated footprint monopolized every dynamic landmark slot. Retain a
-    // bounded reservoir ranked by distance to this connection's direct
-    // corridor, then validate/support the best integral siblings below.
-    constexpr std::size_t maxDynamicLandmarks = 512;
-    constexpr std::size_t maxRawConvexLandmarks = 4096;
-    constexpr std::size_t retainedRawConvexLandmarks = 2048;
-    struct CONVEX_LANDMARK_CANDIDATE
-    {
-        long double corridorDistanceSquared = 0.0L;
-        long double endpointDistanceSquared = 0.0L;
-        ROUTER_NODE node;
-    };
-    std::vector<CONVEX_LANDMARK_CANDIDATE> convexCandidates;
-    convexCandidates.reserve( retainedRawConvexLandmarks );
-    const auto scoreConvexCandidate = [&]( const ROUTER_POINT& aPoint )
-    {
-        const long double startX = static_cast<long double>( aStart.position.x );
-        const long double startY = static_cast<long double>( aStart.position.y );
-        const long double endX = static_cast<long double>( aTarget.position.x );
-        const long double endY = static_cast<long double>( aTarget.position.y );
-        const long double pointX = static_cast<long double>( aPoint.x );
-        const long double pointY = static_cast<long double>( aPoint.y );
-        const long double directionX = endX - startX;
-        const long double directionY = endY - startY;
-        const long double lengthSquared = directionX * directionX + directionY * directionY;
-        const long double startDistanceSquared = ( pointX - startX ) * ( pointX - startX )
-                                               + ( pointY - startY ) * ( pointY - startY );
-        const long double endDistanceSquared = ( pointX - endX ) * ( pointX - endX )
-                                             + ( pointY - endY ) * ( pointY - endY );
-        if( lengthSquared <= 0.0L )
-            return std::pair{ startDistanceSquared, startDistanceSquared };
-
-        const long double projection = std::clamp(
-                ( ( pointX - startX ) * directionX + ( pointY - startY ) * directionY )
-                        / lengthSquared,
-                0.0L, 1.0L );
-        const long double closestX = startX + projection * directionX;
-        const long double closestY = startY + projection * directionY;
-        const long double corridorDistanceSquared = ( pointX - closestX ) * ( pointX - closestX )
-                                                   + ( pointY - closestY )
-                                                             * ( pointY - closestY );
-        return std::pair{ corridorDistanceSquared,
-                          std::min( startDistanceSquared, endDistanceSquared ) };
-    };
-    const auto compareConvexCandidates = []( const CONVEX_LANDMARK_CANDIDATE& aLeft,
-                                             const CONVEX_LANDMARK_CANDIDATE& aRight )
-    {
-        if( aLeft.corridorDistanceSquared != aRight.corridorDistanceSquared )
-            return aLeft.corridorDistanceSquared < aRight.corridorDistanceSquared;
-        if( aLeft.endpointDistanceSquared != aRight.endpointDistanceSquared )
-            return aLeft.endpointDistanceSquared < aRight.endpointDistanceSquared;
-        if( aLeft.node.point.x != aRight.node.point.x )
-            return aLeft.node.point.x < aRight.node.point.x;
-        if( aLeft.node.point.y != aRight.node.point.y )
-            return aLeft.node.point.y < aRight.node.point.y;
-        return aLeft.node.layer < aRight.node.layer;
-    };
-    const auto addConvexCandidate = [&]( const ROUTER_POINT& aPoint, int aLayer )
-    {
-        if( aLayer < 0 )
-            return;
-
-        const auto [corridorDistanceSquared, endpointDistanceSquared] =
-                scoreConvexCandidate( aPoint );
-        convexCandidates.push_back( { corridorDistanceSquared, endpointDistanceSquared,
-                                      { aPoint, aLayer } } );
-        if( convexCandidates.size() > maxRawConvexLandmarks )
-        {
-            std::nth_element( convexCandidates.begin(),
-                              convexCandidates.begin()
-                                      + static_cast<std::ptrdiff_t>( retainedRawConvexLandmarks ),
-                              convexCandidates.end(), compareConvexCandidates );
-            convexCandidates.resize( retainedRawConvexLandmarks );
-        }
-    };
-
-    for( const ROUTING_OBSTACLE& obstacle : m_board.obstacles )
-    {
-        if( obstacle.kind != ROUTER_OBSTACLE_KIND::POLYGON || obstacle.isHole
-            || !obstacle.blocksTracks || !obstacle.polygonHoles.empty()
-            || obstacle.radius != 0
-            || ( obstacle.netCode == aNetCode && !obstacle.isKeepout ) )
-        {
-            continue;
-        }
-
-        for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
-        {
-            if( !layer.enabled
-                || ( !obstacle.layers.empty()
-                     && std::find( obstacle.layers.begin(), obstacle.layers.end(), layer.layerId )
-                                == obstacle.layers.end() ) )
-            {
-                continue;
-            }
-
-            const std::int64_t radius = obstacleExpansionRadius(
-                    obstacle, aNetCode, layer.layerId, false,
-                    netTrackRadius( aNetCode ) );
-            if( radius == std::numeric_limits<std::int64_t>::max() )
-                continue;
-
-            const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon(
-                    obstacle.polygon, radius + 1 );
-            if( !simplex )
-                continue;
-
-            for( std::size_t index = 0; index < simplex->Borders().size(); ++index )
-            {
-                // A source support-line intersection may be rational. KiCad
-                // cannot emit fractional IU coordinates, but dropping the
-                // corner altogether forces an otherwise exact convex route
-                // back onto the coarse grid. Enumerate the at-most four
-                // surrounding integer points and retain only candidates that
-                // pass the full compensated point predicate. This keeps the
-                // exact support geometry as the oracle and never rounds a
-                // corner through copper merely to make it integral.
-                const auto bounds = simplex->Corner( index ).SurroundingBox();
-                if( !bounds )
-                    continue;
-
-                for( const std::int64_t x : { bounds->minX, bounds->maxX } )
-                {
-                    for( const std::int64_t y : { bounds->minY, bounds->maxY } )
-                    {
-                        const ROUTER_POINT candidate{ x, y };
-                        addConvexCandidate( candidate, layer.layerId );
-                    }
-                }
-            }
-        }
-    }
-
-    std::stable_sort( convexCandidates.begin(), convexCandidates.end(), compareConvexCandidates );
-    convexCandidates.erase(
-            std::unique( convexCandidates.begin(), convexCandidates.end(),
-                         []( const CONVEX_LANDMARK_CANDIDATE& aLeft,
-                             const CONVEX_LANDMARK_CANDIDATE& aRight )
-                         { return aLeft.node == aRight.node; } ),
-            convexCandidates.end() );
-    for( const CONVEX_LANDMARK_CANDIDATE& candidate : convexCandidates )
-    {
-        if( result.size() >= maxDynamicLandmarks )
-            break;
-
-        if( isPointAllowed( candidate.node.point, candidate.node.layer, aNetCode, false,
-                            netTrackRadius( aNetCode ) ) )
-        {
-            add( candidate.node.point, candidate.node.layer );
-        }
-    }
-
-    return result;
-}
-
-std::vector<ROUTER_NODE> MAZE_SEARCH_ENGINE::adaptiveNeighbours(
-        const ROUTER_NODE& aNode, const ROUTING_PAD& aTarget,
-        const std::vector<ROUTER_NODE>& aLandmarks, int aNetCode ) const
-{
-    std::vector<ROUTER_NODE> result = neighbours( aNode );
-    std::vector<std::pair<long double, ROUTER_NODE>> nearbyCandidates;
-    std::vector<std::pair<long double, ROUTER_NODE>> localCandidates;
-    nearbyCandidates.reserve( 128 );
-    localCandidates.reserve( std::min<std::size_t>( aLandmarks.size(), 128 ) );
-
-    auto collectNearbyLandmarks = [&]( int aCellRadius )
-    {
-        const std::int64_t centerX = floorDivide( aNode.point.x, m_obstacleBucketSize );
-        const std::int64_t centerY = floorDivide( aNode.point.y, m_obstacleBucketSize );
-
-        for( int offsetX = -aCellRadius; offsetX <= aCellRadius; ++offsetX )
-        {
-            for( int offsetY = -aCellRadius; offsetY <= aCellRadius; ++offsetY )
-            {
-                const ROUTER_CELL_KEY key{ centerX + offsetX, centerY + offsetY,
-                                           aNode.layer };
-                const auto bucket = m_landmarksBySpatialCell.find( key );
-                if( bucket == m_landmarksBySpatialCell.end() )
-                    continue;
-
-                for( std::size_t landmarkIndex : bucket->second )
-                {
-                    if( landmarkIndex >= m_baseLandmarks.size() )
-                        continue;
-
-                    const ROUTER_NODE& landmark = m_baseLandmarks[landmarkIndex];
-                    if( landmark == aNode )
-                        continue;
-
-                    const long double dx = static_cast<long double>( landmark.point.x )
-                                           - aNode.point.x;
-                    const long double dy = static_cast<long double>( landmark.point.y )
-                                           - aNode.point.y;
-                    const long double distanceSquared = dx * dx + dy * dy;
-
-                    if( distanceSquared != 0.0L )
-                        nearbyCandidates.emplace_back( distanceSquared, landmark );
-                }
-            }
-        }
-    };
-
-    // A nearby room normally contains all useful escape doors.  If a
-    // frontier node is in a sparse part of the graph, widen the lookup once
-    // rather than falling back to an O(landmarks) scan.  The exact target is
-    // still considered below, so long clear-board routes do not depend on
-    // the bucket radius.
-    collectNearbyLandmarks( 2 );
-    if( nearbyCandidates.size() < 8 )
-        collectNearbyLandmarks( 8 );
-
-    // buildLandmarks intentionally contains only connection-local terminals
-    // and exact convex support corners. Keep them in a distinct reserve until
-    // the dense-board cap is applied below: a convex support corner is a
-    // faithful escape door, not optional board-wide decoration. Letting
-    // thousands of nearby pad/zone landmarks consume the cap first forces a
-    // general-convex connection back onto the coarse grid even though its
-    // exact support corner was already available.
-    for( const ROUTER_NODE& landmark : aLandmarks )
-    {
-        if( landmark.layer != aNode.layer || landmark == aNode )
-            continue;
-
-        const long double dx = static_cast<long double>( landmark.point.x ) - aNode.point.x;
-        const long double dy = static_cast<long double>( landmark.point.y ) - aNode.point.y;
-        const long double distanceSquared = dx * dx + dy * dy;
-        if( distanceSquared != 0.0L )
-            localCandidates.emplace_back( distanceSquared, landmark );
-    }
-
-    auto compareCandidates = []( const auto& aLeft, const auto& aRight )
-    {
-        if( aLeft.first != aRight.first )
-            return aLeft.first < aRight.first;
-        if( aLeft.second.point.x != aRight.second.point.x )
-            return aLeft.second.point.x < aRight.second.point.x;
-        if( aLeft.second.point.y != aRight.second.point.y )
-            return aLeft.second.point.y < aRight.second.point.y;
-        return aLeft.second.layer < aRight.second.layer;
-    };
-
-    // Freerouting's room graph presents only nearby door sections to a
-    // frontier element.  The native visibility fallback has the same bounded
-    // responsibility: keep enough nearest landmarks to escape a local room,
-    // but do not sort and test every board landmark for every A* cell.  The
-    // regular grid neighbours remain the complete fallback when no landmark
-    // in this bounded set is visible.
-    // Dense boards tend to have thousands of filled-zone fragments.  A room
-    // frontier still needs a few escape landmarks, but testing the complete
-    // visibility fan against every such fragment is disproportionate once
-    // the orthogonal grid already supplies the local fallback.  Keep the
-    // richer set for ordinary boards and use a bounded dense-board set so a
-    // difficult connection remains cancellable in the editor.
-    const auto sortAndUnique = [&]( auto& aCandidates )
-    {
-        std::stable_sort( aCandidates.begin(), aCandidates.end(), compareCandidates );
-        aCandidates.erase( std::unique( aCandidates.begin(), aCandidates.end(),
-                                        []( const auto& aLeft, const auto& aRight )
-                                        { return aLeft.second == aRight.second; } ),
-                           aCandidates.end() );
-    };
-    const auto trimNearest = [&]( auto& aCandidates, std::size_t aMaximum )
-    {
-        if( aCandidates.size() <= aMaximum )
-            return;
-
-        std::nth_element( aCandidates.begin(),
-                          aCandidates.begin() + static_cast<std::ptrdiff_t>( aMaximum ),
-                          aCandidates.end(), compareCandidates );
-        aCandidates.resize( aMaximum );
-        std::stable_sort( aCandidates.begin(), aCandidates.end(), compareCandidates );
-    };
-
-    const bool denseBoard = m_board.obstacles.size() > 2000 || m_board.pads.size() > 300;
-    sortAndUnique( localCandidates );
-    const bool hasExtraLocalDoors = localCandidates.size() > 1;
-
-    // The ordinary visibility graph stays deliberately small on dense
-    // boards. Reserve a handful of slots for per-connection landmarks,
-    // however; these include the exact offset corners of a non-rectangular
-    // convex obstacle and are the only geometrically faithful door choices
-    // when the rectangular room engine declines that layer.
-    const std::size_t localReserve = denseBoard && hasExtraLocalDoors ? 24 : 0;
-    const std::size_t maxVisibilityCandidates = denseBoard ? 24 : 128;
-    trimNearest( localCandidates,
-                 localReserve == 0 ? maxVisibilityCandidates : localReserve );
-
-    trimNearest( nearbyCandidates, maxVisibilityCandidates - localCandidates.size() );
-
-    std::vector<std::pair<long double, ROUTER_NODE>> candidates;
-    candidates.reserve( localCandidates.size() + nearbyCandidates.size() );
-    candidates.insert( candidates.end(), localCandidates.begin(), localCandidates.end() );
-    candidates.insert( candidates.end(), nearbyCandidates.begin(), nearbyCandidates.end() );
-    sortAndUnique( candidates );
-
-    const std::size_t maxVisibleLandmarks = denseBoard
-            ? ( hasExtraLocalDoors ? 24 : 2 ) : 24;
-    std::size_t visible = 0;
-
-    for( const auto& [unusedDistance, candidate] : candidates )
-    {
-        (void) unusedDistance;
-
-        if( visible >= maxVisibleLandmarks )
-            break;
-
-        // The endpoint is a copper pad, not a moving piece of track.  Its
-        // own copper radius is already represented by the same-net obstacle
-        // that is skipped below; inflating a foreign obstacle by the whole
-        // pad radius here can incorrectly make a legal SMD escape have no
-        // legal start point.  Only the routed trace width belongs in this
-        // visibility probe.
-        const std::int64_t candidateRadius = candidate.point == aTarget.position
-                                                     ? netTrackRadius( aNetCode )
-                                                     : -1;
-        if( !isSegmentAllowedFromKnownStart( aNode.point, candidate.point, aNode.layer,
-                                             aNetCode, false, candidateRadius ) )
-            continue;
-
-        if( std::find( result.begin(), result.end(), candidate ) == result.end() )
-        {
-            result.push_back( candidate );
-            ++visible;
-        }
-    }
-
-    // The exact target is a special landmark even when it is farther than the
-    // local visibility radius.  This fast path preserves straight traces on
-    // clear boards and removes an unnecessary dependence on raster alignment.
-    for( int layer : { aNode.layer } )
-    {
-        const ROUTER_NODE target{ aTarget.position, layer };
-        if( target != aNode
-            && isSegmentAllowedFromKnownStart( aNode.point, target.point, layer, aNetCode,
-                                               false, netTrackRadius( aNetCode ) )
-            && std::find( result.begin(), result.end(), target ) == result.end() )
-        {
-            result.push_back( target );
-        }
-    }
-
-    return result;
-}
-
-
-double MAZE_SEARCH_ENGINE::heuristic( const ROUTER_NODE& aNode, const ROUTER_POINT& aTarget,
-                                      int aTargetLayer, const AUTOROUTE_CONTROL& aControl ) const
-{
-    // All destination shapes contribute to the lower bound. A distance to
-    // one arbitrarily selected pad can overestimate the cost to another
-    // member of the destination set and bias the frontier away from it.
-    (void) aTarget;
-    (void) aTargetLayer;
-    (void) aControl;
-    return m_legacyDestinationDistance.Calculate( aNode.point, aNode.layer );
-}
-
-
-bool MAZE_SEARCH_ENGINE::canFinish( const ROUTER_NODE& aNode, const ROUTING_PAD& aTarget,
-                                    int aNetCode ) const
-{
-    if( !isOnPadLayer( aTarget, aNode.layer ) )
-        return false;
-
-    const double maxFinalDistance = std::max<double>( m_activeGridStep * 1.5, 1.0 );
-
-    return distance( aNode.point, aTarget.position ) <= maxFinalDistance
-           && isSegmentAllowedFromKnownStart( aNode.point, aTarget.position, aNode.layer,
-                                              aNetCode, false, netTrackRadius( aNetCode ) );
-}
-
-
 std::optional<ROUTING_CONNECTION>
 MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD& aTarget,
                                     int aRetry, int& aExpandedNodes,
                                     const ROUTER_CANCEL_CALLBACK& aCancel,
                                     const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress,
                                     const std::vector<ROUTING_TERMINAL>& aStarts,
-                                    const std::vector<ROUTING_TERMINAL>& aTargets,
-                                    bool aAllowLegacyFallback ) const
+                                    const std::vector<ROUTING_TERMINAL>& aTargets ) const
 {
     aExpandedNodes = 0;
     m_roomMetrics = {};
@@ -4014,8 +3504,6 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     m_debugPointChecks = 0;
     m_debugSegmentChecks = 0;
 
-    const auto searchStarted = std::chrono::steady_clock::now();
-
     if( debug )
     {
         std::ostringstream message;
@@ -4026,361 +3514,25 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
         autorouterDebugLog( message.str() );
     }
 
-    const std::int64_t baseStep = std::max<std::int64_t>( 1, m_settings.gridStepIU );
-    const int refinement = std::min( 3, std::max( 0, aRetry ) );
-    const std::int64_t refinedStep = std::max<std::int64_t>( 1, baseStep >> refinement );
-    m_activeGridStep = std::min( baseStep, std::max<std::int64_t>( 50000, refinedStep ) );
-
-    // Do not silently substitute a smaller budget on dense boards. The
-    // caller's explicit budget is the limit reported in diagnostics/UI.
-    const int effectiveMaxExpandedNodes = std::max( 0, m_settings.maxExpandedNodes );
-    m_legacyDestinationDistance.Configure( m_settings, targets.front().pad );
-    for( const auto& terminal : targets )
     {
-        const ROUTER_POINT& point = terminal.pad.position;
-        const auto end = terminal.segmentEnd.value_or( point );
-        for( int layer : terminal.pad.layers )
-            m_legacyDestinationDistance.Join( { std::min( point.x, end.x ), std::min( point.y, end.y ),
-                                         std::max( point.x, end.x ), std::max( point.y, end.y ) }, layer );
-    }
-    AUTOROUTE_CONTROL control( m_settings, aStart.netCode, aRetry,
-                               aTarget.isPlaneTarget,
-                               std::max( netTrackRadius( aStart.netCode ),
-                                         netViaRadius( aStart.netCode ) ),
-                               isPureSmdNet( aStart.netCode ) );
+        const auto enabledLayers = std::count_if(
+                m_settings.layers.begin(), m_settings.layers.end(),
+                []( const auto& aLayer ) { return aLayer.enabled; } );
+        m_useRoutableObstacleRooms = m_allowRipupOccupancy;
+        auto roomPath = !m_settings.allowVias || enabledLayers == 1
+                                ? findRoomConnection( starts, targets, aRetry,
+                                                      aExpandedNodes, aCancel, aProgress )
+                                : findMultilayerRoomConnection(
+                                          starts, targets, aRetry, aExpandedNodes,
+                                          aCancel, aProgress,
+                                          fanoutSearch ? &aTarget : nullptr );
+        m_useRoutableObstacleRooms = false;
 
-    // The rectangular room frontier now compares same-layer routes and
-    // through-drill alternatives in one queue. A fanout attempt uses the same
-    // room/drill frontier but terminates at its first layer transition, just
-    // like AutorouteEngine with is_fanout. Production callers stop when this
-    // translated room search rejects a route; they do not substitute the
-    // older raster/visibility implementation.
-    const auto enabledLayers = std::count_if( m_settings.layers.begin(), m_settings.layers.end(),
-                                             []( const auto& layer ) { return layer.enabled; } );
-    m_useRoutableObstacleRooms = m_allowRipupOccupancy;
-    auto roomPath = !m_settings.allowVias || enabledLayers == 1
-                            ? findRoomConnection( starts, targets, aRetry, aExpandedNodes,
-                                                  aCancel, aProgress )
-                            : findMultilayerRoomConnection( starts, targets, aRetry,
-                                                            aExpandedNodes, aCancel, aProgress,
-                                                            fanoutSearch ? &aTarget : nullptr );
-
-    m_useRoutableObstacleRooms = false;
-
-    if( roomPath )
+        // A rejected translated search is a real route failure. Never replace
+        // that decision with the retired raster/visibility implementation.
         return roomPath;
-    if( aCancel && aCancel() )
-        return std::nullopt;
-    if( !aAllowLegacyFallback )
-        return std::nullopt;
-
-    std::priority_queue<OPEN_NODE, std::vector<OPEN_NODE>, OPEN_NODE_COMPARE> open;
-    std::unordered_map<ROUTER_NODE, double, NODE_KEY_HASH> bestCost;
-    std::unordered_map<ROUTER_NODE, ROUTER_NODE, NODE_KEY_HASH> cameFrom;
-    const std::vector<ROUTER_NODE> landmarks = buildLandmarks( aStart, aTarget,
-                                                                 aStart.netCode );
-    std::size_t sequence = 0;
-    std::unordered_map<ROUTER_NODE, std::size_t, NODE_KEY_HASH> startOwners;
-
-    for( const ROUTING_TERMINAL& terminal : starts )
-    {
-        std::vector<ROUTER_POINT> seeds{ terminal.pad.position };
-        if( terminal.segmentEnd )
-        {
-            seeds.push_back( *terminal.segmentEnd );
-            for( const auto& target : targets )
-            {
-                seeds.push_back( terminalPoint( terminal, target.pad.position ) );
-                if( target.segmentEnd )
-                    seeds.push_back( terminalPoint( terminal, *target.segmentEnd ) );
-            }
-        }
-        for( const auto& point : seeds )
-        {
-            for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
-            {
-                if( !layer.enabled || !isOnPadLayer( terminal.pad, layer.layerId )
-                    || !isPointAllowed( point, layer.layerId, aStart.netCode, false,
-                                       netTrackRadius( aStart.netCode ) ) )
-                    continue;
-                if( fanoutSearch && layer.layerId != aTarget.fanoutSourceLayer )
-                    continue;
-                if( fanoutSearch && aTarget.fanoutMaxEscapeLength > 0
-                    && distance( point, aStart.position )
-                               > static_cast<double>( aTarget.fanoutMaxEscapeLength ) )
-                {
-                    continue;
-                }
-                ROUTER_NODE start{ point, layer.layerId };
-                if( bestCost.contains( start ) )
-                    continue;
-                const double h = heuristic( start, aTarget.position, layer.layerId, control );
-                open.push( { start, 0.0, h, sequence++ } );
-                bestCost[start] = 0.0;
-                startOwners[start] = terminal.padIndex;
-            }
-        }
     }
 
-    auto logSearchState = [&]( const char* aState )
-    {
-        if( !debug )
-            return;
-
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::steady_clock::now() - searchStarted )
-                                      .count();
-        std::ostringstream message;
-        message << aState << " search net=" << aStart.netCode << " expanded=" << aExpandedNodes
-                << " open=" << open.size() << " best=" << bestCost.size()
-                << " obstacleQueries=" << m_debugObstacleQueries
-                << " obstacleCandidates=" << m_debugObstacleCandidates
-                << " pointChecks=" << m_debugPointChecks
-                << " segmentChecks=" << m_debugSegmentChecks << " elapsed=" << elapsed << " ms";
-        autorouterDebugLog( message.str() );
-    };
-
-    if( open.empty() )
-        logSearchState( "END search no legal start" );
-
-    auto nextDiagnostic = searchStarted + std::chrono::seconds( 2 );
-
-    while( !open.empty() )
-    {
-        if( aCancel && aCancel() )
-        {
-            logSearchState( "END search cancelled" );
-            return std::nullopt;
-        }
-
-        if( debug && std::chrono::steady_clock::now() >= nextDiagnostic )
-        {
-            logSearchState( "PROGRESS" );
-            nextDiagnostic = std::chrono::steady_clock::now() + std::chrono::seconds( 2 );
-        }
-
-        OPEN_NODE current = open.top();
-        open.pop();
-
-        auto bestIt = bestCost.find( current.node );
-
-        if( bestIt == bestCost.end() || current.g > bestIt->second )
-            continue;
-
-        if( aExpandedNodes >= effectiveMaxExpandedNodes )
-        {
-            logSearchState( "END search expansion limit" );
-            return std::nullopt;
-        }
-        ++aExpandedNodes;
-
-        // A difficult connection may expand tens of thousands of nodes before
-        // it either succeeds or exhausts its budget.  Report at a bounded
-        // cadence so the KiCad progress dialog does not appear frozen,
-        // without taking the job mutex on every A* expansion.
-        if( aProgress && ( aExpandedNodes & 511 ) == 0 )
-            aProgress( aExpandedNodes );
-
-        const auto destination = std::find_if( targets.begin(), targets.end(),
-                [&]( const ROUTING_TERMINAL& terminal )
-                {
-                    ROUTING_PAD target = terminal.pad;
-                    target.position = terminalPoint( terminal, current.node.point );
-                    return canFinish( current.node, target, aStart.netCode );
-                } );
-        const auto fanoutDrillParent = fanoutSearch
-                                               && current.node.layer
-                                                          != aTarget.fanoutSourceLayer
-                ? cameFrom.find( current.node )
-                : cameFrom.end();
-        const bool reachedFanoutDrill =
-                fanoutDrillParent != cameFrom.end()
-                && fanoutDrillParent->second.layer == aTarget.fanoutSourceLayer
-                && fanoutDrillParent->second.point == current.node.point;
-
-        // A fanout search terminates at its first drill even when the drill
-        // happens to touch a destination item on the exit layer.  Checking
-        // the ordinary destination first incorrectly appended the rest of a
-        // plane/trace target and turned one fanout operation into a complete
-        // net route.
-        if( destination != targets.end() && !reachedFanoutDrill )
-        {
-            ROUTING_CONNECTION result;
-            result.netCode = aStart.netCode;
-            result.complete = true;
-            result.isFanoutConnection = fanoutSearch;
-            result.isPlaneConnection = destination->pad.isPlaneTarget;
-            result.toPadIndex = destination->padIndex;
-            const ROUTER_POINT finish = terminalPoint( *destination, current.node.point );
-            result.cost = current.g + control.TraceCost( distance( current.node.point, finish ) );
-            result.nodes.push_back( { finish, current.node.layer } );
-
-            ROUTER_NODE cursor = current.node;
-
-            while( true )
-            {
-                result.nodes.push_back( cursor );
-                auto parentIt = cameFrom.find( cursor );
-
-                if( parentIt == cameFrom.end() )
-                    break;
-
-                cursor = parentIt->second;
-            }
-
-            std::reverse( result.nodes.begin(), result.nodes.end() );
-
-            result.fromPadIndex = startOwners.at( result.nodes.front() );
-
-            // Remove duplicate layer-transition nodes and collinear points.
-            std::vector<ROUTER_NODE> simplified;
-            simplified.reserve( result.nodes.size() );
-
-            for( const ROUTER_NODE& node : result.nodes )
-            {
-                if( simplified.empty() || node != simplified.back() )
-                    simplified.push_back( node );
-
-                while( simplified.size() >= 3 )
-                {
-                    const ROUTER_NODE& first = simplified[simplified.size() - 3];
-                    const ROUTER_NODE& middle = simplified[simplified.size() - 2];
-                    const ROUTER_NODE& last = simplified[simplified.size() - 1];
-
-                    if( first.layer == middle.layer && middle.layer == last.layer
-                        && ( middle.point.x - first.point.x ) * ( last.point.y - middle.point.y )
-                                   == ( middle.point.y - first.point.y )
-                                              * ( last.point.x - middle.point.x )
-                        && isSegmentAllowed( first.point, last.point, first.layer, aStart.netCode,
-                                             false,
-                                             netTrackRadius( aStart.netCode ),
-                                             netTrackRadius( aStart.netCode ) ) )
-                    {
-                        simplified.erase( simplified.end() - 2 );
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-            }
-
-            result.nodes = std::move( simplified );
-
-            if( !assignViaStyles( result ) )
-                continue;
-
-            logSearchState( "END search route found" );
-            return result;
-        }
-
-        if( reachedFanoutDrill )
-        {
-            ROUTING_CONNECTION result;
-            result.netCode = aStart.netCode;
-            result.complete = true;
-            result.isFanoutConnection = true;
-            result.cost = current.g;
-
-            ROUTER_NODE cursor = current.node;
-            while( true )
-            {
-                result.nodes.push_back( cursor );
-                const auto previous = cameFrom.find( cursor );
-                if( previous == cameFrom.end() )
-                    break;
-                cursor = previous->second;
-            }
-            std::reverse( result.nodes.begin(), result.nodes.end() );
-            result.fromPadIndex = startOwners.at( result.nodes.front() );
-
-            if( !assignViaStyles( result ) )
-                continue;
-
-            logSearchState( "END fanout search at first drill" );
-            return result;
-        }
-
-        auto nextNodes = adaptiveNeighbours( current.node, aTarget, landmarks, aStart.netCode );
-        for( const ROUTING_TERMINAL& terminal : targets )
-        {
-            if( !isOnPadLayer( terminal.pad, current.node.layer ) )
-                continue;
-            const ROUTER_NODE node{ terminalPoint( terminal, current.node.point ), current.node.layer };
-            if( node != current.node
-                && std::find( nextNodes.begin(), nextNodes.end(), node ) == nextNodes.end() )
-                nextNodes.push_back( node );
-        }
-        for( const ROUTER_NODE& next : nextNodes )
-        {
-            const bool via = next.layer != current.node.layer;
-
-            if( fanoutSearch && next.layer == aTarget.fanoutSourceLayer
-                && aTarget.fanoutMaxEscapeLength > 0
-                && distance( next.point, aStart.position )
-                           > static_cast<double>( aTarget.fanoutMaxEscapeLength ) )
-            {
-                continue;
-            }
-
-            if( via )
-            {
-                if( fanoutSearch
-                    && distance( current.node.point, aStart.position )
-                               < static_cast<double>( std::max<std::int64_t>(
-                                       0, aTarget.fanoutMinEscapeLength ) ) )
-                {
-                    continue;
-                }
-                // ViaInfo.attachSmdAllowed is profile-local.  A later entry
-                // may legally attach even when an earlier one cannot.
-                const bool attachesToSmd = std::any_of(
-                        starts.begin(), starts.end(), [&]( const auto& terminal )
-                        {
-                            return terminal.pad.isSmd
-                                   && terminal.pad.position == current.node.point;
-                        } );
-                if( !SelectViaStyle( aStart.netCode, current.node, next,
-                                     attachesToSmd ) )
-                    continue;
-            }
-            else if( !isSegmentAllowedFromKnownStart( current.node.point, next.point, next.layer,
-                                                      aStart.netCode, false ) )
-            {
-                continue;
-            }
-
-            const int usage = via ? 0
-                                   : m_occupancy.SegmentUsage( current.node, next,
-                                                                aStart.netCode );
-            const double bend = ( !via && current.node.point != next.point )
-                                        ? static_cast<double>( m_settings.bendCost )
-                                        : 0.0;
-            const double moveCost = via ? control.ViaCost()
-                                        : control.TraceCost( distance( current.node.point,
-                                                                       next.point ) )
-                                                  + control.CongestionCost( usage )
-                                                  + control.DirectionCost( next.layer,
-                                                                           current.node.point,
-                                                                           next.point )
-                                                  + bend;
-            const double newCost = current.g + moveCost;
-
-            auto nextBestIt = bestCost.find( next );
-
-            if( nextBestIt != bestCost.end() && nextBestIt->second <= newCost )
-                continue;
-
-            bestCost[next] = newCost;
-            cameFrom[next] = current.node;
-            open.push( { next, newCost,
-                         newCost + heuristic( next, aTarget.position, next.layer, control ),
-                         sequence++ } );
-        }
-    }
-
-    logSearchState( "END search exhausted" );
-    return std::nullopt;
 }
 
 } // namespace KICAD_AUTOROUTER

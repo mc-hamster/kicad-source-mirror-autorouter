@@ -31,12 +31,6 @@ namespace KICAD_AUTOROUTER
 class MAZE_EXPANSION_ENGINE
 {
 public:
-    // Legacy fallback's coordinate neighbours. The room/drill frontier below
-    // does not use these cells as its routing state.
-    static std::vector<ROUTER_NODE> Neighbours(
-            const ROUTER_NODE& aNode, std::int64_t aGridStep,
-            const std::vector<ROUTER_LAYER_SETTINGS>& aLayers, bool aAllowVias );
-
     struct COST { double expansion; double sorting; FLOAT_POINT entry; };
 
     static FLOAT_POINT Nearest( ROUTER_BOX aShape, FLOAT_POINT aFrom )

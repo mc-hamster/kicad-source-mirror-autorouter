@@ -5974,7 +5974,7 @@ BOOST_AUTO_TEST_CASE( RoomDrillSearchDoesNotTreatBlindViaAsThroughVia )
     MAZE_SEARCH_ENGINE engine( board, settings, occupancy );
     int expanded = 0;
     const auto found = engine.FindConnection( board.pads[0], board.pads[1], 0,
-                                               expanded, {}, {}, {}, {}, false );
+                                               expanded, {}, {}, {}, {} );
     BOOST_REQUIRE( found );
     BOOST_REQUIRE_EQUAL( found->edgeStyles.size(), found->nodes.size() - 1 );
     const auto via = std::find_if(

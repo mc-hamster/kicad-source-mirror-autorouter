@@ -146,10 +146,12 @@ fixed-direction path remains selected for this board, so this also guards
 against accidental ordinary-board drift.
 
 Production routing no longer falls back to the legacy grid/visibility search.
-All pipeline and optimizer calls now default to the translated room/door/drill
+All pipeline and optimizer calls now use the translated room/door/drill
 frontier and fail closed when that frontier cannot produce a legal path. The
-old implementation remains isolated behind an explicit test/debug argument
-while it is removed in a later cleanup. Removing that fallback exposed six
+old A* cells, adaptive visibility neighbours, board-wide landmarks, heuristic,
+backtracking path and public fallback switch have been physically removed from
+`MazeSearchEngine`; engine construction no longer builds the unused landmark
+index. Removing that fallback exposed six
 real coverage gaps. They are now closed in the translated path: concave
 polygons and polygons with holes are triangulated into exact solid convex room
 obstacles while holes remain free; fanout escape-annulus drill candidates pass
@@ -348,9 +350,9 @@ item shove, layer-specific padstack shapes/clearance classes, host capture of
 every configured non-through ViaRule, optimizer moves for arbitrary contact
 graphs/exact source trace mutation, and true parallel optimizer scheduling
 remain open.
-The retired legacy visibility/raster code still exists behind an explicit
-non-production argument and uses compatibility cost units; no production
-caller enables it.
+The old standalone `ExpansionGraph` and `LegacyDestinationDistance` helpers
+remain only as historical QA targets; `MazeSearchEngine` no longer references
+or executes them.
 
 Target-item expansion no longer discards an oblique connected trace to its two
 endpoints. The rectangular room frontier preserves complete start and target

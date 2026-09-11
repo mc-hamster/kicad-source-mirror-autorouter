@@ -21,9 +21,8 @@
  * Freerouting equivalent: autoroute/maze/MazeSearchEngine.java and
  * autoroute/maze/MazeExpansionEngine.java.
  *
- * Single-layer and multilayer paths first try the rectangular room/drill slice.
- * Unsupported or rejected proposals still use the experimental grid/visibility engine;
- * neither the combined implementation nor its cost model is at upstream parity.
+ * Single-layer and multilayer paths use the translated room/door/drill
+ * frontier. Unsupported or rejected geometry fails closed.
  */
 
 #pragma once
@@ -39,7 +38,6 @@
 
 #include "../board/facade/RoutingBoard.h"
 #include "AutorouteControl.h"
-#include "LegacyDestinationDistance.h"
 #include "MazeExpansionEngine.h"
 #include "MazeSearchEngine90Degree.h"
 
@@ -162,8 +160,7 @@ public:
                                                        const ROUTER_CANCEL_CALLBACK& aCancel,
                                                        const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
                                                        const std::vector<ROUTING_TERMINAL>& aStarts = {},
-                                                       const std::vector<ROUTING_TERMINAL>& aTargets = {},
-                                                       bool aAllowLegacyFallback = false ) const;
+                                                       const std::vector<ROUTING_TERMINAL>& aTargets = {} ) const;
 
     // Retry searches may temporarily cross committed routes.  Resolve those
     // crossings with the same netclass, layer-span, copper, and drill rules
@@ -273,30 +270,6 @@ private:
     // conflict discovery and transactional insertion remain authoritative.
     mutable bool m_useRoutableObstacleRooms = false;
 
-    struct OPEN_NODE
-    {
-        ROUTER_NODE node;
-        double      g = 0.0;
-        double      f = 0.0;
-        std::size_t sequence = 0;
-    };
-
-    struct OPEN_NODE_COMPARE
-    {
-        bool operator()( const OPEN_NODE& aLeft, const OPEN_NODE& aRight ) const
-        {
-            if( aLeft.f != aRight.f )
-                return aLeft.f > aRight.f;
-
-            return aLeft.sequence > aRight.sequence;
-        }
-    };
-
-    struct NODE_KEY_HASH
-    {
-        std::size_t operator()( const ROUTER_NODE& aNode ) const noexcept;
-    };
-
     bool isLayerEnabled( int aLayer ) const;
     bool isPureSmdNet( int aNetCode ) const;
     int  layerOrdinal( int aLayer ) const;
@@ -367,39 +340,19 @@ private:
     void collectObstacleIndices( int aLayer, const ROUTER_BOX& aQuery,
                                  std::vector<std::size_t>& aResult ) const;
 
-    std::vector<ROUTER_NODE> neighbours( const ROUTER_NODE& aNode ) const;
-    std::vector<ROUTER_NODE> adaptiveNeighbours(
-            const ROUTER_NODE& aNode, const ROUTING_PAD& aTarget,
-            const std::vector<ROUTER_NODE>& aLandmarks, int aNetCode ) const;
-    std::vector<ROUTER_NODE> buildLandmarks( const ROUTING_PAD& aStart,
-                                             const ROUTING_PAD& aTarget,
-                                             int aNetCode ) const;
-    double heuristic( const ROUTER_NODE& aNode, const ROUTER_POINT& aTarget,
-                      int aTargetLayer, const AUTOROUTE_CONTROL& aControl ) const;
-    bool canFinish( const ROUTER_NODE& aNode, const ROUTING_PAD& aTarget,
-                    int aNetCode ) const;
     bool assignViaStyles( ROUTING_CONNECTION& aConnection ) const;
 
 private:
     const BOARD_SNAPSHOT&     m_board;
     const AUTOROUTER_SETTINGS& m_settings;
     ROUTING_OCCUPANCY&        m_occupancy;
-    mutable std::int64_t       m_activeGridStep;
     // Negotiated-congestion retries may temporarily cross committed copper;
     // the batch layer removes the specific conflicting connections from the
     // occupancy map when the candidate is accepted.
     mutable bool m_allowRipupOccupancy = false;
-    mutable LEGACY_DESTINATION_DISTANCE m_legacyDestinationDistance;
     std::unordered_map<int, std::vector<std::size_t>> m_obstaclesByLayer;
     std::unordered_map<ROUTER_CELL_KEY, std::vector<std::size_t>, ROUTER_CELL_HASH>
             m_obstaclesBySpatialCell;
-    // Visibility landmarks use the same coarse spatial partition as
-    // obstacles.  The expansion graph is deliberately board-wide, but a
-    // frontier element should only sort landmarks in the nearby rooms; a
-    // full scan of all 2048 landmarks for every A* node turns a large board
-    // into an accidental quadratic search.
-    std::unordered_map<ROUTER_CELL_KEY, std::vector<std::size_t>, ROUTER_CELL_HASH>
-            m_landmarksBySpatialCell;
     std::unordered_map<int, std::vector<std::size_t>> m_largeObstaclesByLayer;
     std::int64_t m_obstacleBucketSize = 1;
     std::int64_t m_maxObstacleSearchInflation = 0;
@@ -427,11 +380,6 @@ private:
     // distinguishing same-net holes from foreign drills.  Cache the result by
     // net and position instead of rescanning every net's pad list per query.
     std::unordered_map<ROUTER_CELL_KEY, std::int64_t, ROUTER_CELL_HASH> m_endpointRadii;
-    // Obstacle corners, board boundaries, pad locations and drill-page
-    // centres are independent of the connection being routed.  Keep one
-    // immutable visibility-landmark set per search engine instead of
-    // rebuilding it for every pad pair on a large board.
-    std::vector<ROUTER_NODE> m_baseLandmarks;
     mutable std::map<std::tuple<int, int, int>, std::int64_t> m_pairClearances;
 };
 
