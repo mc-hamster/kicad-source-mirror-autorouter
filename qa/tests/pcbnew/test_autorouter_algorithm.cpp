@@ -693,6 +693,33 @@ BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
 }
 
 
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeSmallDoorMatchesSourceWidthGate )
+{
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM left(
+            1, 0, PLANAR::INT_OCTAGON::FromBox( { 0, 0, 100, 100 } ) );
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM right(
+            2, 0, PLANAR::INT_OCTAGON::FromBox( { 100, 20, 200, 80 } ) );
+    EXPANSION_DOOR lineDoor( &left, &right );
+    BOOST_REQUIRE_EQUAL( lineDoor.GetDimension(), 1 );
+    BOOST_CHECK( lineDoor.IsSmallFor45DegreeTrace( 61 ) );
+    BOOST_CHECK( !lineDoor.IsSmallFor45DegreeTrace( 60 ) );
+
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM overlap(
+            3, 0, PLANAR::INT_OCTAGON::FromBox( { 90, 0, 200, 100 } ) );
+    EXPANSION_DOOR overlapDoor( &left, &overlap );
+    BOOST_REQUIRE_EQUAL( overlapDoor.GetDimension(), 2 );
+    BOOST_CHECK( overlapDoor.IsSmallFor45DegreeTrace( 101 ) );
+    BOOST_CHECK( !overlapDoor.IsSmallFor45DegreeTrace( 100 ) );
+
+    OBSTACLE_EXPANSION_ROOM obstacle(
+            4, 0, PLANAR::INT_OCTAGON::FromBox( { 90, 0, 200, 100 } ),
+            1, 1 );
+    EXPANSION_DOOR obstacleDoor( &left, &obstacle );
+    BOOST_REQUIRE_EQUAL( obstacleDoor.GetDimension(), 2 );
+    BOOST_CHECK( !obstacleDoor.IsSmallFor45DegreeTrace( 1000 ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( GeneralExpansionDoorMatchesPinnedFreerouting )
 {
     using PLANAR::LINE;

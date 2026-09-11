@@ -34,6 +34,8 @@ public:
     ROUTER_BOX            GetShape() const;
     PLANAR::INT_OCTAGON   GetOctagonShape() const;
     PLANAR::SIMPLEX       GetSimplexShape() const;
+    /** Freerouting MazeSearchEngine.doorIsSmall for a 45-degree frontier. */
+    bool                  IsSmallFor45DegreeTrace( double aTraceWidth ) const;
     // Tolerance is explicit because KiCad IU and reference coordinates differ.
     std::vector<FLOAT_LINE> GetSectionSegments( double aOffset, double aTolerance = 2,
                                                double aMaxSectionWidth = 0,

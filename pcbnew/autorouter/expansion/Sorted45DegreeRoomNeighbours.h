@@ -47,6 +47,15 @@ public:
     std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> ObstacleIncompleteRooms(
             const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer ) const;
 
+    /** Run the source y-up boundary cycle for geometry held in KiCad y-down
+     * coordinates, then reflect the generated rooms back to KiCad. */
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
+    IncompleteRoomsForYDownCoordinates(
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer ) const;
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
+    ObstacleIncompleteRoomsForYDownCoordinates(
+            const PLANAR::INT_OCTAGON& aBoardBounds, int aLayer ) const;
+
 private:
     static int compare( const NEIGHBOUR& aLeft, const NEIGHBOUR& aRight );
     void addNeighbour( const SHAPE_TREE_ENTRY& aEntry,

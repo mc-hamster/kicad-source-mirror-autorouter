@@ -274,12 +274,28 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             return path;
         }
 
-        if( current.door && !occupied.emplace( current.door, current.section ).second )
+        // Match MazeSearchEngine.occupyNextElement(): occupation is delayed
+        // until room expansion actually produced work.  A small/thin entry
+        // that expands nothing remains available from another queue entry.
+        if( current.door && occupied.contains( { current.door, current.section } ) )
             continue;
         ++aMetrics.sections;
         search.completeNeighbours( current.room );
         if( search.stopped() )
             return std::nullopt;
+
+        if( current.door
+            && current.door->IsSmallFor45DegreeTrace(
+                    2 * ( aSectionOffset
+                          + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) ) )
+        {
+            EXPANSION_ROOM* fromRoom =
+                    current.door->OtherRoom( current.room->shape.get() );
+            if( !dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( fromRoom ) )
+                continue;
+        }
+
+        bool somethingExpanded = false;
         const FLOAT_POINT from = current.entry.Middle();
         for( std::size_t targetIndex = 0; targetIndex < aTargets.size(); ++targetIndex )
         {
@@ -294,10 +310,14 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             push( { nullptr, nullptr, 0, { to, to }, g, g, index,
                     current.owner, target.owner,
                     static_cast<std::uint32_t>( aStarts.size() + targetIndex + 1 ) } );
+            somethingExpanded = true;
         }
 
         for( EXPANSION_DOOR* door : current.room->shape->GetDoors() )
         {
+            if( door == current.door )
+                continue;
+
             ROOM* next = search.byShape.at(
                     door->OtherRoom( current.room->shape.get() ) );
             if( !next->complete || !next->active )
@@ -367,8 +387,12 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                           { "sorting_value", std::to_string( g + distance( to ) ) } } );
                 push( { next, door, section, sections[section], g,
                         g + distance( to ), index, current.owner, {}, 0, ripupCost } );
+                somethingExpanded = true;
             }
         }
+
+        if( current.door && somethingExpanded )
+            occupied.emplace( current.door, current.section );
     }
 
     if( autorouterDebugEnabled() )

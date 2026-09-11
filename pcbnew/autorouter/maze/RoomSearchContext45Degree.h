@@ -105,8 +105,9 @@ public:
             } );
             SORTED_45_DEGREE_ROOM_NEIGHBOURS sorted(
                     obstacleRoom->shape->GetOctagon(), entries );
-            for( const auto& gap : sorted.ObstacleIncompleteRooms(
-                         PLANAR::INT_OCTAGON::FromBox( tree.Bounds() ), layer ) )
+            const auto gaps = sorted.ObstacleIncompleteRoomsForYDownCoordinates(
+                    PLANAR::INT_OCTAGON::FromBox( tree.Bounds() ), layer );
+            for( const auto& gap : gaps )
             {
                 door( obstacleRoom, incomplete( gap ) );
             }
@@ -258,8 +259,9 @@ public:
             for( const SHAPE_TREE_ENTRY& entry : entries )
                 if( entry.isRoom )
                     door( result, byId.at( entry.objectId ) );
-            for( const auto& gap : sorted.IncompleteRooms(
-                         PLANAR::INT_OCTAGON::FromBox( tree.Bounds() ), layer ) )
+            const auto gaps = sorted.IncompleteRoomsForYDownCoordinates(
+                    PLANAR::INT_OCTAGON::FromBox( tree.Bounds() ), layer );
+            for( const auto& gap : gaps )
             {
                 door( result, incomplete( gap ) );
             }

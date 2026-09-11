@@ -12,6 +12,7 @@
 #include "ExpansionDoor.h"
 
 #include <algorithm>
+#include <cmath>
 
 
 namespace KICAD_AUTOROUTER
@@ -89,6 +90,22 @@ PLANAR::SIMPLEX EXPANSION_DOOR::GetSimplexShape() const
     // Simplex operands that means second-room supports are concatenated first;
     // stable equal-direction normalization keeps that anchor identity.
     return m_secondRoom->GetSimplex().Intersection( m_firstRoom->GetSimplex() );
+}
+
+
+bool EXPANSION_DOOR::IsSmallFor45DegreeTrace( double aTraceWidth ) const
+{
+    if( !std::isfinite( aTraceWidth ) || aTraceWidth < 0 )
+        return true;
+
+    const bool freeSpaceOverlap = m_firstRoom && m_secondRoom
+                                  && m_firstRoom->IsCompleteFreeSpace()
+                                  && m_secondRoom->IsCompleteFreeSpace();
+    if( m_dimension != 1 && !freeSpaceOverlap )
+        return false;
+
+    const PLANAR::INT_OCTAGON shape = GetOctagonShape();
+    return shape.IsEmpty() || shape.MaxWidth() < aTraceWidth;
 }
 
 

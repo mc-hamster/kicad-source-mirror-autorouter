@@ -45,6 +45,74 @@ SORTED_45_DEGREE_ROOM_NEIGHBOURS::SORTED_45_DEGREE_ROOM_NEIGHBOURS(
 }
 
 
+namespace
+{
+INT_OCTAGON reflectY( const INT_OCTAGON& aShape )
+{
+    return INT_OCTAGON(
+            aShape.leftX, -aShape.topY, aShape.rightX, -aShape.bottomY,
+            aShape.lowerLeftDiagonalX, aShape.upperRightDiagonalX,
+            aShape.upperLeftDiagonalX, aShape.lowerRightDiagonalX );
+}
+
+
+std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> reflectY(
+        const std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>& aRooms )
+{
+    std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> result;
+    result.reserve( aRooms.size() );
+    for( const auto& room : aRooms )
+        result.push_back( { reflectY( room.shape ), room.layer,
+                            reflectY( room.containedShape ) } );
+    return result;
+}
+} // namespace
+
+
+std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
+SORTED_45_DEGREE_ROOM_NEIGHBOURS::IncompleteRoomsForYDownCoordinates(
+        const INT_OCTAGON& aBoardBounds, int aLayer ) const
+{
+    std::vector<SHAPE_TREE_ENTRY> sourceEntries;
+    sourceEntries.reserve( m_neighbours.size() );
+    for( const NEIGHBOUR& neighbour : m_neighbours )
+    {
+        SHAPE_TREE_ENTRY entry = neighbour.entry;
+        const INT_OCTAGON sourceShape = reflectY( neighbour.shape );
+        entry.shape = sourceShape.BoundingBox();
+        entry.octagon = sourceShape;
+        sourceEntries.push_back( std::move( entry ) );
+    }
+
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
+            reflectY( m_room ), sourceEntries );
+    return reflectY( sourceOrder.IncompleteRooms(
+            reflectY( aBoardBounds ), aLayer ) );
+}
+
+
+std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
+SORTED_45_DEGREE_ROOM_NEIGHBOURS::ObstacleIncompleteRoomsForYDownCoordinates(
+        const INT_OCTAGON& aBoardBounds, int aLayer ) const
+{
+    std::vector<SHAPE_TREE_ENTRY> sourceEntries;
+    sourceEntries.reserve( m_neighbours.size() );
+    for( const NEIGHBOUR& neighbour : m_neighbours )
+    {
+        SHAPE_TREE_ENTRY entry = neighbour.entry;
+        const INT_OCTAGON sourceShape = reflectY( neighbour.shape );
+        entry.shape = sourceShape.BoundingBox();
+        entry.octagon = sourceShape;
+        sourceEntries.push_back( std::move( entry ) );
+    }
+
+    const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
+            reflectY( m_room ), sourceEntries );
+    return reflectY( sourceOrder.ObstacleIncompleteRooms(
+            reflectY( aBoardBounds ), aLayer ) );
+}
+
+
 void SORTED_45_DEGREE_ROOM_NEIGHBOURS::addNeighbour(
         const SHAPE_TREE_ENTRY& aEntry, const INT_OCTAGON& aShape,
         const INT_OCTAGON& aIntersection )

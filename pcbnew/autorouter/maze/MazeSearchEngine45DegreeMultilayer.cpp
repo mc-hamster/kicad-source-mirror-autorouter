@@ -656,7 +656,13 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             }
             continue;
         }
-        if( current.door && !occupied.emplace( current.door, current.section ).second )
+        // Freerouting only occupies the section after expandToRoomDoors()
+        // reports that something was expanded.  In particular, entering a
+        // room through a small or thin door may deliberately produce no work;
+        // that section must remain available to a cheaper/later frontier
+        // entry.  Occupying it here, at pop time, suppressed that retry and
+        // changed deterministic maze ordering.
+        if( current.door && occupied.contains( { current.door, current.section } ) )
             continue;
         ++metrics.sections;
         const std::size_t doorsBeforeCompletion =
@@ -690,6 +696,25 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                     std::to_string( current.room->shape->GetDoors().size() ) } } );
         if( stopped() )
             return std::nullopt;
+
+        // MazeSearchEngine.expandToRoomDoors does not leave a free-space room
+        // through a door narrower than the compensated trace diameter.  It
+        // completes the room first (the topology mutation above is still
+        // required), then leaves that entry unexpanded so another section can
+        // reach it.  Obstacle entries are handled by the shove/rip-up path and
+        // therefore are not rejected by this free-space guard.
+        if( current.door
+            && current.door->IsSmallFor45DegreeTrace(
+                    2 * ( sectionOffset
+                          + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) ) )
+        {
+            EXPANSION_ROOM* fromRoom =
+                    current.door->OtherRoom( current.room->shape.get() );
+            if( !dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( fromRoom ) )
+                continue;
+        }
+
+        bool somethingExpanded = false;
         int targetId = targetIdBase;
         for( std::size_t i = 0; i < current.layer; ++i )
             targetId += layers[i].targets.size();
@@ -727,14 +752,13 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             state.f = state.g; state.parent = index; state.owner = current.owner;
             state.targetOwner = target.owner; state.itemId = targetId;
             push( state );
+            // Java's expandToTargetDoors() reports expansion after assigning
+            // an otherwise valid, unoccupied target section; TreeSet
+            // deduplication does not change that return value.
+            somethingExpanded = true;
         }
-        // Freerouting evaluates the counter-clockwise neighbour list in its
-        // y-up board coordinates.  KiCad's native board coordinates are
-        // y-down, so the directly translated room builder stores the same
-        // geometric cycle in reverse.  Traverse it backwards to preserve the
-        // source door/section insertion order and queue tie-breaks.
         const auto& roomDoors = current.room->shape->GetDoors();
-        for( auto doorIt = roomDoors.rbegin(); doorIt != roomDoors.rend(); ++doorIt )
+        for( auto doorIt = roomDoors.begin(); doorIt != roomDoors.end(); ++doorIt )
         {
             auto* door = *doorIt;
             // AutorouteEngine.occupyNextElement() never expands the door by
@@ -815,6 +839,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                           { "expansion_value", std::to_string( state.g ) },
                           { "sorting_value", std::to_string( state.f ) } } );
                 push( state );
+                somethingExpanded = true;
             }
         }
         // The reference normally reaches the next page through a room door.
@@ -834,7 +859,11 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                 state.page = page; state.section = current.layer; state.entry = current.entry;
                 state.g = cost.expansion; state.f = cost.sorting; state.parent = index; state.owner = current.owner;
                 push( state );
+                somethingExpanded = true;
             }
+
+        if( current.door && somethingExpanded )
+            occupied.emplace( current.door, current.section );
     }
     if( autorouterDebugEnabled() )
     {
