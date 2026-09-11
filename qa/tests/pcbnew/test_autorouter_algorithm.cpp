@@ -3749,6 +3749,54 @@ BOOST_AUTO_TEST_CASE( TraceCombineUsesAddedTraceIdentityAndStartBeforeEndOrder )
 }
 
 
+BOOST_AUTO_TEST_CASE( CycleNormalizationRemovesTheCompleteSourceConnectionAtomically )
+{
+    auto board = makeBoard();
+    ROUTING_BOARD copper( board, makeSettings() );
+    const auto fixedItems = copper.ItemCount();
+    const std::array<ROUTER_POINT, 4> corners = {
+        ROUTER_POINT{ 2000000, 1000000 }, ROUTER_POINT{ 4000000, 1000000 },
+        ROUTER_POINT{ 4000000, 2500000 }, ROUTER_POINT{ 2000000, 2500000 } };
+    std::array<ROUTING_CONNECTION, 4> edges;
+    for( std::size_t index = 0; index < edges.size(); ++index )
+    {
+        edges[index].netCode = 1;
+        edges[index].complete = true;
+        edges[index].nodes = { { corners[index], 0 },
+                               { corners[( index + 1 ) % corners.size()], 0 } };
+        edges[index].edgeStyles = { ROUTING_EDGE_STYLE{} };
+        edges[index].edgeStyles.front().trackWidth = 100000
+                                                     + static_cast<std::int64_t>( index ) * 10000;
+    }
+
+    for( std::size_t index = 0; index < 3; ++index )
+        copper.AddRoute( edges[index] );
+    std::array<std::vector<ROUTING_BOARD::ITEM_ID>, 3> before;
+    for( std::size_t index = 0; index < before.size(); ++index )
+    {
+        before[index] = copper.RouteItems( edges[index] );
+        BOOST_REQUIRE_EQUAL( before[index].size(), 1U );
+    }
+
+    {
+        ROUTING_BOARD::TRANSACTION transaction( copper );
+        copper.AddRoute( edges.back() );
+        for( const auto& edge : edges )
+            BOOST_CHECK( copper.RouteItems( edge ).empty() );
+        BOOST_CHECK_EQUAL( copper.ItemCount(), fixedItems );
+    }
+    for( std::size_t index = 0; index < before.size(); ++index )
+        BOOST_CHECK( copper.RouteItems( edges[index] ) == before[index] );
+    BOOST_CHECK( copper.RouteItems( edges.back() ).empty() );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), fixedItems + 3 );
+
+    copper.AddRoute( edges.back() );
+    for( const auto& edge : edges )
+        BOOST_CHECK( copper.RouteItems( edge ).empty() );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), fixedItems );
+}
+
+
 BOOST_AUTO_TEST_CASE( ConnectionGetUsesSourcePolylineItemsForksAndReverseIdOrder )
 {
     auto board = makeBoard();

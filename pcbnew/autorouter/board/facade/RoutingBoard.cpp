@@ -279,6 +279,123 @@ struct ROUTING_BOARD::IMPL
         return result;
     }
 
+    std::optional<ROUTER_POINT> normalContactPoint( ITEM_ID first, ITEM_ID second ) const
+    {
+        const auto left = items.find( first ), right = items.find( second );
+        if( left == items.end() || right == items.end() || first == second )
+            return {};
+        return left->second.normal.Point( right->second.normal );
+    }
+
+    int firstCommonLayer( ITEM_ID first, ITEM_ID second ) const
+    {
+        const auto left = items.find( first ), right = items.find( second );
+        if( left == items.end() || right == items.end() || first == second )
+            return -1;
+
+        int result = std::numeric_limits<int>::max();
+        for( int layer : left->second.normal.layers )
+        {
+            if( std::find( right->second.normal.layers.begin(),
+                           right->second.normal.layers.end(), layer )
+                != right->second.normal.layers.end() )
+            {
+                result = std::min( result, layer );
+            }
+        }
+        return result == std::numeric_limits<int>::max() ? -1 : result;
+    }
+
+    ITEM_ID_SET connectionItems( ITEM_ID id ) const
+    {
+        const auto source = items.find( id );
+        if( source == items.end() || !source->second.routable )
+            return {};
+
+        ITEM_ID_SET result{ id };
+        for( ITEM_ID currentId : source->second.normalContacts )
+        {
+            std::optional<ROUTER_POINT> previousPoint = normalContactPoint( id, currentId );
+            if( !previousPoint )
+                continue;
+
+            int previousLayer = firstCommonLayer( id, currentId );
+            if( source->second.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE
+                && normalContactsAt( id, *previousPoint ).size() != 1 )
+            {
+                continue;
+            }
+
+            ITEM_ID_SET visited{ id };
+            for( ;; )
+            {
+                const auto current = items.find( currentId );
+                if( current == items.end() || !current->second.routable )
+                    break;
+
+                result.insert( currentId );
+                visited.insert( currentId );
+                std::optional<ITEM_ID> next;
+                std::optional<ROUTER_POINT> nextPoint;
+                int nextLayer = -1;
+                bool forkFound = false;
+
+                for( ITEM_ID contact : current->second.normalContacts )
+                {
+                    const int contactLayer = firstCommonLayer( currentId, contact );
+                    if( contactLayer < 0 )
+                        continue;
+
+                    const auto contactPoint = normalContactPoint( currentId, contact );
+                    if( !contactPoint )
+                    {
+                        forkFound = true;
+                        break;
+                    }
+
+                    if( contactLayer != previousLayer || *contactPoint != *previousPoint )
+                    {
+                        if( next )
+                        {
+                            forkFound = true;
+                            break;
+                        }
+                        next = contact;
+                        nextPoint = contactPoint;
+                        nextLayer = contactLayer;
+                    }
+                }
+
+                if( !next || forkFound || visited.contains( *next ) )
+                    break;
+
+                currentId = *next;
+                previousPoint = nextPoint;
+                previousLayer = nextLayer;
+            }
+        }
+        return result;
+    }
+
+    std::optional<ITEM_ID> traceTailAt( ROUTER_POINT location, int layer, int net ) const
+    {
+        for( const auto& [id, item] : items )
+        {
+            if( item.net != net || item.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
+                || std::find( item.normal.layers.begin(), item.normal.layers.end(), layer )
+                           == item.normal.layers.end() )
+            {
+                continue;
+            }
+            if( ( item.normal.first == location || item.normal.last == location )
+                && normalContactsAt( id, location ).empty() )
+            {
+                return id;
+            }
+        }
+        return {};
+    }
+
     void removeItemFromRoutes( ITEM_ID id )
     {
         for( auto& route : routes )
@@ -472,8 +589,48 @@ struct ROUTING_BOARD::IMPL
         {
             return false;
         }
-        removeItem( id );
-        removeItemFromRoutes( id );
+
+        const ROUTER_POINT endpoints[] = { trace->second.normal.first,
+                                           trace->second.normal.last };
+        const int layer = trace->second.normal.layers.empty()
+                ? -1 : trace->second.normal.layers.front();
+        const int net = trace->second.net;
+        const bool tailBefore[] = { traceTailAt( endpoints[0], layer, net ).has_value(),
+                                    traceTailAt( endpoints[1], layer, net ).has_value() };
+        const ITEM_ID_SET cycleConnection = connectionItems( id );
+        for( ITEM_ID itemId : cycleConnection )
+        {
+            removeItem( itemId );
+            removeItemFromRoutes( itemId );
+        }
+
+        // BasicBoard.removeIfCycle removes a tail manufactured at either
+        // endpoint only when there was no tail there before the cycle was
+        // deleted.  This prevents normalization from leaving disconnected
+        // fragments of the removed connection.
+        for( int endpoint = 0; endpoint < 2; ++endpoint )
+        {
+            if( tailBefore[endpoint] )
+                continue;
+            const auto tail = traceTailAt( endpoints[endpoint], layer, net );
+            if( !tail )
+                continue;
+            const ITEM_ID_SET tailConnection = connectionItems( *tail );
+            const bool removable = std::all_of(
+                    tailConnection.begin(), tailConnection.end(), [&]( ITEM_ID itemId )
+                    {
+                        const auto found = items.find( itemId );
+                        return found != items.end() && found->second.dynamic
+                               && found->second.routable && found->second.route;
+                    } );
+            if( !removable )
+                continue;
+            for( ITEM_ID itemId : tailConnection )
+            {
+                removeItem( itemId );
+                removeItemFromRoutes( itemId );
+            }
+        }
         return true;
     }
 
@@ -1299,26 +1456,13 @@ ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetNormalContacts( ITEM_ID id ) const
 
 std::optional<ROUTER_POINT> ROUTING_BOARD::NormalContactPoint( ITEM_ID first, ITEM_ID second ) const
 {
-    const auto a = m_impl->items.find( first ), b = m_impl->items.find( second );
-    if( a == m_impl->items.end() || b == m_impl->items.end() || first == second )
-        return {};
-    return a->second.normal.Point( b->second.normal );
+    return m_impl->normalContactPoint( first, second );
 }
 
 
 int ROUTING_BOARD::FirstCommonLayer( ITEM_ID first, ITEM_ID second ) const
 {
-    const auto a = m_impl->items.find( first ), b = m_impl->items.find( second );
-    if( a == m_impl->items.end() || b == m_impl->items.end() || first == second )
-        return -1;
-
-    int result = std::numeric_limits<int>::max();
-    for( int layer : a->second.normal.layers )
-        if( std::find( b->second.normal.layers.begin(), b->second.normal.layers.end(), layer )
-            != b->second.normal.layers.end() )
-            result = std::min( result, layer );
-
-    return result == std::numeric_limits<int>::max() ? -1 : result;
+    return m_impl->firstCommonLayer( first, second );
 }
 
 
@@ -1349,76 +1493,7 @@ ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
 
 ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetConnectionItems( ITEM_ID id ) const
 {
-    const auto source = m_impl->items.find( id );
-    if( source == m_impl->items.end() || !source->second.routable )
-        return {};
-
-    ITEM_ID_SET result{ id };
-    for( ITEM_ID currentId : source->second.normalContacts )
-    {
-        std::optional<ROUTER_POINT> previousPoint = NormalContactPoint( id, currentId );
-        if( !previousPoint )
-            continue;
-
-        int previousLayer = FirstCommonLayer( id, currentId );
-        if( source->second.normal.kind == NORMAL_CONTACT_ITEM::KIND::TRACE
-            && NormalContactsAt( id, *previousPoint ).size() != 1 )
-        {
-            continue;
-        }
-
-        // Item.getConnectionItems() walks through exactly one contact away
-        // from the point it entered. A second outgoing contact is a fork and
-        // ends this side of the connection without consuming either branch.
-        ITEM_ID_SET visited{ id };
-        for( ;; )
-        {
-            const auto current = m_impl->items.find( currentId );
-            if( current == m_impl->items.end() || !current->second.routable )
-                break;
-
-            result.insert( currentId );
-            visited.insert( currentId );
-            std::optional<ITEM_ID> next;
-            std::optional<ROUTER_POINT> nextPoint;
-            int nextLayer = -1;
-            bool forkFound = false;
-
-            for( ITEM_ID contact : current->second.normalContacts )
-            {
-                const int contactLayer = FirstCommonLayer( currentId, contact );
-                if( contactLayer < 0 )
-                    continue;
-
-                const auto contactPoint = NormalContactPoint( currentId, contact );
-                if( !contactPoint )
-                {
-                    forkFound = true;
-                    break;
-                }
-
-                if( contactLayer != previousLayer || *contactPoint != *previousPoint )
-                {
-                    if( next )
-                    {
-                        forkFound = true;
-                        break;
-                    }
-                    next = contact;
-                    nextPoint = contactPoint;
-                    nextLayer = contactLayer;
-                }
-            }
-
-            if( !next || forkFound || visited.contains( *next ) )
-                break;
-
-            currentId = *next;
-            previousPoint = nextPoint;
-            previousLayer = nextLayer;
-        }
-    }
-    return result;
+    return m_impl->connectionItems( id );
 }
 
 

@@ -436,11 +436,11 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
             if( first.layer == second.layer || first.point != second.point )
                 continue;
             const ROUTING_CONNECTION original = connection;
+            ROUTING_OCCUPANCY::TRANSACTION edit( m_occupancy );
             m_occupancy.Remove( original );
             if( !RemoveRouteEndpoint( connection, front ) )
             {
                 connection = original;
-                m_occupancy.Add( original );
                 continue;
             }
             promoteChangedAutorouterCopper( connection, original );
@@ -458,10 +458,10 @@ void BATCH_OPTIMIZER::RemoveRedundantViaTails( std::vector<ROUTING_CONNECTION>& 
             }
             if( !preservesContacts )
             {
-                m_occupancy.Remove( connection );
                 connection = original;
-                m_occupancy.Add( connection );
+                continue;
             }
+            edit.Commit();
         }
     }
     removeTraceTails( aConnections, aCancel, aOnlyNetCode );
@@ -509,6 +509,7 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
                     if( from.layer != to.layer )
                         break;
                     const auto original = connection;
+                    ROUTING_OCCUPANCY::TRANSACTION edit( m_occupancy );
                     m_occupancy.Remove( original );
                     const bool endHasContact = m_occupancy.Board()->HasCopperAt(
                             connection.netCode, from, radius );
@@ -532,10 +533,10 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
                     // electrically connected, but retaining a doubled stub
                     // past that junction still fails KiCad's dangling check.
                     if( endHasContact && junctions.empty() )
-                    { m_occupancy.Add( original ); break; }
+                        break;
                     const auto next = junctions.empty() ? to.point : junctions.front();
                     if( next == from.point )
-                    { m_occupancy.Add( original ); break; }
+                        break;
                     if( next == to.point )
                         RemoveRouteEndpoint( connection, front );
                     else
@@ -555,11 +556,10 @@ void BATCH_OPTIMIZER::removeTraceTails( std::vector<ROUTING_CONNECTION>& connect
                     }
                     if( !preserves )
                     {
-                        m_occupancy.Remove( connection );
                         connection = original;
-                        m_occupancy.Add( original );
                         break;
                     }
+                    edit.Commit();
                     changed = true;
                 }
             if( connection.nodes.size() == 1 )

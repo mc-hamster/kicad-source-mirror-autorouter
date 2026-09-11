@@ -12,7 +12,7 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — unrestricted-angle source geometry and shove lifecycle
+## Latest core milestone — source connection/cycle normalization lifecycle
 
 The worker board now also ports the pinned `PolylineTrace.split`,
 `PolylineTrace.combine`, `PolylineTrace.isCycle`,
@@ -35,14 +35,29 @@ rebuilds only the transitive alias cluster from the surviving requests inside
 the same worker transaction; unrelated item identities and index entries remain
 stable, and rollback restores the exact pre-edit graph. The optimizer selects
 the combined item-local geometry only for such an alias, retaining the complete
-compound route for ordinary trace/via and fanout records. This checkpoint
-passes **224/224 native autorouter cases** and all **26 Python parity-harness
+compound route for ordinary trace/via and fanout records.
+
+`Item.getConnectionItems()`, `BasicBoard.getTraceTail()` and the complete
+`BasicBoard.removeIfCycle()` lifecycle are now active in normalization as well.
+Connection traversal follows unique normal-contact points through mutable
+trace/via items until a fork, stub, layer transition ambiguity, repeated item,
+or non-routable terminal; cycle deletion removes that complete item connection
+and then removes only endpoint tails manufactured by the deletion. Every such
+edit remains inside the worker transaction, including exact item IDs and
+topology on rollback. Optimizer endpoint/tail probes now use a full occupancy
+transaction rather than attempting an inverse remove/add operation; this is
+necessary because source normalization is intentionally non-invertible when
+coincident host insertion records alias the same normalized trace.
+
+This checkpoint passes **225/225 native autorouter cases** and all **26 Python parity-harness
 tests**. The BJT A/B gate remains 16/16 with zero new KiCad DRC violations; the
 stripped 555 gate remains 12/12 with zero native DRC violations and is red only
 because the pinned reference output introduces ten KiCad DRC violations.
 Rational, non-integral trace junction materialization, fixed host-item
-normalization, and complete connection-tail removal remain explicit open parts
-of the mutable-board phase.
+normalization, and the stop-option/fanout-via variants of connection traversal
+remain explicit open parts of the mutable-board phase.
+
+## Previous core milestone — unrestricted-angle source geometry and shove lifecycle
 
 The active unrestricted-angle single-layer frontier now uses Freerouting's
 source obstacle-side compensation model instead of the former native shortcut
