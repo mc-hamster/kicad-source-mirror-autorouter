@@ -126,6 +126,43 @@ void appendPoint( std::vector<ROUTER_POINT>& aPoints, ROUTER_POINT aPoint )
     }
     aPoints.push_back( aPoint );
 }
+
+struct PORTAL
+{
+    FLOAT_POINT left;
+    FLOAT_POINT right;
+    const PLANAR::SIMPLEX* shape = nullptr;
+};
+
+std::optional<PORTAL> portalForStep(
+        const GENERAL_CORRIDOR_STEP& aStep )
+{
+    if( !aStep.door || aStep.door->Dimension() < 0
+        || !aStep.door->IsBounded() )
+    {
+        return std::nullopt;
+    }
+
+    const auto gravity = aStep.room.CentreOfGravity();
+    const FLOAT_POINT pole{ gravity.first, gravity.second };
+    const int left = aStep.door->IndexOfLeftMostCorner( pole );
+    const int right = aStep.door->IndexOfRightMostCorner( pole );
+
+    if( left < 0 || right < 0 )
+        return std::nullopt;
+
+    return PORTAL{ aStep.door->CornerApprox( static_cast<std::size_t>( left ) ),
+                   aStep.door->CornerApprox( static_cast<std::size_t>( right ) ),
+                   &*aStep.door };
+}
+
+std::optional<ROUTER_POINT> integralPortalCorner(
+        const PORTAL& aPortal, bool aLeft )
+{
+    const FLOAT_POINT corner = aLeft ? aPortal.left : aPortal.right;
+    return FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralPoint(
+            *aPortal.shape, corner.Round() );
+}
 } // namespace
 
 
@@ -190,30 +227,130 @@ std::optional<ROUTER_POINT> FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralP
 std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_ANY_ANGLE::Locate(
         ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps )
 {
-    std::vector<ROUTER_POINT> points{ aStart };
-    for( const GENERAL_CORRIDOR_STEP& step : aSteps )
+    if( aSteps.empty() )
+        return std::vector<ROUTER_POINT>{ aStart };
+
+    // The Java locator computes a maximum visible range through successive
+    // doors and emits a bend only when the next door closes that range.  Its
+    // tangent-circle radius is the compensated trace half-width.  Native room
+    // search has already moved that radius into the obstacle/room boundaries,
+    // so the equivalent operation here is the zero-radius portal funnel.  The
+    // left/right tests and constraining-door indices deliberately retain the
+    // source control flow and tie directions.
+    std::vector<PORTAL> portals;
+    portals.reserve( aSteps.size() );
+    for( std::size_t index = 0; index + 1 < aSteps.size(); ++index )
     {
-        const ROUTER_POINT from = points.back();
-        if( !step.room.Contains( PLANAR::POINT( from ) ) )
+        const auto portal = portalForStep( aSteps[index] );
+        if( !portal )
             return std::nullopt;
+        portals.push_back( *portal );
+    }
 
-        std::optional<ROUTER_POINT> target;
-        if( step.door )
-            target = NearestIntegralPoint( *step.door, from );
-        else
+    const GENERAL_CORRIDOR_STEP& targetStep = aSteps.back();
+    if( targetStep.door )
+    {
+        const auto portal = portalForStep( targetStep );
+        if( !portal )
+            return std::nullopt;
+        portals.push_back( *portal );
+    }
+
+    const ROUTER_POINT requestedTarget = targetStep.section.Middle().Round();
+    const std::optional<ROUTER_POINT> target =
+            targetStep.room.Contains( PLANAR::POINT( requestedTarget ) )
+                    ? std::optional( requestedTarget )
+                    : NearestIntegralPoint( targetStep.room, requestedTarget );
+    if( !target )
+        return std::nullopt;
+
+    std::vector<ROUTER_POINT> points{ aStart };
+    std::size_t firstPortal = 0;
+
+    while( firstPortal < portals.size()
+           && portals[firstPortal].shape->Contains( PLANAR::POINT( points.back() ) ) )
+    {
+        ++firstPortal;
+    }
+
+    while( firstPortal < portals.size() )
+    {
+        const FLOAT_POINT from{ static_cast<double>( points.back().x ),
+                                static_cast<double>( points.back().y ) };
+        FLOAT_POINT left = portals[firstPortal].left;
+        FLOAT_POINT right = portals[firstPortal].right;
+        std::size_t leftIndex = firstPortal;
+        std::size_t rightIndex = firstPortal;
+        bool restarted = false;
+
+        for( std::size_t index = firstPortal + 1; index <= portals.size(); ++index )
         {
-            const ROUTER_POINT requested = step.section.Middle().Round();
-            target = step.room.Contains( PLANAR::POINT( requested ) )
-                             ? std::optional( requested )
-                             : NearestIntegralPoint( step.room, requested );
+            const FLOAT_POINT nextLeft = index < portals.size()
+                    ? portals[index].left
+                    : FLOAT_POINT{ static_cast<double>( target->x ),
+                                   static_cast<double>( target->y ) };
+            const FLOAT_POINT nextRight = index < portals.size()
+                    ? portals[index].right : nextLeft;
+
+            // The next left boundary crossed to the right of the current
+            // right boundary: the current right constraining corner is the
+            // next source bend.
+            if( nextLeft.SideOf( from, right ) < 0 )
+            {
+                const auto corner = integralPortalCorner(
+                        portals[rightIndex], false );
+                if( !corner )
+                    return std::nullopt;
+                appendPoint( points, *corner );
+                firstPortal = rightIndex + 1;
+                restarted = true;
+                break;
+            }
+
+            // Symmetric closure of the left side of the visibility range.
+            if( nextRight.SideOf( from, left ) > 0 )
+            {
+                const auto corner = integralPortalCorner(
+                        portals[leftIndex], true );
+                if( !corner )
+                    return std::nullopt;
+                appendPoint( points, *corner );
+                firstPortal = leftIndex + 1;
+                restarted = true;
+                break;
+            }
+
+            if( nextRight.SideOf( from, right ) >= 0 )
+            {
+                right = nextRight;
+                rightIndex = index;
+            }
+
+            if( nextLeft.SideOf( from, left ) <= 0 )
+            {
+                left = nextLeft;
+                leftIndex = index;
+            }
         }
 
-        if( !target || !step.room.Contains( PLANAR::POINT( *target ) )
-            || ( step.door && !step.door->Contains( PLANAR::POINT( *target ) ) ) )
+        if( !restarted )
+            break;
+    }
+
+    appendPoint( points, *target );
+
+    // Every emitted constraining corner must remain an exact lattice point of
+    // its door.  The final host CanUseSegment validation remains authoritative
+    // for copper/rule legality across decomposition-only room boundaries.
+    for( std::size_t index = 1; index + 1 < points.size(); ++index )
+    {
+        if( std::none_of( portals.begin(), portals.end(), [&]( const PORTAL& aPortal )
+            {
+                return aPortal.shape->Contains( PLANAR::POINT( points[index] ) );
+            } ) )
         {
             return std::nullopt;
         }
-        appendPoint( points, *target );
     }
     return points;
 }

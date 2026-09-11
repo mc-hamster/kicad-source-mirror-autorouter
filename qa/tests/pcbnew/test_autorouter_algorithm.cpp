@@ -7953,8 +7953,11 @@ BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesOnlyRepresentableExactDoorPoints )
     BOOST_REQUIRE( path );
     BOOST_CHECK( path->front() == ROUTER_POINT( { 10, 63 } ) );
     BOOST_CHECK( path->back() == ROUTER_POINT( { 180, 90 } ) );
-    BOOST_CHECK( left.Contains( POINT( path->at( 1 ) ) ) );
-    BOOST_CHECK( right.Contains( POINT( path->at( 1 ) ) ) );
+    const auto direct = PLANAR::POLYLINE::FromPoints(
+            { path->front(), path->back() } );
+    BOOST_REQUIRE( !direct.Empty() );
+    BOOST_CHECK( door.IntersectsSegment( direct, 1 ) );
+    BOOST_CHECK_EQUAL( path->size(), 2U );
 
     const auto rationalOnly = SIMPLEX::FromConvexPolygon(
             { { 0, 0 }, { 1, 2 }, { -1, 3 } } );
@@ -7969,6 +7972,43 @@ BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesOnlyRepresentableExactDoorPoints )
         if( !rationalPoint.Corner( 0 ).Integral() )
             BOOST_CHECK( !exact );
     }
+}
+
+
+BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesSourceVisibilityRangeAcrossSeveralDoors )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    const SIMPLEX firstRoom = SIMPLEX::Box( { 0, 0, 100, 100 } );
+    const SIMPLEX secondRoom = SIMPLEX::Box( { 100, 20, 200, 100 } );
+    const SIMPLEX thirdRoom = SIMPLEX::Box( { 140, 100, 220, 200 } );
+    const SIMPLEX firstDoor = firstRoom.Intersection( secondRoom );
+    const SIMPLEX secondDoor = secondRoom.Intersection( thirdRoom );
+    BOOST_REQUIRE_EQUAL( firstDoor.Dimension(), 1 );
+    BOOST_REQUIRE_EQUAL( secondDoor.Dimension(), 1 );
+
+    const std::vector<GENERAL_CORRIDOR_STEP> corridor{
+        { firstRoom, firstDoor, { { 100, 20 }, { 100, 100 } } },
+        { secondRoom, secondDoor, { { 140, 100 }, { 200, 100 } } },
+        { thirdRoom, {}, { { 180, 180 }, { 180, 180 } } }
+    };
+    const auto path = FOUND_CONNECTION_LOCATOR_ANY_ANGLE::Locate(
+            { 10, 40 }, corridor );
+    BOOST_REQUIRE( path );
+    BOOST_CHECK( path->front() == ROUTER_POINT( { 10, 40 } ) );
+    BOOST_CHECK( path->back() == ROUTER_POINT( { 180, 180 } ) );
+    BOOST_REQUIRE_EQUAL( path->size(), 3U );
+    BOOST_CHECK( firstDoor.Contains( POINT( path->at( 1 ) ) )
+                 || secondDoor.Contains( POINT( path->at( 1 ) ) ) );
+
+    const auto firstEdge = PLANAR::POLYLINE::FromPoints(
+            { path->at( 0 ), path->at( 1 ) } );
+    const auto secondEdge = PLANAR::POLYLINE::FromPoints(
+            { path->at( 1 ), path->at( 2 ) } );
+    BOOST_REQUIRE( !firstEdge.Empty() );
+    BOOST_REQUIRE( !secondEdge.Empty() );
+    BOOST_CHECK( firstDoor.IntersectsSegment( firstEdge, 1 ) );
+    BOOST_CHECK( secondDoor.IntersectsSegment( secondEdge, 1 ) );
 }
 
 
