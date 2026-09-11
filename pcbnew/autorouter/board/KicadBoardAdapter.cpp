@@ -28,6 +28,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <tuple>
@@ -545,6 +546,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         return;
 
     std::map<const PAD*, std::pair<int, int>> packagePins;
+    std::map<const PAD*, std::size_t>         packagePinCounts;
     std::vector<PAD*> sourceOrderedPads;
     DSN::SPECCTRA_DB  orderDatabase;
     const std::vector<FOOTPRINT*> sourceOrderedComponents =
@@ -560,6 +562,12 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
     for( FOOTPRINT* footprint : sourceOrderedComponents )
     {
         ++component;
+        const std::size_t packagePinCount = static_cast<std::size_t>( std::count_if(
+                footprint->Pads().begin(), footprint->Pads().end(),
+                []( const PAD* aPad )
+                {
+                    return aPad && ( aPad->GetLayerSet() & LSET::AllCuMask() ).any();
+                } ) );
         int pin = 0;
         for( PAD* pad : footprint->Pads() )
         {
@@ -567,6 +575,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                 continue;
 
             packagePins.emplace( pad, std::pair{ component, pin++ } );
+            packagePinCounts.emplace( pad, packagePinCount );
             sourceOrderedPads.push_back( pad );
         }
     }
@@ -861,13 +870,75 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     std::max( std::abs( shapeSize.x ), std::abs( shapeSize.y ) ) );
             const std::int64_t compensation =
                     ( std::max<std::int64_t>( 0, clearance ) + 1 ) / 2;
-            layerGeometry.push_back(
-                    { layer, minShapeWidth, maxShapeWidth,
-                      std::max<std::int64_t>( 0, clearance ),
-                      { static_cast<std::int64_t>( padBox.GetLeft() ) - compensation,
-                        static_cast<std::int64_t>( padBox.GetTop() ) - compensation,
-                        static_cast<std::int64_t>( padBox.GetRight() ) + compensation,
-                        static_cast<std::int64_t>( padBox.GetBottom() ) + compensation } } );
+            ROUTING_PAD::LAYER_GEOMETRY geometry;
+            geometry.layer = layer;
+            geometry.minWidth = minShapeWidth;
+            geometry.maxWidth = maxShapeWidth;
+            geometry.clearance = std::max<std::int64_t>( 0, clearance );
+            geometry.treeBounds = {
+                    static_cast<std::int64_t>( padBox.GetLeft() ) - compensation,
+                    static_cast<std::int64_t>( padBox.GetTop() ) - compensation,
+                    static_cast<std::int64_t>( padBox.GetRight() ) + compensation,
+                    static_cast<std::int64_t>( padBox.GetBottom() ) + compensation };
+
+            // Padstack.getTraceExitDirections() only restricts IntBox and
+            // IntOctagon shapes.  KiCad's Specctra exporter emits RECTANGLE
+            // as an IntBox; oval, rounded, chamfered, trapezoid and custom
+            // pads are paths/polygons and deliberately retain no restriction.
+            if( pad->GetShape( layerId ) == PAD_SHAPE::RECTANGLE
+                && minShapeWidth > 0 && maxShapeWidth > 0
+                && packagePins.contains( pad ) )
+            {
+                const double factor = packagePinCounts.at( pad ) <= 3 ? 3.0 : 1.5;
+                const bool allDirections =
+                        static_cast<double>( maxShapeWidth )
+                        < factor * static_cast<double>( minShapeWidth );
+                std::vector<VECTOR2I> localDirections;
+
+                // Preserve source order: RIGHT, LEFT, UP, DOWN.
+                if( allDirections || std::abs( shapeSize.x ) >= std::abs( shapeSize.y ) )
+                {
+                    localDirections.emplace_back( 10000, 0 );
+                    localDirections.emplace_back( -10000, 0 );
+                }
+                if( allDirections || std::abs( shapeSize.x ) <= std::abs( shapeSize.y ) )
+                {
+                    localDirections.emplace_back( 0, -10000 );
+                    localDirections.emplace_back( 0, 10000 );
+                }
+
+                const VECTOR2I pinCenter = pad->GetPosition();
+                const VECTOR2I shapeOffset = shapePos - pinCenter;
+                for( VECTOR2I direction : localDirections )
+                {
+                    const bool alongX = direction.x != 0;
+                    const std::int64_t halfExtent =
+                            ( alongX ? std::abs( shapeSize.x )
+                                     : std::abs( shapeSize.y ) ) / 2;
+                    RotatePoint( direction, pad->GetOrientation() );
+                    const std::int64_t divisor = std::gcd(
+                            std::llabs( static_cast<std::int64_t>( direction.x ) ),
+                            std::llabs( static_cast<std::int64_t>( direction.y ) ) );
+                    if( divisor <= 0 )
+                        continue;
+
+                    ROUTER_POINT normalized{
+                            static_cast<std::int64_t>( direction.x ) / divisor,
+                            static_cast<std::int64_t>( direction.y ) / divisor };
+                    const long double directionLength = std::hypotl(
+                            static_cast<long double>( normalized.x ),
+                            static_cast<long double>( normalized.y ) );
+                    const long double offsetProjection =
+                            ( static_cast<long double>( shapeOffset.x ) * normalized.x
+                              + static_cast<long double>( shapeOffset.y ) * normalized.y )
+                            / directionLength;
+                    geometry.traceExitRestrictions.push_back(
+                            { normalized, static_cast<double>( std::max<long double>(
+                                                  0, halfExtent + offsetProjection ) ) } );
+                }
+            }
+
+            layerGeometry.push_back( std::move( geometry ) );
             largestRadius = std::max<std::int64_t>(
                     largestRadius,
                     static_cast<std::int64_t>(
@@ -875,6 +946,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                                       std::abs( padBox.GetBottom() - padBox.GetTop() ) ) )
                             / 2 );
 
+            const std::size_t firstCopperShape = aSnapshot.obstacles.size();
             ROUTING_OBSTACLE obstacle;
             obstacle.netCode = pad->GetNetCode();
             obstacle.boardItemId = pad->m_Uuid.AsString().ToStdString();
@@ -977,6 +1049,12 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     }
                     aSnapshot.obstacles.push_back( std::move( part ) );
                 }
+            }
+
+            for( std::size_t shapeIndex = firstCopperShape;
+                 shapeIndex < aSnapshot.obstacles.size(); ++shapeIndex )
+            {
+                layerGeometry.back().copperShapeIndices.push_back( shapeIndex );
             }
 
             auto thermal = thermalReservations( pad, layerId, clearance );

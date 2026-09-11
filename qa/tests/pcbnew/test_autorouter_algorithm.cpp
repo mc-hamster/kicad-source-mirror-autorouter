@@ -37,6 +37,7 @@
 #include <autorouter/maze/MazeSearchEngine.h>
 #include <autorouter/maze/AutorouteEngine.h>
 #include <autorouter/board/model/items/NormalContacts.h>
+#include <autorouter/board/model/items/Pin.h>
 #include <autorouter/geometry/planar/ContactGeometry.h>
 #include <autorouter/geometry/planar/IntOctagon.h>
 #include <autorouter/geometry/planar/Simplex.h>
@@ -3251,6 +3252,19 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesRotatedCopperAndInactiveLayerObstacle
     BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
     BOOST_CHECK( snapshot->obstacles[0].kind == ROUTER_OBSTACLE_KIND::POLYGON );
     BOOST_CHECK_EQUAL( snapshot->obstacles[0].polygon.size(), 4 );
+    BOOST_REQUIRE_EQUAL( snapshot->pads.size(), 1 );
+    BOOST_REQUIRE_EQUAL( snapshot->pads[0].layerGeometry.size(), 1 );
+    const auto& padGeometry = snapshot->pads[0].layerGeometry[0];
+    BOOST_REQUIRE_EQUAL( padGeometry.copperShapeIndices.size(), 1 );
+    BOOST_CHECK_EQUAL( padGeometry.copperShapeIndices.front(), 0 );
+    // One-pin packages use factor 3 rather than 1.5, but this 7.5:1 source
+    // IntBox still permits only the two short-side exits.
+    BOOST_REQUIRE_EQUAL( padGeometry.traceExitRestrictions.size(), 2 );
+    const ROUTER_POINT firstExit = padGeometry.traceExitRestrictions[0].direction;
+    const ROUTER_POINT secondExit = padGeometry.traceExitRestrictions[1].direction;
+    BOOST_CHECK_EQUAL( std::llabs( firstExit.x ), std::llabs( firstExit.y ) );
+    BOOST_CHECK_EQUAL( secondExit.x, -firstExit.x );
+    BOOST_CHECK_EQUAL( secondExit.y, -firstExit.y );
     BOARD_SNAPSHOT routingBoard = *snapshot;
     routingBoard.bounds = { 0, 0, 6000000, 6000000 };
     routingBoard.boardOutline.clear();
@@ -3270,6 +3284,64 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterPreservesRotatedCopperAndInactiveLayerObstacle
     BOOST_REQUIRE( snapshot );
     BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
     BOOST_CHECK_EQUAL( snapshot->obstacles[0].layers.front(), F_Cu );
+}
+
+
+BOOST_AUTO_TEST_CASE( PinTraceExitHelpersMatchSourceDirectionAndNearestCorner )
+{
+    using RESTRICTION = ROUTING_PAD::LAYER_GEOMETRY::TRACE_EXIT_RESTRICTION;
+    const std::vector<RESTRICTION> restrictions{
+        { { 1, 0 }, 10.0 }, { { -1, 0 }, 10.0 },
+        { { 0, -1 }, 5.0 }, { { 0, 1 }, 5.0 }
+    };
+
+    const auto nearest = PIN::NearestTraceExitCorner(
+            { 100, 100 }, restrictions, { 160, 103 }, 7.0 );
+    BOOST_REQUIRE( nearest );
+    BOOST_CHECK( *nearest == ( ROUTER_POINT{ 117, 100 } ) );
+    BOOST_CHECK( PIN::MatchesTraceDirection( restrictions[0], { 99, 0 } ) );
+    BOOST_CHECK( !PIN::MatchesTraceDirection( restrictions[0], { -1, 0 } ) );
+    BOOST_CHECK( !PIN::MatchesTraceDirection( restrictions[0], { 1, 1 } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( RectangularPadExitAspectPolicyMatchesPackagePinCount )
+{
+    const auto restrictionCount = []( int aPinCount )
+    {
+        BOARD board;
+        auto* net = new NETINFO_ITEM( &board, "PAD_EXIT", 1 );
+        board.Add( net );
+        auto* footprint = new FOOTPRINT( &board );
+        board.Add( footprint );
+
+        for( int pin = 0; pin < aPinCount; ++pin )
+        {
+            auto* pad = new PAD( footprint );
+            pad->SetAttribute( PAD_ATTRIB::SMD );
+            pad->SetLayerSet( LSET( { F_Cu } ) );
+            pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::RECTANGLE );
+            pad->SetSize( PADSTACK::ALL_LAYERS, { 2500000, 1000000 } );
+            pad->SetPosition( { 4000000 * pin, 1000000 } );
+            pad->SetNet( net );
+            footprint->Add( pad );
+        }
+
+        const KICAD_BOARD_ADAPTER adapter( &board );
+        const auto snapshot = adapter.CreateSnapshot( adapter.CreateDefaultSettings() );
+        BOOST_REQUIRE( snapshot );
+        BOOST_REQUIRE_EQUAL( snapshot->pads.size(),
+                             static_cast<std::size_t>( aPinCount ) );
+        BOOST_REQUIRE_EQUAL( snapshot->pads.front().layerGeometry.size(), 1 );
+        return snapshot->pads.front().layerGeometry.front()
+                .traceExitRestrictions.size();
+    };
+
+    // 2.5:1 is below the doubled factor 3 for short packages, but above the
+    // ordinary factor 1.5. Thus the three-pin package permits all four exits
+    // while the four-pin package permits only its two short-side exits.
+    BOOST_CHECK_EQUAL( restrictionCount( 3 ), 4 );
+    BOOST_CHECK_EQUAL( restrictionCount( 4 ), 2 );
 }
 
 

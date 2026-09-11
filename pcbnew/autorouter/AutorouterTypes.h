@@ -289,6 +289,23 @@ struct ROUTING_PAD
     // keep that layer-local information in the worker snapshot.
     struct LAYER_GEOMETRY
     {
+        /** Source Pin.TraceExitRestriction translated without an angle.
+         *
+         * Freerouting Direction is an equivalence class of integral vectors.
+         * Preserve that representation so arbitrary component rotations do
+         * not acquire floating-point equality rules at the worker boundary.
+         */
+        struct TRACE_EXIT_RESTRICTION
+        {
+            ROUTER_POINT direction;
+            double       minLength = 0;
+
+            bool operator==( const TRACE_EXIT_RESTRICTION& aOther ) const
+            {
+                return direction == aOther.direction && minLength == aOther.minLength;
+            }
+        };
+
         int          layer = -1;
         std::int64_t minWidth = 0;
         std::int64_t maxWidth = 0;
@@ -298,6 +315,11 @@ struct ROUTING_PAD
         // An inverted box means that a data-only caller supplied only the
         // legacy width metadata.
         ROUTER_BOX   treeBounds{ 1, 1, 0, 0 };
+        // Indices of the exact ROUTING_OBSTACLE contours which form this
+        // physical layer of the padstack.  One custom pad can have several
+        // disjoint outlines; a bounding box alone cannot represent it.
+        std::vector<std::size_t> copperShapeIndices;
+        std::vector<TRACE_EXIT_RESTRICTION> traceExitRestrictions;
 
         bool operator==( const LAYER_GEOMETRY& aOther ) const
         {
@@ -306,7 +328,9 @@ struct ROUTING_PAD
                    && treeBounds.minX == aOther.treeBounds.minX
                    && treeBounds.minY == aOther.treeBounds.minY
                    && treeBounds.maxX == aOther.treeBounds.maxX
-                   && treeBounds.maxY == aOther.treeBounds.maxY;
+                   && treeBounds.maxY == aOther.treeBounds.maxY
+                   && copperShapeIndices == aOther.copperShapeIndices
+                   && traceExitRestrictions == aOther.traceExitRestrictions;
         }
     };
 

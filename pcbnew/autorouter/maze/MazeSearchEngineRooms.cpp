@@ -12,6 +12,7 @@
 #include "MazeSearchEngineAnyAngle.h"
 #include "MazeTraceShover.h"
 #include "../board/searchtree/ShapeSearchTree45Degree.h"
+#include "../board/model/items/Pin.h"
 #include "../path/Connection.h"
 #include "../path/FoundConnectionInserter.h"
 #include "../geometry/planar/ContactGeometry.h"
@@ -97,6 +98,43 @@ ROUTER_BOX terminalTreeBounds( const ROUTING_TERMINAL& aTerminal, int aLayer,
              aTerminal.pad.position.y - expansion,
              aTerminal.pad.position.x + expansion,
              aTerminal.pad.position.y + expansion };
+}
+
+
+std::vector<ROUTING_PAD::LAYER_GEOMETRY::TRACE_EXIT_RESTRICTION>
+terminalTraceExitRestrictions( const ROUTING_TERMINAL& aTerminal, int aLayer )
+{
+    // A source TargetItemExpansionDoor carries the Pin only for a real pin
+    // endpoint. Existing trace terminals and conduction areas must not inherit
+    // the anchor pad's package restrictions.
+    if( aTerminal.segmentEnd || aTerminal.connectionArea )
+        return {};
+
+    const auto geometry = std::find_if(
+            aTerminal.pad.layerGeometry.begin(), aTerminal.pad.layerGeometry.end(),
+            [&]( const ROUTING_PAD::LAYER_GEOMETRY& aGeometry )
+            {
+                return aGeometry.layer == aLayer;
+            } );
+    return geometry == aTerminal.pad.layerGeometry.end()
+                   ? std::vector<ROUTING_PAD::LAYER_GEOMETRY::TRACE_EXIT_RESTRICTION>{}
+                   : geometry->traceExitRestrictions;
+}
+
+
+std::int64_t pinEdgeToTurnDistance( const BOARD_SNAPSHOT& aBoard )
+{
+    // Structure.readScope() uses BoardRules.getMinTraceHalfWidth() when the
+    // DSN has no explicit smd_to_turn_gap. KiCad's exporter does not emit that
+    // rule, so derive the same minimum from the routed net widths captured on
+    // the editor thread.
+    std::int64_t result = std::numeric_limits<std::int64_t>::max();
+    for( const ROUTING_PAD& pad : aBoard.pads )
+        if( pad.netCode > 0 && pad.trackWidth > 0 )
+            result = std::min( result, pad.trackWidth / 2 );
+
+    return result == std::numeric_limits<std::int64_t>::max()
+                   ? 0 : std::max<std::int64_t>( 0, result );
 }
 
 INT_OCTAGON octagonalEnvelope( const std::vector<ROUTER_POINT>& aPoints,
@@ -982,6 +1020,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
 
     const auto radius = netTrackRadius( net );
     const auto compensation = traceClearanceCompensation( net );
+    const std::int64_t edgeToTurn = pinEdgeToTurnDistance( m_board );
     const auto margin = std::max<std::int64_t>(
                                 0, m_board.edgeClearance - compensation ) + 1;
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
@@ -1006,7 +1045,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                                     terminalTreeBounds( terminal, layer.layerId,
                                                         compensation ),
                                     terminal.connectionArea,
-                                    terminal.connectionArea ? radius : 0 } );
+                                    terminal.connectionArea ? radius : 0,
+                                    terminalTraceExitRestrictions(
+                                            terminal, layer.layerId ),
+                                    static_cast<double>( edgeToTurn
+                                                         + std::max<std::int64_t>(
+                                                                 1, radius + compensation ) ) } );
             }
             return result;
         };
@@ -1160,6 +1204,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
 
     const auto radius = netTrackRadius( net );
     const auto compensation = traceClearanceCompensation( net );
+    const std::int64_t edgeToTurn = pinEdgeToTurnDistance( m_board );
     const auto margin = std::max<std::int64_t>(
                                 0, m_board.edgeClearance - compensation ) + 1;
     const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
@@ -1431,7 +1476,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                     output.push_back( { a, b, t.padIndex,
                                         terminalTreeBounds( t, id, compensation ),
                                         t.connectionArea,
-                                        t.connectionArea ? radius : 0 } );
+                                        t.connectionArea ? radius : 0,
+                                        terminalTraceExitRestrictions( t, id ),
+                                        static_cast<double>( edgeToTurn
+                                                             + std::max<std::int64_t>(
+                                                                     1, radius
+                                                                                + compensation ) ) } );
                 else
                 {
                     ROUTING_TERMINAL first = t;
@@ -1442,11 +1492,11 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                     output.push_back( { a, a, t.padIndex,
                                         terminalTreeBounds( first, id, compensation ),
                                         t.connectionArea,
-                                        t.connectionArea ? radius : 0 } );
+                                        t.connectionArea ? radius : 0, {}, 0 } );
                     output.push_back( { b, b, t.padIndex,
                                         terminalTreeBounds( second, id, compensation ),
                                         t.connectionArea,
-                                        t.connectionArea ? radius : 0 } );
+                                        t.connectionArea ? radius : 0, {}, 0 } );
                 }
             }
         };

@@ -62,6 +62,13 @@ struct ROOM_TERMINAL
     // just as FoundConnectionLocator does for a two-dimensional target.
     std::shared_ptr<const ROUTING_OBSTACLE> connectionArea;
     std::int64_t areaInset = 0;
+    // Present only when this terminal is a source Pin with a rectangular
+    // padstack shape.  It is copied because ROOM_LAYER outlives temporary
+    // ROUTING_TERMINAL values and is shared by all multilayer frontiers.
+    std::vector<ROUTING_PAD::LAYER_GEOMETRY::TRACE_EXIT_RESTRICTION>
+            traceExitRestrictions;
+    // BoardRules.pinEdgeToTurnDist + compensatedTraceHalfWidth.
+    double traceExitOffset = 0;
 };
 
 struct ROOM_PATH

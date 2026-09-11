@@ -12,6 +12,7 @@
 #include "../drill/DrillPageArray.h"
 #include "../expansion/TargetItemExpansionDoor.h"
 #include "../path/FoundConnectionLocator45Degree.h"
+#include "../board/model/items/Pin.h"
 #include <deque>
 #include <map>
 #include <set>
@@ -204,6 +205,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         MAZE_ADJUSTMENT adjustment = MAZE_ADJUSTMENT::NONE;
         bool alreadyChecked = false;
         std::optional<ROUTING_EDGE_STYLE> viaStyle;
+        const ROOM_TERMINAL* backtrackPin = nullptr;
     };
     constexpr auto NONE = std::numeric_limits<std::size_t>::max();
     std::deque<STATE> states;
@@ -369,6 +371,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             STATE state;
             state.room = room; state.layer = shape.layer; state.entry = { p, p };
             state.f = bestDistance; state.owner = start.owner; state.itemId = shape.itemId;
+            state.backtrackPin = &start;
             const ROUTER_BOX roomBounds = room->shape->GetShape();
             autorouterDecisionLog(
                     "START_ROOM_SEED",
@@ -484,8 +487,23 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                     }
                     continue;
                 }
-                const auto nearest = MAZE_EXPANSION_ENGINE::Nearest( drill.freeShape, from );
-                const auto cost = MAZE_EXPANSION_ENGINE::ToDrill( drill.freeShape, from, current.g,
+                FLOAT_POINT compareCorner = from;
+                if( current.backtrackPin )
+                {
+                    if( const auto exit = PIN::NearestTraceExitCorner(
+                                current.backtrackPin->start,
+                                current.backtrackPin->traceExitRestrictions,
+                                drill.location,
+                                current.backtrackPin->traceExitOffset ) )
+                    {
+                        compareCorner = { static_cast<double>( exit->x ),
+                                          static_cast<double>( exit->y ) };
+                    }
+                }
+                const auto nearest = MAZE_EXPANSION_ENGINE::Nearest(
+                        drill.freeShape, compareCorner );
+                const auto cost = MAZE_EXPANSION_ENGINE::ToDrill(
+                        drill.freeShape, compareCorner, current.g,
                         via.normalCost, true, layer.horizontalCost, layer.verticalCost,
                         remaining( nearest, current.layer ) );
                 STATE state = current;
@@ -1055,6 +1073,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                 state.kind = KIND::PAGE; state.room = current.room; state.layer = current.layer;
                 state.page = page; state.section = current.layer; state.entry = current.entry;
                 state.g = cost.expansion; state.f = cost.sorting; state.parent = index; state.owner = current.owner;
+                state.backtrackPin = current.parent == NONE ? current.backtrackPin : nullptr;
                 push( state );
                 somethingExpanded = true;
             }
