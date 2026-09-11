@@ -12,6 +12,7 @@
 #include "MazeSearchEngineAnyAngle.h"
 #include "MazeTraceShover.h"
 #include "../board/searchtree/ShapeSearchTree45Degree.h"
+#include "../board/model/structure/BoardOutline.h"
 #include "../board/model/items/Pin.h"
 #include "../path/Connection.h"
 #include "../path/FoundConnectionInserter.h"
@@ -443,6 +444,16 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         addOctagon( octagonalEnvelope( { start, end }, expansion ),
                     std::move( simplex ) );
     };
+
+    // BasicBoard inserts BoardOutline before ordinary board items.  Keep that
+    // source order because equal-area tree insertion ties are observable in
+    // completed-room and door ordering.
+    auto outlineEntries = BOARD_OUTLINE::CalculateTreeShapes(
+            m_board, aLayer, candidateCompensation, id );
+    entries.insert( entries.end(),
+                    std::make_move_iterator( outlineEntries.begin() ),
+                    std::make_move_iterator( outlineEntries.end() ) );
+
     for( auto index : obstacleIndices( aLayer ) )
     {
         if( aCancel && aCancel() )
@@ -1026,10 +1037,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
     const auto radius = netTrackRadius( net );
     const auto compensation = traceClearanceCompensation( net );
     const std::int64_t edgeToTurn = pinEdgeToTurnDistance( m_board );
-    const auto margin = std::max<std::int64_t>(
-                                0, m_board.edgeClearance - compensation ) + 1;
-    const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
-                             m_board.bounds.maxX - margin, m_board.bounds.maxY - margin };
+    const ROUTER_BOX bounds = BOARD_OUTLINE::SearchBounds( m_board );
     std::optional<ROUTING_CONNECTION> best;
     std::int64_t bestRipupCost = 0;
     const auto started = std::chrono::steady_clock::now();
@@ -1210,10 +1218,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     const auto radius = netTrackRadius( net );
     const auto compensation = traceClearanceCompensation( net );
     const std::int64_t edgeToTurn = pinEdgeToTurnDistance( m_board );
-    const auto margin = std::max<std::int64_t>(
-                                0, m_board.edgeClearance - compensation ) + 1;
-    const ROUTER_BOX bounds{ m_board.bounds.minX + margin, m_board.bounds.minY + margin,
-                             m_board.bounds.maxX - margin, m_board.bounds.maxY - margin };
+    const ROUTER_BOX bounds = BOARD_OUTLINE::SearchBounds( m_board );
     const auto physical = VIA_RULE::ThroughLayers( m_settings );
     if( physical.size() < 2 )
         return std::nullopt;

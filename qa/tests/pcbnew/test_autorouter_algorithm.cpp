@@ -41,6 +41,7 @@
 #include <autorouter/maze/AutorouteEngine.h>
 #include <autorouter/board/model/items/NormalContacts.h>
 #include <autorouter/board/model/items/Pin.h>
+#include <autorouter/board/model/structure/BoardOutline.h>
 #include <autorouter/geometry/planar/ContactGeometry.h>
 #include <autorouter/geometry/planar/IntOctagon.h>
 #include <autorouter/geometry/planar/Simplex.h>
@@ -157,6 +158,48 @@ AUTOROUTER_SETTINGS makeSettings()
 
 
 BOOST_AUTO_TEST_SUITE( NativeAutorouter )
+
+
+BOOST_AUTO_TEST_CASE( BoardOutlineUsesGeometricContourAndSourceCompensation )
+{
+    BOARD_SNAPSHOT board;
+    // Emulate KiCad's 0.05 mm Edge.Cuts stroke bounding box around an exact
+    // 10 x 5 mm rectangular contour.
+    board.bounds = { -25000, -25000, 10025000, 5025000 };
+    board.boardOutline = { { 0, 0 }, { 10000000, 0 },
+                           { 10000000, 5000000 }, { 0, 5000000 } };
+    board.boardHoles = { { { 4000000, 2000000 }, { 6000000, 2000000 },
+                           { 6000000, 3000000 }, { 4000000, 3000000 } } };
+    board.edgeClearance = 500000;
+
+    const ROUTER_BOX bounds = BOARD_OUTLINE::SearchBounds( board );
+    BOOST_CHECK_EQUAL( bounds.minX, -100000 );
+    BOOST_CHECK_EQUAL( bounds.minY, -100000 );
+    BOOST_CHECK_EQUAL( bounds.maxX, 10100000 );
+    BOOST_CHECK_EQUAL( bounds.maxY, 5100000 );
+
+    int nextObjectId = 7;
+    const auto shapes = BOARD_OUTLINE::CalculateTreeShapes(
+            board, 1, 100000, nextObjectId );
+    BOOST_REQUIRE_EQUAL( shapes.size(), 8U );
+    BOOST_CHECK_EQUAL( nextObjectId, 8 );
+    for( std::size_t index = 0; index < shapes.size(); ++index )
+    {
+        BOOST_CHECK_EQUAL( shapes[index].objectId, 7 );
+        BOOST_CHECK_EQUAL( shapes[index].shapeIndex,
+                           static_cast<int>( index ) );
+        BOOST_CHECK_EQUAL( shapes[index].layer, 1 );
+        BOOST_CHECK_EQUAL( shapes[index].net, 0 );
+    }
+
+    // BoardOutline.HALF_WIDTH (10 um) plus 0.5 mm edge clearance minus
+    // the candidate's 0.1 mm self-clearance compensation, and the native
+    // one-IU closed-clearance guard.  The answer is measured from x=0, not
+    // from the -0.025 mm outside edge of the displayed Edge.Cuts stroke.
+    const SHAPE_TREE_ENTRY& leftEdge = shapes[3];
+    BOOST_CHECK_EQUAL( leftEdge.BoundingOctagon().rightX, 410001 );
+    BOOST_CHECK_EQUAL( leftEdge.BoundingOctagon().leftX, -410001 );
+}
 
 
 BOOST_AUTO_TEST_CASE( ChangedAreaMatchesPinnedOutwardOctagonalBounds )
