@@ -8871,6 +8871,48 @@ BOOST_AUTO_TEST_CASE( MultilayerRoomSearchKeepsGlobalQueueWhenViasAreDisabled )
 }
 
 
+BOOST_AUTO_TEST_CASE( ExactMultilayerFrontierUsesSourceShoveRequeueLifecycle )
+{
+    ROOM_LAYER top, bottom;
+    top.id = 0;
+    bottom.id = 31;
+    top.bounds = bottom.bounds = { 0, 0, 10000, 10000 };
+    top.starts = { { { 1000, 5000 }, { 1000, 5000 }, 7 } };
+    top.targets = { { { 9000, 5000 }, { 9000, 5000 }, 8 } };
+    const SHAPE_TREE_ENTRY shape{ { 4500, 2000, 5500, 8000 }, 7, 0, 0, 2,
+                                  false, true };
+    auto traceInfo = std::make_shared<MAZE_TRACE_ROOM_INFO>();
+    traceInfo->corners = { { 5000, 2000 }, { 5000, 8000 } };
+    traceInfo->firstShapeIndex = 1;
+    traceInfo->halfWidth = 100;
+    traceInfo->sourceStyleMatches = true;
+    top.ripupObstacles = {
+        ROOM_RIPUP_OBSTACLE{ shape, 42, 100, 3, traceInfo }
+    };
+
+    ROOM_VIA_SETTINGS via;
+    via.bounds = top.bounds;
+    via.pageWidth = 2000;
+    via.transitionsEnabled = false;
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto found = MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
+            { top, bottom }, 1, 100, via, 10000, expanded, metrics,
+            {}, {}, true );
+
+    BOOST_REQUIRE( found );
+    BOOST_REQUIRE_EQUAL( found->rippedObstacleGroups.size(), 1U );
+    BOOST_CHECK_EQUAL( found->rippedObstacleGroups.front(), 42U );
+    BOOST_CHECK_EQUAL( found->ripupCost, 100 );
+    BOOST_CHECK_EQUAL( metrics.rippedRooms, 1 );
+    BOOST_CHECK_EQUAL( metrics.ripupCost, 100 );
+    BOOST_CHECK( std::all_of( found->nodes.begin(), found->nodes.end(),
+                              []( const ROUTER_NODE& node )
+                              { return node.layer == 0; } ) );
+}
+
+
 BOOST_AUTO_TEST_CASE( MultilayerRoomSearchSeedsADiagonalConnectedTrace )
 {
     ROOM_LAYER top, bottom;

@@ -14,8 +14,8 @@ latter. Never modify the protected reference checkout or build inside it.
 
 ## Latest core milestone — expansion-time trace shove and paid requeue
 
-The active 45-degree single-layer frontier and its bounded orthogonal fallback
-now carry the source
+The active 45-degree single- and multilayer frontiers and the bounded
+single-layer orthogonal fallback now carry the source
 `MazeSearchElement` shove lifecycle instead of treating every movable trace as
 an immediate conventional rip-up. `ObstacleExpansionRoom` shapes retain one
 shared immutable trace-item record for each same-layer/same-style polyline run:
@@ -36,11 +36,19 @@ mode: door sections are compensated exactly once, backtracking uses the same
 free-room versus ripped-obstacle shrink rules as the primary locator, and both
 45-degree and strict orthogonal corner realization share that source corridor.
 
-This checkpoint builds both native test executables, passes **217 native
+The multilayer frontier carries the same state across room, drill-page, drill
+entry/exit and target queue kinds, charges each source obstacle item at the
+source-equivalent room exit, and preserves exact paid group identity through
+backtracking. Complete-centre fanout/plane attempts now explicitly bypass the
+source-width door/locator compensation instead of shrinking those corridors a
+second time.
+
+This checkpoint builds both native test executables, passes **218 native
 autorouter cases**, passes all **26 Python parity-harness tests**, and routes the
 saved 16-connection BJT board at 16/16 with zero new KiCad DRC violations. The
-same lifecycle still has to be generalized to the unrestricted-angle and three
-multilayer frontiers; complete mutable item normalization remains the next
+same lifecycle still has to be generalized to the unrestricted-angle
+single/multilayer frontiers and the legacy orthogonal multilayer frontier;
+complete mutable item normalization remains the next
 dependency for source-identical arbitrary trace/via displacement.
 
 ## Previous core milestone — active obstacle items and source batch convergence
