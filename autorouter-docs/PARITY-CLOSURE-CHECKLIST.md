@@ -14,7 +14,8 @@ latter. Never modify the protected reference checkout or build inside it.
 
 ## Latest core milestone — expansion-time trace shove and paid requeue
 
-The active 45-degree single-layer frontier now carries the source
+The active 45-degree single-layer frontier and its bounded orthogonal fallback
+now carry the source
 `MazeSearchElement` shove lifecycle instead of treating every movable trace as
 an immediate conventional rip-up. `ObstacleExpansionRoom` shapes retain one
 shared immutable trace-item record for each same-layer/same-style polyline run:
@@ -30,14 +31,17 @@ cost and group identity are retained on the exact queue entry that paid them,
 so backtracking no longer infers payment merely from entering an obstacle
 shape. Unsupported geometry, mismatched width/clearance, cancellation, or an
 unproved transaction falls through to ordinary paid rip-up without weakening
-KiCad insertion checks.
+KiCad insertion checks. The fallback now has an explicit source-tree geometry
+mode: door sections are compensated exactly once, backtracking uses the same
+free-room versus ripped-obstacle shrink rules as the primary locator, and both
+45-degree and strict orthogonal corner realization share that source corridor.
 
-This checkpoint builds both native test executables, passes **216 native
+This checkpoint builds both native test executables, passes **217 native
 autorouter cases**, passes all **26 Python parity-harness tests**, and routes the
 saved 16-connection BJT board at 16/16 with zero new KiCad DRC violations. The
-same lifecycle still has to be generalized to the 90-degree, unrestricted-angle
-and three multilayer frontiers; complete mutable item normalization remains the
-next dependency for source-identical arbitrary trace/via displacement.
+same lifecycle still has to be generalized to the unrestricted-angle and three
+multilayer frontiers; complete mutable item normalization remains the next
+dependency for source-identical arbitrary trace/via displacement.
 
 ## Previous core milestone — active obstacle items and source batch convergence
 

@@ -7694,6 +7694,43 @@ BOOST_AUTO_TEST_CASE( ObstacleRoomFrontierChargesEachSourceItemOnce )
 }
 
 
+BOOST_AUTO_TEST_CASE( OrthogonalFallbackUsesSourceShoveRequeueLifecycle )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    const std::vector<ROOM_TERMINAL> starts{
+        { { 1000, 5000 }, { 1000, 5000 }, 0 }
+    };
+    const std::vector<ROOM_TERMINAL> targets{
+        { { 9000, 5000 }, { 9000, 5000 }, 1 }
+    };
+    const SHAPE_TREE_ENTRY shape{ { 4500, 2000, 5500, 8000 }, 7, 0, 0, 2,
+                                  false, true };
+    auto traceInfo = std::make_shared<MAZE_TRACE_ROOM_INFO>();
+    traceInfo->corners = { { 5000, 2000 }, { 5000, 8000 } };
+    // A stale source shape index is the reference case which must delay paid
+    // rip-up and requeue this exact door section once with alreadyChecked.
+    traceInfo->firstShapeIndex = 1;
+    traceInfo->halfWidth = 100;
+    traceInfo->clearance = 0;
+    traceInfo->sourceStyleMatches = true;
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
+            bounds, {}, 0, 1, starts, targets, 100, 1, 1, 10000,
+            expanded, metrics, {}, {}, false, 0,
+            { ROOM_RIPUP_OBSTACLE{ shape, 42, 100, 3, traceInfo } }, true );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE_EQUAL( path->rippedObstacleGroups.size(), 1U );
+    BOOST_CHECK_EQUAL( path->rippedObstacleGroups.front(), 42U );
+    BOOST_CHECK_EQUAL( path->ripupCost, 100 );
+    BOOST_CHECK_EQUAL( metrics.rippedRooms, 1 );
+    BOOST_CHECK_EQUAL( metrics.ripupCost, 100 );
+    BOOST_CHECK_GT( expanded, 1 );
+}
+
+
 BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles )
 {
     auto board = makeBoard();

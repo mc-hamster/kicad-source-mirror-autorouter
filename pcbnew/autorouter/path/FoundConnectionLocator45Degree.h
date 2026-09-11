@@ -60,7 +60,7 @@ public:
     static std::optional<std::vector<ROUTER_POINT>> LocateOctagonal(
             ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps,
             double aCompensatedTraceHalfWidth = 0,
-            double aTraceWidthTolerance = 2 );
+            double aTraceWidthTolerance = 2, bool aOrthogonal = false );
 };
 
 } // namespace KICAD_AUTOROUTER

@@ -1026,7 +1026,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                     m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
                     aCancel, aProgress, false,
                     static_cast<double>( std::max( 0, m_settings.bendCost ) )
-                            * std::max( 1, m_settings.gridStepIU ), ripupEntries );
+                            * std::max( 1, m_settings.gridStepIU ), ripupEntries,
+                    sourceTraceRooms );
         }
         if( !path )
             continue;

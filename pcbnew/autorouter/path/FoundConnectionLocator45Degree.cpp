@@ -130,7 +130,8 @@ bool horizontalFirstToDoor( const PLANAR::INT_OCTAGON& aDoor,
 
 bool appendFortyFiveDegreeMove( std::vector<ROUTER_POINT>& aPoints,
                                 ROUTER_POINT aTarget, bool aHorizontalFirst,
-                                const PLANAR::INT_OCTAGON* aRequiredRoom = nullptr )
+                                const PLANAR::INT_OCTAGON* aRequiredRoom = nullptr,
+                                bool aOrthogonal = false )
 {
     if( aPoints.empty() )
         return false;
@@ -141,12 +142,12 @@ bool appendFortyFiveDegreeMove( std::vector<ROUTER_POINT>& aPoints,
     const FLOAT_POINT toFloat{ static_cast<double>( aTarget.x ),
                                static_cast<double>( aTarget.y ) };
     ROUTER_POINT corner = FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
-            fromFloat, toFloat, aHorizontalFirst, false ).Round();
+            fromFloat, toFloat, aHorizontalFirst, aOrthogonal ).Round();
 
     if( aRequiredRoom && !aRequiredRoom->Contains( corner ) )
     {
         corner = FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
-                fromFloat, toFloat, !aHorizontalFirst, false ).Round();
+                fromFloat, toFloat, !aHorizontalFirst, aOrthogonal ).Round();
 
         if( !aRequiredRoom->Contains( corner ) )
             return false;
@@ -239,7 +240,8 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
 
 std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
         ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps,
-        double aCompensatedTraceHalfWidth, double aTraceWidthTolerance )
+        double aCompensatedTraceHalfWidth, double aTraceWidthTolerance,
+        bool aOrthogonal )
 {
     if( aSteps.empty() )
         return std::vector<ROUTER_POINT>{ aStart };
@@ -276,7 +278,7 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
 
             const bool horizontalFirst = std::abs( dx ) >= std::abs( dy );
             if( !appendFortyFiveDegreeMove( points, target, horizontalFirst,
-                                            &step.room ) )
+                                            &step.room, aOrthogonal ) )
                 return std::nullopt;
         }
         return points;
@@ -326,7 +328,8 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
                                   static_cast<double>( nearestRoom->y ) };
             if( !appendFortyFiveDegreeMove(
                         reversePoints, *nearestRoom,
-                        horizontalFirstFromDoor( fromDoor, from, to ) ) )
+                        horizontalFirstFromDoor( fromDoor, from, to ),
+                        nullptr, aOrthogonal ) )
                 return fail( "enter_room", reverseIndex );
         }
         else
@@ -396,7 +399,8 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
         const PLANAR::INT_OCTAGON* requiredRoom = reverseIndex == 0
                 ? &shrunkenRoom : nullptr;
         if( !appendFortyFiveDegreeMove( reversePoints, nextPoint,
-                                        horizontalFirst, requiredRoom ) )
+                                        horizontalFirst, requiredRoom,
+                                        aOrthogonal ) )
             return fail( "leave_room", reverseIndex );
 
         const ROUTER_BOX roomBounds = step.room.BoundingBox();

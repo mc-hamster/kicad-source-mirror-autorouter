@@ -162,7 +162,8 @@ public:
             const ROUTER_CANCEL_CALLBACK& aCancel = {},
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {}, bool aOrthogonal = true,
             double aBendCost = 0,
-            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {} );
+            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {},
+            bool aSourceTraceRooms = false );
 
     // Layers are in physical stack order, with explicit (possibly nonordinal)
     // host IDs. Inactive layers are retained for full through-drill validation.
