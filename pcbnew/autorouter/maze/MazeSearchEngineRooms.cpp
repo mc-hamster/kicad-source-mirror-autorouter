@@ -933,10 +933,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     // RoutingBoard.fanout() uses the same 45-degree room/door/drill frontier
     // as an ordinary connection and changes only its termination condition:
     // the first drill which exits the source layer is a destination.  Keeping
-    // fanout on the older rectangular frontier changed both drill ordering and
-    // narrow diagonal clearance decisions.  Exact drill free regions are now
-    // available, so use the source-shaped frontier for both call paths.
+    // Fanout on the older rectangular frontier changed both drill ordering and
+    // narrow diagonal clearance decisions. Exact fixed-direction and general
+    // trace rooms are available, so use the source-shaped frontier for both
+    // call paths. Drill pages retain their source rectangular partition.
     const bool exactFrontier = true;
+    bool anyAngleFrontier = false;
     int nextObstacleId = 1;
     for( int id : physical )
     {
@@ -949,6 +951,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         layer.active = setting->enabled
                        && ( exactFrontier || !hasGeneralConvexRoomGeometry( net, id ) );
         layer.bounds = bounds;
+        anyAngleFrontier = anyAngleFrontier
+                           || hasGeneralConvexRoomGeometry( net, id );
         if( layer.active )
         {
             layer.ripupObstacles = roomRipupObstacles(
@@ -992,7 +996,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         }
         layers.push_back( std::move( layer ) );
     }
-    const auto path = exactFrontier
+    const auto path = anyAngleFrontier
+            ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayerConnection(
+                      layers, net, std::max<std::int64_t>( 1, radius ), via,
+                      m_settings.maxExpandedNodes, expanded, m_roomMetrics,
+                      cancel, progress )
+            : exactFrontier
             ? MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
                       layers, net, std::max<std::int64_t>( 1, radius ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,

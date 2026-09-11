@@ -69,7 +69,8 @@ public:
             const std::vector<SHAPE_TREE_ENTRY>& aObstacles, int aNet, int aLayerCount,
             bool aAttachSmd = false, const std::vector<DRILL_PIN>& aPins = {},
             const ROUTER_CANCEL_CALLBACK& aCancel = {},
-            std::size_t aMaxPieces = std::numeric_limits<std::size_t>::max() );
+            std::size_t aMaxPieces = std::numeric_limits<std::size_t>::max(),
+            bool aAnyAngle = false );
 
 private:
     ROUTER_BOX             m_shape;
@@ -79,6 +80,7 @@ private:
     int m_net = -1;
     int m_layerCount = 0;
     bool m_attachSmd = false;
+    bool m_anyAngle = false;
 };
 
 } // namespace KICAD_AUTOROUTER

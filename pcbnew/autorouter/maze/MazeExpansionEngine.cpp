@@ -74,6 +74,16 @@ FLOAT_POINT MAZE_EXPANSION_ENGINE::Nearest(
     return result;
 }
 
+
+FLOAT_POINT MAZE_EXPANSION_ENGINE::Nearest(
+        const PLANAR::SIMPLEX& aShape, FLOAT_POINT aFrom )
+{
+    if( aShape.SideOfBorder( aFrom, 1e-9 ) <= 0 )
+        return aFrom;
+    const auto nearest = aShape.NearestPointApprox( aFrom.x, aFrom.y );
+    return { nearest.first, nearest.second };
+}
+
 std::vector<ROUTER_NODE> MAZE_EXPANSION_ENGINE::Neighbours(
         const ROUTER_NODE& aNode, std::int64_t aGridStep,
         const std::vector<ROUTER_LAYER_SETTINGS>& aLayers, bool aAllowVias )

@@ -22,6 +22,7 @@
 #include "../AutorouterTypes.h"
 #include "../geometry/planar/IntBox.h"
 #include "../geometry/planar/IntOctagon.h"
+#include "../geometry/planar/Simplex.h"
 
 namespace KICAD_AUTOROUTER
 {
@@ -33,6 +34,9 @@ struct EXPANSION_DRILL
 {
     ROUTER_POINT location;
     PLANAR::INT_OCTAGON freeShape = PLANAR::INT_OCTAGON::Empty();
+    /** Exact unrestricted-angle free region.  The octagon remains populated
+     * for fixed-direction consumers and broad-phase diagnostics. */
+    std::optional<PLANAR::SIMPLEX> generalFreeShape;
     int          firstLayer = -1;
     int          lastLayer = -1;
     bool         valid = true;

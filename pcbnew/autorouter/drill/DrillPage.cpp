@@ -51,16 +51,108 @@ int DRILL_PAGE::GetId() const
 std::vector<EXPANSION_DRILL>* DRILL_PAGE::GetDrills(
         const std::vector<SHAPE_TREE_ENTRY>& aObstacles, int aNet, int aLayerCount,
         bool aAttachSmd, const std::vector<DRILL_PIN>& aPins,
-        const ROUTER_CANCEL_CALLBACK& aCancel, std::size_t aMaxPieces )
+        const ROUTER_CANCEL_CALLBACK& aCancel, std::size_t aMaxPieces,
+        bool aAnyAngle )
 {
     if( aLayerCount < 1 || ( aCancel && aCancel() ) )
         return nullptr;
-    if( m_drills && m_net == aNet && m_attachSmd == aAttachSmd && m_layerCount == aLayerCount )
+    if( m_drills && m_net == aNet && m_attachSmd == aAttachSmd
+        && m_layerCount == aLayerCount && m_anyAngle == aAnyAngle )
+    {
         return &*m_drills;
+    }
     Invalidate();
     m_net = aNet;
     m_attachSmd = aAttachSmd;
     m_layerCount = aLayerCount;
+    m_anyAngle = aAnyAngle;
+
+    if( aAnyAngle )
+    {
+        const PLANAR::SIMPLEX pageShape = PLANAR::SIMPLEX::Box( m_shape );
+        std::vector<PLANAR::SIMPLEX> holes;
+        std::optional<PLANAR::SIMPLEX> previous;
+
+        for( const auto& entry : aObstacles )
+        {
+            if( aCancel && aCancel() )
+                return nullptr;
+
+            if( entry.isRoom || !entry.IsTraceObstacle( aNet )
+                || !INT_BOX::Intersects( entry.shape, m_shape ) )
+            {
+                continue;
+            }
+
+            const PLANAR::SIMPLEX obstacle = entry.BoundingSimplex();
+
+            // Preserve DrillPage.getDrills()' source-order suppression of
+            // repeated layer shapes (most commonly the identical contours of
+            // a through via).  Compare the uncut shapes exactly; page clipping
+            // is performed only for a shape that survives this test.
+            if( !previous || !previous->Contains( obstacle ) )
+            {
+                const PLANAR::SIMPLEX cutout = obstacle.Intersection( pageShape );
+
+                if( cutout.Dimension() == 2 )
+                    holes.push_back( cutout );
+            }
+
+            previous = obstacle;
+        }
+
+        auto shapes = POLYLINE_AREA::SplitSimplexToConvex(
+                pageShape, holes, aCancel, aMaxPieces );
+
+        if( !shapes )
+            return nullptr;
+
+        std::vector<EXPANSION_DRILL> drills;
+
+        for( auto& shape : *shapes )
+        {
+            if( aCancel && aCancel() )
+                return nullptr;
+
+            std::optional<ROUTER_POINT> pinCenter;
+
+            if( aAttachSmd )
+            {
+                for( int layer : { 0, aLayerCount - 1 } )
+                {
+                    for( const auto& pin : aPins )
+                    {
+                        if( pin.layer == layer && pin.drillAllowed
+                            && shape.ContainsInside( PLANAR::POINT( pin.position ) ) )
+                        {
+                            pinCenter = pin.position;
+                        }
+                    }
+
+                    if( pinCenter )
+                        break;
+                }
+            }
+
+            EXPANSION_DRILL drill;
+            drill.generalFreeShape = shape;
+            drill.freeShape = shape.BoundingOctagon().value_or(
+                    PLANAR::INT_OCTAGON::Empty() );
+            const auto center = shape.CentreOfGravity();
+            drill.location = pinCenter.value_or(
+                    FLOAT_POINT{ center.first, center.second }.Round() );
+            drill.firstLayer = 0;
+            drill.lastLayer = aLayerCount - 1;
+            drill.rooms.resize( aLayerCount, nullptr );
+            drill.occupied.resize( aLayerCount, false );
+            drills.push_back( std::move( drill ) );
+        }
+
+        m_drills = std::move( drills );
+        m_valid = true;
+        return &*m_drills;
+    }
+
     std::vector<PLANAR::INT_OCTAGON> holes;
     std::optional<PLANAR::INT_OCTAGON> previous;
     for( const auto& entry : aObstacles )

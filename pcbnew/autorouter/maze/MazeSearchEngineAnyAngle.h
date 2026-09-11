@@ -21,6 +21,16 @@ public:
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
             double aBendCost = 0,
             const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {} );
+
+    /** General-rational room/page/drill frontier.  Drill pages retain the
+     * source IntBox partition while every per-layer trace room remains an
+     * exact SIMPLEX. */
+    static std::optional<ROOM_MULTILAYER_PATH> FindMultilayerConnection(
+            const std::vector<ROOM_LAYER>& aLayers, int aNet,
+            double aSectionOffset, const ROOM_VIA_SETTINGS& aVia,
+            int aMaxExpanded, int& aExpanded, ROOM_SEARCH_METRICS& aMetrics,
+            const ROUTER_CANCEL_CALLBACK& aCancel = {},
+            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {} );
 };
 
 } // namespace KICAD_AUTOROUTER

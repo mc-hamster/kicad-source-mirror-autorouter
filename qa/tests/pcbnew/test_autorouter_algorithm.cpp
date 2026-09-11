@@ -8367,6 +8367,56 @@ BOOST_AUTO_TEST_CASE( DrillPagePreservesExactOctagonalFreeRegions )
     BOOST_CHECK_SMALL( nearest.y - 20.0, 1e-9 );
 }
 
+BOOST_AUTO_TEST_CASE( DrillPagePreservesExactGeneralConvexFreeRegions )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+
+    DRILL_PAGE page( { -20, -20, 120, 60 } );
+    const auto triangle = SIMPLEX::FromConvexPolygon(
+            { { 0, 0 }, { 100, 0 }, { 0, 30 } } );
+    BOOST_REQUIRE( triangle );
+    const auto bounds = triangle->BoundingBox();
+    BOOST_REQUIRE( bounds );
+    SHAPE_TREE_ENTRY obstacle{ *bounds, 1, 0, 0, 2, false, true,
+                               triangle->BoundingOctagon(), *triangle };
+
+    // This point satisfies every axis/45-degree support of the triangle's
+    // octagonal envelope, but is outside its exact 3*x + 10*y <= 300 support.
+    // General drill decomposition must retain the usable wedge around it.
+    const ROUTER_POINT generalOnlyFreePoint{ 60, 20 };
+    BOOST_REQUIRE( obstacle.BoundingOctagon().Contains( generalOnlyFreePoint ) );
+    BOOST_CHECK( !triangle->Contains( POINT( generalOnlyFreePoint ) ) );
+
+    const auto* drills = page.GetDrills(
+            { obstacle }, 1, 2, false, {}, {},
+            std::numeric_limits<std::size_t>::max(), true );
+    BOOST_REQUIRE( drills );
+    BOOST_REQUIRE( !drills->empty() );
+    BOOST_CHECK( std::all_of( drills->begin(), drills->end(), []( const auto& drill )
+    {
+        return drill.generalFreeShape.has_value();
+    } ) );
+    BOOST_CHECK( std::none_of( drills->begin(), drills->end(), []( const auto& drill )
+    {
+        return drill.generalFreeShape->ContainsInside(
+                POINT( ROUTER_POINT{ 10, 10 } ) );
+    } ) );
+    BOOST_CHECK( std::any_of( drills->begin(), drills->end(), [&]( const auto& drill )
+    {
+        return drill.generalFreeShape->Contains( POINT( generalOnlyFreePoint ) );
+    } ) );
+
+    // The representation is part of the cache key: switching to the legacy
+    // fixed-direction path must rebuild rather than return exact-shape drills.
+    const auto* fixedDrills = page.GetDrills( { obstacle }, 1, 2 );
+    BOOST_REQUIRE( fixedDrills );
+    BOOST_CHECK( std::none_of( fixedDrills->begin(), fixedDrills->end(), []( const auto& drill )
+    {
+        return drill.generalFreeShape.has_value();
+    } ) );
+}
+
 BOOST_AUTO_TEST_CASE( MultilayerRoomSearchUsesDrillSectionsAndFullPhysicalStack )
 {
     ROOM_LAYER a, b, inactive;
@@ -8531,6 +8581,83 @@ BOOST_AUTO_TEST_CASE( ExactOctagonalMultilayerSearchUsesRoomsDoorsAndDrills )
             const auto obstacle = diamond.Offset( -1 ).ToSimplex();
             BOOST_REQUIRE( obstacle );
             BOOST_CHECK( path.Empty() || !obstacle->IntersectsSegment( path, 1 ) );
+        }
+    }
+    BOOST_CHECK_EQUAL( transitions, 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( ExactGeneralMultilayerSearchUsesRoomsDoorsAndDrills )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    ROOM_LAYER top, bottom;
+    top.id = 0;
+    bottom.id = 31;
+    top.bounds = bottom.bounds = { 0, 0, 10000, 10000 };
+    top.starts = { { { 1000, 5000 }, { 1000, 5000 }, 7 } };
+    bottom.targets = { { { 9000, 5000 }, { 9000, 5000 }, 9 } };
+
+    const auto obstacle = SIMPLEX::FromConvexPolygon(
+            { { 2500, 1800 }, { 8200, 3900 },
+              { 6900, 8300 }, { 1700, 6400 } } );
+    BOOST_REQUIRE( obstacle );
+    top.obstacles.push_back( {
+            obstacle->BoundingBox().value(), 1, 0, top.id, 2,
+            false, true, obstacle->BoundingOctagon(), *obstacle } );
+
+    ROOM_VIA_SETTINGS via;
+    via.bounds = top.bounds;
+    via.pageWidth = 2000;
+    via.normalCost = 1000;
+    via.obstacles = top.obstacles;
+    via.canDrill = []( auto ) { return true; };
+    via.selectViaStyle = [&]( ROUTER_POINT, int fromLayer, int toLayer )
+            -> std::optional<ROUTING_EDGE_STYLE>
+    {
+        if( fromLayer != top.id || toLayer != bottom.id )
+            return std::nullopt;
+        ROUTING_EDGE_STYLE style;
+        style.viaDiameter = 321;
+        style.viaDrill = 123;
+        style.viaLayers = { top.id, bottom.id };
+        style.viaType = ROUTER_VIA_TYPE::BLIND_BURIED;
+        return style;
+    };
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto found = MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayerConnection(
+            { top, bottom }, 1, 100, via, 10000, expanded, metrics );
+
+    BOOST_REQUIRE( found );
+    BOOST_CHECK_EQUAL( found->startOwner, 7U );
+    BOOST_CHECK_EQUAL( found->targetOwner, 9U );
+    BOOST_CHECK_GT( metrics.rooms, 0 );
+    BOOST_CHECK_GT( metrics.doors, 0 );
+    BOOST_CHECK_GT( metrics.drillPages, 0 );
+    BOOST_CHECK_GT( metrics.drills, 0 );
+    BOOST_CHECK_GT( metrics.layerTransitions, 0 );
+    BOOST_REQUIRE_EQUAL( found->edgeStyles.size(), found->nodes.size() - 1 );
+    int transitions = 0;
+    for( std::size_t index = 1; index < found->nodes.size(); ++index )
+    {
+        const ROUTER_NODE& from = found->nodes[index - 1];
+        const ROUTER_NODE& to = found->nodes[index];
+        if( from.layer != to.layer )
+        {
+            ++transitions;
+            BOOST_CHECK( from.point == to.point );
+            BOOST_CHECK_EQUAL( found->edgeStyles[index - 1].viaDiameter, 321 );
+        }
+        else if( from.layer == top.id )
+        {
+            const auto path = PLANAR::POLYLINE::FromPoints(
+                    { from.point, to.point } );
+            BOOST_REQUIRE( !path.Empty() );
+            BOOST_CHECK( !obstacle->ContainsInside( POINT( from.point ) ) );
+            BOOST_CHECK( !obstacle->ContainsInside( POINT( to.point ) ) );
+            BOOST_CHECK( !obstacle->IntersectsSegment( path, 1 ) );
         }
     }
     BOOST_CHECK_EQUAL( transitions, 1 );
