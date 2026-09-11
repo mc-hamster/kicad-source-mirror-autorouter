@@ -33,6 +33,22 @@ std::optional<ROUTER_POINT> nearestInRoom45(
     return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
             aTerminal.start, aTerminal.end, aPoint, aRoom );
 }
+
+
+std::string pointSequence( const std::vector<ROUTER_POINT>& aPoints )
+{
+    std::ostringstream result;
+
+    for( std::size_t index = 0; index < aPoints.size(); ++index )
+    {
+        if( index > 0 )
+            result << ';';
+
+        result << aPoints[index].x << ',' << aPoints[index].y;
+    }
+
+    return result.str();
+}
 } // namespace
 
 
@@ -235,13 +251,23 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                         to.door ? std::optional<INT_OCTAGON>(
                                           to.door->GetOctagonShape() )
                                 : std::nullopt,
-                        to.entry } );
+                        to.entry,
+                        dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                                from.room->shape.get() ) != nullptr } );
             }
             const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
-                    states[entries.front()].entry.Middle().Round(), corridor );
+                    states[entries.front()].entry.Middle().Round(), corridor,
+                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
             if( !located )
                 continue;
             path.points = *located;
+            autorouterDecisionLog(
+                    "LOCATED_PATH_45",
+                    { { "net", std::to_string( aNet ) },
+                      { "layer", std::to_string( aLayer ) },
+                      { "section_offset", std::to_string( aSectionOffset ) },
+                      { "corridor_steps", std::to_string( corridor.size() ) },
+                      { "points", pointSequence( path.points ) } } );
             aMetrics.rippedRooms += static_cast<int>( path.rippedObstacleGroups.size() );
             aMetrics.ripupCost += path.ripupCost;
             aMetrics.routed = true;
@@ -277,7 +303,7 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             if( !next->complete || !next->active )
                 continue;
             const auto sections = door->GetSectionSegments(
-                    0, 0, 10 * aSectionOffset,
+                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
                     static_cast<std::size_t>(
                             std::max( 0, aMaxExpanded - aExpanded ) ) );
             for( std::size_t section = 0; section < sections.size(); ++section )

@@ -548,12 +548,69 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             result.nodes.push_back( { states[chain.front()].entry.Middle().Round(),
                                       layers[states[chain.front()].layer].id } );
             bool valid = true;
+            std::vector<OCTAGONAL_CORRIDOR_STEP> corridor;
+            std::size_t corridorLayer = NONE;
+            auto locateCorridor = [&]()
+            {
+                if( corridor.empty() )
+                    return true;
+
+                const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
+                        result.nodes.back().point, corridor, sectionOffset,
+                        FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                if( !located )
+                {
+                    if( autorouterDebugEnabled() )
+                    {
+                        std::ostringstream message;
+                        message << "ROOM45_DRILL_LOCATOR_REJECTED net=" << net
+                                << " chain=" << chain.size()
+                                << " corridor=" << corridor.size()
+                                << " layer=" << layers[corridorLayer].id
+                                << " from=(" << result.nodes.back().point.x << ','
+                                << result.nodes.back().point.y << ')';
+                        autorouterDebugLog( message.str() );
+                    }
+                    return false;
+                }
+
+                for( std::size_t point = 1; point < located->size(); ++point )
+                {
+                    result.nodes.push_back(
+                            { ( *located )[point], layers[corridorLayer].id } );
+                    result.edgeStyles.emplace_back();
+                }
+
+                std::ostringstream locatedPoints;
+                for( std::size_t point = 0; point < located->size(); ++point )
+                {
+                    if( point > 0 )
+                        locatedPoints << ';';
+                    locatedPoints << ( *located )[point].x << ','
+                                  << ( *located )[point].y;
+                }
+                autorouterDecisionLog(
+                        "LOCATED_PATH_45",
+                        { { "net", std::to_string( net ) },
+                          { "layer", std::to_string( layers[corridorLayer].id ) },
+                          { "section_offset", std::to_string( sectionOffset ) },
+                          { "corridor_steps", std::to_string( corridor.size() ) },
+                          { "points", locatedPoints.str() } } );
+                corridor.clear();
+                corridorLayer = NONE;
+                return true;
+            };
             for( std::size_t i = 1; i < chain.size() && valid; ++i )
             {
                 const auto& before = states[chain[i - 1]];
                 const auto& after = states[chain[i]];
                 if( after.kind == KIND::DRILL_EXIT || after.kind == KIND::FANOUT_TARGET )
                 {
+                    if( !corridor.empty() )
+                    {
+                        valid = false;
+                        break;
+                    }
                     if( result.nodes.back().point != after.drill->location )
                     { valid = false; break; }
                     result.nodes.push_back( { after.drill->location, layers[after.layer].id } );
@@ -568,38 +625,28 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                     entry = { { static_cast<double>( p.x ), static_cast<double>( p.y ) },
                               { static_cast<double>( p.x ), static_cast<double>( p.y ) } };
                 }
-                const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
-                        result.nodes.back().point,
-                        { { before.room->shape->GetOctagon(),
-                            after.door
-                                    ? std::optional<INT_OCTAGON>(
-                                              after.door->GetOctagonShape() )
-                                    : std::nullopt,
-                            entry } } );
-                if( !located )
+                if( corridor.empty() )
+                    corridorLayer = before.layer;
+                if( before.layer != corridorLayer || after.layer != corridorLayer )
                 {
-                    if( autorouterDebugEnabled() )
-                    {
-                        std::ostringstream message;
-                        message << "ROOM45_DRILL_LOCATOR_REJECTED net=" << net
-                                << " chain=" << chain.size() << " step=" << i
-                                << " kind=" << static_cast<int>( after.kind )
-                                << " layer=" << layers[after.layer].id
-                                << " from=(" << result.nodes.back().point.x << ','
-                                << result.nodes.back().point.y << ") entry=("
-                                << entry.a.x << ',' << entry.a.y << ")-("
-                                << entry.b.x << ',' << entry.b.y << ')';
-                        autorouterDebugLog( message.str() );
-                    }
                     valid = false;
                     break;
                 }
-                for( std::size_t j = 1; j < located->size(); ++j )
-                {
-                    result.nodes.push_back( { ( *located )[j], layers[after.layer].id } );
-                    result.edgeStyles.emplace_back();
-                }
+                corridor.push_back(
+                        { before.room->shape->GetOctagon(),
+                          after.door
+                                  ? std::optional<INT_OCTAGON>(
+                                            after.door->GetOctagonShape() )
+                                  : std::nullopt,
+                          entry,
+                          dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                                  before.room->shape.get() ) != nullptr } );
+
+                if( after.kind == KIND::DRILL_ENTER || after.kind == KIND::TARGET )
+                    valid = locateCorridor();
             }
+            if( valid )
+                valid = locateCorridor();
             if( valid && !( cancel && cancel() ) )
             {
                 metrics.rippedRooms += static_cast<int>( result.rippedObstacleGroups.size() );
@@ -714,7 +761,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                       { "next_room_bounds",
                         autorouterDecisionBounds( next->shape->GetShape() ) },
                       { "is_backtrack", door == current.door ? "true" : "false" } } );
-            const auto sections = door->GetSectionSegments( 0, 0, 10 * sectionOffset,
+            const auto sections = door->GetSectionSegments(
+                    sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
                     static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
             for( std::size_t section = 0; section < sections.size(); ++section )
             {

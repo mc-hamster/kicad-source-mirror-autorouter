@@ -37,6 +37,11 @@ struct OCTAGONAL_CORRIDOR_STEP
     PLANAR::INT_OCTAGON room;
     std::optional<PLANAR::INT_OCTAGON> door;
     FLOAT_LINE section;
+    // ObstacleExpansionRoom is routed through only after that movable item
+    // has been selected for rip-up.  Freerouting shrinks such a room by the
+    // compensated half width, while free-space rooms receive the additional
+    // two-coordinate tolerance.
+    bool obstacleRoom = false;
 };
 
 /**
@@ -53,7 +58,9 @@ public:
             ROUTER_POINT aStart, const std::vector<RECTANGULAR_CORRIDOR_STEP>& aSteps,
             bool aOrthogonal );
     static std::optional<std::vector<ROUTER_POINT>> LocateOctagonal(
-            ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps );
+            ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps,
+            double aCompensatedTraceHalfWidth = 0,
+            double aTraceWidthTolerance = 2 );
 };
 
 } // namespace KICAD_AUTOROUTER

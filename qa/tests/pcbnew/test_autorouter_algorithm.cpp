@@ -8031,6 +8031,81 @@ BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesSourceVisibilityRangeAcrossSeveralDoors
 }
 
 
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeLocatorAppliesSourceRoomShrinkTolerance )
+{
+    using PLANAR::INT_OCTAGON;
+    const INT_OCTAGON room = INT_OCTAGON::FromBox( { 0, 0, 100, 100 } );
+    const FLOAT_LINE destination{ { 100, 90 }, { 100, 90 } };
+
+    const auto freePath = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
+            { 0, 50 }, { { room, std::nullopt, destination, false } }, 10 );
+    const auto obstaclePath = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
+            { 0, 50 }, { { room, std::nullopt, destination, true } }, 10 );
+
+    BOOST_REQUIRE( freePath );
+    BOOST_REQUIRE( obstaclePath );
+    BOOST_CHECK( freePath->front() == ROUTER_POINT( { 0, 50 } ) );
+    BOOST_CHECK( freePath->back() == ROUTER_POINT( { 100, 90 } ) );
+    BOOST_CHECK( obstaclePath->front() == ROUTER_POINT( { 0, 50 } ) );
+    BOOST_CHECK( obstaclePath->back() == ROUTER_POINT( { 100, 90 } ) );
+
+    const auto freeInner = room.Offset( -12 );
+    const auto obstacleInner = room.Offset( -10 );
+    BOOST_CHECK( std::any_of( freePath->begin(), freePath->end(),
+                              [&]( ROUTER_POINT aPoint )
+                              {
+                                  return freeInner.Contains( aPoint );
+                              } ) );
+    BOOST_CHECK( std::any_of( obstaclePath->begin(), obstaclePath->end(),
+                              [&]( ROUTER_POINT aPoint )
+                              {
+                                  return obstacleInner.Contains( aPoint );
+                              } ) );
+    BOOST_CHECK( *freePath != *obstaclePath );
+}
+
+
+BOOST_AUTO_TEST_CASE( FortyFiveDegreeLocatorShrinksTwoDimensionalDoors )
+{
+    using PLANAR::INT_OCTAGON;
+    const INT_OCTAGON firstRoom = INT_OCTAGON::FromBox( { 0, 0, 120, 100 } );
+    const INT_OCTAGON secondRoom = INT_OCTAGON::FromBox( { 80, 20, 200, 120 } );
+    const INT_OCTAGON door = firstRoom.Intersection( secondRoom );
+    BOOST_REQUIRE_EQUAL( door.Dimension(), 2 );
+
+    const std::vector<OCTAGONAL_CORRIDOR_STEP> corridor{
+        { firstRoom, door, { { 80, 20 }, { 120, 100 } }, false },
+        { secondRoom, std::nullopt, { { 190, 110 }, { 190, 110 } }, false }
+    };
+    const auto path = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
+            { 10, 10 }, corridor, 10 );
+
+    BOOST_REQUIRE( path );
+    BOOST_CHECK( path->front() == ROUTER_POINT( { 10, 10 } ) );
+    BOOST_CHECK( path->back() == ROUTER_POINT( { 190, 110 } ) );
+    BOOST_CHECK( std::adjacent_find( path->begin(), path->end() ) == path->end() );
+    for( std::size_t i = 1; i < path->size(); ++i )
+    {
+        const std::int64_t dx = std::abs( path->at( i ).x - path->at( i - 1 ).x );
+        const std::int64_t dy = std::abs( path->at( i ).y - path->at( i - 1 ).y );
+        BOOST_CHECK( dx == 0 || dy == 0 || dx == dy );
+    }
+    const INT_OCTAGON shrunkenDoor = door.Offset( -12 );
+    const auto doorSimplex = shrunkenDoor.ToSimplex();
+    BOOST_REQUIRE( doorSimplex );
+    bool crossesShrunkenDoor = false;
+    for( std::size_t i = 1; i < path->size(); ++i )
+    {
+        const auto edge = PLANAR::POLYLINE::FromPoints(
+                { path->at( i - 1 ), path->at( i ) } );
+        BOOST_REQUIRE( !edge.Empty() );
+        crossesShrunkenDoor = crossesShrunkenDoor
+                              || doorSimplex->IntersectsSegment( edge, 1 );
+    }
+    BOOST_CHECK( crossesShrunkenDoor );
+}
+
+
 BOOST_AUTO_TEST_CASE( OctagonalRoomSeedPointsBracketEverySupportLineCrossing )
 {
     using PLANAR::INT_OCTAGON;

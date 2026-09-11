@@ -44,6 +44,12 @@
 namespace KICAD_AUTOROUTER
 {
 
+/** KiCad's Specctra exporter writes `(resolution um 10)`, so one coordinate
+ * in the pinned Freerouting engine is 0.1 micrometre, or 100 KiCad IU. */
+inline constexpr double FREEROUTING_COORDINATE_UNIT_IU = 100.0;
+inline constexpr double FREEROUTING_TRACE_WIDTH_TOLERANCE_IU =
+        2.0 * FREEROUTING_COORDINATE_UNIT_IU;
+
 /** A board coordinate used by the routing engine (KiCad IU, not floating point). */
 struct ROUTER_POINT
 {
