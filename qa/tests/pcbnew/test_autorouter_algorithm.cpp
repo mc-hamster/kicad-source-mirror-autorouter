@@ -3235,6 +3235,92 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterCreatesOrdinaryPreviewBoardItems )
 }
 
 
+BOOST_AUTO_TEST_CASE( KiCadAdapterMaterializesAndRecapturesLayerShapedViaPadstacks )
+{
+    BOARD board;
+    board.SetCopperLayerCount( 4 );
+    KICAD_BOARD_ADAPTER adapter( &board );
+    ROUTING_RESULT      result;
+    ROUTING_VIA         via;
+    via.netCode = 1;
+    via.position = { 2000000, 2000000 };
+    via.topLayer = static_cast<int>( F_Cu );
+    via.bottomLayer = static_cast<int>( B_Cu );
+    via.diameter = 300000;
+    via.drill = 150000;
+    via.layers = { static_cast<int>( F_Cu ), static_cast<int>( In1_Cu ), static_cast<int>( In2_Cu ),
+                   static_cast<int>( B_Cu ) };
+    via.type = ROUTER_VIA_TYPE::THROUGH;
+    via.layerGeometry = { { static_cast<int>( F_Cu ), 600000, 10000 },
+                          { static_cast<int>( In1_Cu ), 250000, 20000 },
+                          { static_cast<int>( In2_Cu ), 350000, 30000 },
+                          { static_cast<int>( B_Cu ), 500000, 40000 } };
+    result.vias.push_back( via );
+
+    auto preview = adapter.CreatePreviewItems( result );
+    BOOST_REQUIRE_EQUAL( preview.size(), 1U );
+    BOOST_REQUIRE_EQUAL( preview.front()->Type(), PCB_VIA_T );
+    PCB_VIA* materialized = static_cast<PCB_VIA*>( preview.front().get() );
+    BOOST_CHECK( materialized->Padstack().Mode() == PADSTACK::MODE::CUSTOM );
+    BOOST_CHECK_EQUAL( materialized->GetWidth( F_Cu ), 600000 );
+    BOOST_CHECK_EQUAL( materialized->GetWidth( In1_Cu ), 250000 );
+    BOOST_CHECK_EQUAL( materialized->GetWidth( In2_Cu ), 350000 );
+    BOOST_CHECK_EQUAL( materialized->GetWidth( B_Cu ), 500000 );
+    BOOST_REQUIRE( materialized->Padstack().Clearance( In1_Cu ) );
+    BOOST_CHECK_EQUAL( *materialized->Padstack().Clearance( In1_Cu ), 20000 );
+
+    auto* net = new NETINFO_ITEM( &board, "N1", 1 );
+    board.Add( net );
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    for( const VECTOR2I position : { VECTOR2I( 1000000, 1000000 ), VECTOR2I( 4000000, 1000000 ) } )
+    {
+        auto* pad = new PAD( footprint );
+        pad->SetAttribute( PAD_ATTRIB::SMD );
+        pad->SetLayerSet( LSET( { F_Cu } ) );
+        pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
+        pad->SetSize( PADSTACK::ALL_LAYERS, { 300000, 300000 } );
+        pad->SetPosition( position );
+        pad->SetNet( net );
+        footprint->Add( pad );
+    }
+    materialized->SetFlags( 0 );
+    materialized->SetNet( net );
+    const std::string viaId = materialized->m_Uuid.AsString().ToStdString();
+    board.Add( static_cast<PCB_TRACK*>( preview.front().release() ) );
+    board.BuildConnectivity();
+
+    AUTOROUTER_SETTINGS settings = adapter.CreateDefaultSettings();
+    settings.allowRipupExisting = true;
+    const auto snapshot = adapter.CreateSnapshot( settings );
+    BOOST_REQUIRE( snapshot );
+    std::map<int, std::int64_t> capturedDiameters;
+    bool                        capturedHole = false;
+    for( const ROUTING_OBSTACLE& obstacle : snapshot->removableExistingRoutes )
+    {
+        if( obstacle.boardItemId != viaId )
+            continue;
+
+        BOOST_CHECK( obstacle.isMovable );
+        if( obstacle.isHole )
+        {
+            capturedHole = true;
+            BOOST_CHECK_EQUAL( obstacle.radius, 75000 );
+        }
+        else
+        {
+            BOOST_REQUIRE_EQUAL( obstacle.layers.size(), 1U );
+            capturedDiameters[obstacle.layers.front()] = 2 * obstacle.radius;
+        }
+    }
+    BOOST_CHECK( capturedHole );
+    BOOST_CHECK_EQUAL( capturedDiameters[static_cast<int>( F_Cu )], 600000 );
+    BOOST_CHECK_EQUAL( capturedDiameters[static_cast<int>( In1_Cu )], 250000 );
+    BOOST_CHECK_EQUAL( capturedDiameters[static_cast<int>( In2_Cu )], 350000 );
+    BOOST_CHECK_EQUAL( capturedDiameters[static_cast<int>( B_Cu )], 500000 );
+}
+
+
 BOOST_AUTO_TEST_CASE( ThroughViasOccupyInactiveLayersOutsideSearchTransition )
 {
     auto board = makeBoard();
@@ -3272,6 +3358,106 @@ BOOST_AUTO_TEST_CASE( ThroughViasOccupyInactiveLayersOutsideSearchTransition )
     candidate.nodes = { { { 2500000, 1500000 }, 10 }, { { 3500000, 1500000 }, 10 } };
     MAZE_SEARCH_ENGINE occupiedSearch( board, settings, occupancy );
     BOOST_CHECK_EQUAL( occupiedSearch.FindConflictingConnections( candidate ).size(), 1 );
+}
+
+
+BOOST_AUTO_TEST_CASE( LayerShapedViaUsesTheDiameterAndClearanceOfEachPhysicalLayer )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 0, 0, 0 }, { 1, true, 0, 0, 1 }, { 2, true, 0, 0, 2 }, { 3, true, 0, 0, 3 } };
+    ROUTING_NET foreign;
+    foreign.netCode = 2;
+    board.nets.push_back( foreign );
+
+    const ROUTER_POINT position{ 3000000, 1500000 };
+    ROUTING_OBSTACLE   obstacle;
+    obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
+    obstacle.netCode = 2;
+    obstacle.layers = { 1 };
+    obstacle.start = obstacle.end = { 3300000, 1500000 };
+    obstacle.radius = 50000;
+    board.obstacles.push_back( obstacle );
+
+    ROUTING_EDGE_STYLE style;
+    style.viaDiameter = 200000;
+    style.viaDrill = 100000;
+    style.viaLayers = { 0, 1, 2, 3 };
+    style.viaType = ROUTER_VIA_TYPE::THROUGH;
+    style.viaLayerGeometry = { { 0, 800000, 0 }, { 1, 200000, 0 }, { 2, 250000, 0 }, { 3, 300000, 0 } };
+
+    ROUTING_OCCUPANCY occupancy( settings.gridStepIU );
+    occupancy.InitializeBoard( board, settings );
+    MAZE_SEARCH_ENGINE search( board, settings, occupancy );
+    const ROUTER_NODE  from{ position, 0 };
+    const ROUTER_NODE  to{ position, 3 };
+
+    // The 800000-IU outer annulus is irrelevant to an obstacle on layer 1;
+    // using one maximum radius on every layer would reject this legal via.
+    BOOST_CHECK( search.CanUseSegment( 1, from, to, true, &style ) );
+
+    style.viaLayerGeometry[1].clearance = 200000;
+    BOOST_CHECK( !search.CanUseSegment( 1, from, to, true, &style ) );
+    style.viaLayerGeometry[1].clearance = 0;
+    style.viaLayerGeometry[1].diameter = 600000;
+    BOOST_CHECK( !search.CanUseSegment( 1, from, to, true, &style ) );
+
+    ROUTING_RESULT result;
+    ROUTING_VIA    via;
+    via.netCode = 1;
+    via.position = position;
+    via.topLayer = 0;
+    via.bottomLayer = 3;
+    via.diameter = 200000;
+    via.drill = 100000;
+    via.layers = style.viaLayers;
+    via.type = ROUTER_VIA_TYPE::THROUGH;
+    via.layerGeometry = { { 0, 800000, 0 }, { 1, 200000, 0 }, { 2, 250000, 0 }, { 3, 300000, 0 } };
+    result.vias.push_back( via );
+    BOOST_CHECK_EQUAL( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+    result.vias.front().layerGeometry[1].clearance = 200000;
+    BOOST_CHECK_GT( DESIGN_RULES_CHECKER::CountViolations( board, settings, result ), 0 );
+}
+
+
+BOOST_AUTO_TEST_CASE( RoutingBoardRetainsAndValidatesLayerShapedViaStyle )
+{
+    auto board = makeBoard();
+    auto settings = makeSettings();
+    settings.layers = { { 0, true, 0, 0, 0 }, { 1, true, 0, 0, 1 }, { 2, true, 0, 0, 2 }, { 3, true, 0, 0, 3 } };
+    ROUTING_CONNECTION route;
+    route.netCode = 1;
+    route.complete = true;
+    route.nodes = { { { 3000000, 1500000 }, 0 }, { { 3000000, 1500000 }, 3 } };
+    ROUTING_EDGE_STYLE style;
+    style.viaDiameter = 200000;
+    style.viaDrill = 100000;
+    style.viaLayers = { 0, 1, 2, 3 };
+    style.viaType = ROUTER_VIA_TYPE::THROUGH;
+    style.viaLayerGeometry = { { 0, 800000, 10000 }, { 1, 200000, 20000 }, { 2, 250000, 30000 }, { 3, 300000, 40000 } };
+    route.edgeStyles = { style };
+
+    ROUTING_BOARD copper( board, settings );
+    copper.AddRoute( route );
+    const auto items = copper.RouteItems( route );
+    BOOST_REQUIRE_EQUAL( items.size(), 1U );
+    const auto retained = copper.ItemRoute( items.front() );
+    BOOST_REQUIRE( retained );
+    BOOST_REQUIRE_EQUAL( retained->edgeStyles.size(), 1U );
+    BOOST_CHECK_EQUAL( retained->edgeStyles.front().viaDiameter, style.viaDiameter );
+    BOOST_CHECK_EQUAL( retained->edgeStyles.front().viaDrill, style.viaDrill );
+    BOOST_CHECK( retained->edgeStyles.front().viaLayers == style.viaLayers );
+    BOOST_CHECK( retained->edgeStyles.front().viaLayerGeometry == style.viaLayerGeometry );
+
+    const std::size_t  itemCount = copper.ItemCount();
+    ROUTING_CONNECTION invalid = route;
+    invalid.edgeStyles.front().viaLayerGeometry.push_back( { 1, 300000, 0 } );
+    BOOST_CHECK_THROW( copper.AddRoute( invalid ), std::invalid_argument );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), itemCount );
+    invalid = route;
+    invalid.edgeStyles.front().viaLayerGeometry.push_back( { 4, 300000, 0 } );
+    BOOST_CHECK_THROW( copper.AddRoute( invalid ), std::invalid_argument );
+    BOOST_CHECK_EQUAL( copper.ItemCount(), itemCount );
 }
 
 

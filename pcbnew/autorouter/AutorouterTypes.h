@@ -250,6 +250,62 @@ struct AUTOROUTER_SETTINGS
 };
 
 
+/** Circular copper geometry for one physical layer of a via padstack.
+ *
+ * Freerouting Padstack stores one ConvexShape per layer.  KiCad PCB_VIA
+ * currently materializes circular copper, but its PADSTACK can retain a
+ * different diameter and local clearance on every layer.  A zero diameter
+ * inherits the profile/style diameter; a negative clearance is unspecified.
+ */
+struct ROUTING_VIA_LAYER_GEOMETRY
+{
+    int          layer = -1;
+    std::int64_t diameter = 0;
+    std::int64_t clearance = -1;
+
+    bool operator==( const ROUTING_VIA_LAYER_GEOMETRY& aOther ) const
+    {
+        return layer == aOther.layer && diameter == aOther.diameter && clearance == aOther.clearance;
+    }
+};
+
+
+inline std::int64_t ViaDiameterOnLayer( const std::vector<ROUTING_VIA_LAYER_GEOMETRY>& aGeometry, int aLayer,
+                                        std::int64_t aFallback )
+{
+    const auto found = std::find_if( aGeometry.begin(), aGeometry.end(),
+                                     [aLayer]( const ROUTING_VIA_LAYER_GEOMETRY& aEntry )
+                                     {
+                                         return aEntry.layer == aLayer;
+                                     } );
+    return found != aGeometry.end() && found->diameter > 0 ? found->diameter : aFallback;
+}
+
+
+inline std::optional<std::int64_t> ViaClearanceOnLayer( const std::vector<ROUTING_VIA_LAYER_GEOMETRY>& aGeometry,
+                                                        int                                            aLayer )
+{
+    const auto found = std::find_if( aGeometry.begin(), aGeometry.end(),
+                                     [aLayer]( const ROUTING_VIA_LAYER_GEOMETRY& aEntry )
+                                     {
+                                         return aEntry.layer == aLayer;
+                                     } );
+    if( found == aGeometry.end() || found->clearance < 0 )
+        return std::nullopt;
+    return found->clearance;
+}
+
+
+inline std::int64_t MaximumViaDiameter( const std::vector<ROUTING_VIA_LAYER_GEOMETRY>& aGeometry,
+                                        std::int64_t                                   aFallback )
+{
+    std::int64_t result = aFallback;
+    for( const ROUTING_VIA_LAYER_GEOMETRY& entry : aGeometry )
+        result = std::max( result, entry.diameter );
+    return result;
+}
+
+
 struct ROUTING_PAD
 {
     int                    netCode = 0;
@@ -359,6 +415,7 @@ struct ROUTING_PAD
     std::vector<int> fanoutViaLayers;
     bool             fanoutViaAttachSmdAllowed = false;
     ROUTER_VIA_TYPE  fanoutViaType = ROUTER_VIA_TYPE::AUTO;
+    std::vector<ROUTING_VIA_LAYER_GEOMETRY> fanoutViaLayerGeometry;
 };
 
 
@@ -520,12 +577,13 @@ struct ROUTING_VIA_PROFILE
     std::vector<int>      layers;
     bool                  attachSmdAllowed = false;
     ROUTER_VIA_TYPE       type = ROUTER_VIA_TYPE::AUTO;
+    std::vector<ROUTING_VIA_LAYER_GEOMETRY> layerGeometry;
 
     bool operator==( const ROUTING_VIA_PROFILE& aOther ) const
     {
-        return diameter == aOther.diameter && drill == aOther.drill
-               && layers == aOther.layers
-               && attachSmdAllowed == aOther.attachSmdAllowed && type == aOther.type;
+        return diameter == aOther.diameter && drill == aOther.drill && layers == aOther.layers
+               && attachSmdAllowed == aOther.attachSmdAllowed && type == aOther.type
+               && layerGeometry == aOther.layerGeometry;
     }
 };
 
@@ -657,13 +715,13 @@ struct ROUTING_EDGE_STYLE
     // A same-layer run changes source PolylineTrace identity at a fixed-state
     // boundary even when width and clearance are unchanged.
     ROUTER_FIXED_STATE fixedState = ROUTER_FIXED_STATE::UNFIXED;
+    std::vector<ROUTING_VIA_LAYER_GEOMETRY> viaLayerGeometry;
 
     bool operator==( const ROUTING_EDGE_STYLE& aOther ) const
     {
-        return trackWidth == aOther.trackWidth && clearance == aOther.clearance
-               && viaDiameter == aOther.viaDiameter && viaDrill == aOther.viaDrill
-               && viaLayers == aOther.viaLayers && viaType == aOther.viaType
-               && fixedState == aOther.fixedState;
+        return trackWidth == aOther.trackWidth && clearance == aOther.clearance && viaDiameter == aOther.viaDiameter
+               && viaDrill == aOther.viaDrill && viaLayers == aOther.viaLayers && viaType == aOther.viaType
+               && fixedState == aOther.fixedState && viaLayerGeometry == aOther.viaLayerGeometry;
     }
 
     bool operator!=( const ROUTING_EDGE_STYLE& aOther ) const
@@ -671,6 +729,20 @@ struct ROUTING_EDGE_STYLE
         return !( *this == aOther );
     }
 };
+
+
+inline std::int64_t ViaStyleDiameterOnLayer( const ROUTING_EDGE_STYLE& aStyle, int aLayer, std::int64_t aFallback )
+{
+    return ViaDiameterOnLayer( aStyle.viaLayerGeometry, aLayer,
+                               aStyle.viaDiameter > 0 ? aStyle.viaDiameter : aFallback );
+}
+
+
+inline std::int64_t ViaStyleClearanceOnLayer( const ROUTING_EDGE_STYLE& aStyle, int aLayer )
+{
+    const auto layerClearance = ViaClearanceOnLayer( aStyle.viaLayerGeometry, aLayer );
+    return layerClearance.value_or( std::max<std::int64_t>( 0, aStyle.clearance ) );
+}
 
 
 /** A route produced for one electrical connection. */
@@ -900,7 +972,21 @@ struct ROUTING_VIA
     // annulus; hole-to-hole clearance remains a distinct board rule.
     std::int64_t           clearance = 0;
     ROUTER_VIA_TYPE        type = ROUTER_VIA_TYPE::AUTO;
+    std::vector<ROUTING_VIA_LAYER_GEOMETRY> layerGeometry;
 };
+
+
+inline std::int64_t ViaResultDiameterOnLayer( const ROUTING_VIA& aVia, int aLayer, std::int64_t aFallback = 0 )
+{
+    return ViaDiameterOnLayer( aVia.layerGeometry, aLayer, aVia.diameter > 0 ? aVia.diameter : aFallback );
+}
+
+
+inline std::int64_t ViaResultClearanceOnLayer( const ROUTING_VIA& aVia, int aLayer )
+{
+    const auto layerClearance = ViaClearanceOnLayer( aVia.layerGeometry, aLayer );
+    return layerClearance.value_or( std::max<std::int64_t>( 0, aVia.clearance ) );
+}
 
 
 struct ROUTER_METRICS

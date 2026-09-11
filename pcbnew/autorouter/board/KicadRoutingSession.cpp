@@ -378,10 +378,24 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
             output.position = { p.x, p.y };
             output.topLayer = via->TopLayer();
             output.bottomLayer = via->BottomLayer();
-            output.diameter = via->GetWidth();
             output.drill = via->GetDrill();
             for( auto layer : via->GetLayerSet().Seq() )
+            {
                 output.layers.push_back( layer );
+                const std::int64_t diameter = via->GetWidth( layer );
+                output.diameter = std::max( output.diameter, diameter );
+                const auto clearance = via->Padstack().Clearance( layer );
+                output.layerGeometry.push_back( { static_cast<int>( layer ), diameter,
+                                                  clearance ? static_cast<std::int64_t>( *clearance ) : -1 } );
+            }
+            const bool uniformGeometry =
+                    std::all_of( output.layerGeometry.begin(), output.layerGeometry.end(),
+                                 [&]( const ROUTING_VIA_LAYER_GEOMETRY& aGeometry )
+                                 {
+                                     return aGeometry.diameter == output.diameter && aGeometry.clearance < 0;
+                                 } );
+            if( uniformGeometry )
+                output.layerGeometry.clear();
             result.vias.push_back( output );
         }
         else

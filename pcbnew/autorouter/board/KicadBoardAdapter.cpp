@@ -1506,9 +1506,9 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
         // The source router can shove an unfixed trace/via only when it has
         // the complete contact topology required to rebuild it.  Capture a
         // deliberately small, safe host subset here: an unlocked straight
-        // trace or a uniform drilled via.  BatchAutorouter reconstructs the
+        // trace or a drilled circular KiCad via.  BatchAutorouter reconstructs the
         // neighbourhood again and fails closed for branches, pad-attached
-        // drills, arcs, custom padstacks, and any other unsupported case.
+        // drills, arcs, non-circular source shapes, and any other unsupported case.
         // A locked BOARD_ITEM is always retained as a fixed obstacle.
         bool movableExistingRoute = false;
         if( !track->IsLocked() && track->Type() == PCB_TRACE_T
@@ -1521,19 +1521,17 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
             const PCB_VIA* via = static_cast<const PCB_VIA*>( track );
             std::vector<int> viaLayers;
             appendLayers( viaLayers, via->GetLayerSet() );
-            int expectedWidth = -1;
-            bool uniformWidth = via->GetDrill() > 0 && viaLayers.size() >= 2;
+            bool validPadstack = via->GetDrill() > 0 && viaLayers.size() >= 2;
             for( int layer : viaLayers )
             {
                 const int width = via->GetWidth( static_cast<PCB_LAYER_ID>( layer ) );
-                if( width <= 0 || ( expectedWidth >= 0 && width != expectedWidth ) )
+                if( width <= 0 )
                 {
-                    uniformWidth = false;
+                    validPadstack = false;
                     break;
                 }
-                expectedWidth = width;
             }
-            movableExistingRoute = uniformWidth;
+            movableExistingRoute = validPadstack;
         }
 
         auto makeObstacle = [&]()
@@ -1564,6 +1562,7 @@ void KICAD_BOARD_ADAPTER::addExistingCopper( BOARD_SNAPSHOT& aSnapshot,
                 obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
                 obstacle.start = obstacle.end = point( via->GetPosition() );
                 obstacle.radius = halfWidth( via->GetWidth( layer ) );
+                obstacle.clearance = std::max( 0, via->GetOwnClearance( layer ) );
                 obstacle.layers = { static_cast<int>( layer ) };
                 obstacles.push_back( std::move( obstacle ) );
             }
@@ -2055,6 +2054,20 @@ KICAD_BOARD_ADAPTER::CreatePreviewItems( const ROUTING_RESULT& aResult ) const
         }
         via->SetLayerPair( static_cast<PCB_LAYER_ID>( topLayer ),
                            static_cast<PCB_LAYER_ID>( bottomLayer ) );
+        if( !viaData.layerGeometry.empty() )
+        {
+            via->SetPadstackMode( PADSTACK::MODE::CUSTOM );
+            for( int layer : viaData.layers )
+            {
+                const PCB_LAYER_ID layerId = static_cast<PCB_LAYER_ID>( layer );
+                const std::int64_t layerDiameter = ViaResultDiameterOnLayer( viaData, layer, viaData.diameter );
+                via->SetWidth( layerId, static_cast<int>( layerDiameter ) );
+                if( const auto clearance = ViaClearanceOnLayer( viaData.layerGeometry, layer ) )
+                {
+                    via->Padstack().Clearance( layerId ) = static_cast<int>( *clearance );
+                }
+            }
+        }
         via->SetNetCode( viaData.netCode );
         items.push_back( std::move( via ) );
     }

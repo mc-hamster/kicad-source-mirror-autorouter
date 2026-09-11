@@ -254,12 +254,11 @@ std::int64_t trackRadius( const BOARD_SNAPSHOT& aBoard, int aNetCode,
 }
 
 
-std::int64_t viaRadius( const BOARD_SNAPSHOT& aBoard, int aNetCode,
-                        std::int64_t aDiameter )
+std::int64_t viaRadius( const BOARD_SNAPSHOT& aBoard, const ROUTING_VIA& aVia, int aLayer )
 {
-    const ROUTING_NET* net = findNet( aBoard, aNetCode );
-    const std::int64_t diameter = aDiameter > 0 ? aDiameter : ( net ? net->viaDiameter : 0 );
-    return std::max<std::int64_t>( 1, diameter / 2 );
+    const ROUTING_NET* net = findNet( aBoard, aVia.netCode );
+    const std::int64_t fallback = aVia.diameter > 0 ? aVia.diameter : ( net ? net->viaDiameter : 0 );
+    return std::max<std::int64_t>( 1, ViaResultDiameterOnLayer( aVia, aLayer, fallback ) / 2 );
 }
 
 
@@ -610,14 +609,11 @@ bool segmentVsVia( const ROUTING_SEGMENT& aSegment, std::int64_t aSegmentRadius,
     if( aSegment.netCode == aVia.netCode || !spansLayer( aVia, aSegment.layer ) )
         return false;
 
-    return pointToSegmentDistance( aVia.position, aSegment.start, aSegment.end )
-           <= static_cast<double>( aSegmentRadius
-                                   + viaRadius( aBoard, aVia.netCode, aVia.diameter )
-                                   + std::max(
-                                             { pairClearance( aBoard, aSegment.netCode,
-                                                              aVia.netCode, aSegment.layer ),
-                                               std::max<std::int64_t>( 0, aSegment.clearance ),
-                                               std::max<std::int64_t>( 0, aVia.clearance ) } ) );
+    return pointToSegmentDistance( aVia.position, aSegment.start, aSegment.end ) <= static_cast<double>(
+                   aSegmentRadius + viaRadius( aBoard, aVia, aSegment.layer )
+                   + std::max( { pairClearance( aBoard, aSegment.netCode, aVia.netCode, aSegment.layer ),
+                                 std::max<std::int64_t>( 0, aSegment.clearance ),
+                                 ViaResultClearanceOnLayer( aVia, aSegment.layer ) } ) );
 }
 
 
@@ -642,9 +638,6 @@ bool viaVsVia( const ROUTING_VIA& aLeft, const ROUTING_VIA& aRight,
         return false;
 
     const double centerDistance = distance( aLeft.position, aRight.position );
-    const double copperRadius = static_cast<double>(
-            viaRadius( aBoard, aLeft.netCode, aLeft.diameter )
-            + viaRadius( aBoard, aRight.netCode, aRight.diameter ) );
     const double drillRadius = static_cast<double>(
             viaDrillRadius( aBoard, aLeft.netCode, aLeft.drill )
             + viaDrillRadius( aBoard, aRight.netCode, aRight.drill )
@@ -658,21 +651,21 @@ bool viaVsVia( const ROUTING_VIA& aLeft, const ROUTING_VIA& aRight,
     // Net-pair rules may differ by copper layer.  Test every common layer
     // instead of using the first layer of one via as a proxy for the entire
     // span.
-    return std::any_of( sharedLayers.begin(), sharedLayers.end(),
-                        [&]( int aLayer )
-                        {
-                            return centerDistance
-                                           <= copperRadius
-                                                      + std::max(
-                                                                { pairClearance(
-                                                                          aBoard, aLeft.netCode,
-                                                                          aRight.netCode, aLayer ),
-                                                                  std::max<std::int64_t>(
-                                                                          0, aLeft.clearance ),
-                                                                  std::max<std::int64_t>(
-                                                                          0, aRight.clearance ) } )
-                                   || centerDistance < drillRadius;
-                        } );
+    return std::any_of(
+            sharedLayers.begin(), sharedLayers.end(),
+            [&]( int aLayer )
+            {
+                const double copperRadius =
+                        static_cast<double>( viaRadius( aBoard, aLeft, aLayer ) + viaRadius( aBoard, aRight, aLayer ) );
+                return centerDistance
+                               <= copperRadius
+                                          + std::max( { pairClearance( aBoard, aLeft.netCode, aRight.netCode, aLayer ),
+                                                        std::max<std::int64_t>(
+                                                                0, ViaResultClearanceOnLayer( aLeft, aLayer ) ),
+                                                        std::max<std::int64_t>(
+                                                                0, ViaResultClearanceOnLayer( aRight, aLayer ) ) } )
+                       || centerDistance < drillRadius;
+            } );
 }
 
 
@@ -773,10 +766,9 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
 
     for( const ROUTING_VIA& via : aResult.vias )
     {
-        const std::int64_t radius = viaRadius( aBoard, via.netCode, via.diameter );
-
         for( int layer : viaLayerSpan( via ) )
         {
+            const std::int64_t radius = viaRadius( aBoard, via, layer );
             if( !insideBoard( aBoard, via.position, radius ) )
             {
                 ++violations;
@@ -798,8 +790,8 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                     continue;
                 }
 
-                ROUTING_SEGMENT probe{ via.netCode, layer, via.position, via.position, 0,
-                                       via.clearance };
+                ROUTING_SEGMENT probe{ via.netCode,  layer, via.position,
+                                       via.position, 0,     ViaResultClearanceOnLayer( via, layer ) };
                 if( segmentVsObstacle( probe, radius, obstacle, aBoard ) )
                 {
                     ++violations;
@@ -832,8 +824,9 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
                 if( !layerContains( obstacle.layers, layer ) )
                     continue;
 
-                ROUTING_SEGMENT probe{ via.netCode, layer, via.position, via.position, 0,
-                                       via.clearance };
+                const std::int64_t radius = viaRadius( aBoard, via, layer );
+                ROUTING_SEGMENT    probe{ via.netCode,  layer, via.position,
+                                       via.position, 0,     ViaResultClearanceOnLayer( via, layer ) };
                 if( segmentVsObstacle( probe, radius, obstacle, aBoard ) )
                 {
                     ++violations;

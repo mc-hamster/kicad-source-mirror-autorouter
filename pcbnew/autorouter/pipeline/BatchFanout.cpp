@@ -115,8 +115,12 @@ std::vector<ROUTING_VIA_PROFILE> fanoutViasForNet(
     }
     else if( net->viaDiameter > 0 )
     {
-        append( { net->viaDiameter, net->viaDrill > 0 ? net->viaDrill : 300000, {}, false,
-                  ROUTER_VIA_TYPE::THROUGH } );
+        append( { net->viaDiameter,
+                  net->viaDrill > 0 ? net->viaDrill : 300000,
+                  {},
+                  false,
+                  ROUTER_VIA_TYPE::THROUGH,
+                  {} } );
     }
 
     if( !aSettings.fanoutFallbackToBoardVias )
@@ -127,8 +131,7 @@ std::vector<ROUTING_VIA_PROFILE> fanoutViasForNet(
     // in that declared order, matching the source ViaRule traversal.
     for( const ROUTING_VIA_DIMENSION& profile : aBoard.boardViaDimensions )
     {
-        append( { profile.diameter, profile.drill, {}, false,
-                  ROUTER_VIA_TYPE::THROUGH } );
+        append( { profile.diameter, profile.drill, {}, false, ROUTER_VIA_TYPE::THROUGH, {} } );
     }
 
     return result;
@@ -312,6 +315,7 @@ BOARD_SNAPSHOT BATCH_FANOUT::PrepareSnapshot( const BOARD_SNAPSHOT& aBoard,
                             style.viaDrill = aVia.drill;
                             style.viaLayers = aVia.layers;
                             style.viaType = aVia.type;
+                            style.viaLayerGeometry = aVia.layerGeometry;
                             return !VIA_RULE::LayersFor( aSettings, pad.layers.front(), layer,
                                                          &style ).empty();
                         } );

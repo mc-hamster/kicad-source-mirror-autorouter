@@ -581,12 +581,12 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
             {
                 if( !VIA_RULE::SpansLayer( m_settings, from.layer, to.layer, style, aLayer ) )
                     continue;
-                const std::int64_t otherViaRadius = style.viaDiameter > 0
-                        ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
+                const std::int64_t otherViaRadius = std::max<std::int64_t>(
+                        1, ViaStyleDiameterOnLayer( style, aLayer, 2 * netViaRadius( connection.netCode ) ) / 2 );
                 const std::int64_t otherDrillRadius = style.viaDrill > 0
                         ? style.viaDrill / 2 : netViaDrillRadius( connection.netCode );
-                const std::int64_t pairClearance = edgePairClearance(
-                        net, connection.netCode, aLayer, 0, style.clearance );
+                const std::int64_t pairClearance = edgePairClearance( net, connection.netCode, aLayer, 0,
+                                                                      ViaStyleClearanceOnLayer( style, aLayer ) );
                 expansion = aSourceTraceRooms && !aForVia
                         ? otherViaRadius + std::max<std::int64_t>(
                                 0, pairClearance - candidateCompensation )
@@ -866,9 +866,6 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     return std::find( viaLayers.begin(), viaLayers.end(), aCandidateLayer )
                            != viaLayers.end();
                 };
-                const std::int64_t viaRadius = style.viaDiameter > 0
-                        ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
-
                 // Via.getNormalContacts() rejects rip-up as soon as a pin or
                 // conduction area is present; forced insertion may still
                 // move the via transactionally while preserving that contact.
@@ -891,9 +888,13 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     for( const int viaLayer : viaLayers )
                     {
                         if( ( area.layers.empty()
-                              || std::find( area.layers.begin(), area.layers.end(), viaLayer )
-                                         != area.layers.end() )
-                            && areaTouchesVia( area, from.point, viaRadius ) )
+                              || std::find( area.layers.begin(), area.layers.end(), viaLayer ) != area.layers.end() )
+                            && areaTouchesVia(
+                                    area, from.point,
+                                    std::max<std::int64_t>(
+                                            1, ViaStyleDiameterOnLayer( style, viaLayer,
+                                                                        2 * netViaRadius( connection.netCode ) )
+                                                       / 2 ) ) )
                         {
                             unrippableNormalContact = true;
                             break;
@@ -970,12 +971,12 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
             {
                 if( !VIA_RULE::SpansLayer( m_settings, from.layer, to.layer, style, aLayer ) )
                     continue;
-                const std::int64_t otherViaRadius = style.viaDiameter > 0
-                        ? style.viaDiameter / 2 : netViaRadius( connection.netCode );
+                const std::int64_t otherViaRadius = std::max<std::int64_t>(
+                        1, ViaStyleDiameterOnLayer( style, aLayer, 2 * netViaRadius( connection.netCode ) ) / 2 );
                 const std::int64_t otherDrillRadius = style.viaDrill > 0
                         ? style.viaDrill / 2 : netViaDrillRadius( connection.netCode );
-                const std::int64_t pairClearance = edgePairClearance(
-                        net, connection.netCode, aLayer, 0, style.clearance );
+                const std::int64_t pairClearance = edgePairClearance( net, connection.netCode, aLayer, 0,
+                                                                      ViaStyleClearanceOnLayer( style, aLayer ) );
                 expansion = aSourceTraceRooms
                         ? otherViaRadius + std::max<std::int64_t>(
                                 0, pairClearance - candidateCompensation )
@@ -1266,6 +1267,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                                            ? netRule->viaDrill : 0;
         style.viaLayers = profile.layers;
         style.viaType = profile.type;
+        style.viaLayerGeometry = profile.layerGeometry;
         if( style.viaDiameter <= 0 || style.viaDrill <= 0 )
             continue;
 
@@ -1298,13 +1300,13 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         if( span.empty() )
             continue;
 
-        const std::int64_t profileRadius = std::max<std::int64_t>( radius,
-                                                                   style.viaDiameter / 2 );
         const std::int64_t profileDrillRadius = std::max<std::int64_t>( 1,
                                                                         style.viaDrill / 2 );
-        maximumViaRadius = std::max( maximumViaRadius, profileRadius );
         for( int layer : span )
         {
+            const std::int64_t profileRadius =
+                    std::max<std::int64_t>( radius, ViaStyleDiameterOnLayer( style, layer, style.viaDiameter ) / 2 );
+            maximumViaRadius = std::max( maximumViaRadius, profileRadius );
             viaLayers.insert( layer );
             viaRadiusByLayer[layer] = std::max( viaRadiusByLayer[layer], profileRadius );
             viaDrillRadiusByLayer[layer] = std::max( viaDrillRadiusByLayer[layer],

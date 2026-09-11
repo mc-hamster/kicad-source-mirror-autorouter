@@ -790,7 +790,8 @@ MAZE_SEARCH_ENGINE::MAZE_SEARCH_ENGINE( const BOARD_SNAPSHOT& aBoard,
         std::int64_t maximumViaDrill = net.viaDrill;
         for( const ROUTING_VIA_PROFILE& profile : net.viaProfiles )
         {
-            maximumViaDiameter = std::max( maximumViaDiameter, profile.diameter );
+            maximumViaDiameter =
+                    std::max( maximumViaDiameter, MaximumViaDiameter( profile.layerGeometry, profile.diameter ) );
             maximumViaDrill = std::max( maximumViaDrill, profile.drill );
         }
         m_viaRadii[net.netCode] = std::max<std::int64_t>(
@@ -1644,8 +1645,8 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                 const ROUTING_EDGE_STYLE& otherStyle = EdgeStyle( connection, i - 1 );
                 const std::int64_t otherTrackRadius = otherStyle.trackWidth > 0
                         ? otherStyle.trackWidth / 2 : netTrackRadius( connection.netCode );
-                const std::int64_t otherViaRadius = otherStyle.viaDiameter > 0
-                        ? otherStyle.viaDiameter / 2 : netViaRadius( connection.netCode );
+                const std::int64_t        otherViaRadius = std::max<std::int64_t>(
+                        1, ViaStyleDiameterOnLayer( otherStyle, aLayer, 2 * netViaRadius( connection.netCode ) ) / 2 );
                 const std::int64_t otherViaDrillRadius = otherStyle.viaDrill > 0
                         ? otherStyle.viaDrill / 2 : netViaDrillRadius( connection.netCode );
 
@@ -1662,15 +1663,12 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
                         return false;
                     }
                 }
-                else if( distance( aPoint, previous.point )
-                         <= std::max( currentRadius + otherViaRadius
-                                              + edgePairClearance( aNetCode, connection.netCode,
-                                                                   aLayer, aEdgeClearance,
-                                                                   otherStyle.clearance ),
-                                      drillRadius + otherViaDrillRadius
-                                              + m_board.holeToHoleClearance )
-                    && VIA_RULE::SpansLayer( m_settings, previous.layer, current.layer,
-                                              otherStyle, aLayer ) )
+                else if( distance( aPoint, previous.point ) <= std::max(
+                                 currentRadius + otherViaRadius
+                                         + edgePairClearance( aNetCode, connection.netCode, aLayer, aEdgeClearance,
+                                                              ViaStyleClearanceOnLayer( otherStyle, aLayer ) ),
+                                 drillRadius + otherViaDrillRadius + m_board.holeToHoleClearance )
+                         && VIA_RULE::SpansLayer( m_settings, previous.layer, current.layer, otherStyle, aLayer ) )
                 {
                     return false;
                 }
@@ -1863,18 +1861,20 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
                 const ROUTER_NODE& current = connection.nodes[i];
                 const bool otherIsVia = previous.layer != current.layer;
                 const ROUTING_EDGE_STYLE& otherStyle = EdgeStyle( connection, i - 1 );
-                const std::int64_t otherCopperRadius = otherIsVia
-                        ? ( otherStyle.viaDiameter > 0 ? otherStyle.viaDiameter / 2
-                                                       : netViaRadius( connection.netCode ) )
-                        : ( otherStyle.trackWidth > 0 ? otherStyle.trackWidth / 2
-                                                       : netTrackRadius( connection.netCode ) );
+                const std::int64_t        otherCopperRadius =
+                        otherIsVia ? std::max<std::int64_t>(
+                                             1, ViaStyleDiameterOnLayer( otherStyle, aLayer,
+                                                                                2 * netViaRadius( connection.netCode ) )
+                                                        / 2 )
+                                          : ( otherStyle.trackWidth > 0 ? otherStyle.trackWidth / 2
+                                                                        : netTrackRadius( connection.netCode ) );
                 const std::int64_t otherDrillRadius = otherStyle.viaDrill > 0
                         ? otherStyle.viaDrill / 2 : netViaDrillRadius( connection.netCode );
                 const std::int64_t copperClearance =
-                        currentRadius
-                        + otherCopperRadius
-                        + edgePairClearance( aNetCode, connection.netCode, aLayer,
-                                             aEdgeClearance, otherStyle.clearance );
+                        currentRadius + otherCopperRadius
+                        + edgePairClearance( aNetCode, connection.netCode, aLayer, aEdgeClearance,
+                                             otherIsVia ? ViaStyleClearanceOnLayer( otherStyle, aLayer )
+                                                        : otherStyle.clearance );
                 const std::int64_t clearance =
                         aForVia && otherIsVia
                                 ? std::max( copperClearance,
@@ -1935,8 +1935,12 @@ bool MAZE_SEARCH_ENGINE::CanUseSegment( int aNetCode, const ROUTER_NODE& aStart,
                 ? aStyle->viaDrill / 2 : netViaDrillRadius( aNetCode );
         for( int layer : viaLayers )
         {
-            if( !isPointAllowed( aStart.point, layer, aNetCode, true, styleRadius, drillRadius,
-                                 styleClearance ) )
+            const std::int64_t layerRadius =
+                    aStyle ? std::max<std::int64_t>(
+                                     1, ViaStyleDiameterOnLayer( *aStyle, layer, 2 * netViaRadius( aNetCode ) ) / 2 )
+                           : styleRadius;
+            const std::int64_t layerClearance = aStyle ? ViaStyleClearanceOnLayer( *aStyle, layer ) : styleClearance;
+            if( !isPointAllowed( aStart.point, layer, aNetCode, true, layerRadius, drillRadius, layerClearance ) )
                 return false;
         }
 
@@ -2031,6 +2035,7 @@ std::optional<ROUTING_EDGE_STYLE> MAZE_SEARCH_ENGINE::SelectViaStyle(
         style.viaDrill = m_viaOverride->drill;
         style.viaLayers = m_viaOverride->layers;
         style.viaType = m_viaOverride->type;
+        style.viaLayerGeometry = m_viaOverride->layerGeometry;
         return tryStyle( std::move( style ), m_viaOverride->attachSmdAllowed );
     }
 
@@ -2043,6 +2048,7 @@ std::optional<ROUTING_EDGE_STYLE> MAZE_SEARCH_ENGINE::SelectViaStyle(
             style.viaDrill = profile.drill > 0 ? profile.drill : net->viaDrill;
             style.viaLayers = profile.layers;
             style.viaType = profile.type;
+            style.viaLayerGeometry = profile.layerGeometry;
             if( style.viaDiameter <= 0 || style.viaDrill <= 0 )
                 continue;
 
@@ -2225,9 +2231,12 @@ bool MAZE_SEARCH_ENGINE::preservesConductionAreaContacts(
     if( !HasValidEdgeStyles( aOriginal ) || !HasValidEdgeStyles( aReplacement ) )
         return false;
 
-    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle, int aLayer = -1 )
     {
-        return aStyle.viaDiameter > 0 ? aStyle.viaDiameter / 2 : netViaRadius( aNetCode );
+        const std::int64_t fallback = aStyle.viaDiameter > 0 ? aStyle.viaDiameter : 2 * netViaRadius( aNetCode );
+        const std::int64_t diameter = aLayer >= 0 ? ViaStyleDiameterOnLayer( aStyle, aLayer, fallback )
+                                                  : MaximumViaDiameter( aStyle.viaLayerGeometry, fallback );
+        return std::max<std::int64_t>( 1, diameter / 2 );
     };
     const auto appliesOnLayer = []( const ROUTING_OBSTACLE& aArea, int aLayer )
     {
@@ -2276,8 +2285,7 @@ bool MAZE_SEARCH_ENGINE::preservesConductionAreaContacts(
             if( !VIA_RULE::SpansLayer( m_settings, first.layer, second.layer, style, aLayer ) )
                 continue;
 
-            if( annulusTouchesArea( aArea, first.point,
-                                    viaRadius( aReplacement.netCode, style ) ) )
+            if( annulusTouchesArea( aArea, first.point, viaRadius( aReplacement.netCode, style, aLayer ) ) )
             {
                 return true;
             }
@@ -2304,8 +2312,7 @@ bool MAZE_SEARCH_ENGINE::preservesConductionAreaContacts(
             for( const ROUTING_OBSTACLE& area : m_board.conductionAreas )
             {
                 if( area.netCode != aOriginal.netCode || !appliesOnLayer( area, layer )
-                    || !annulusTouchesArea( area, first.point,
-                                            viaRadius( aOriginal.netCode, style ) ) )
+                    || !annulusTouchesArea( area, first.point, viaRadius( aOriginal.netCode, style, layer ) ) )
                 {
                     continue;
                 }
@@ -2574,13 +2581,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
                         continue;
                     }
 
-                    const std::int64_t transientRadius = transientStyle.viaDiameter > 0
-                            ? transientStyle.viaDiameter / 2
-                            : netViaRadius( transient.netCode );
+                    const std::int64_t transientRadius = std::max<std::int64_t>(
+                            1, ViaStyleDiameterOnLayer( transientStyle, layer, 2 * netViaRadius( transient.netCode ) )
+                                       / 2 );
                     expansion = movingRadius + transientRadius
-                                + edgePairClearance( connection.netCode, transient.netCode,
-                                                     layer, style.clearance,
-                                                     transientStyle.clearance );
+                                + edgePairClearance( connection.netCode, transient.netCode, layer, style.clearance,
+                                                     ViaStyleClearanceOnLayer( transientStyle, layer ) );
                     raw = { first.point.x, first.point.y, first.point.x, first.point.y };
                 }
 
@@ -2673,9 +2679,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::ShoveViaConnection(
     {
         return aStyle.trackWidth > 0 ? aStyle.trackWidth / 2 : netTrackRadius( aNetCode );
     };
-    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle, int aLayer )
     {
-        return aStyle.viaDiameter > 0 ? aStyle.viaDiameter / 2 : netViaRadius( aNetCode );
+        return std::max<std::int64_t>( 1, ViaStyleDiameterOnLayer( aStyle, aLayer, 2 * netViaRadius( aNetCode ) ) / 2 );
     };
     const auto viaDrillRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
     {
@@ -2891,7 +2897,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::ShoveViaConnection(
                 if( obstacleVia )
                 {
                     bool sharesLayer = false;
-                    std::int64_t pair = 0;
+                    std::int64_t copperClearance = 0;
                     for( int layer : viaLayers )
                     {
                         if( !VIA_RULE::SpansLayer( m_settings, first.layer, second.layer,
@@ -2901,22 +2907,22 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::ShoveViaConnection(
                         }
 
                         sharesLayer = true;
-                        pair = std::max(
-                                pair, edgePairClearance( source.netCode,
-                                                         obstacleRoute.netCode, layer,
-                                                         viaStyle.clearance,
-                                                         obstacleStyle.clearance ) );
+                        copperClearance = std::max(
+                                copperClearance,
+                                viaRadius( source.netCode, viaStyle, layer )
+                                        + viaRadius( obstacleRoute.netCode, obstacleStyle, layer )
+                                        + edgePairClearance( source.netCode, obstacleRoute.netCode, layer,
+                                                             ViaStyleClearanceOnLayer( viaStyle, layer ),
+                                                             ViaStyleClearanceOnLayer( obstacleStyle, layer ) ) );
                     }
 
                     if( !sharesLayer )
                         continue;
 
-                    clearance = std::max(
-                            viaRadius( source.netCode, viaStyle )
-                                    + viaRadius( obstacleRoute.netCode, obstacleStyle ) + pair,
-                            viaDrillRadius( source.netCode, viaStyle )
-                                    + viaDrillRadius( obstacleRoute.netCode, obstacleStyle )
-                                    + m_board.holeToHoleClearance );
+                    clearance =
+                            std::max( copperClearance, viaDrillRadius( source.netCode, viaStyle )
+                                                               + viaDrillRadius( obstacleRoute.netCode, obstacleStyle )
+                                                               + m_board.holeToHoleClearance );
                     bounds = { first.point.x, first.point.y, first.point.x, first.point.y };
 
                     if( distance( viaStart.point, first.point ) > clearance )
@@ -2964,11 +2970,10 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::ShoveViaConnection(
                         continue;
                     }
 
-                    clearance = viaRadius( source.netCode, viaStyle )
+                    clearance = viaRadius( source.netCode, viaStyle, first.layer )
                                 + traceRadius( obstacleRoute.netCode, obstacleStyle )
-                                + edgePairClearance( source.netCode,
-                                                     obstacleRoute.netCode, first.layer,
-                                                     viaStyle.clearance,
+                                + edgePairClearance( source.netCode, obstacleRoute.netCode, first.layer,
+                                                     ViaStyleClearanceOnLayer( viaStyle, first.layer ),
                                                      obstacleStyle.clearance );
                     bounds = { std::min( first.point.x, second.point.x ),
                                std::min( first.point.y, second.point.y ),
@@ -3364,9 +3369,9 @@ bool MAZE_SEARCH_ENGINE::connectionsConflict( const ROUTING_CONNECTION& aCandida
     {
         return aStyle.trackWidth > 0 ? aStyle.trackWidth / 2 : netTrackRadius( aNetCode );
     };
-    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
+    const auto viaRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle, int aLayer )
     {
-        return aStyle.viaDiameter > 0 ? aStyle.viaDiameter / 2 : netViaRadius( aNetCode );
+        return std::max<std::int64_t>( 1, ViaStyleDiameterOnLayer( aStyle, aLayer, 2 * netViaRadius( aNetCode ) ) / 2 );
     };
     const auto viaDrillRadius = [&]( int aNetCode, const ROUTING_EDGE_STYLE& aStyle )
     {
@@ -3407,7 +3412,7 @@ bool MAZE_SEARCH_ENGINE::connectionsConflict( const ROUTING_CONNECTION& aCandida
 
         if( leftVia && rightVia )
         {
-            std::int64_t pair = 0;
+            std::int64_t copperClearance = 0;
             bool sharesLayer = false;
             for( const ROUTER_LAYER_SETTINGS& layer : m_settings.layers )
             {
@@ -3418,17 +3423,18 @@ bool MAZE_SEARCH_ENGINE::connectionsConflict( const ROUTING_CONNECTION& aCandida
                 }
 
                 sharesLayer = true;
-                pair = std::max( pair, edgePairClearance( aLeftNetCode, aRightNetCode,
-                                                           layer.layerId,
-                                                           aLeftStyle.clearance,
-                                                           aRightStyle.clearance ) );
+                copperClearance = std::max(
+                        copperClearance,
+                        viaRadius( aLeftNetCode, aLeftStyle, layer.layerId )
+                                + viaRadius( aRightNetCode, aRightStyle, layer.layerId )
+                                + edgePairClearance( aLeftNetCode, aRightNetCode, layer.layerId,
+                                                     ViaStyleClearanceOnLayer( aLeftStyle, layer.layerId ),
+                                                     ViaStyleClearanceOnLayer( aRightStyle, layer.layerId ) ) );
             }
 
             if( !sharesLayer )
                 return false;
 
-            const std::int64_t copperClearance = viaRadius( aLeftNetCode, aLeftStyle )
-                                                 + viaRadius( aRightNetCode, aRightStyle ) + pair;
             const std::int64_t drillClearance = viaDrillRadius( aLeftNetCode, aLeftStyle )
                                                 + viaDrillRadius( aRightNetCode, aRightStyle )
                                                 + m_board.holeToHoleClearance;
@@ -3450,12 +3456,10 @@ bool MAZE_SEARCH_ENGINE::connectionsConflict( const ROUTING_CONNECTION& aCandida
             return false;
         }
 
-        const std::int64_t clearance = viaRadius( viaNetCode, viaStyle )
-                                       + trackRadius( trackNetCode, trackStyle )
-                                       + edgePairClearance( viaNetCode, trackNetCode,
-                                                             trackStart.layer,
-                                                             viaStyle.clearance,
-                                                             trackStyle.clearance );
+        const std::int64_t clearance =
+                viaRadius( viaNetCode, viaStyle, trackStart.layer ) + trackRadius( trackNetCode, trackStyle )
+                + edgePairClearance( viaNetCode, trackNetCode, trackStart.layer,
+                                     ViaStyleClearanceOnLayer( viaStyle, trackStart.layer ), trackStyle.clearance );
         return pointToSegmentDistance( viaStart.point, trackStart.point, trackEnd.point )
                <= static_cast<double>( clearance );
     };

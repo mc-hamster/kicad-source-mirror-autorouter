@@ -175,6 +175,7 @@ void applyFanoutViaStyle( ROUTING_CONNECTION& aConnection, const ROUTING_PAD& aL
         style.viaDrill = aLanding.fanoutViaDrill;
         style.viaLayers = aLanding.fanoutViaLayers;
         style.viaType = aLanding.fanoutViaType;
+        style.viaLayerGeometry = aLanding.fanoutViaLayerGeometry;
     }
 }
 
@@ -191,13 +192,14 @@ void applyFanoutViaStyle( ROUTING_CONNECTION& aConnection, const ROUTING_PAD& aL
  * pieces by UUID.  Here we rebuild:
  *
  * - a single straight trace as a static route whose endpoints stay fixed;
- * - each uniform drilled via as its own static route.  Its normal endpoint
+ * - each circular KiCad drilled via, including per-layer diameters, as its
+ *   own static route.  Its normal endpoint
  *   trace contacts remain separate source items so a later
  *   `ShoveViaConnectionPlan` can reproduce `DrillItem.moveBy()`: retain
  *   each trace and add one bridge per contacted layer.
  *
  * Anything with an interior/non-normal contact, pad-attached drill, arc,
- * non-uniform padstack, or unsupported shape remains a static obstacle and is
+ * non-circular padstack shape, or unsupported shape remains a static obstacle and is
  * never destructively ripped up by forced insertion.  This maps the source's
  * `DrillItemMover` normal-contact guard instead of pretending a UUID alone is
  * enough to mutate arbitrary host topology.
@@ -297,14 +299,15 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
             continue;
         }
 
-        // A uniform drilled via becomes one layer transition.  The adapter
-        // marks non-uniform padstacks as non-movable, but revalidate the
-        // captured pieces here because this function is also used by
-        // data-only regression tests.
+        // A drilled KiCad via becomes one layer transition while retaining
+        // the circular copper diameter and effective clearance of every
+        // physical padstack layer. Revalidate the captured pieces here because
+        // this function is also used by data-only regression tests.
         const ROUTER_POINT position = copper.front()->start;
         std::vector<int> layers;
         std::int64_t diameter = 0;
         std::int64_t clearance = 0;
+        std::vector<ROUTING_VIA_LAYER_GEOMETRY> layerGeometry;
         bool via = hole != nullptr && copper.size() >= 2;
         for( const ROUTING_OBSTACLE* piece : copper )
         {
@@ -316,18 +319,29 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
                 break;
             }
             const std::int64_t currentDiameter = 2 * piece->radius;
-            if( diameter != 0 && diameter != currentDiameter )
-            {
-                via = false;
-                break;
-            }
-            diameter = currentDiameter;
-            clearance = std::max( clearance, std::max<std::int64_t>( 0, piece->clearance ) );
+            diameter = std::max( diameter, currentDiameter );
+            const std::int64_t currentClearance = std::max<std::int64_t>( 0, piece->clearance );
+            clearance = std::max( clearance, currentClearance );
+            layerGeometry.push_back( { piece->layers.front(), currentDiameter, currentClearance } );
             layers.push_back( piece->layers.front() );
         }
 
         std::sort( layers.begin(), layers.end(), [&]( int aLeft, int aRight )
         { return layerOrder( aLeft ) < layerOrder( aRight ); } );
+        std::sort( layerGeometry.begin(), layerGeometry.end(),
+                   [&]( const ROUTING_VIA_LAYER_GEOMETRY& aLeft, const ROUTING_VIA_LAYER_GEOMETRY& aRight )
+                   {
+                       return layerOrder( aLeft.layer ) < layerOrder( aRight.layer );
+                   } );
+        if( std::adjacent_find( layerGeometry.begin(), layerGeometry.end(),
+                                []( const ROUTING_VIA_LAYER_GEOMETRY& aLeft, const ROUTING_VIA_LAYER_GEOMETRY& aRight )
+                                {
+                                    return aLeft.layer == aRight.layer;
+                                } )
+            != layerGeometry.end() )
+        {
+            via = false;
+        }
         layers.erase( std::unique( layers.begin(), layers.end() ), layers.end() );
         if( !via || !hole || hole->start != position || hole->end != position
             || hole->radius <= 0 || layers.size() < 2 )
@@ -340,6 +354,7 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
         viaStyle.viaDrill = 2 * hole->radius;
         viaStyle.viaLayers = layers;
         viaStyle.clearance = clearance;
+        viaStyle.viaLayerGeometry = std::move( layerGeometry );
         viaStyle.fixedState = ROUTER_FIXED_STATE::UNFIXED;
         connection.nodes = { { position, layers.front() }, { position, layers.back() } };
         connection.edgeStyles = { std::move( viaStyle ) };
@@ -624,7 +639,6 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
 
         const ROUTER_POINT position = via.nodes.front().point;
         const ROUTING_EDGE_STYLE& style = via.edgeStyles.front();
-        const std::int64_t viaRadius = std::max<std::int64_t>( 1, style.viaDiameter / 2 );
         const std::vector<int>& layers = style.viaLayers;
         if( layers.empty() )
             return false;
@@ -635,17 +649,28 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
         // pad radius.  False positives are intentionally fail-closed.
         for( const ROUTING_PAD& pad : aBoard.pads )
         {
-            if( pad.isFanoutTarget || pad.isPlaneTarget || pad.netCode != via.netCode
-                || !std::any_of( layers.begin(), layers.end(), [&]( int aLayer )
-                   { return isOnLayer( pad.layers, aLayer ); } ) )
+            if( pad.isFanoutTarget || pad.isPlaneTarget || pad.netCode != via.netCode )
             {
                 continue;
             }
 
+            std::int64_t sharedLayerRadius = 0;
+            for( int layer : layers )
+            {
+                if( !isOnLayer( pad.layers, layer ) )
+                    continue;
+
+                sharedLayerRadius = std::max(
+                        sharedLayerRadius,
+                        std::max<std::int64_t>( 1, ViaStyleDiameterOnLayer( style, layer, style.viaDiameter ) / 2 ) );
+            }
+            if( sharedLayerRadius <= 0 )
+                continue;
+
             const long double dx = static_cast<long double>( position.x ) - pad.position.x;
             const long double dy = static_cast<long double>( position.y ) - pad.position.y;
-            const long double radius = static_cast<long double>( viaRadius )
-                                       + std::max<std::int64_t>( 0, pad.radius );
+            const long double radius =
+                    static_cast<long double>( sharedLayerRadius ) + std::max<std::int64_t>( 0, pad.radius );
             if( dx * dx + dy * dy <= radius * radius )
                 return false;
         }
@@ -713,8 +738,19 @@ std::vector<ROUTING_CONNECTION> existingMovableConnections(
                 if( obstacle.kind != ROUTER_OBSTACLE_KIND::SEGMENT )
                     return false;
 
-                const long double radius = static_cast<long double>( viaRadius )
-                                           + std::max<std::int64_t>( 0, obstacle.radius );
+                std::int64_t layerRadius = 0;
+                for( int layer : obstacle.layers )
+                {
+                    if( isOnLayer( layers, layer ) )
+                    {
+                        layerRadius =
+                                std::max( layerRadius,
+                                          std::max<std::int64_t>(
+                                                  1, ViaStyleDiameterOnLayer( style, layer, style.viaDiameter ) / 2 ) );
+                    }
+                }
+                const long double radius =
+                        static_cast<long double>( layerRadius ) + std::max<std::int64_t>( 0, obstacle.radius );
                 if( pointToSegmentDistanceSquared( obstacle.start, obstacle.end )
                     > radius * radius )
                 {
@@ -1893,16 +1929,16 @@ void BATCH_AUTOROUTER::buildGeometry( const BOARD_SNAPSHOT& aBoard,
     uniqueVias.reserve( aResult.vias.size() );
     for( ROUTING_VIA& via : aResult.vias )
     {
-        const auto duplicate = std::find_if(
-                uniqueVias.begin(), uniqueVias.end(),
-                [&]( const ROUTING_VIA& existing )
-                {
-                    return existing.netCode == via.netCode && existing.position == via.position
-                           && existing.topLayer == via.topLayer
-                           && existing.bottomLayer == via.bottomLayer
-                           && existing.diameter == via.diameter && existing.drill == via.drill
-                           && existing.layers == via.layers;
-                } );
+        const auto duplicate =
+                std::find_if( uniqueVias.begin(), uniqueVias.end(),
+                              [&]( const ROUTING_VIA& existing )
+                              {
+                                  return existing.netCode == via.netCode && existing.position == via.position
+                                         && existing.topLayer == via.topLayer && existing.bottomLayer == via.bottomLayer
+                                         && existing.diameter == via.diameter && existing.drill == via.drill
+                                         && existing.layers == via.layers
+                                         && existing.layerGeometry == via.layerGeometry;
+                              } );
         if( duplicate == uniqueVias.end() )
             uniqueVias.push_back( std::move( via ) );
         else
@@ -2472,6 +2508,7 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                                 mutableLanding.fanoutViaDrill = selected.viaDrill;
                                 mutableLanding.fanoutViaLayers = selected.viaLayers;
                                 mutableLanding.fanoutViaType = selected.viaType;
+                                mutableLanding.fanoutViaLayerGeometry = selected.viaLayerGeometry;
                             }
                         }
                     }

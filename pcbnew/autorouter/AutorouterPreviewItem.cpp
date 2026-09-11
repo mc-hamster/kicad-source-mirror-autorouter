@@ -57,7 +57,8 @@ const BOX2I AUTOROUTER_PREVIEW_ITEM::ViewBBox() const
         const VECTOR2I center( static_cast<int>( m_via.position.x ),
                                static_cast<int>( m_via.position.y ) );
         BOX2I result( center, VECTOR2I( 0, 0 ) );
-        result.Inflate( std::max( 1, static_cast<int>( m_via.diameter / 2 ) ) );
+        result.Inflate(
+                std::max( 1, static_cast<int>( MaximumViaDiameter( m_via.layerGeometry, m_via.diameter ) / 2 ) ) );
         return result;
     }
 
@@ -88,7 +89,7 @@ void AUTOROUTER_PREVIEW_ITEM::ViewDraw( int, KIGFX::VIEW* aView ) const
         gal->SetFillColor( viaColor.WithAlpha( 0.55 ) );
         gal->SetIsFill( true );
         gal->SetLineWidth( 1.0f );
-        gal->DrawCircle( center, std::max( 1.0, m_via.diameter / 2.0 ) );
+        gal->DrawCircle( center, std::max( 1.0, MaximumViaDiameter( m_via.layerGeometry, m_via.diameter ) / 2.0 ) );
 
         gal->SetIsFill( false );
         gal->SetStrokeColor( KIGFX::COLOR4D( 0.15, 0.15, 0.15, 0.9 ) );

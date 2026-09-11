@@ -1271,6 +1271,19 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         coordinate( style.trackWidth > 0 ? style.trackWidth : width );
         coordinate( style.viaDiameter > 0 ? style.viaDiameter : diameter );
         coordinate( style.viaDrill > 0 ? style.viaDrill : drill );
+        std::set<int> geometryLayers;
+        for( const ROUTING_VIA_LAYER_GEOMETRY& layerGeometry : style.viaLayerGeometry )
+        {
+            if( layerGeometry.layer < 0 || layerGeometry.diameter < 0
+                || !geometryLayers.insert( layerGeometry.layer ).second )
+            {
+                throw std::invalid_argument( "Invalid routing-board via layer geometry" );
+            }
+            if( layerGeometry.diameter > 0 )
+                coordinate( layerGeometry.diameter );
+            if( layerGeometry.clearance < -1 )
+                throw std::invalid_argument( "Invalid routing-board via layer clearance" );
+        }
 
         if( route.nodes[i - 1].layer != route.nodes[i].layer
             && ( route.nodes[i - 1].point != route.nodes[i].point
@@ -1283,6 +1296,19 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                                     route.nodes[i].layer, &style ).empty() )
         {
             throw std::invalid_argument( "Invalid routing-board via layer mask" );
+        }
+
+        if( route.nodes[i - 1].layer != route.nodes[i].layer )
+        {
+            const std::vector<int> span =
+                    VIA_RULE::LayersFor( state.settings, route.nodes[i - 1].layer, route.nodes[i].layer, &style );
+            for( int layer : geometryLayers )
+            {
+                if( std::find( span.begin(), span.end(), layer ) == span.end() )
+                {
+                    throw std::invalid_argument( "Via layer geometry lies outside the routing-board span" );
+                }
+            }
         }
     }
 
@@ -1301,7 +1327,8 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         const bool via = from.layer != to.layer;
         const ROUTING_EDGE_STYLE& style = EdgeStyle( route, edge );
         const std::int64_t edgeWidth = style.trackWidth > 0 ? style.trackWidth : width;
-        const std::int64_t edgeDiameter = style.viaDiameter > 0 ? style.viaDiameter : diameter;
+        const std::int64_t        edgeDiameter =
+                MaximumViaDiameter( style.viaLayerGeometry, style.viaDiameter > 0 ? style.viaDiameter : diameter );
         const std::vector<int> edgeLayers = via
                 ? VIA_RULE::LayersFor( state.settings, from.layer, to.layer, &style )
                 : std::vector<int>{ from.layer };
@@ -1313,7 +1340,7 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         item.routable = item.fixedState < ROUTER_FIXED_STATE::USER_FIXED;
         if( via )
         {
-            resolvedStyle.viaDiameter = edgeDiameter;
+            resolvedStyle.viaDiameter = style.viaDiameter > 0 ? style.viaDiameter : diameter;
             resolvedStyle.viaDrill = style.viaDrill > 0 ? style.viaDrill : drill;
             resolvedStyle.viaLayers = edgeLayers;
         }
@@ -1331,9 +1358,15 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
         if( via )
         {
             item.normal.last = to.point;
-            state.addShape( item, copper );
             for( int layer : copper.layers )
             {
+                ROUTING_OBSTACLE layerCopper = copper;
+                layerCopper.radius =
+                        std::max<std::int64_t>( 1, ViaStyleDiameterOnLayer( resolvedStyle, layer, edgeDiameter ) / 2 );
+                layerCopper.clearance = ViaStyleClearanceOnLayer( resolvedStyle, layer );
+                layerCopper.layers = { layer };
+                state.addShape( item, std::move( layerCopper ) );
+
                 ROUTING_PAD terminal;
                 terminal.netCode = route.netCode;
                 terminal.position = from.point;

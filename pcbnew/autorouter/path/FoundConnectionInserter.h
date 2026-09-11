@@ -86,12 +86,11 @@ public:
                         const std::vector<int>& aViaLayers,
                         ROUTING_RESULT& aResult );
 
-    static void AppendEdge( int aNetCode, const ROUTER_NODE& aPrevious,
-                            const ROUTER_NODE& aCurrent, std::int64_t aTrackWidth,
-                            std::int64_t aViaDiameter, std::int64_t aViaDrill,
-                            const std::vector<int>& aViaLayers, ROUTING_RESULT& aResult,
-                            std::int64_t aClearance = 0,
-                            ROUTER_VIA_TYPE aViaType = ROUTER_VIA_TYPE::AUTO );
+    static void AppendEdge( int aNetCode, const ROUTER_NODE& aPrevious, const ROUTER_NODE& aCurrent,
+                            std::int64_t aTrackWidth, std::int64_t aViaDiameter, std::int64_t aViaDrill,
+                            const std::vector<int>&                        aViaLayers,
+                            const std::vector<ROUTING_VIA_LAYER_GEOMETRY>& aViaLayerGeometry, ROUTING_RESULT& aResult,
+                            std::int64_t aClearance = 0, ROUTER_VIA_TYPE aViaType = ROUTER_VIA_TYPE::AUTO );
 };
 
 } // namespace KICAD_AUTOROUTER

@@ -864,22 +864,17 @@ void FOUND_CONNECTION_INSERTER::Append( const ROUTING_CONNECTION& aConnection,
         const std::int64_t viaDrill = style.viaDrill > 0 ? style.viaDrill : aViaDrill;
         const std::vector<int>& viaLayers = style.viaLayers.empty() ? aViaLayers : style.viaLayers;
 
-        AppendEdge( aConnection.netCode, previous, current, trackWidth, viaDiameter, viaDrill,
-                    viaLayers, aResult, std::max<std::int64_t>( 0, style.clearance ),
-                    style.viaType );
+        AppendEdge( aConnection.netCode, previous, current, trackWidth, viaDiameter, viaDrill, viaLayers,
+                    style.viaLayerGeometry, aResult, std::max<std::int64_t>( 0, style.clearance ), style.viaType );
     }
 }
 
 
-void FOUND_CONNECTION_INSERTER::AppendEdge( int aNetCode, const ROUTER_NODE& aPrevious,
-                                            const ROUTER_NODE& aCurrent,
-                                            std::int64_t aTrackWidth,
-                                            std::int64_t aViaDiameter,
-                                            std::int64_t aViaDrill,
-                                            const std::vector<int>& aViaLayers,
-                                            ROUTING_RESULT& aResult,
-                                            std::int64_t aClearance,
-                                            ROUTER_VIA_TYPE aViaType )
+void FOUND_CONNECTION_INSERTER::AppendEdge( int aNetCode, const ROUTER_NODE& aPrevious, const ROUTER_NODE& aCurrent,
+                                            std::int64_t aTrackWidth, std::int64_t aViaDiameter, std::int64_t aViaDrill,
+                                            const std::vector<int>&                        aViaLayers,
+                                            const std::vector<ROUTING_VIA_LAYER_GEOMETRY>& aViaLayerGeometry,
+                                            ROUTING_RESULT& aResult, std::int64_t aClearance, ROUTER_VIA_TYPE aViaType )
 {
     const ROUTER_NODE& previous = aPrevious;
     const ROUTER_NODE& current = aCurrent;
@@ -905,6 +900,7 @@ void FOUND_CONNECTION_INSERTER::AppendEdge( int aNetCode, const ROUTER_NODE& aPr
     via.layers = aViaLayers;
     via.clearance = std::max<std::int64_t>( 0, aClearance );
     via.type = aViaType;
+    via.layerGeometry = aViaLayerGeometry;
     aResult.vias.push_back( std::move( via ) );
 }
 

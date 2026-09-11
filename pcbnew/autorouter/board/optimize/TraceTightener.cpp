@@ -153,7 +153,7 @@ std::int64_t resolvedViaDiameter( const BOARD_SNAPSHOT& aBoard,
 {
     const ROUTING_EDGE_STYLE& style = EdgeStyle( aConnection, aEdge );
     if( style.viaDiameter > 0 )
-        return style.viaDiameter;
+        return MaximumViaDiameter( style.viaLayerGeometry, style.viaDiameter );
     if( const ROUTING_NET* net = findNet( aBoard, aConnection.netCode ) )
         return std::max<std::int64_t>( 0, net->viaDiameter );
     return 0;

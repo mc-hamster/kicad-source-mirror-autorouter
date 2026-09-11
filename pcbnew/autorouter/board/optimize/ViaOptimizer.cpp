@@ -179,10 +179,29 @@ bool profileAllowsSmdAttachment( const ROUTING_CONNECTION& aConnection,
                 profileStyle.viaDrill = aProfile.drill;
                 profileStyle.viaLayers = aProfile.layers;
                 profileStyle.viaType = aProfile.type;
+                profileStyle.viaLayerGeometry = aProfile.layerGeometry;
                 const std::vector<int> span = VIA_RULE::LayersFor(
                         aSettings, aConnection.nodes[aViaEdge - 1].layer,
                         aConnection.nodes[aViaEdge].layer, &profileStyle );
-                return style.viaLayers.empty() || span == style.viaLayers;
+                if( !style.viaLayers.empty() && span != style.viaLayers )
+                    return false;
+
+                for( int layer : span )
+                {
+                    if( ViaStyleDiameterOnLayer( profileStyle, layer, aProfile.diameter )
+                        != ViaStyleDiameterOnLayer( style, layer, style.viaDiameter ) )
+                    {
+                        return false;
+                    }
+
+                    if( ViaClearanceOnLayer( profileStyle.viaLayerGeometry, layer )
+                        != ViaClearanceOnLayer( style.viaLayerGeometry, layer ) )
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
             } );
 }
 
@@ -206,8 +225,6 @@ bool avoidsForbiddenSmdAttachment( const ROUTING_CONNECTION& aCandidate,
         if( net != aBoard.nets.end() )
             viaDiameter = net->viaDiameter;
     }
-    const std::int64_t viaRadius = std::max<std::int64_t>(
-            1, viaDiameter / 2 );
     const std::vector<int> viaLayers = !style.viaLayers.empty()
             ? style.viaLayers
             : std::vector<int>{ aCandidate.nodes[aViaEdge - 1].layer,
@@ -221,19 +238,25 @@ bool avoidsForbiddenSmdAttachment( const ROUTING_CONNECTION& aCandidate,
             continue;
         }
 
-        const bool sharesLayer = std::any_of(
-                viaLayers.begin(), viaLayers.end(), [&]( int aLayer )
-                {
-                    return std::find( pad.layers.begin(), pad.layers.end(), aLayer )
-                           != pad.layers.end();
-                } );
-        if( !sharesLayer )
+        std::int64_t sharedLayerRadius = 0;
+        for( int layer : viaLayers )
+        {
+            if( std::find( pad.layers.begin(), pad.layers.end(), layer ) == pad.layers.end() )
+            {
+                continue;
+            }
+
+            sharedLayerRadius =
+                    std::max( sharedLayerRadius,
+                              std::max<std::int64_t>( 1, ViaStyleDiameterOnLayer( style, layer, viaDiameter ) / 2 ) );
+        }
+        if( sharedLayerRadius <= 0 )
             continue;
 
         using CONTACT_GEOMETRY::WIDE;
         const WIDE dx = WIDE( point.x ) - pad.position.x;
         const WIDE dy = WIDE( point.y ) - pad.position.y;
-        const WIDE minimum = WIDE( std::max<std::int64_t>( 1, pad.radius ) ) + viaRadius;
+        const WIDE minimum = WIDE( std::max<std::int64_t>( 1, pad.radius ) ) + sharedLayerRadius;
         if( dx * dx + dy * dy <= minimum * minimum )
             return false;
     }
