@@ -151,9 +151,10 @@ bool DoorEntryIsThick( const EXPANSION_ROOM& aRoom,
 /**
  * Active rectangular room/door search, with a full-stack through-drill
  * frontier for multilayer attempts. Movable rectangular trace/via shapes are
- * represented by paid obstacle-room states; actual shove/rip-up and neckdown
- * remain insertion responsibilities. The caller supplies compensated
- * rectangles and independently checks every output edge.
+ * represented by obstacle-room states; source-compatible trace rooms are
+ * probed for expansion-time shove before a one-time paid rip-up requeue.
+ * Forced insertion and neckdown remain insertion responsibilities. The caller
+ * supplies compensated rectangles and independently checks every output edge.
  */
 class MAZE_SEARCH_ENGINE_90_DEGREE
 {
@@ -176,6 +177,7 @@ public:
             const std::vector<ROOM_LAYER>& aLayers, int aNet, double aSectionOffset,
             const ROOM_VIA_SETTINGS& aVia, int aMaxExpanded, int& aExpanded,
             ROOM_SEARCH_METRICS& aMetrics, const ROUTER_CANCEL_CALLBACK& aCancel = {},
-            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {}, bool aOrthogonal = false );
+            const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {}, bool aOrthogonal = false,
+            bool aSourceTraceRooms = false );
 };
 } // namespace KICAD_AUTOROUTER

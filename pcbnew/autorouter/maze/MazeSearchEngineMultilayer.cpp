@@ -1,7 +1,8 @@
 /*
  * KiCad, GPL-3.0-or-later. Freerouting a11c0a42 room -> drill-page -> drill ->
  * layer expansion, with the native rectangular centre-space shape adapter.
- * Forced pad shove, obstacle rooms and non-through padstacks are not emulated.
+ * This retained fixed-direction frontier includes the source trace-room shove
+ * lifecycle; forced pad displacement remains outside this bounded variant.
  */
 #include "MazeSearchEngine90Degree.h"
 #include "RoomSearchContext.h"
@@ -36,7 +37,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         const std::vector<ROOM_LAYER>& layers, int net, double sectionOffset,
         const ROOM_VIA_SETTINGS& via, int maxExpanded, int& expanded,
         ROOM_SEARCH_METRICS& metrics, const ROUTER_CANCEL_CALLBACK& cancel,
-        const ROUTER_SEARCH_PROGRESS_CALLBACK& progress, bool orthogonal )
+        const ROUTER_SEARCH_PROGRESS_CALLBACK& progress, bool orthogonal,
+        bool sourceTraceRooms )
 {
     using DETAIL::ROOM;
     using DETAIL::ROOM_SEARCH;
@@ -174,13 +176,17 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         std::size_t targetOwner = 0;
         int itemId = 0;
         int ripupCost = 0;
+        std::optional<std::size_t> rippedGroup;
+        bool roomRipped = false;
+        MAZE_ADJUSTMENT adjustment = MAZE_ADJUSTMENT::NONE;
+        bool alreadyChecked = false;
         std::optional<ROUTING_EDGE_STYLE> viaStyle;
     };
     constexpr auto NONE = std::numeric_limits<std::size_t>::max();
     std::deque<STATE> states;
     std::map<decltype( MAZE_LIST_ELEMENT{}.SortKey() ), std::size_t> open;
     std::set<std::pair<EXPANSION_DOOR*, std::size_t>> occupied;
-    auto push = [&]( STATE state )
+    auto push = [&]( const STATE& state )
     {
         // A completed free room may be divided into source-mandated page-size
         // sections. Rejecting the artificial inter-section door by its
@@ -195,16 +201,26 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                                                    + state.room->shape->GetId() );
         const MAZE_LIST_ELEMENT key{ state.g, state.f, id, state.section };
         if( open.contains( key.SortKey() ) )
-            return;
+            return false;
         // Bound pending work rather than the append-only parent store.  Popped
         // ancestors must remain available for backtracking and are not queue
         // pressure.  With at most maxExpanded pops and pending states this
         // still retains O(maxExpanded) state while allowing a dense door to
         // drain before later target/drill states are enqueued.
         if( open.size() >= static_cast<std::size_t>( maxExpanded ) )
-            return;
+            return false;
         open.emplace( key.SortKey(), states.size() );
         states.push_back( state );
+        return true;
+    };
+    const auto adjustmentName = []( MAZE_ADJUSTMENT aAdjustment )
+    {
+        switch( aAdjustment )
+        {
+        case MAZE_ADJUSTMENT::LEFT: return "LEFT";
+        case MAZE_ADJUSTMENT::RIGHT: return "RIGHT";
+        default: return "NONE";
+        }
     };
     int nextItemId = 1;
     for( std::size_t layer = 0; layer < layers.size(); ++layer )
@@ -403,11 +419,19 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     state.room = spaces[to]->byShape.at( current.drill->rooms[to] );
                     state.parent = index;
                     state.viaStyle = std::move( selectedStyle );
+                    state.ripupCost = 0;
+                    state.rippedGroup.reset();
+                    state.roomRipped = false;
+                    state.adjustment = MAZE_ADJUSTMENT::NONE;
+                    state.alreadyChecked = false;
                     if( const auto* obstacle =
                                 dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
                                         state.room->shape.get() ) )
                     {
                         state.ripupCost = obstacle->GetRipupCost();
+                        state.rippedGroup = obstacle->GetGroup();
+                        state.roomRipped = true;
+                        state.alreadyChecked = true;
                         state.g += state.ripupCost;
                     }
                     // A fanout exits at the first drill-layer element popped
@@ -436,11 +460,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             std::set<std::size_t> rippedGroups;
             for( std::size_t entry : chain )
             {
-                const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
-                        states[entry].room ? states[entry].room->shape.get() : nullptr );
-                if( obstacle && states[entry].ripupCost > 0 )
+                if( states[entry].rippedGroup && states[entry].ripupCost > 0 )
                 {
-                    rippedGroups.insert( obstacle->GetGroup() );
+                    rippedGroups.insert( *states[entry].rippedGroup );
                     result.ripupCost += states[entry].ripupCost;
                 }
             }
@@ -448,35 +470,151 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             result.nodes.push_back( { states[chain.front()].entry.Middle().Round(),
                                       layers[states[chain.front()].layer].id } );
             bool valid = true;
-            for( std::size_t i = 1; i < chain.size() && valid; ++i )
+            if( sourceTraceRooms )
             {
-                const auto& before = states[chain[i - 1]];
-                const auto& after = states[chain[i]];
-                if( after.kind == KIND::DRILL_EXIT || after.kind == KIND::FANOUT_TARGET )
+                std::vector<OCTAGONAL_CORRIDOR_STEP> corridor;
+                std::size_t corridorLayer = NONE;
+                auto locateCorridor = [&]()
                 {
-                    if( result.nodes.back().point != after.drill->location )
-                    { valid = false; break; }
-                    result.nodes.push_back( { after.drill->location, layers[after.layer].id } );
-                    result.edgeStyles.push_back( after.viaStyle.value_or(
-                            ROUTING_EDGE_STYLE{} ) );
-                    continue;
+                    if( corridor.empty() )
+                        return true;
+
+                    const auto located =
+                            FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
+                                    result.nodes.back().point, corridor,
+                                    sectionOffset,
+                                    FREEROUTING_TRACE_WIDTH_TOLERANCE_IU,
+                                    orthogonal );
+                    if( !located )
+                        return false;
+
+                    for( std::size_t point = 1; point < located->size(); ++point )
+                    {
+                        result.nodes.push_back(
+                                { ( *located )[point], layers[corridorLayer].id } );
+                        result.edgeStyles.emplace_back();
+                    }
+                    corridor.clear();
+                    corridorLayer = NONE;
+                    return true;
+                };
+
+                for( std::size_t i = 1; i < chain.size() && valid; ++i )
+                {
+                    const auto& before = states[chain[i - 1]];
+                    const auto& after = states[chain[i]];
+                    if( after.kind == KIND::DRILL_EXIT
+                        || after.kind == KIND::FANOUT_TARGET )
+                    {
+                        if( !corridor.empty()
+                            || result.nodes.back().point != after.drill->location )
+                        {
+                            valid = false;
+                            break;
+                        }
+                        result.nodes.push_back(
+                                { after.drill->location, layers[after.layer].id } );
+                        result.edgeStyles.push_back( after.viaStyle.value_or(
+                                ROUTING_EDGE_STYLE{} ) );
+                        continue;
+                    }
+
+                    FLOAT_LINE entry = after.entry;
+                    if( after.kind == KIND::DRILL_ENTER )
+                    {
+                        const auto point = after.drill->location;
+                        entry = {
+                            { static_cast<double>( point.x ),
+                              static_cast<double>( point.y ) },
+                            { static_cast<double>( point.x ),
+                              static_cast<double>( point.y ) }
+                        };
+                    }
+                    if( corridor.empty() )
+                        corridorLayer = before.layer;
+                    if( before.layer != corridorLayer || after.layer != corridorLayer )
+                    {
+                        valid = false;
+                        break;
+                    }
+                    const auto* beforeObstacle =
+                            dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                                    before.room->shape.get() );
+                    const bool obstacleRipped = beforeObstacle
+                            && ( before.roomRipped
+                                 || ( after.rippedGroup
+                                      && *after.rippedGroup
+                                                 == beforeObstacle->GetGroup() ) );
+                    corridor.push_back(
+                            { before.room->shape->GetOctagon(),
+                              after.door
+                                      ? std::optional<PLANAR::INT_OCTAGON>(
+                                                after.door->GetOctagonShape() )
+                                      : std::nullopt,
+                              entry,
+                              obstacleRipped } );
+
+                    if( after.kind == KIND::DRILL_ENTER
+                        || after.kind == KIND::TARGET )
+                    {
+                        valid = locateCorridor();
+                    }
                 }
-                FLOAT_LINE entry = after.entry;
-                if( after.kind == KIND::DRILL_ENTER )
+                if( valid )
+                    valid = locateCorridor();
+            }
+            else
+            {
+                for( std::size_t i = 1; i < chain.size() && valid; ++i )
                 {
-                    const auto p = after.drill->location;
-                    entry = { { static_cast<double>( p.x ), static_cast<double>( p.y ) },
-                              { static_cast<double>( p.x ), static_cast<double>( p.y ) } };
-                }
-                const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateRectangular(
-                        result.nodes.back().point, { { before.room->shape->GetShape(),
-                            after.door ? std::optional<ROUTER_BOX>( after.door->GetShape() ) : std::nullopt,
-                            entry } }, orthogonal );
-                if( !located ) { valid = false; break; }
-                for( std::size_t j = 1; j < located->size(); ++j )
-                {
-                    result.nodes.push_back( { ( *located )[j], layers[after.layer].id } );
-                    result.edgeStyles.emplace_back();
+                    const auto& before = states[chain[i - 1]];
+                    const auto& after = states[chain[i]];
+                    if( after.kind == KIND::DRILL_EXIT
+                        || after.kind == KIND::FANOUT_TARGET )
+                    {
+                        if( result.nodes.back().point != after.drill->location )
+                        {
+                            valid = false;
+                            break;
+                        }
+                        result.nodes.push_back(
+                                { after.drill->location, layers[after.layer].id } );
+                        result.edgeStyles.push_back( after.viaStyle.value_or(
+                                ROUTING_EDGE_STYLE{} ) );
+                        continue;
+                    }
+                    FLOAT_LINE entry = after.entry;
+                    if( after.kind == KIND::DRILL_ENTER )
+                    {
+                        const auto point = after.drill->location;
+                        entry = {
+                            { static_cast<double>( point.x ),
+                              static_cast<double>( point.y ) },
+                            { static_cast<double>( point.x ),
+                              static_cast<double>( point.y ) }
+                        };
+                    }
+                    const auto located =
+                            FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateRectangular(
+                                    result.nodes.back().point,
+                                    { { before.room->shape->GetShape(),
+                                        after.door
+                                                ? std::optional<ROUTER_BOX>(
+                                                          after.door->GetShape() )
+                                                : std::nullopt,
+                                        entry } },
+                                    orthogonal );
+                    if( !located )
+                    {
+                        valid = false;
+                        break;
+                    }
+                    for( std::size_t point = 1; point < located->size(); ++point )
+                    {
+                        result.nodes.push_back(
+                                { ( *located )[point], layers[after.layer].id } );
+                        result.edgeStyles.emplace_back();
+                    }
                 }
             }
             if( valid && !( cancel && cancel() ) )
@@ -513,6 +651,100 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 *current.room->shape, sectionOffset, current.door, from,
                 currentDoorIsSmall );
         bool somethingExpanded = false;
+        auto* currentObstacle = dynamic_cast<OBSTACLE_EXPANSION_ROOM*>(
+                current.room->shape.get() );
+        int currentRoomRipupCost = 0;
+        if( currentObstacle && !current.alreadyChecked )
+        {
+            const auto* previousObstacle = current.door
+                    ? dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                              current.door->OtherRoom( current.room->shape.get() ) )
+                    : nullptr;
+            currentRoomRipupCost = previousObstacle
+                                           && current.adjustment == MAZE_ADJUSTMENT::NONE
+                                           && previousObstacle->GetGroup()
+                                                      == currentObstacle->GetGroup()
+                                   ? 1 : currentObstacle->GetRipupCost();
+        }
+
+        auto expandToDoorSection = [&]( EXPANSION_DOOR* aDoor,
+                                        std::size_t aSection,
+                                        const FLOAT_LINE& aShapeEntry,
+                                        int aAddCost,
+                                        MAZE_ADJUSTMENT aAdjustment )
+        {
+            if( !aDoor || occupied.contains( { aDoor, aSection } ) )
+                return false;
+
+            ROOM* next = space.byShape.at(
+                    aDoor->OtherRoom( current.room->shape.get() ) );
+            if( !next->complete || !next->active )
+                return false;
+
+            const FLOAT_POINT to = aShapeEntry.Middle();
+            double bend = 0;
+            if( current.parent != NONE
+                && states[current.parent].layer == current.layer )
+            {
+                bend = MAZE_LIST_ELEMENT::BendPenalty(
+                        states[current.parent].entry.Middle(), from, to,
+                        layer.bendCost );
+            }
+            const double g = current.g
+                    + from.WeightedDistance(
+                            to, layer.horizontalCost, layer.verticalCost )
+                    + bend + aAddCost;
+            const bool roomRipped =
+                    ( aAddCost > 0 && aAdjustment == MAZE_ADJUSTMENT::NONE )
+                    || ( current.alreadyChecked && current.roomRipped );
+            const std::optional<std::size_t> rippedGroup =
+                    aAddCost > 0 && aAdjustment == MAZE_ADJUSTMENT::NONE
+                            && currentObstacle
+                    ? std::optional<std::size_t>( currentObstacle->GetGroup() )
+                    : std::nullopt;
+
+            STATE state;
+            state.room = next;
+            state.layer = current.layer;
+            state.door = aDoor;
+            state.section = aSection;
+            state.entry = aShapeEntry;
+            state.g = g;
+            state.f = g + remaining( to, current.layer );
+            state.parent = index;
+            state.owner = current.owner;
+            state.ripupCost = aAddCost;
+            state.rippedGroup = rippedGroup;
+            state.roomRipped = roomRipped;
+            state.adjustment = aAdjustment;
+
+            const ROUTER_BOX doorBounds = aDoor->GetShape();
+            const ROUTER_BOX fromDoorBounds = current.door
+                                                    ? current.door->GetShape()
+                                                    : ROUTER_BOX{};
+            autorouterDecisionLog(
+                    "RAW_SECTION_ASSIGN",
+                    { { "net", std::to_string( net ) },
+                      { "layer", std::to_string( current.layer ) },
+                      { "selected_section", std::to_string( aSection ) },
+                      { "from_section", std::to_string( current.section ) },
+                      { "backtrack_section",
+                        current.parent == NONE
+                                ? "0"
+                                : std::to_string( states[current.parent].section ) },
+                      { "add_costs", std::to_string( aAddCost ) },
+                      { "adjustment", adjustmentName( aAdjustment ) },
+                      { "room_ripped", roomRipped ? "true" : "false" },
+                      { "door_dimension", std::to_string( aDoor->GetDimension() ) },
+                      { "door_bounds", autorouterDecisionBounds( doorBounds ) },
+                      { "from_door_dimension",
+                        current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
+                      { "from_door_bounds",
+                        current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
+                      { "expansion_value", std::to_string( state.g ) },
+                      { "sorting_value", std::to_string( state.f ) } } );
+            return push( state );
+        };
         int targetId = targetIdBase;
         for( std::size_t i = 0; i < current.layer; ++i )
             targetId += layers[i].targets.size();
@@ -531,9 +763,84 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             state.entry = { to, to }; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost );
             state.f = state.g; state.parent = index; state.owner = current.owner;
             state.targetOwner = target.owner; state.itemId = targetId;
+            state.roomRipped = current.roomRipped;
             push( state );
             somethingExpanded = true;
         }
+
+        if( sourceTraceRooms && currentObstacle && current.door
+            && !current.alreadyChecked && currentRoomRipupCost != 1
+            && nextRoomIsThick && !currentDoorIsSmall
+            && currentObstacle->GetTraceInfo() )
+        {
+            const auto fromSections = current.door->GetSectionSegments(
+                    sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+            const bool outerSection = !fromSections.empty()
+                    && ( current.section == 0
+                         || current.section + 1 == fromSections.size() );
+            if( outerSection )
+            {
+                bool shoveCompleted = false;
+                if( current.adjustment != MAZE_ADJUSTMENT::RIGHT )
+                {
+                    std::vector<MAZE_SHOVE_DOOR_SECTION> doors;
+                    shoveCompleted = MAZE_TRACE_SHOVER::CheckShoveTraceLine(
+                            *current.door, current.section, current.entry,
+                            *currentObstacle, sectionOffset, false, doors,
+                            FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                    for( const MAZE_SHOVE_DOOR_SECTION& door : doors )
+                    {
+                        const MAZE_ADJUSTMENT adjustment =
+                                door.door->GetDimension() == 2
+                                        ? MAZE_ADJUSTMENT::LEFT
+                                        : MAZE_ADJUSTMENT::NONE;
+                        somethingExpanded = expandToDoorSection(
+                                door.door, door.section, door.line, 0,
+                                adjustment ) || somethingExpanded;
+                    }
+                }
+
+                if( current.adjustment != MAZE_ADJUSTMENT::LEFT )
+                {
+                    std::vector<MAZE_SHOVE_DOOR_SECTION> doors;
+                    shoveCompleted = MAZE_TRACE_SHOVER::CheckShoveTraceLine(
+                            *current.door, current.section, current.entry,
+                            *currentObstacle, sectionOffset, true, doors,
+                            FREEROUTING_TRACE_WIDTH_TOLERANCE_IU )
+                            || shoveCompleted;
+                    for( const MAZE_SHOVE_DOOR_SECTION& door : doors )
+                    {
+                        const MAZE_ADJUSTMENT adjustment =
+                                door.door->GetDimension() == 2
+                                        ? MAZE_ADJUSTMENT::RIGHT
+                                        : MAZE_ADJUSTMENT::NONE;
+                        somethingExpanded = expandToDoorSection(
+                                door.door, door.section, door.line, 0,
+                                adjustment ) || somethingExpanded;
+                    }
+                }
+
+                if( !shoveCompleted )
+                {
+                    if( currentRoomRipupCost > 0 )
+                    {
+                        STATE retry = current;
+                        retry.g += currentRoomRipupCost;
+                        retry.f += currentRoomRipupCost;
+                        retry.ripupCost = currentRoomRipupCost;
+                        retry.rippedGroup = currentObstacle->GetGroup();
+                        retry.roomRipped = true;
+                        retry.alreadyChecked = true;
+                        push( retry );
+                    }
+
+                    if( current.door && somethingExpanded )
+                        occupied.emplace( current.door, current.section );
+                    continue;
+                }
+            }
+        }
+
         for( auto* door : current.room->shape->GetDoors() )
         {
             if( door == current.door )
@@ -542,7 +849,10 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             ROOM* next = space.byShape.at( door->OtherRoom( current.room->shape.get() ) );
             if( !next->complete || !next->active )
                 continue;
-            const auto sections = door->GetSectionSegments( 0, 0, 10 * sectionOffset,
+            const auto sections = door->GetSectionSegments(
+                    sourceTraceRooms ? sectionOffset : 0,
+                    sourceTraceRooms ? FREEROUTING_TRACE_WIDTH_TOLERANCE_IU : 0,
+                    sourceTraceRooms ? 0 : 10 * sectionOffset,
                     static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
             if( nextRoomIsThick
                 && !DETAIL::DoorEntryIsThick(
@@ -572,54 +882,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                         continue;
                     shapeEntry = *projected;
                 }
-                const auto to = shapeEntry.Middle();
-                double bend = 0;
-                if( current.parent != NONE && states[current.parent].layer == current.layer )
-                    bend = MAZE_LIST_ELEMENT::BendPenalty( states[current.parent].entry.Middle(), from, to, layer.bendCost );
-                int ripupCost = 0;
-                if( const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
-                            next->shape.get() ) )
-                {
-                    const auto* currentObstacle =
-                            dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
-                                    current.room->shape.get() );
-                    ripupCost = currentObstacle
-                                            && currentObstacle->GetGroup()
-                                                       == obstacle->GetGroup()
-                                        ? 1 : obstacle->GetRipupCost();
-                }
-                STATE state;
-                state.room = next; state.layer = current.layer; state.door = door; state.section = section;
-                state.entry = shapeEntry; state.g = current.g + from.WeightedDistance( to, layer.horizontalCost, layer.verticalCost ) + bend + ripupCost;
-                state.f = state.g + remaining( to, current.layer ); state.parent = index; state.owner = current.owner;
-                state.ripupCost = ripupCost;
-                const ROUTER_BOX doorBounds = door->GetShape();
-                const ROUTER_BOX fromDoorBounds = current.door
-                                                        ? current.door->GetShape()
-                                                        : ROUTER_BOX{};
-                autorouterDecisionLog(
-                        "RAW_SECTION_ASSIGN",
-                        { { "net", std::to_string( net ) },
-                          { "layer", std::to_string( current.layer ) },
-                          { "selected_section", std::to_string( section ) },
-                          { "from_section", std::to_string( current.section ) },
-                          { "backtrack_section",
-                            current.parent == NONE
-                                    ? "0"
-                                    : std::to_string( states[current.parent].section ) },
-                          { "add_costs", std::to_string( ripupCost ) },
-                          { "adjustment", "NONE" },
-                          { "room_ripped", ripupCost > 0 ? "true" : "false" },
-                          { "door_dimension", std::to_string( door->GetDimension() ) },
-                          { "door_bounds", autorouterDecisionBounds( doorBounds ) },
-                          { "from_door_dimension",
-                            current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
-                          { "from_door_bounds",
-                            current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
-                          { "expansion_value", std::to_string( state.g ) },
-                          { "sorting_value", std::to_string( state.f ) } } );
-                push( state );
-                somethingExpanded = true;
+                somethingExpanded = expandToDoorSection(
+                        door, section, shapeEntry, currentRoomRipupCost,
+                        MAZE_ADJUSTMENT::NONE ) || somethingExpanded;
             }
         }
         // The reference normally reaches the next page through a room door.

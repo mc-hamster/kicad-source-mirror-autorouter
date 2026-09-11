@@ -1477,7 +1477,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             : MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
                       layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
-                      cancel, progress );
+                      cancel, progress, false, sourceTraceRooms );
     std::optional<ROUTING_CONNECTION> result;
     if( path && !path->nodes.empty() )
     {
