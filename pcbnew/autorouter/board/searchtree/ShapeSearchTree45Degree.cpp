@@ -5,12 +5,29 @@
  */
 #include "ShapeSearchTree45Degree.h"
 
+#include "../../AutorouterDebug.h"
+
 #include <algorithm>
 #include <cmath>
 
 namespace KICAD_AUTOROUTER
 {
 using PLANAR::INT_OCTAGON;
+
+namespace
+{
+std::string octagonSupports( const INT_OCTAGON& aOctagon )
+{
+    return std::to_string( aOctagon.leftX ) + ','
+           + std::to_string( aOctagon.bottomY ) + ','
+           + std::to_string( aOctagon.rightX ) + ','
+           + std::to_string( aOctagon.topY ) + ','
+           + std::to_string( aOctagon.upperLeftDiagonalX ) + ','
+           + std::to_string( aOctagon.lowerRightDiagonalX ) + ','
+           + std::to_string( aOctagon.lowerLeftDiagonalX ) + ','
+           + std::to_string( aOctagon.upperRightDiagonalX );
+}
+} // namespace
 
 MIN_AREA_TREE::HANDLE SHAPE_SEARCH_TREE_45_DEGREE::Insert( SHAPE_TREE_ENTRY aEntry )
 {
@@ -52,6 +69,12 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
         return result;
 
     result.push_back( { startShape, aRoom.layer, aRoom.containedShape } );
+    autorouterDecisionLog(
+            "COMPLETE_SHAPE_BEGIN",
+            { { "layer", std::to_string( aRoom.layer ) },
+              { "net", std::to_string( aNet ) },
+              { "room_supports", octagonSupports( startShape ) },
+              { "contained_supports", octagonSupports( aRoom.containedShape ) } } );
     ROUTER_BOX bounding = startShape.BoundingBox();
     const bool finished = m_tree.Visit( bounding, [&]( const SHAPE_TREE_ENTRY& aEntry )
     {
@@ -64,6 +87,16 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
         }
 
         const INT_OCTAGON obstacle = aEntry.BoundingOctagon();
+        autorouterDecisionLog(
+                "COMPLETE_SHAPE_OBSTACLE",
+                { { "layer", std::to_string( aRoom.layer ) },
+                  { "net", std::to_string( aNet ) },
+                  { "object_id", std::to_string( aEntry.objectId ) },
+                  { "shape_index", std::to_string( aEntry.shapeIndex ) },
+                  { "obstacle_net", std::to_string( aEntry.net ) },
+                  { "is_room", aEntry.isRoom ? "true" : "false" },
+                  { "obstacle_supports", octagonSupports( obstacle ) },
+                  { "candidate_count", std::to_string( result.size() ) } } );
         std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> next;
         ROUTER_BOX nextBounding = INT_BOX::Empty();
         for( const auto& room : result )
@@ -86,8 +119,28 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
                 }
 
                 auto restrained = RestrainShape( room, obstacle );
+                autorouterDecisionLog(
+                        "COMPLETE_SHAPE_RESTRAIN",
+                        { { "layer", std::to_string( aRoom.layer ) },
+                          { "net", std::to_string( aNet ) },
+                          { "object_id", std::to_string( aEntry.objectId ) },
+                          { "shape_index", std::to_string( aEntry.shapeIndex ) },
+                          { "input_supports", octagonSupports( room.shape ) },
+                          { "contained_supports", octagonSupports(
+                                                            room.containedShape ) },
+                          { "obstacle_supports", octagonSupports( obstacle ) },
+                          { "output_count", std::to_string( restrained.size() ) } } );
                 for( const auto& candidate : restrained )
                 {
+                    autorouterDecisionLog(
+                            "COMPLETE_SHAPE_RESTRAIN_RESULT",
+                            { { "layer", std::to_string( aRoom.layer ) },
+                              { "net", std::to_string( aNet ) },
+                              { "object_id", std::to_string( aEntry.objectId ) },
+                              { "shape_index", std::to_string( aEntry.shapeIndex ) },
+                              { "output_supports", octagonSupports( candidate.shape ) },
+                              { "output_contained_supports",
+                                octagonSupports( candidate.containedShape ) } } );
                     nextBounding = INT_BOX::Union( nextBounding,
                                                   candidate.shape.BoundingBox() );
                     next.push_back( candidate );
@@ -283,6 +336,17 @@ INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::CalcInsideRestrainedShape(
     default: throw std::out_of_range( "45-degree obstacle line index" );
     }
     return result.Normalize();
+}
+
+
+INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemBox(
+        const ROUTER_BOX& aBox, std::int64_t aDistance )
+{
+    const ROUTER_BOX expanded{
+        aBox.minX - aDistance, aBox.minY - aDistance,
+        aBox.maxX + aDistance, aBox.maxY + aDistance
+    };
+    return INT_OCTAGON::FromBox( expanded );
 }
 
 

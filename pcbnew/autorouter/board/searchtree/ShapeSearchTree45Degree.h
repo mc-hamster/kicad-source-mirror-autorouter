@@ -50,6 +50,17 @@ public:
             const PLANAR::INT_OCTAGON& aObstacle, int aObstacleLine,
             const PLANAR::INT_OCTAGON& aRoom );
 
+    /** Offset an IntBox-backed DrillItem without chamfering its corners.
+     *
+     * ShapeSearchTree45Degree.calculateTreeShapes(DrillItem) deliberately
+     * uses IntBox.offset() when the pad's bounding octagon is a box.  Keeping
+     * this operation named at the tree boundary prevents generic obstacle
+     * offsets from accidentally changing room topology around rectangular
+     * pads.
+     */
+    static PLANAR::INT_OCTAGON OffsetDrillItemBox(
+            const ROUTER_BOX& aBox, std::int64_t aDistance );
+
 private:
     static bool obstacleSegmentTouchesInside( const PLANAR::INT_OCTAGON& aObstacle,
                                                int aObstacleLine,

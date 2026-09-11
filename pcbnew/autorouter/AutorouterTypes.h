@@ -401,6 +401,12 @@ struct ROUTING_OBSTACLE
     // may be ripped up/rerouted like any other generated route.  Kept at the
     // end to preserve the aggregate-initializer layout used by tests.
     bool                    isAutorouterOwned = false;
+    // Source ShapeSearchTree45Degree treats a rectangular DrillItem shape
+    // specially: it offsets the IntBox as another IntBox before converting
+    // it to an octagon.  ObstacleArea rectangles instead use the normal
+    // chamfered octagonal offset.  Preserve that source type distinction
+    // after the KiCad adapter has detached the geometry from PAD.
+    bool                    isPad = false;
 };
 
 

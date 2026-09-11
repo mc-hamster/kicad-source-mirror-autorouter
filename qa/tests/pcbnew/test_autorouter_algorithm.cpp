@@ -3179,6 +3179,49 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterUsesExactOvalCapsules )
 }
 
 
+BOOST_AUTO_TEST_CASE( RectangularPadTreeOffsetKeepsSourceSquareCorners )
+{
+    BOARD board;
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    auto* pad = new PAD( footprint );
+    pad->SetAttribute( PAD_ATTRIB::SMD );
+    pad->SetLayerSet( LSET( { F_Cu } ) );
+    pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::RECTANGLE );
+    pad->SetSize( PADSTACK::ALL_LAYERS, { 1500000, 1050000 } );
+    pad->SetPosition( { 3000000, 3000000 } );
+    footprint->Add( pad );
+
+    KICAD_BOARD_ADAPTER adapter( &board );
+    const auto snapshot = adapter.CreateSnapshot( adapter.CreateDefaultSettings() );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
+    const ROUTING_OBSTACLE& rectangle = snapshot->obstacles.front();
+    BOOST_CHECK( rectangle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE );
+    BOOST_CHECK( rectangle.isPad );
+
+    constexpr std::int64_t offset = 100000;
+    const PLANAR::INT_OCTAGON sourceShape =
+            SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemBox( rectangle.box, offset );
+    BOOST_CHECK_EQUAL( sourceShape.leftX, rectangle.box.minX - offset );
+    BOOST_CHECK_EQUAL( sourceShape.bottomY, rectangle.box.minY - offset );
+    BOOST_CHECK_EQUAL( sourceShape.rightX, rectangle.box.maxX + offset );
+    BOOST_CHECK_EQUAL( sourceShape.topY, rectangle.box.maxY + offset );
+    BOOST_CHECK_EQUAL( sourceShape.lowerRightDiagonalX,
+                       sourceShape.rightX - sourceShape.bottomY );
+    BOOST_CHECK_EQUAL( sourceShape.upperRightDiagonalX,
+                       sourceShape.rightX + sourceShape.topY );
+
+    // A generic octagonal offset chamfers each corner.  That was the native
+    // mismatch which selected a diagonal restraint and created a 2-D door
+    // where the pinned source has a 1-D pad-side contact.
+    const PLANAR::INT_OCTAGON chamfered =
+            PLANAR::INT_OCTAGON::FromBox( rectangle.box ).Offset( offset );
+    BOOST_CHECK_NE( chamfered.lowerRightDiagonalX,
+                    sourceShape.lowerRightDiagonalX );
+}
+
+
 BOOST_AUTO_TEST_CASE( KiCadAdapterUsesSpecctraCompensatedRoundedRectangleCore )
 {
     BOARD board;

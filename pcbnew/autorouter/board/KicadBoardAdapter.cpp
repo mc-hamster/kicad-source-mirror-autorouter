@@ -879,6 +879,7 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             obstacle.netCode = pad->GetNetCode();
             obstacle.boardItemId = pad->m_Uuid.AsString().ToStdString();
             obstacle.layers = { layer };
+            obstacle.isPad = true;
 
             obstacle.blocksTracks = true;
             obstacle.blocksVias = true;

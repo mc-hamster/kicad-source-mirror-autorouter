@@ -11,6 +11,7 @@
 #include "../expansion/ExpansionDoor.h"
 #include "../expansion/ObstacleExpansionRoom.h"
 #include "../expansion/Sorted45DegreeRoomNeighbours.h"
+#include "../AutorouterDebug.h"
 
 #include <map>
 #include <memory>
@@ -145,6 +146,15 @@ public:
         ROOM* result = room.get();
         byShape.emplace( room->shape.get(), result );
         rooms.push_back( std::move( room ) );
+        autorouterDecisionLog(
+                "ROOM_INCOMPLETE_CREATE",
+                { { "layer", std::to_string( aSeed.layer ) },
+                  { "shape_bounds", autorouterDecisionBounds(
+                                            aSeed.shape.BoundingBox() ) },
+                  { "contained_bounds", autorouterDecisionBounds(
+                                                aSeed.containedShape.BoundingBox() ) },
+                  { "contained_dimension", std::to_string(
+                                                   aSeed.containedShape.Dimension() ) } } );
         return result;
     }
 
@@ -175,6 +185,15 @@ public:
 
     ROOM* addComplete( INCOMPLETE_45_DEGREE_EXPANSION_ROOM aSeed )
     {
+        autorouterDecisionLog(
+                "ROOM_ADD_COMPLETE_BEGIN",
+                { { "layer", std::to_string( aSeed.layer ) },
+                  { "shape_bounds", autorouterDecisionBounds(
+                                            aSeed.shape.BoundingBox() ) },
+                  { "contained_bounds", autorouterDecisionBounds(
+                                                aSeed.containedShape.BoundingBox() ) },
+                  { "contained_dimension", std::to_string(
+                                                   aSeed.containedShape.Dimension() ) } } );
         while( step() )
         {
             const auto entries = neighbours( aSeed.shape );
@@ -246,6 +265,16 @@ public:
             }
             tree.Insert( { aSeed.shape.BoundingBox(), id, 0, layer, 0,
                            true, true, aSeed.shape } );
+            autorouterDecisionLog(
+                    "ROOM_COMPLETE_ADDED",
+                    { { "layer", std::to_string( layer ) },
+                      { "room_id", std::to_string( id ) },
+                      { "room_bounds", autorouterDecisionBounds(
+                                                aSeed.shape.BoundingBox() ) },
+                      { "contained_bounds", autorouterDecisionBounds(
+                                                    aSeed.containedShape.BoundingBox() ) },
+                      { "contained_dimension", std::to_string(
+                                                       aSeed.containedShape.Dimension() ) } } );
             ++metrics.rooms;
             return result;
         }
@@ -274,6 +303,19 @@ public:
                 break;
             }
         }
+        autorouterDecisionLog(
+                "ROOM_COMPLETE_REQUEST",
+                { { "layer", std::to_string( layer ) },
+                  { "shape_bounds", autorouterDecisionBounds(
+                                            incompleteRoom->GetOctagon().BoundingBox() ) },
+                  { "contained_bounds", autorouterDecisionBounds(
+                                                incompleteRoom->GetContainedOctagon()
+                                                        .BoundingBox() ) },
+                  { "ignored_object", ignored ? std::to_string( *ignored ) : "" },
+                  { "ignored_shape_bounds", ignoredShape
+                                                       ? autorouterDecisionBounds(
+                                                                 ignoredShape->BoundingBox() )
+                                                       : "" } } );
         const auto candidates = tree.CompleteShape(
                 { incompleteRoom->GetOctagon(), layer,
                   incompleteRoom->GetContainedOctagon() },

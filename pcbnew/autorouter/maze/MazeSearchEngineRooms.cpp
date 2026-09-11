@@ -11,6 +11,7 @@
 #include "MazeSearchEngine45Degree.h"
 #include "MazeSearchEngineAnyAngle.h"
 #include "MazeTraceShover.h"
+#include "../board/searchtree/ShapeSearchTree45Degree.h"
 #include "../path/Connection.h"
 #include "../geometry/planar/ContactGeometry.h"
 #include "../geometry/planar/Simplex.h"
@@ -427,8 +428,21 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         if( isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
             simplex = PLANAR::SIMPLEX::FromConvexPolygon(
                     obstacle.polygon, expansion );
-        addOctagon( octagonalEnvelope( obstacle, expansion ),
-                    std::move( simplex ) );
+        if( aSourceTraceRooms && !aForVia && obstacle.isPad
+            && obstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+        {
+            // ShapeSearchTree45Degree.calculateTreeShapes(DrillItem) avoids
+            // corner cut-offs by offsetting an IntBox as an IntBox.  Calling
+            // INT_OCTAGON::Offset here would chamfer the rectangular pad and
+            // can change an orthogonal room restraint into a diagonal one.
+            addOctagon( SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemBox(
+                                obstacle.box, expansion ) );
+        }
+        else
+        {
+            addOctagon( octagonalEnvelope( obstacle, expansion ),
+                        std::move( simplex ) );
+        }
     }
     // Every attempt sees current copper, including through-via copper on
     // intermediate layers. No stale per-net tree survives add/remove/rip-up.
