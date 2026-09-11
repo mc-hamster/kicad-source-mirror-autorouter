@@ -7,6 +7,8 @@
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <tuple>
 
 namespace KICAD_AUTOROUTER
@@ -156,12 +158,428 @@ std::optional<PORTAL> portalForStep(
                    &*aStep.door };
 }
 
+
+std::optional<PORTAL> portalForShape(
+        const PLANAR::SIMPLEX& aDoor, const PLANAR::SIMPLEX& aViewRoom )
+{
+    if( aDoor.Dimension() < 0 || !aDoor.IsBounded() )
+        return std::nullopt;
+
+    const auto gravity = aViewRoom.CentreOfGravity();
+    const FLOAT_POINT pole{ gravity.first, gravity.second };
+    const int left = aDoor.IndexOfLeftMostCorner( pole );
+    const int right = aDoor.IndexOfRightMostCorner( pole );
+
+    if( left < 0 || right < 0 )
+        return std::nullopt;
+
+    return PORTAL{ aDoor.CornerApprox( static_cast<std::size_t>( left ) ),
+                   aDoor.CornerApprox( static_cast<std::size_t>( right ) ),
+                   &aDoor };
+}
+
 std::optional<ROUTER_POINT> integralPortalCorner(
         const PORTAL& aPortal, bool aLeft )
 {
     const FLOAT_POINT corner = aLeft ? aPortal.left : aPortal.right;
     return FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralPoint(
             *aPortal.shape, corner.Round() );
+}
+
+
+bool samePoint( FLOAT_POINT aFirst, FLOAT_POINT aSecond )
+{
+    return aFirst.x == aSecond.x && aFirst.y == aSecond.y;
+}
+
+
+FLOAT_POINT rightTurnNextCorner( FLOAT_POINT aFrom, double aDistance,
+                                 FLOAT_POINT aTo, FLOAT_POINT aNext )
+{
+    const auto firstTangent = aFrom.LeftTangentialPoint( aTo, aDistance );
+    if( !firstTangent )
+        return aFrom;
+
+    const auto secondTangent = aTo.RightTangentialPoint(
+            aNext, 2 * aDistance + 1.0 );
+    if( !secondTangent )
+        return aFrom;
+
+    const FLOAT_LINE firstLine{ aFrom, *firstTangent };
+    const FLOAT_LINE secondLine = FLOAT_LINE{ aTo, *secondTangent }.Translate(
+            aDistance );
+    return firstLine.Intersection( secondLine ).value_or( aFrom );
+}
+
+
+FLOAT_POINT leftTurnNextCorner( FLOAT_POINT aFrom, double aDistance,
+                                FLOAT_POINT aTo, FLOAT_POINT aNext )
+{
+    const auto firstTangent = aFrom.RightTangentialPoint( aTo, aDistance );
+    if( !firstTangent )
+        return aFrom;
+
+    const auto secondTangent = aTo.LeftTangentialPoint(
+            aNext, 2 * aDistance + 1.0 );
+    if( !secondTangent )
+        return aFrom;
+
+    const FLOAT_LINE firstLine{ aFrom, *firstTangent };
+    const FLOAT_LINE secondLine = FLOAT_LINE{ aTo, *secondTangent }.Translate(
+            -aDistance );
+    return firstLine.Intersection( secondLine ).value_or( aFrom );
+}
+
+
+std::optional<FLOAT_POINT> rightLeftTangentialPoint(
+        FLOAT_POINT aFrom, FLOAT_POINT aTo, FLOAT_POINT aCentre,
+        double aDistance )
+{
+    const auto firstTangent = aFrom.RightTangentialPoint( aCentre, aDistance );
+    const auto secondTangent = aTo.LeftTangentialPoint( aCentre, aDistance );
+    if( !firstTangent || !secondTangent )
+        return std::nullopt;
+    return FLOAT_LINE{ aFrom, *firstTangent }.Intersection(
+            FLOAT_LINE{ aTo, *secondTangent } );
+}
+
+
+std::optional<FLOAT_POINT> leftRightTangentialPoint(
+        FLOAT_POINT aFrom, FLOAT_POINT aTo, FLOAT_POINT aCentre,
+        double aDistance )
+{
+    const auto firstTangent = aFrom.LeftTangentialPoint( aCentre, aDistance );
+    const auto secondTangent = aTo.RightTangentialPoint( aCentre, aDistance );
+    if( !firstTangent || !secondTangent )
+        return std::nullopt;
+    return FLOAT_LINE{ aFrom, *firstTangent }.Intersection(
+            FLOAT_LINE{ aTo, *secondTangent } );
+}
+
+
+std::optional<std::vector<ROUTER_POINT>> locateWithSourceRadius(
+        ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps,
+        double aCompensatedTraceHalfWidth, double aTraceWidthTolerance )
+{
+    // FoundConnectionLocator starts at the maze destination and walks the
+    // backtrack doors toward the start item.  The native corridor is stored in
+    // the opposite direction, so construct the same door sequence here and
+    // reverse the rounded result at the end.
+    std::vector<PORTAL> doors;
+    doors.reserve( aSteps.size() );
+    for( std::size_t index = aSteps.size(); index-- > 0; )
+    {
+        if( !aSteps[index].door )
+            continue;
+        const PLANAR::SIMPLEX& viewRoom = index + 1 < aSteps.size()
+                ? aSteps[index + 1].room : aSteps[index].room;
+        const auto portal = portalForShape( *aSteps[index].door, viewRoom );
+        if( !portal )
+            return std::nullopt;
+        doors.push_back( *portal );
+    }
+
+    FLOAT_POINT current = aSteps.back().section.Middle();
+    FLOAT_POINT previous = current;
+    std::vector<FLOAT_POINT> reversePoints{ current };
+
+    // FoundConnectionLocator.adjustStartCorner(): the point chosen on the
+    // destination item must first enter the room far enough for the complete
+    // trace cross-section.  An empty shrink keeps the original point, exactly
+    // as the source does.
+    const auto destinationRoom = aSteps.back().room.Offset(
+            -aCompensatedTraceHalfWidth );
+    if( destinationRoom && destinationRoom->Dimension() >= 0
+        && !destinationRoom->Contains( current ) )
+    {
+        const auto nearest = destinationRoom->NearestPoint(
+                PLANAR::POINT( current.Round() ) );
+        if( nearest )
+        {
+            const FLOAT_POINT adjusted{ nearest->X(), nearest->Y() };
+            if( !samePoint( adjusted, current ) )
+            {
+                reversePoints.push_back( adjusted );
+                previous = current;
+                current = adjusted;
+            }
+        }
+    }
+
+    const double maximumHalfWidth = aCompensatedTraceHalfWidth
+                                    + aTraceWidthTolerance;
+    const double middleHalfWidth = aCompensatedTraceHalfWidth + 1.0;
+    std::size_t currentDoor = 0;
+    const std::size_t targetDoor = doors.size();
+    const FLOAT_POINT target{ static_cast<double>( aStart.x ),
+                              static_cast<double>( aStart.y ) };
+
+    // A successful source iteration either advances the door index or emits a
+    // new corner.  The guard fails closed on malformed/degenerate geometry.
+    const std::size_t iterationLimit = 64 + 16 * ( doors.size() + 1 );
+    for( std::size_t iteration = 0; iteration < iterationLimit; ++iteration )
+    {
+        if( currentDoor > targetDoor )
+            break;
+        if( currentDoor == targetDoor )
+        {
+            ++currentDoor;
+            if( !samePoint( target, current ) )
+            {
+                reversePoints.push_back( target );
+                previous = current;
+                current = target;
+            }
+            continue;
+        }
+
+        std::optional<FLOAT_POINT> doorLeft = doors[currentDoor].left;
+        std::optional<FLOAT_POINT> doorRight = doors[currentDoor].right;
+        if( current.SideOf( *doorLeft, *doorRight ) != -1 )
+        {
+            if( current.ScalarProduct( previous, *doorLeft ) >= 0 )
+                doorLeft.reset();
+            if( current.ScalarProduct( previous, *doorRight ) >= 0 )
+                doorRight.reset();
+            if( !doorLeft && !doorRight )
+            {
+                ++currentDoor;
+                continue;
+            }
+        }
+
+        bool endOfTrace = false;
+        std::optional<FLOAT_POINT> leftTangent;
+        std::optional<FLOAT_POINT> rightTangent;
+        std::size_t newDoor = currentDoor;
+        std::size_t leftIndex = newDoor;
+        std::size_t rightIndex = newDoor;
+        std::size_t nextDoorIndex = currentDoor + 1;
+        std::optional<FLOAT_POINT> resultCorner;
+        bool passedUnexpectedDoor = false;
+
+        for( ;; )
+        {
+            leftTangent = doorLeft
+                    ? current.RightTangentialPoint( *doorLeft, maximumHalfWidth )
+                    : std::nullopt;
+            if( doorLeft && !leftTangent )
+                leftTangent = doorLeft;
+            rightTangent = doorRight
+                    ? current.LeftTangentialPoint( *doorRight, maximumHalfWidth )
+                    : std::nullopt;
+            if( doorRight && !rightTangent )
+                rightTangent = doorRight;
+
+            if( leftTangent && rightTangent
+                && rightTangent->SideOf( current, *leftTangent ) != -1 )
+            {
+                if( !doorLeft || !doorRight )
+                    return std::nullopt;
+                if( doorLeft->Distance( current ) <= doorRight->Distance( current ) )
+                {
+                    newDoor = leftIndex;
+                    resultCorner = leftTurnNextCorner(
+                            current, maximumHalfWidth, *doorLeft, *doorRight );
+                }
+                else
+                {
+                    newDoor = rightIndex;
+                    resultCorner = rightTurnNextCorner(
+                            current, maximumHalfWidth, *doorRight, *doorLeft );
+                }
+                break;
+            }
+
+            if( nextDoorIndex >= targetDoor )
+            {
+                endOfTrace = true;
+                break;
+            }
+
+            std::optional<FLOAT_POINT> nextLeft = doors[nextDoorIndex].left;
+            std::optional<FLOAT_POINT> nextRight = doors[nextDoorIndex].right;
+            if( current.SideOf( *nextLeft, *nextRight ) != -1 )
+            {
+                if( !doorLeft && current.ScalarProduct( previous, *nextLeft ) >= 0 )
+                    nextLeft.reset();
+                if( !doorRight && current.ScalarProduct( previous, *nextRight ) >= 0 )
+                    nextRight.reset();
+                if( !nextLeft && !nextRight )
+                {
+                    newDoor = currentDoor + 1;
+                    passedUnexpectedDoor = true;
+                    break;
+                }
+            }
+
+            if( doorLeft && doorRight && nextLeft && nextRight )
+            {
+                if( nextLeft->SideOf( current, *doorRight ) == -1 )
+                {
+                    newDoor = rightIndex + 1;
+                    resultCorner = rightTurnNextCorner(
+                            current, maximumHalfWidth, *doorRight, *nextLeft );
+                    break;
+                }
+                if( nextRight->SideOf( current, *doorLeft ) == 1 )
+                {
+                    newDoor = leftIndex + 1;
+                    resultCorner = leftTurnNextCorner(
+                            current, maximumHalfWidth, *doorLeft, *nextRight );
+                    break;
+                }
+            }
+
+            bool smallerRight = !doorRight;
+            if( doorRight && nextRight
+                && nextRight->SideOf( current, *doorRight ) != -1 )
+            {
+                const auto tangent = current.LeftTangentialPoint(
+                        *nextRight, maximumHalfWidth );
+                if( tangent
+                    && FLOAT_LINE{ current, *tangent }.SegmentDistance( *doorRight )
+                               >= maximumHalfWidth )
+                {
+                    smallerRight = true;
+                }
+            }
+            if( smallerRight )
+            {
+                doorRight = nextRight;
+                rightIndex = nextDoorIndex;
+            }
+
+            bool smallerLeft = !doorLeft;
+            if( doorLeft && nextLeft
+                && nextLeft->SideOf( current, *doorLeft ) != 1 )
+            {
+                const auto tangent = current.RightTangentialPoint(
+                        *nextLeft, maximumHalfWidth );
+                if( tangent
+                    && FLOAT_LINE{ current, *tangent }.SegmentDistance( *doorLeft )
+                               >= maximumHalfWidth )
+                {
+                    smallerLeft = true;
+                }
+            }
+            if( smallerLeft )
+            {
+                doorLeft = nextLeft;
+                leftIndex = nextDoorIndex;
+            }
+            ++nextDoorIndex;
+        }
+
+        if( passedUnexpectedDoor )
+        {
+            currentDoor = newDoor;
+            continue;
+        }
+
+        if( endOfTrace )
+        {
+            resultCorner = target;
+            if( leftTangent
+                && target.SideOf( current, *leftTangent ) == 1 && doorLeft )
+            {
+                newDoor = leftIndex + 1;
+                const auto corner = rightLeftTangentialPoint(
+                        current, target, *doorLeft, maximumHalfWidth );
+                if( corner )
+                {
+                    resultCorner = corner;
+                    endOfTrace = false;
+                }
+            }
+            else if( rightTangent
+                     && target.SideOf( current, *rightTangent ) == -1
+                     && doorRight )
+            {
+                newDoor = rightIndex + 1;
+                const auto corner = leftRightTangentialPoint(
+                        current, target, *doorRight, maximumHalfWidth );
+                if( corner )
+                {
+                    resultCorner = corner;
+                    endOfTrace = false;
+                }
+            }
+        }
+        if( endOfTrace )
+            newDoor = targetDoor;
+        if( !resultCorner || !std::isfinite( resultCorner->x )
+            || !std::isfinite( resultCorner->y ) )
+        {
+            return std::nullopt;
+        }
+
+        const FLOAT_LINE checkLine{ current, *resultCorner };
+        const std::size_t checkFrom = currentDoor > 5 ? currentDoor - 5 : 0;
+        std::optional<FLOAT_POINT> corrected;
+        std::size_t correctedDoor = 0;
+        for( std::size_t index = checkFrom; index < newDoor; ++index )
+        {
+            const FLOAT_POINT left = doors[index].left;
+            if( std::abs( checkLine.SegmentDistance( left ) ) < middleHalfWidth )
+            {
+                const auto candidate = rightLeftTangentialPoint(
+                        checkLine.a, checkLine.b, left, maximumHalfWidth );
+                if( candidate
+                    && ( !corrected
+                         || candidate->SideOf( current, *corrected ) == -1 ) )
+                {
+                    correctedDoor = index;
+                    corrected = candidate;
+                }
+            }
+            const FLOAT_POINT right = doors[index].right;
+            if( std::abs( checkLine.SegmentDistance( right ) ) < middleHalfWidth )
+            {
+                const auto candidate = leftRightTangentialPoint(
+                        checkLine.a, checkLine.b, right, maximumHalfWidth );
+                if( candidate
+                    && ( !corrected
+                         || candidate->SideOf( current, *corrected ) == 1 ) )
+                {
+                    correctedDoor = index;
+                    corrected = candidate;
+                }
+            }
+        }
+        if( corrected )
+        {
+            resultCorner = corrected;
+            newDoor = std::max( correctedDoor, currentDoor );
+        }
+
+        const std::size_t previousDoor = currentDoor;
+        currentDoor = newDoor;
+        if( !samePoint( *resultCorner, current ) )
+        {
+            reversePoints.push_back( *resultCorner );
+            previous = current;
+            current = *resultCorner;
+        }
+        else if( currentDoor == previousDoor )
+        {
+            return std::nullopt;
+        }
+    }
+
+    if( currentDoor <= targetDoor || !samePoint( current, target ) )
+        return std::nullopt;
+
+    std::vector<ROUTER_POINT> rounded;
+    rounded.reserve( reversePoints.size() );
+    for( const FLOAT_POINT point : reversePoints )
+    {
+        const ROUTER_POINT integral = point.Round();
+        if( rounded.empty() || rounded.back() != integral )
+            rounded.push_back( integral );
+    }
+    std::reverse( rounded.begin(), rounded.end() );
+    return rounded;
 }
 } // namespace
 
@@ -225,10 +643,24 @@ std::optional<ROUTER_POINT> FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralP
 
 
 std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_ANY_ANGLE::Locate(
-        ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps )
+        ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps,
+        double aCompensatedTraceHalfWidth, double aTraceWidthTolerance )
 {
     if( aSteps.empty() )
         return std::vector<ROUTER_POINT>{ aStart };
+
+    if( aCompensatedTraceHalfWidth > 0 )
+    {
+        if( !std::isfinite( aCompensatedTraceHalfWidth )
+            || !std::isfinite( aTraceWidthTolerance )
+            || aTraceWidthTolerance < 0 )
+        {
+            return std::nullopt;
+        }
+        return locateWithSourceRadius( aStart, aSteps,
+                                       aCompensatedTraceHalfWidth,
+                                       aTraceWidthTolerance );
+    }
 
     // The Java locator computes a maximum visible range through successive
     // doors and emits a bend only when the next door closes that range.  Its

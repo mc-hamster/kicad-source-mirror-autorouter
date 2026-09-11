@@ -7731,6 +7731,40 @@ BOOST_AUTO_TEST_CASE( OrthogonalFallbackUsesSourceShoveRequeueLifecycle )
 }
 
 
+BOOST_AUTO_TEST_CASE( AnyAngleFrontierUsesSourceShoveRequeueLifecycle )
+{
+    const ROUTER_BOX bounds{ 0, 0, 10000, 10000 };
+    const std::vector<ROOM_TERMINAL> starts{
+        { { 1000, 5000 }, { 1000, 5000 }, 0 }
+    };
+    const std::vector<ROOM_TERMINAL> targets{
+        { { 9000, 5000 }, { 9000, 5000 }, 1 }
+    };
+    const SHAPE_TREE_ENTRY shape{ { 4500, 2000, 5500, 8000 }, 7, 0, 0, 2,
+                                  false, true };
+    auto traceInfo = std::make_shared<MAZE_TRACE_ROOM_INFO>();
+    traceInfo->corners = { { 5000, 2000 }, { 5000, 8000 } };
+    traceInfo->firstShapeIndex = 1;
+    traceInfo->halfWidth = 100;
+    traceInfo->sourceStyleMatches = true;
+
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
+            bounds, {}, 0, 1, starts, targets, 100, 1, 1, 10000,
+            expanded, metrics, {}, {}, 0,
+            { ROOM_RIPUP_OBSTACLE{ shape, 42, 100, 3, traceInfo } }, true );
+
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE_EQUAL( path->rippedObstacleGroups.size(), 1U );
+    BOOST_CHECK_EQUAL( path->rippedObstacleGroups.front(), 42U );
+    BOOST_CHECK_EQUAL( path->ripupCost, 100 );
+    BOOST_CHECK_EQUAL( metrics.rippedRooms, 1 );
+    BOOST_CHECK_EQUAL( metrics.ripupCost, 100 );
+    BOOST_CHECK_GT( expanded, 1 );
+}
+
+
 BOOST_AUTO_TEST_CASE( ProductionNoViaSearchUsesRoomsAndRefreshesMutableObstacles )
 {
     auto board = makeBoard();
@@ -8252,6 +8286,47 @@ BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesSourceVisibilityRangeAcrossSeveralDoors
     BOOST_REQUIRE( !secondEdge.Empty() );
     BOOST_CHECK( firstDoor.IntersectsSegment( firstEdge, 1 ) );
     BOOST_CHECK( secondDoor.IntersectsSegment( secondEdge, 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( AnyAngleLocatorUsesSourceTangentRadiusAcrossSeveralDoors )
+{
+    using PLANAR::POINT;
+    using PLANAR::SIMPLEX;
+    const SIMPLEX firstRoom = SIMPLEX::Box( { 0, 0, 100, 100 } );
+    const SIMPLEX secondRoom = SIMPLEX::Box( { 100, 20, 200, 100 } );
+    const SIMPLEX thirdRoom = SIMPLEX::Box( { 140, 100, 220, 200 } );
+    const SIMPLEX firstDoor = firstRoom.Intersection( secondRoom );
+    const SIMPLEX secondDoor = secondRoom.Intersection( thirdRoom );
+
+    const std::vector<GENERAL_CORRIDOR_STEP> corridor{
+        { firstRoom, firstDoor, { { 100, 20 }, { 100, 100 } } },
+        { secondRoom, secondDoor, { { 140, 100 }, { 200, 100 } } },
+        { thirdRoom, {}, { { 180, 180 }, { 180, 180 } } }
+    };
+    const auto path = FOUND_CONNECTION_LOCATOR_ANY_ANGLE::Locate(
+            { 10, 40 }, corridor, 10, 2 );
+
+    BOOST_REQUIRE( path );
+    BOOST_CHECK( path->front() == ROUTER_POINT( { 10, 40 } ) );
+    BOOST_CHECK( path->back() == ROUTER_POINT( { 180, 180 } ) );
+    BOOST_REQUIRE_GE( path->size(), 3U );
+
+    // Source any-angle realization follows tangent lines around the limiting
+    // portal corner instead of placing a zero-radius bend on that corner.
+    const FLOAT_POINT limitingCorner{ 140, 100 };
+    double minimumDistance = std::numeric_limits<double>::infinity();
+    for( std::size_t index = 1; index < path->size(); ++index )
+    {
+        const FLOAT_POINT from{ static_cast<double>( path->at( index - 1 ).x ),
+                                static_cast<double>( path->at( index - 1 ).y ) };
+        const FLOAT_POINT to{ static_cast<double>( path->at( index ).x ),
+                              static_cast<double>( path->at( index ).y ) };
+        minimumDistance = std::min(
+                minimumDistance,
+                FLOAT_LINE{ from, to }.SegmentDistance( limitingCorner ) );
+    }
+    BOOST_CHECK_GE( minimumDistance, 9.0 );
 }
 
 

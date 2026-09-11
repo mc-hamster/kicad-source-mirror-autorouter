@@ -46,7 +46,9 @@ public:
             const PLANAR::SIMPLEX& aShape, ROUTER_POINT aFrom );
 
     static std::optional<std::vector<ROUTER_POINT>> Locate(
-            ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps );
+            ROUTER_POINT aStart, const std::vector<GENERAL_CORRIDOR_STEP>& aSteps,
+            double aCompensatedTraceHalfWidth = 0,
+            double aTraceWidthTolerance = 2 );
 };
 
 } // namespace KICAD_AUTOROUTER

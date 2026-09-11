@@ -76,12 +76,18 @@ std::optional<PLANAR::SIMPLEX> exactConvexClearanceShape(
     // rectangle. Rounded and holed contours retain their dedicated generic
     // geometry paths until their arc/decomposition semantics are ported.
     if( aObstacle.kind != ROUTER_OBSTACLE_KIND::POLYGON || aObstacle.radius != 0
-        || !aObstacle.polygonHoles.empty() )
+        || !aObstacle.polygonHoles.empty() || aRadius != 0 )
     {
         return {};
     }
 
-    return PLANAR::SIMPLEX::FromConvexPolygon( aObstacle.polygon, aRadius );
+    // A positive-radius SIMPLEX offset has sharp/mitered convex corners.
+    // Copper clearance around the end or side of a trace is Euclidean and is
+    // therefore rounded at a polygon vertex.  Let the exact finite-segment
+    // distance predicate handle that case; otherwise a legal source tangent
+    // is rejected inside the artificial miter.  Radius zero retains exact
+    // rational segment/area intersection.
+    return PLANAR::SIMPLEX::FromConvexPolygon( aObstacle.polygon );
 }
 
 

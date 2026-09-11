@@ -211,8 +211,9 @@ std::optional<std::vector<PLANAR::SIMPLEX>> splitPolygonAreaToConvex(
         {
             VECTOR2I a, b, c;
             triangulated->GetTriangle( static_cast<int>( triangle ), a, b, c );
-            auto simplex = PLANAR::SIMPLEX::FromConvexPolygon(
-                    { { a.x, a.y }, { b.x, b.y }, { c.x, c.y } }, aExpansion );
+            const auto base = PLANAR::SIMPLEX::FromConvexPolygon(
+                    { { a.x, a.y }, { b.x, b.y }, { c.x, c.y } } );
+            const auto simplex = base ? base->Offset( aExpansion ) : std::nullopt;
             if( !simplex || simplex->Dimension() != 2 )
                 return std::nullopt;
             result.push_back( std::move( *simplex ) );
@@ -427,8 +428,11 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
 
         std::optional<PLANAR::SIMPLEX> simplex;
         if( isGeneralConvexRoomObstacle( obstacle, net, aForVia ) )
-            simplex = PLANAR::SIMPLEX::FromConvexPolygon(
-                    obstacle.polygon, expansion );
+        {
+            const auto base = PLANAR::SIMPLEX::FromConvexPolygon(
+                    obstacle.polygon );
+            simplex = base ? base->Offset( expansion ) : std::nullopt;
+        }
         if( aSourceTraceRooms && !aForVia && obstacle.isPad
             && obstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
         {
@@ -984,10 +988,12 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                 {
                     return aTarget.pad.isPlaneTarget;
                 } );
-        // The source 45-degree locator consumes ShapeSearchTree rooms which
-        // contain only the obstacle-side clearance share.  General-convex and
-        // plane paths still use their established complete-centre geometry.
-        const bool sourceTraceRooms = !anyAngle && !plane;
+        // Freerouting's room tree contains only the obstacle-side clearance
+        // share for ordinary traces.  The locator then realizes the candidate
+        // centreline with its compensated half-width.  Plane targets retain
+        // complete-centre geometry until their finite area semantics are
+        // represented by the native target door.
+        const bool sourceTraceRooms = !plane;
         const auto ripupEntries = roomRipupObstacles(
                 net, layer.layerId, false, aRetry, false, sourceTraceRooms, aCancel );
         const auto entries = roomObstacles( net, layer.layerId, false, false,
@@ -1004,7 +1010,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                         m_settings.maxExpandedNodes, aExpanded, m_roomMetrics,
                         aCancel, aProgress,
                         static_cast<double>( std::max( 0, m_settings.bendCost ) )
-                                * std::max( 1, m_settings.gridStepIU ), ripupEntries )
+                                * std::max( 1, m_settings.gridStepIU ), ripupEntries,
+                        sourceTraceRooms )
                 : MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                         bounds, entries, layer.layerId, net, starts, targets,
                         std::max<std::int64_t>( 1, radius + compensation ),

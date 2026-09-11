@@ -20,7 +20,8 @@ public:
             const ROUTER_CANCEL_CALLBACK& aCancel = {},
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
             double aBendCost = 0,
-            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {} );
+            const std::vector<ROOM_RIPUP_OBSTACLE>& aRipupObstacles = {},
+            bool aSourceTraceRooms = false );
 
     /** General-rational room/page/drill frontier.  Drill pages retain the
      * source IntBox partition while every per-layer trace room remains an

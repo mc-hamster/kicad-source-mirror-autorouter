@@ -12,10 +12,27 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
-## Latest core milestone — expansion-time trace shove and paid requeue
+## Latest core milestone — unrestricted-angle source geometry and shove lifecycle
 
+The active unrestricted-angle single-layer frontier now uses Freerouting's
+source obstacle-side compensation model instead of the former native shortcut
+which inflated obstacles by the complete candidate radius and then realized a
+zero-radius portal funnel. `FoundConnectionLocatorAnyAngle` now directly ports
+the source tangent-circle visibility algorithm: destination-room entry,
+already-crossed door handling, left/right visibility contraction, narrow-gap
+turn selection, target tangents, five-door backward clearance correction and
+source-equivalent integral rounding. Exact general convex obstacle pieces use
+parallel support-line offsets rather than the unrelated square/Chebyshev
+polygon expansion. Positive-radius host validation uses exact finite-segment
+Euclidean distance at convex vertices; rational `Simplex` intersection remains
+authoritative at radius zero. This avoids the artificial sharp miter which
+previously rejected a legal source tangent while preserving conservative KiCad
+clearance validation.
+
+The unrestricted-angle frontier also carries the same expansion-time trace
+shove and one-time paid requeue state already present in the 45-degree engines.
 The active 45-degree single- and multilayer frontiers and the bounded
-single-layer orthogonal fallback now carry the source
+single-layer orthogonal fallback likewise carry the source
 `MazeSearchElement` shove lifecycle instead of treating every movable trace as
 an immediate conventional rip-up. `ObstacleExpansionRoom` shapes retain one
 shared immutable trace-item record for each same-layer/same-style polyline run:
@@ -43,11 +60,11 @@ backtracking. Complete-centre fanout/plane attempts now explicitly bypass the
 source-width door/locator compensation instead of shrinking those corridors a
 second time.
 
-This checkpoint builds both native test executables, passes **218 native
+This checkpoint builds both native test executables, passes **220 native
 autorouter cases**, passes all **26 Python parity-harness tests**, and routes the
 saved 16-connection BJT board at 16/16 with zero new KiCad DRC violations. The
 same lifecycle still has to be generalized to the unrestricted-angle
-single/multilayer frontiers and the legacy orthogonal multilayer frontier;
+multilayer frontier and the legacy orthogonal multilayer frontier;
 complete mutable item normalization remains the next
 dependency for source-identical arbitrary trace/via displacement.
 
