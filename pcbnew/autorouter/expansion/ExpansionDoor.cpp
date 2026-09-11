@@ -96,6 +96,21 @@ PLANAR::SIMPLEX EXPANSION_DOOR::GetSimplexShape() const
 
 namespace
 {
+PLANAR::INT_OCTAGON reflectY( const PLANAR::INT_OCTAGON& aShape )
+{
+    return PLANAR::INT_OCTAGON(
+            aShape.leftX, -aShape.topY, aShape.rightX, -aShape.bottomY,
+            aShape.lowerLeftDiagonalX, aShape.upperRightDiagonalX,
+            aShape.upperLeftDiagonalX, aShape.lowerRightDiagonalX );
+}
+
+
+FLOAT_LINE reflectY( const FLOAT_LINE& aLine )
+{
+    return { { aLine.a.x, -aLine.a.y }, { aLine.b.x, -aLine.b.y } };
+}
+
+
 bool widthMustBeChecked( const EXPANSION_ROOM* aFirstRoom,
                          const EXPANSION_ROOM* aSecondRoom, int aDimension )
 {
@@ -165,7 +180,8 @@ int EXPANSION_DOOR::GetId() const
 std::vector<FLOAT_LINE> EXPANSION_DOOR::GetSectionSegments( double aOffset,
                                                           double aTolerance,
                                                           double aMaxSectionWidth,
-                                                          std::size_t aMaxSections ) const
+                                                          std::size_t aMaxSections,
+                                                          bool aReflectYToSource ) const
 {
     const double offset = aOffset + aTolerance;
     const double sectionWidth = aMaxSectionWidth > 0 ? aMaxSectionWidth : 10 * offset;
@@ -180,7 +196,20 @@ std::vector<FLOAT_LINE> EXPANSION_DOOR::GetSectionSegments( double aOffset,
     // take the exact Simplex branch below.
     if( !m_firstRoom->UsesGeneralShape() && !m_secondRoom->UsesGeneralShape() )
     {
-        const PLANAR::INT_OCTAGON doorShape = GetOctagonShape();
+        // Corner order is observable in calcDoorLineSegment().  Production
+        // KiCad geometry is y-down while Freerouting's geometry is y-up, so
+        // run this order-sensitive operation in source coordinates and then
+        // reflect the resulting, source-ordered sections back.  Direct
+        // geometry-oracle callers already provide source coordinates and
+        // leave aReflectYToSource false.
+        const PLANAR::INT_OCTAGON doorShape = aReflectYToSource
+                ? reflectY( GetOctagonShape() ) : GetOctagonShape();
+        const PLANAR::INT_OCTAGON firstRoomShape = aReflectYToSource
+                ? reflectY( m_firstRoom->GetOctagon() )
+                : m_firstRoom->GetOctagon();
+        const PLANAR::INT_OCTAGON secondRoomShape = aReflectYToSource
+                ? reflectY( m_secondRoom->GetOctagon() )
+                : m_secondRoom->GetOctagon();
         if( doorShape.IsEmpty() )
             return {};
 
@@ -209,8 +238,8 @@ std::vector<FLOAT_LINE> EXPANSION_DOOR::GetSectionSegments( double aOffset,
             for( int cornerIndex = 0; cornerIndex < 8; ++cornerIndex )
             {
                 const ROUTER_POINT corner = doorShape.Corner( cornerIndex );
-                if( !inside( m_firstRoom->GetOctagon(), corner )
-                    && !inside( m_secondRoom->GetOctagon(), corner )
+                if( !inside( firstRoomShape, corner )
+                    && !inside( secondRoomShape, corner )
                     && ( shared.empty()
                          || shared.front().x != static_cast<double>( corner.x )
                          || shared.front().y != static_cast<double>( corner.y ) ) )
@@ -275,6 +304,9 @@ std::vector<FLOAT_LINE> EXPANSION_DOOR::GetSectionSegments( double aOffset,
             result.push_back( { current, next } );
             current = next;
         }
+        if( aReflectYToSource )
+            for( FLOAT_LINE& section : result )
+                section = reflectY( section );
         return result;
     }
 

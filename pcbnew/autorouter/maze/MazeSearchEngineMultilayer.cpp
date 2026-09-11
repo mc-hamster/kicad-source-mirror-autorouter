@@ -716,9 +716,29 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             if( current.parent != NONE
                 && states[current.parent].layer == current.layer )
             {
+                const STATE& previous = states[current.parent];
+                FLOAT_POINT previousDoorCentre = previous.entry.Middle();
+                if( previous.door )
+                {
+                    const ROUTER_BOX shape = previous.door->GetShape();
+                    previousDoorCentre = {
+                            ( static_cast<double>( shape.minX ) + shape.maxX ) / 2,
+                            ( static_cast<double>( shape.minY ) + shape.maxY ) / 2 };
+                }
+                else if( previous.drill )
+                {
+                    previousDoorCentre = {
+                            static_cast<double>( previous.drill->location.x ),
+                            static_cast<double>( previous.drill->location.y ) };
+                }
+                else if( previous.page )
+                {
+                    const ROUTER_POINT centre = previous.page->Center();
+                    previousDoorCentre = { static_cast<double>( centre.x ),
+                                           static_cast<double>( centre.y ) };
+                }
                 bend = MAZE_LIST_ELEMENT::BendPenalty(
-                        states[current.parent].entry.Middle(), from, to,
-                        layer.bendCost );
+                        previousDoorCentre, from, to, layer.bendCost );
             }
             const double g = current.g
                     + from.WeightedDistance(
@@ -804,7 +824,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
             && currentObstacle->GetTraceInfo() )
         {
             const auto fromSections = current.door->GetSectionSegments(
-                    sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                    sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                    std::numeric_limits<std::size_t>::max(), true );
             const bool outerSection = !fromSections.empty()
                     && ( current.section == 0
                          || current.section + 1 == fromSections.size() );
@@ -883,7 +904,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     sourceTraceRooms ? sectionOffset : 0,
                     sourceTraceRooms ? FREEROUTING_TRACE_WIDTH_TOLERANCE_IU : 0,
                     sourceTraceRooms ? 0 : 10 * sectionOffset,
-                    static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
+                    static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ),
+                    true );
             if( nextRoomIsThick
                 && !DETAIL::DoorEntryIsThick(
                         *current.room->shape, *door, sections,

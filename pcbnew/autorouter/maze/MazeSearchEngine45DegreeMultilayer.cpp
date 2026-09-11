@@ -418,6 +418,33 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         auto& space = *spaces[current.layer];
         const auto& layer = layers[current.layer];
         const auto from = current.entry.Middle();
+        if( current.room && current.door )
+        {
+            autorouterDecisionLog(
+                    "ROOM_ENTRY_POP_RAW",
+                    { { "net", std::to_string( net ) },
+                      { "layer", std::to_string( current.layer ) },
+                      { "section", std::to_string( current.section ) },
+                      { "from_section",
+                        current.parent == NONE
+                                ? "-1"
+                                : std::to_string( states[current.parent].section ) },
+                      { "room_id", std::to_string( current.room->shape->GetId() ) },
+                      { "room_bounds",
+                        autorouterDecisionBounds( current.room->shape->GetShape() ) },
+                      { "door_id", std::to_string( current.door->GetId() ) },
+                      { "door_dimension",
+                        std::to_string( current.door->GetDimension() ) },
+                      { "door_bounds",
+                        autorouterDecisionBounds( current.door->GetShape() ) },
+                      { "shape_entry",
+                        std::to_string( current.entry.a.x ) + ','
+                                + std::to_string( current.entry.a.y ) + ','
+                                + std::to_string( current.entry.b.x ) + ','
+                                + std::to_string( current.entry.b.y ) },
+                      { "expansion_value", std::to_string( current.g ) },
+                      { "sorting_value", std::to_string( current.f ) } } );
+        }
         if( via.transitionsEnabled && current.kind == KIND::PAGE )
         {
             ++metrics.drillPages;
@@ -755,6 +782,12 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                   { "room_id", std::to_string( current.room->shape->GetId() ) },
                   { "room_bounds",
                     autorouterDecisionBounds( current.room->shape->GetShape() ) },
+                  { "from_section",
+                    current.parent == NONE
+                            ? "-1"
+                            : std::to_string( states[current.parent].section ) },
+                  { "door_id",
+                    current.door ? std::to_string( current.door->GetId() ) : "-1" },
                   { "door_dimension",
                     current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
                   { "door_bounds",
@@ -834,9 +867,28 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             if( current.parent != NONE
                 && states[current.parent].layer == current.layer )
             {
+                const STATE& previous = states[current.parent];
+                FLOAT_POINT previousDoorCentre = previous.entry.Middle();
+                if( previous.door )
+                {
+                    const auto gravity =
+                            previous.door->GetOctagonShape().CentreOfGravity();
+                    previousDoorCentre = { gravity.first, gravity.second };
+                }
+                else if( previous.drill )
+                {
+                    previousDoorCentre = {
+                            static_cast<double>( previous.drill->location.x ),
+                            static_cast<double>( previous.drill->location.y ) };
+                }
+                else if( previous.page )
+                {
+                    const ROUTER_POINT centre = previous.page->Center();
+                    previousDoorCentre = { static_cast<double>( centre.x ),
+                                           static_cast<double>( centre.y ) };
+                }
                 bend = MAZE_LIST_ELEMENT::BendPenalty(
-                        states[current.parent].entry.Middle(), from, to,
-                        layer.bendCost );
+                        previousDoorCentre, from, to, layer.bendCost );
             }
             const double g = current.g
                     + from.WeightedDistance(
@@ -889,6 +941,11 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                         current.door ? std::to_string( current.door->GetDimension() ) : "-1" },
                       { "from_door_bounds",
                         current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
+                      { "shape_entry",
+                        std::to_string( aShapeEntry.a.x ) + ','
+                                + std::to_string( aShapeEntry.a.y ) + ','
+                                + std::to_string( aShapeEntry.b.x ) + ','
+                                + std::to_string( aShapeEntry.b.y ) },
                       { "expansion_value", std::to_string( state.g ) },
                       { "sorting_value", std::to_string( state.f ) } } );
             return push( state );
@@ -941,7 +998,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             && currentObstacle->GetTraceInfo() )
         {
             const auto fromSections = current.door->GetSectionSegments(
-                    sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                    sectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                    std::numeric_limits<std::size_t>::max(), true );
             const bool outerSection = !fromSections.empty()
                     && ( current.section == 0
                          || current.section + 1 == fromSections.size() );
@@ -1040,7 +1098,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                     sourceTraceRooms ? sectionOffset : 0,
                     sourceTraceRooms ? FREEROUTING_TRACE_WIDTH_TOLERANCE_IU : 0,
                     sourceTraceRooms ? 0 : 10 * sectionOffset,
-                    static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ) );
+                    static_cast<std::size_t>( std::max( 0, maxExpanded - expanded ) ),
+                    true );
             if( nextRoomIsThick
                 && !DETAIL::DoorEntryIsThick(
                         *current.room->shape, *door, sections,

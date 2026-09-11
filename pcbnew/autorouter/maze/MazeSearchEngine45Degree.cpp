@@ -364,11 +364,9 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                 FLOAT_POINT centre = previous.entry.Middle();
                 if( previous.door )
                 {
-                    const INT_OCTAGON shape = previous.door->GetOctagonShape();
-                    const ROUTER_POINT first = shape.Corner( 0 );
-                    const ROUTER_POINT last = shape.Corner( 4 );
-                    centre = { ( static_cast<double>( first.x ) + last.x ) / 2,
-                               ( static_cast<double>( first.y ) + last.y ) / 2 };
+                    const auto gravity =
+                            previous.door->GetOctagonShape().CentreOfGravity();
+                    centre = { gravity.first, gravity.second };
                 }
                 bend = MAZE_LIST_ELEMENT::BendPenalty(
                         centre, from, to, aBendCost );
@@ -439,7 +437,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             && !currentDoorIsSmall && currentObstacle->GetTraceInfo() )
         {
             const auto fromSections = current.door->GetSectionSegments(
-                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                    std::numeric_limits<std::size_t>::max(), true );
             const bool outerSection = !fromSections.empty()
                     && ( current.section == 0
                          || current.section + 1 == fromSections.size() );
@@ -518,7 +517,7 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             const auto sections = door->GetSectionSegments(
                     aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
                     static_cast<std::size_t>(
-                            std::max( 0, aMaxExpanded - aExpanded ) ) );
+                            std::max( 0, aMaxExpanded - aExpanded ) ), true );
             if( nextRoomIsThick
                 && !DETAIL::DoorEntryIsThick(
                         *current.room->shape, *door, sections,

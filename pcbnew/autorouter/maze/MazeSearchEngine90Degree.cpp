@@ -586,7 +586,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
             && currentObstacle->GetTraceInfo() )
         {
             const auto fromSections = current.door->GetSectionSegments(
-                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                    std::numeric_limits<std::size_t>::max(), true );
             const bool outerSection = !fromSections.empty()
                     && ( current.section == 0
                          || current.section + 1 == fromSections.size() );
@@ -665,7 +666,8 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                     aSourceTraceRooms ? aSectionOffset : 0,
                     aSourceTraceRooms ? FREEROUTING_TRACE_WIDTH_TOLERANCE_IU : 0,
                     aSourceTraceRooms ? 0 : 10 * aSectionOffset,
-                    static_cast<std::size_t>( std::max( 0, aMaxExpanded - aExpanded ) ) );
+                    static_cast<std::size_t>( std::max( 0, aMaxExpanded - aExpanded ) ),
+                    true );
             if( nextRoomIsThick
                 && !DETAIL::DoorEntryIsThick(
                         *current.room->shape, *door, sections,

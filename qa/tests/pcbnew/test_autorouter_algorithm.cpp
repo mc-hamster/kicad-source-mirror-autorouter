@@ -160,6 +160,15 @@ AUTOROUTER_SETTINGS makeSettings()
 BOOST_AUTO_TEST_SUITE( NativeAutorouter )
 
 
+BOOST_AUTO_TEST_CASE( DefaultMazeBendCostMatchesPinnedSource )
+{
+    const AUTOROUTER_SETTINGS settings;
+    BOOST_CHECK_EQUAL( settings.bendCost, 0 );
+    // Board-history scoring is a separate Freerouting setting.
+    BOOST_CHECK_EQUAL( settings.bendPenalty, 10.0 );
+}
+
+
 BOOST_AUTO_TEST_CASE( BoardOutlineUsesGeometricContourAndSourceCompensation )
 {
     BOARD_SNAPSHOT board;
@@ -806,6 +815,13 @@ BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
         return std::abs( aActual - aExpected )
                <= 1e-12 * std::max( { 1.0, std::abs( aActual ), std::abs( aExpected ) } );
     };
+    auto reflectY = []( const INT_OCTAGON& aShape )
+    {
+        return INT_OCTAGON(
+                aShape.leftX, -aShape.topY, aShape.rightX, -aShape.bottomY,
+                aShape.lowerLeftDiagonalX, aShape.upperRightDiagonalX,
+                aShape.upperLeftDiagonalX, aShape.lowerRightDiagonalX );
+    };
 
     for( int test = 0; test < 2048; ++test )
     {
@@ -843,16 +859,59 @@ BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
             BOOST_CHECK( door.GetOctagonShape() == expectedShape );
             const auto sections = door.GetSectionSegments( offset );
             BOOST_REQUIRE_EQUAL( sections.size(), expectedSections );
-            for( const FLOAT_LINE& section : sections )
+            std::vector<FLOAT_LINE> expected;
+            expected.reserve( expectedSections );
+            for( std::size_t sectionIndex = 0;
+                 sectionIndex < expectedSections; ++sectionIndex )
             {
                 const double ax = readDouble();
                 const double ay = readDouble();
                 const double bx = readDouble();
                 const double by = readDouble();
-                BOOST_CHECK( sameDouble( section.a.x, ax ) );
-                BOOST_CHECK( sameDouble( section.a.y, ay ) );
-                BOOST_CHECK( sameDouble( section.b.x, bx ) );
-                BOOST_CHECK( sameDouble( section.b.y, by ) );
+                expected.push_back( { { ax, ay }, { bx, by } } );
+                BOOST_CHECK( sameDouble( sections[sectionIndex].a.x, ax ) );
+                BOOST_CHECK( sameDouble( sections[sectionIndex].a.y, ay ) );
+                BOOST_CHECK( sameDouble( sections[sectionIndex].b.x, bx ) );
+                BOOST_CHECK( sameDouble( sections[sectionIndex].b.y, by ) );
+            }
+
+            // Production rooms use KiCad y-down coordinates.  The
+            // corner-order-dependent source operation must produce the same
+            // source section order and geometry after a y reflection.
+            COMPLETE_FREE_SPACE_EXPANSION_ROOM reflectedSecond(
+                    20001 + 2 * test, 2, reflectY( secondShape ) );
+            std::unique_ptr<EXPANSION_ROOM> reflectedFirst;
+            if( completePair )
+            {
+                reflectedFirst =
+                        std::make_unique<COMPLETE_FREE_SPACE_EXPANSION_ROOM>(
+                                20000 + 2 * test, 2,
+                                reflectY( firstShape ) );
+            }
+            else
+            {
+                reflectedFirst =
+                        std::make_unique<INCOMPLETE_FREE_SPACE_EXPANSION_ROOM>(
+                                reflectY( firstShape ), 2,
+                                reflectY( firstShape ) );
+            }
+            EXPANSION_DOOR reflectedDoor(
+                    reflectedFirst.get(), &reflectedSecond );
+            const auto reflectedSections = reflectedDoor.GetSectionSegments(
+                    offset, 2, 0,
+                    std::numeric_limits<std::size_t>::max(), true );
+            BOOST_REQUIRE_EQUAL( reflectedSections.size(), expected.size() );
+            for( std::size_t sectionIndex = 0;
+                 sectionIndex < expected.size(); ++sectionIndex )
+            {
+                BOOST_CHECK( sameDouble( reflectedSections[sectionIndex].a.x,
+                                         expected[sectionIndex].a.x ) );
+                BOOST_CHECK( sameDouble( reflectedSections[sectionIndex].a.y,
+                                         -expected[sectionIndex].a.y ) );
+                BOOST_CHECK( sameDouble( reflectedSections[sectionIndex].b.x,
+                                         expected[sectionIndex].b.x ) );
+                BOOST_CHECK( sameDouble( reflectedSections[sectionIndex].b.y,
+                                         -expected[sectionIndex].b.y ) );
             }
             BOOST_REQUIRE( !input.fail() );
         }

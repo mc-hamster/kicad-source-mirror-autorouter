@@ -41,7 +41,8 @@ public:
     // Tolerance is explicit because KiCad IU and reference coordinates differ.
     std::vector<FLOAT_LINE> GetSectionSegments( double aOffset, double aTolerance = 2,
                                                double aMaxSectionWidth = 0,
-                                               std::size_t aMaxSections = std::numeric_limits<std::size_t>::max() ) const;
+                                               std::size_t aMaxSections = std::numeric_limits<std::size_t>::max(),
+                                               bool aReflectYToSource = false ) const;
     int                   GetId() const override;
     void                  Reset() override {}
 

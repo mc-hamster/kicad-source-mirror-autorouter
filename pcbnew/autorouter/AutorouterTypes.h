@@ -161,7 +161,9 @@ struct AUTOROUTER_SETTINGS
     int  planeViaCost = 5;
     int  traceLengthCost = 1;
     int  congestionCost = 100;
-    int  bendCost = 10;
+    // Freerouting DefaultSettings.scoring.defaultBendCost.  This is distinct
+    // from the board-history bend penalty below.
+    int  bendCost = 0;
     // BoardHistory/stagnation scoring weights.  These are distinct from the
     // maze costs above and match Freerouting's DefaultSettings values.
     double unroutedNetPenalty = 5000000.0;
