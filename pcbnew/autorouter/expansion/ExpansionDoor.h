@@ -24,16 +24,16 @@ class EXPANSION_DOOR : public EXPANDABLE_OBJECT
 {
 public:
     EXPANSION_DOOR( EXPANSION_ROOM* aFirstRoom, EXPANSION_ROOM* aSecondRoom,
-                    int aDimension = -1 );
+                    int aDimension = -1, bool aRegisterWithRooms = true );
 
     EXPANSION_ROOM*       FirstRoom() const { return m_firstRoom; }
     EXPANSION_ROOM*       SecondRoom() const { return m_secondRoom; }
     EXPANSION_ROOM*       OtherRoom( EXPANSION_ROOM* aRoom ) const;
     bool                  Connects( const EXPANSION_ROOM* aRoom ) const;
     int                   GetDimension() const { return m_dimension; }
-    ROUTER_BOX            GetShape() const;
-    PLANAR::INT_OCTAGON   GetOctagonShape() const;
-    PLANAR::SIMPLEX       GetSimplexShape() const;
+    virtual ROUTER_BOX          GetShape() const;
+    virtual PLANAR::INT_OCTAGON GetOctagonShape() const;
+    virtual PLANAR::SIMPLEX     GetSimplexShape() const;
     /** Angle-specific translations of MazeSearchEngine.doorIsSmall(). */
     bool                  IsSmallFor90DegreeTrace( double aTraceWidth ) const;
     bool                  IsSmallFor45DegreeTrace( double aTraceWidth ) const;

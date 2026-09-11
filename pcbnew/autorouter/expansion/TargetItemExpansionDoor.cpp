@@ -22,6 +22,55 @@
 
 namespace KICAD_AUTOROUTER
 {
+
+ROUTER_BOX TARGET_ITEM_EXPANSION_DOOR::GetShape() const
+{
+    return GetSimplexShape().BoundingBox().value_or( INT_BOX::Empty() );
+}
+
+
+PLANAR::INT_OCTAGON TARGET_ITEM_EXPANSION_DOOR::GetOctagonShape() const
+{
+    if( !FirstRoom() || INT_BOX::Dimension( m_treeBounds ) < 0 )
+        return PLANAR::INT_OCTAGON::Empty();
+
+    if( !FirstRoom()->UsesGeneralShape() )
+    {
+        return FirstRoom()->GetOctagon().Intersection(
+                PLANAR::INT_OCTAGON::FromBox( m_treeBounds ) );
+    }
+
+    return GetSimplexShape().BoundingOctagon().value_or(
+            PLANAR::INT_OCTAGON::Empty() );
+}
+
+
+PLANAR::SIMPLEX TARGET_ITEM_EXPANSION_DOOR::GetSimplexShape() const
+{
+    if( !FirstRoom() || INT_BOX::Dimension( m_treeBounds ) < 0 )
+        return PLANAR::SIMPLEX::Empty();
+
+    // Target items can legitimately have a point or line tree shape in
+    // data-only tests and for zero-width connection shapes.  FromBox mirrors
+    // IntBox.toSimplex for those lower-dimensional cases; Box is deliberately
+    // restricted to a full-dimensional convex region.
+    return PLANAR::SIMPLEX::FromBox( m_treeBounds ).Intersection(
+            FirstRoom()->GetSimplex() );
+}
+
+
+int TARGET_ITEM_EXPANSION_DOOR::GetId() const
+{
+    // Java int arithmetic wraps modulo 2^32.  Keep that deterministic
+    // TargetItemExpansionDoor identity without signed-overflow UB.
+    const std::uint32_t item = static_cast<std::uint32_t>( m_itemId );
+    const std::uint32_t room = FirstRoom()
+                                       ? static_cast<std::uint32_t>(
+                                                 FirstRoom()->GetId() )
+                                       : 0;
+    return static_cast<std::int32_t>( 31u * item + room );
+}
+
 namespace
 {
 using WIDE = boost::multiprecision::cpp_int;

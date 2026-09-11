@@ -699,6 +699,32 @@ BOOST_AUTO_TEST_CASE( OctagonalExpansionDoorMatchesPinnedFreerouting )
 }
 
 
+BOOST_AUTO_TEST_CASE( TargetItemDoorIsAFirstClassTwoDimensionalFrontierObject )
+{
+    COMPLETE_FREE_SPACE_EXPANSION_ROOM room(
+            23, 0, PLANAR::INT_OCTAGON::FromBox( { 0, 0, 100, 100 } ) );
+    TARGET_ITEM_EXPANSION_DOOR door(
+            &room, 17, 5, { 60, 20 }, { 60, 20 }, { 40, -20, 80, 30 } );
+
+    // Source TargetItemExpansionDoor.getDimension() is always two and its
+    // identity is 31 * item ID + room ID.  It belongs to the separate target
+    // door collection, so it must not pollute ordinary neighbour traversal.
+    BOOST_CHECK_EQUAL( door.GetDimension(), 2 );
+    BOOST_CHECK_EQUAL( door.GetId(), 31 * 17 + 23 );
+    BOOST_CHECK( room.GetDoors().empty() );
+    BOOST_CHECK_EQUAL( door.PadIndex(), 5U );
+    BOOST_CHECK( door.Target() == ROUTER_POINT( 60, 20 ) );
+
+    const ROUTER_BOX shape = door.GetShape();
+    BOOST_CHECK_EQUAL( shape.minX, 40 );
+    BOOST_CHECK_EQUAL( shape.minY, 0 );
+    BOOST_CHECK_EQUAL( shape.maxX, 80 );
+    BOOST_CHECK_EQUAL( shape.maxY, 30 );
+    BOOST_CHECK_EQUAL( door.GetOctagonShape().Dimension(), 2 );
+    BOOST_CHECK_EQUAL( door.GetSimplexShape().Dimension(), 2 );
+}
+
+
 BOOST_AUTO_TEST_CASE( FortyFiveDegreeSmallDoorMatchesSourceWidthGate )
 {
     COMPLETE_FREE_SPACE_EXPANSION_ROOM left(

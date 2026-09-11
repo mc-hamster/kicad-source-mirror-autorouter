@@ -33,23 +33,59 @@ class TARGET_ITEM_EXPANSION_DOOR : public EXPANSION_DOOR
 public:
     TARGET_ITEM_EXPANSION_DOOR( EXPANSION_ROOM* aRoom, std::size_t aPadIndex,
                                 const ROUTER_POINT& aTarget ) :
-            TARGET_ITEM_EXPANSION_DOOR( aRoom, aPadIndex, aTarget, aTarget )
+            TARGET_ITEM_EXPANSION_DOOR( aRoom, static_cast<int>( aPadIndex ),
+                                        aPadIndex, aTarget, aTarget,
+                                        { aTarget.x, aTarget.y,
+                                          aTarget.x, aTarget.y } )
     {
     }
 
     TARGET_ITEM_EXPANSION_DOOR( EXPANSION_ROOM* aRoom, std::size_t aPadIndex,
                                 const ROUTER_POINT& aStart,
                                 const ROUTER_POINT& aEnd ) :
-            EXPANSION_DOOR( aRoom, nullptr, 0 ),
+            TARGET_ITEM_EXPANSION_DOOR(
+                    aRoom, static_cast<int>( aPadIndex ), aPadIndex,
+                    aStart, aEnd,
+                    { std::min( aStart.x, aEnd.x ),
+                      std::min( aStart.y, aEnd.y ),
+                      std::max( aStart.x, aEnd.x ),
+                      std::max( aStart.y, aEnd.y ) } )
+    {
+    }
+
+    /**
+     * Construct the source/destination item door represented by
+     * TargetItemExpansionDoor(item, treeEntryNo, room, searchTree).
+     *
+     * Unlike an ordinary ExpansionDoor it has only one room, has dimension
+     * two by definition, and is stored in the room's target-door collection
+     * rather than its ordinary neighbour-door collection.  The native room
+     * frontiers own these objects separately, so registering this one-sided
+     * door in ExpansionRoom::GetDoors() would make neighbour traversal try to
+     * follow a null second room.
+     */
+    TARGET_ITEM_EXPANSION_DOOR( EXPANSION_ROOM* aRoom, int aItemId,
+                                std::size_t aPadIndex,
+                                const ROUTER_POINT& aStart,
+                                const ROUTER_POINT& aEnd,
+                                ROUTER_BOX aTreeBounds ) :
+            EXPANSION_DOOR( aRoom, nullptr, 2, false ),
+            m_itemId( aItemId ),
             m_padIndex( aPadIndex ),
             m_target( aStart ),
-            m_targetEnd( aEnd )
+            m_targetEnd( aEnd ),
+            m_treeBounds( aTreeBounds )
     {
     }
 
     std::size_t PadIndex() const { return m_padIndex; }
     const ROUTER_POINT& Target() const { return m_target; }
     const ROUTER_POINT& TargetEnd() const { return m_targetEnd; }
+
+    ROUTER_BOX GetShape() const override;
+    PLANAR::INT_OCTAGON GetOctagonShape() const override;
+    PLANAR::SIMPLEX GetSimplexShape() const override;
+    int GetId() const override;
 
     /**
      * Host-safe target-door attachment for an integral trace segment.
@@ -118,9 +154,11 @@ public:
             const std::vector<PLANAR::SIMPLEX>& aAnyAngleCuts );
 
 private:
+    int          m_itemId;
     std::size_t  m_padIndex;
     ROUTER_POINT m_target;
     ROUTER_POINT m_targetEnd;
+    ROUTER_BOX   m_treeBounds;
 };
 
 } // namespace KICAD_AUTOROUTER

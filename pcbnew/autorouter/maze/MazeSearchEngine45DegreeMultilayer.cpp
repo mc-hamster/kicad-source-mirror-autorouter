@@ -211,6 +211,10 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
     std::deque<STATE> states;
     std::map<decltype( MAZE_LIST_ELEMENT{}.SortKey() ), std::size_t> open;
     std::set<std::pair<EXPANSION_DOOR*, std::size_t>> occupied;
+    // TargetItemExpansionDoor instances are one-sided frontier objects, not
+    // ordinary room-neighbour doors.  Keep them alive for every queued start
+    // state and its complete parent chain.
+    std::vector<std::unique_ptr<TARGET_ITEM_EXPANSION_DOOR>> startDoors;
     bool allocationLimit = false;
     auto push = [&]( const STATE& state )
     {
@@ -372,6 +376,17 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
             state.room = room; state.layer = shape.layer; state.entry = { p, p };
             state.f = bestDistance; state.owner = start.owner; state.itemId = shape.itemId;
             state.backtrackPin = &start;
+            const ROUTER_BOX treeBounds = INT_BOX::Dimension( start.treeBounds ) >= 0
+                    ? start.treeBounds
+                    : ROUTER_BOX{ std::min( start.start.x, start.end.x ),
+                                  std::min( start.start.y, start.end.y ),
+                                  std::max( start.start.x, start.end.x ),
+                                  std::max( start.start.y, start.end.y ) };
+            auto startDoor = std::make_unique<TARGET_ITEM_EXPANSION_DOOR>(
+                    room->shape.get(), shape.itemId, start.owner,
+                    start.start, start.end, treeBounds );
+            state.door = startDoor.get();
+            startDoors.push_back( std::move( startDoor ) );
             const ROUTER_BOX roomBounds = room->shape->GetShape();
             autorouterDecisionLog(
                     "START_ROOM_SEED",
@@ -380,6 +395,9 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                       { "item_id", std::to_string( shape.itemId ) },
                       { "room_id", std::to_string( room->shape->GetId() ) },
                       { "room_bounds", autorouterDecisionBounds( roomBounds ) },
+                      { "door_dimension", "2" },
+                      { "door_bounds",
+                        autorouterDecisionBounds( state.door->GetShape() ) },
                       { "attachment", std::to_string( attachment->x ) + ','
                                               + std::to_string( attachment->y ) },
                       { "sorting_value", std::to_string( bestDistance ) } } );

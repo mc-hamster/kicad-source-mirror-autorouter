@@ -19,7 +19,8 @@ namespace KICAD_AUTOROUTER
 {
 
 EXPANSION_DOOR::EXPANSION_DOOR( EXPANSION_ROOM* aFirstRoom,
-                                EXPANSION_ROOM* aSecondRoom, int aDimension ) :
+                                EXPANSION_ROOM* aSecondRoom, int aDimension,
+                                bool aRegisterWithRooms ) :
         m_firstRoom( aFirstRoom ),
         m_secondRoom( aSecondRoom ),
         m_dimension( aDimension )
@@ -33,9 +34,9 @@ EXPANSION_DOOR::EXPANSION_DOOR( EXPANSION_ROOM* aFirstRoom,
                       : GetSimplexShape().Dimension();
     }
 
-    if( m_firstRoom )
+    if( aRegisterWithRooms && m_firstRoom )
         m_firstRoom->AddDoor( this );
-    if( m_secondRoom )
+    if( aRegisterWithRooms && m_secondRoom )
         m_secondRoom->AddDoor( this );
 }
 

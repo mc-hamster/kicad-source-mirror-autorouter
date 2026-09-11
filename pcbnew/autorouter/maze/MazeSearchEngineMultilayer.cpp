@@ -188,6 +188,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     std::deque<STATE> states;
     std::map<decltype( MAZE_LIST_ELEMENT{}.SortKey() ), std::size_t> open;
     std::set<std::pair<EXPANSION_DOOR*, std::size_t>> occupied;
+    std::vector<std::unique_ptr<TARGET_ITEM_EXPANSION_DOOR>> startDoors;
     auto push = [&]( const STATE& state )
     {
         // A completed free room may be divided into source-mandated page-size
@@ -313,6 +314,17 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                 state.room = room; state.layer = layer; state.entry = { p, p };
                 state.f = bestDistance; state.owner = start.owner; state.itemId = itemId;
                 state.backtrackPin = &start;
+                const ROUTER_BOX treeBounds = INT_BOX::Dimension( start.treeBounds ) >= 0
+                        ? start.treeBounds
+                        : ROUTER_BOX{ std::min( start.start.x, start.end.x ),
+                                      std::min( start.start.y, start.end.y ),
+                                      std::max( start.start.x, start.end.x ),
+                                      std::max( start.start.y, start.end.y ) };
+                auto startDoor = std::make_unique<TARGET_ITEM_EXPANSION_DOOR>(
+                        room->shape.get(), itemId, start.owner,
+                        start.start, start.end, treeBounds );
+                state.door = startDoor.get();
+                startDoors.push_back( std::move( startDoor ) );
                 push( state );
             }
         }
