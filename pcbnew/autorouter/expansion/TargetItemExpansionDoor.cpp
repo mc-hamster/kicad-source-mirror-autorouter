@@ -12,9 +12,12 @@
 #include "TargetItemExpansionDoor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <set>
+#include <tuple>
 
 #include <boost/multiprecision/cpp_int.hpp>
+#include <geometry/shape_poly_set.h>
 
 
 namespace KICAD_AUTOROUTER
@@ -141,6 +144,179 @@ void addCutIndices( const WIDE& aOrigin, const WIDE& aStep,
         }
     }
 }
+
+
+std::optional<std::vector<PLANAR::SIMPLEX>> areaSimplexes(
+        const ROUTING_OBSTACLE& aArea, std::int64_t aInset )
+{
+    aInset = std::max<std::int64_t>( 0, aInset );
+    if( aInset > std::numeric_limits<int>::max() )
+        return std::nullopt;
+
+    if( aArea.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+    {
+        ROUTER_BOX box = aArea.box;
+        box.minX += aInset;
+        box.minY += aInset;
+        box.maxX -= aInset;
+        box.maxY -= aInset;
+        if( box.minX > box.maxX || box.minY > box.maxY )
+            return std::nullopt;
+        return std::vector<PLANAR::SIMPLEX>{ PLANAR::SIMPLEX::Box( box ) };
+    }
+
+    if( aArea.kind != ROUTER_OBSTACLE_KIND::POLYGON || aArea.polygon.size() < 3 )
+        return std::nullopt;
+
+    const auto fitsHostCoordinate = []( const ROUTER_POINT& aPoint )
+    {
+        return aPoint.x >= std::numeric_limits<int>::min()
+               && aPoint.x <= std::numeric_limits<int>::max()
+               && aPoint.y >= std::numeric_limits<int>::min()
+               && aPoint.y <= std::numeric_limits<int>::max();
+    };
+    if( !std::all_of( aArea.polygon.begin(), aArea.polygon.end(),
+                      fitsHostCoordinate ) )
+    {
+        return std::nullopt;
+    }
+    for( const auto& hole : aArea.polygonHoles )
+        if( hole.size() < 3
+            || !std::all_of( hole.begin(), hole.end(), fitsHostCoordinate ) )
+        {
+            return std::nullopt;
+        }
+
+    SHAPE_POLY_SET area;
+    const int outline = area.NewOutline();
+    for( const ROUTER_POINT& point : aArea.polygon )
+        area.Append( static_cast<int>( point.x ), static_cast<int>( point.y ), outline, -1 );
+    for( const auto& hole : aArea.polygonHoles )
+    {
+        const int holeIndex = area.NewHole( outline );
+        for( const ROUTER_POINT& point : hole )
+            area.Append( static_cast<int>( point.x ), static_cast<int>( point.y ),
+                         outline, holeIndex );
+    }
+
+    if( aInset > 0 )
+        area.Deflate( static_cast<int>( aInset ),
+                      CORNER_STRATEGY::ALLOW_ACUTE_CORNERS, 1 );
+    if( area.OutlineCount() == 0 )
+        return std::nullopt;
+
+    area.CacheTriangulation( false );
+    std::vector<PLANAR::SIMPLEX> result;
+    for( unsigned int polygon = 0; polygon < area.TriangulatedPolyCount(); ++polygon )
+    {
+        const auto* triangulated = area.TriangulatedPolygon( polygon );
+        if( !triangulated )
+            return std::nullopt;
+        for( std::size_t triangle = 0;
+             triangle < triangulated->GetTriangleCount(); ++triangle )
+        {
+            VECTOR2I a, b, c;
+            triangulated->GetTriangle( static_cast<int>( triangle ), a, b, c );
+            const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon(
+                    { { a.x, a.y }, { b.x, b.y }, { c.x, c.y } } );
+            if( simplex && simplex->Dimension() >= 0 )
+                result.push_back( *simplex );
+        }
+    }
+    return result.empty() ? std::nullopt
+                          : std::optional<std::vector<PLANAR::SIMPLEX>>(
+                                    std::move( result ) );
+}
+
+
+std::optional<ROUTER_POINT> nearestIntegralInSimplex(
+        const PLANAR::SIMPLEX& aShape, const ROUTER_POINT& aFrom )
+{
+    if( aShape.Dimension() < 0 )
+        return std::nullopt;
+    if( aShape.Contains( PLANAR::POINT( aFrom ) ) )
+        return aFrom;
+
+    std::set<std::pair<std::int64_t, std::int64_t>> candidates;
+    const auto addSurrounding = [&]( const PLANAR::POINT& aPoint )
+    {
+        const auto box = aPoint.SurroundingBox();
+        if( !box )
+            return;
+        candidates.emplace( box->minX, box->minY );
+        candidates.emplace( box->minX, box->maxY );
+        candidates.emplace( box->maxX, box->minY );
+        candidates.emplace( box->maxX, box->maxY );
+    };
+    if( const auto nearest = aShape.NearestPoint( PLANAR::POINT( aFrom ) ) )
+        addSurrounding( *nearest );
+    for( const PLANAR::POINT& corner : aShape.BoundedCorners() )
+        addSurrounding( corner );
+
+    // Around a rational support intersection, the nearest feasible lattice
+    // point can lie just beyond the four enclosing corners when two acute
+    // inequalities meet. The number of supports is a strict local bound for
+    // that adjustment and avoids scanning an IU-sized polygon.
+    const auto initial = candidates;
+    const std::int64_t radius = static_cast<std::int64_t>(
+            std::max<std::size_t>( 2, aShape.Borders().size() ) );
+    for( const auto& [x, y] : initial )
+        for( std::int64_t dx = -radius; dx <= radius; ++dx )
+            for( std::int64_t dy = -radius; dy <= radius; ++dy )
+                candidates.emplace( x + dx, y + dy );
+
+    std::optional<ROUTER_POINT> best;
+    WIDE bestDistance;
+    for( const auto& [x, y] : candidates )
+    {
+        const ROUTER_POINT point{ x, y };
+        if( !aShape.Contains( PLANAR::POINT( point ) ) )
+            continue;
+        const WIDE dx = WIDE( x ) - aFrom.x;
+        const WIDE dy = WIDE( y ) - aFrom.y;
+        const WIDE distance = dx * dx + dy * dy;
+        if( !best || distance < bestDistance
+            || ( distance == bestDistance
+                 && std::tie( x, y ) < std::tie( best->x, best->y ) ) )
+        {
+            best = point;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+
+std::optional<ROUTER_POINT> nearestIntegralAreaPoint(
+        const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+        const ROUTER_POINT& aFrom, const PLANAR::SIMPLEX& aRoom )
+{
+    const auto pieces = areaSimplexes( aArea, aInset );
+    if( !pieces )
+        return std::nullopt;
+
+    std::optional<ROUTER_POINT> best;
+    WIDE bestDistance;
+    for( const PLANAR::SIMPLEX& piece : *pieces )
+    {
+        const PLANAR::SIMPLEX intersection = piece.Intersection( aRoom );
+        const auto candidate = nearestIntegralInSimplex( intersection, aFrom );
+        if( !candidate )
+            continue;
+        const WIDE dx = WIDE( candidate->x ) - aFrom.x;
+        const WIDE dy = WIDE( candidate->y ) - aFrom.y;
+        const WIDE distance = dx * dx + dy * dy;
+        if( !best || distance < bestDistance
+            || ( distance == bestDistance
+                 && std::tie( candidate->x, candidate->y )
+                            < std::tie( best->x, best->y ) ) )
+        {
+            best = candidate;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
 } // namespace
 
 
@@ -262,6 +438,36 @@ std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRo
     const WIDE index = std::clamp( nearestInteger( numerator, denominator ), first, last );
     return ROUTER_POINT{ ( WIDE( aStart.x ) + index * stepX ).convert_to<std::int64_t>(),
                          ( WIDE( aStart.y ) + index * stepY ).convert_to<std::int64_t>() };
+}
+
+
+std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+        const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+        const ROUTER_POINT& aFrom, const ROUTER_BOX& aRoom )
+{
+    if( aRoom.minX > aRoom.maxX || aRoom.minY > aRoom.maxY )
+        return std::nullopt;
+    return nearestIntegralAreaPoint( aArea, aInset, aFrom,
+                                     PLANAR::SIMPLEX::Box( aRoom ) );
+}
+
+
+std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+        const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+        const ROUTER_POINT& aFrom, const PLANAR::INT_OCTAGON& aRoom )
+{
+    const auto room = aRoom.ToSimplex();
+    if( !room )
+        return std::nullopt;
+    return nearestIntegralAreaPoint( aArea, aInset, aFrom, *room );
+}
+
+
+std::optional<ROUTER_POINT> TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+        const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+        const ROUTER_POINT& aFrom, const PLANAR::SIMPLEX& aRoom )
+{
+    return nearestIntegralAreaPoint( aArea, aInset, aFrom, aRoom );
 }
 
 

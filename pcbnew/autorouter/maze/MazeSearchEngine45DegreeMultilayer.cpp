@@ -20,6 +20,20 @@
 
 namespace KICAD_AUTOROUTER
 {
+namespace
+{
+std::optional<ROUTER_POINT> nearestInRoom45Multilayer(
+        const ROOM_TERMINAL& aTerminal, ROUTER_POINT aPoint,
+        const PLANAR::INT_OCTAGON& aRoom )
+{
+    if( aTerminal.connectionArea )
+        return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                *aTerminal.connectionArea, aTerminal.areaInset, aPoint, aRoom );
+    return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            aTerminal.start, aTerminal.end, aPoint, aRoom );
+}
+}
+
 std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
         const std::vector<ROOM_LAYER>& layers, int net, double sectionOffset,
         const ROOM_VIA_SETTINGS& via, int maxExpanded, int& expanded,
@@ -335,10 +349,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
                 for( const ROOM_TERMINAL& target : targetLayer.targets )
                     for( const ROUTER_POINT& toward : { target.start, target.end } )
                     {
-                        const auto candidate =
-                                TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
-                                        start.start, start.end, toward,
-                                        room->shape->GetOctagon() );
+                        const auto candidate = nearestInRoom45Multilayer(
+                                start, toward, room->shape->GetOctagon() );
                         if( !candidate )
                             continue;
                         const FLOAT_POINT point{ static_cast<double>( candidate->x ),
@@ -852,10 +864,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayer
         for( const auto& target : layer.targets )
         {
             ++targetId;
-            const auto targetPoint =
-                    TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
-                            target.start, target.end, from.Round(),
-                            current.room->shape->GetOctagon() );
+            const auto targetPoint = nearestInRoom45Multilayer(
+                    target, from.Round(), current.room->shape->GetOctagon() );
             if( !targetPoint )
             {
                 if( autorouterDebugEnabled() )

@@ -48,6 +48,37 @@ ROUTER_BOX terminalTreeBounds( const ROUTING_TERMINAL& aTerminal, int aLayer,
                  std::max( aTerminal.pad.position.y, end.y ) + expansion };
     }
 
+    if( aTerminal.connectionArea )
+    {
+        const ROUTING_OBSTACLE& area = *aTerminal.connectionArea;
+        ROUTER_BOX bounds = area.box;
+        if( area.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
+        {
+            bounds = { std::min( area.start.x, area.end.x ) - area.radius,
+                       std::min( area.start.y, area.end.y ) - area.radius,
+                       std::max( area.start.x, area.end.x ) + area.radius,
+                       std::max( area.start.y, area.end.y ) + area.radius };
+        }
+        else if( area.kind == ROUTER_OBSTACLE_KIND::POLYGON
+                 && !area.polygon.empty() )
+        {
+            bounds = { area.polygon.front().x, area.polygon.front().y,
+                       area.polygon.front().x, area.polygon.front().y };
+            for( const ROUTER_POINT& point : area.polygon )
+            {
+                bounds.minX = std::min( bounds.minX, point.x );
+                bounds.minY = std::min( bounds.minY, point.y );
+                bounds.maxX = std::max( bounds.maxX, point.x );
+                bounds.maxY = std::max( bounds.maxY, point.y );
+            }
+        }
+        bounds.minX -= aClearanceCompensation;
+        bounds.minY -= aClearanceCompensation;
+        bounds.maxX += aClearanceCompensation;
+        bounds.maxY += aClearanceCompensation;
+        return bounds;
+    }
+
     const auto geometry = std::find_if(
             aTerminal.pad.layerGeometry.begin(), aTerminal.pad.layerGeometry.end(),
             [&]( const ROUTING_PAD::LAYER_GEOMETRY& aGeometry )
@@ -973,7 +1004,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                 const auto end = terminal.segmentEnd.value_or( start );
                 result.push_back( { start, end, terminal.padIndex,
                                     terminalTreeBounds( terminal, layer.layerId,
-                                                        compensation ) } );
+                                                        compensation ),
+                                    terminal.connectionArea,
+                                    terminal.connectionArea ? radius : 0 } );
             }
             return result;
         };
@@ -1396,7 +1429,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                 const auto a = t.pad.position, b = t.segmentEnd.value_or( a );
                 if( exactFrontier || aTarget || a.x == b.x || a.y == b.y )
                     output.push_back( { a, b, t.padIndex,
-                                        terminalTreeBounds( t, id, compensation ) } );
+                                        terminalTreeBounds( t, id, compensation ),
+                                        t.connectionArea,
+                                        t.connectionArea ? radius : 0 } );
                 else
                 {
                     ROUTING_TERMINAL first = t;
@@ -1405,9 +1440,13 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                     ROUTING_TERMINAL second = first;
                     second.pad.position = b;
                     output.push_back( { a, a, t.padIndex,
-                                        terminalTreeBounds( first, id, compensation ) } );
+                                        terminalTreeBounds( first, id, compensation ),
+                                        t.connectionArea,
+                                        t.connectionArea ? radius : 0 } );
                     output.push_back( { b, b, t.padIndex,
-                                        terminalTreeBounds( second, id, compensation ) } );
+                                        terminalTreeBounds( second, id, compensation ),
+                                        t.connectionArea,
+                                        t.connectionArea ? radius : 0 } );
                 }
             }
         };

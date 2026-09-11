@@ -306,13 +306,97 @@ struct ROUTING_BOARD::IMPL
         return result == std::numeric_limits<int>::max() ? -1 : result;
     }
 
-    ITEM_ID_SET connectionItems( ITEM_ID id ) const
+    bool isFanoutVia( ITEM_ID id, const ITEM_ID_SET* ignoreItems ) const
+    {
+        const auto via = items.find( id );
+        if( via == items.end()
+            || via->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::DRILL )
+        {
+            return false;
+        }
+
+        const auto isIsolatedSmdPin = [&]( ITEM_ID contactId )
+        {
+            const auto contact = items.find( contactId );
+            if( contact == items.end() || contact->second.pad == NO_PAD
+                || contact->second.pad >= snapshot.pads.size() )
+            {
+                return false;
+            }
+
+            const ROUTING_PAD& pad = snapshot.pads[contact->second.pad];
+            // Pin.isFanoutVia() tests the actual one-layer padstack, not its
+            // package attribute.  A single-copper-layer connector pad has the
+            // same source semantics even when KiCad does not classify it SMD.
+            return pad.layers.size() == 1
+                   && contact->second.normalContacts.size() <= 1;
+        };
+
+        for( ITEM_ID contactId : via->second.normalContacts )
+        {
+            if( isIsolatedSmdPin( contactId ) )
+                return true;
+
+            const auto contact = items.find( contactId );
+            if( contact == items.end()
+                || contact->second.normal.kind != NORMAL_CONTACT_ITEM::KIND::TRACE
+                || ( ignoreItems && ignoreItems->contains( contactId ) ) )
+            {
+                continue;
+            }
+
+            long double length = 0;
+            for( std::size_t corner = 1;
+                 corner < contact->second.traceCorners.size(); ++corner )
+            {
+                const long double dx = static_cast<long double>(
+                        contact->second.traceCorners[corner].x )
+                                       - contact->second.traceCorners[corner - 1].x;
+                const long double dy = static_cast<long double>(
+                        contact->second.traceCorners[corner].y )
+                                       - contact->second.traceCorners[corner - 1].y;
+                length += std::hypotl( dx, dy );
+            }
+            const std::int64_t halfWidth = contact->second.trace
+                    ? std::max<std::int64_t>( 0, contact->second.trace->radius ) : 0;
+            if( length >= 400.0L * halfWidth )
+                continue;
+
+            for( ITEM_ID traceContactId : contact->second.normalContacts )
+            {
+                if( isIsolatedSmdPin( traceContactId ) )
+                    return true;
+
+                const auto traceContact = items.find( traceContactId );
+                // KiCad has no SHOVE_FIXED intermediate state.  A fixed,
+                // straight source trace is its exact detached-board analogue;
+                // user-generated mutable traces and unlocked shove candidates
+                // are deliberately excluded.
+                if( traceContact != items.end()
+                    && traceContact->second.normal.kind
+                               == NORMAL_CONTACT_ITEM::KIND::TRACE
+                    && !traceContact->second.dynamic
+                    && !traceContact->second.routable
+                    && traceContact->second.traceCorners.size() == 2 )
+                {
+                    return true;
+                }
+            }
+        }
+        return via->second.route && via->second.route->isFanoutConnection;
+    }
+
+    ITEM_ID_SET connectionItems( ITEM_ID id,
+                                 STOP_CONNECTION_OPTION stopOption
+                                         = STOP_CONNECTION_OPTION::NONE ) const
     {
         const auto source = items.find( id );
-        if( source == items.end() || !source->second.routable )
+        if( source == items.end() )
             return {};
 
-        ITEM_ID_SET result{ id };
+        ITEM_ID_SET result;
+        if( source->second.routable )
+            result.insert( id );
         for( ITEM_ID currentId : source->second.normalContacts )
         {
             std::optional<ROUTER_POINT> previousPoint = normalContactPoint( id, currentId );
@@ -332,6 +416,17 @@ struct ROUTING_BOARD::IMPL
                 const auto current = items.find( currentId );
                 if( current == items.end() || !current->second.routable )
                     break;
+
+                if( current->second.normal.kind == NORMAL_CONTACT_ITEM::KIND::DRILL )
+                {
+                    if( stopOption == STOP_CONNECTION_OPTION::VIA )
+                        break;
+                    if( stopOption == STOP_CONNECTION_OPTION::FANOUT_VIA
+                        && isFanoutVia( currentId, &result ) )
+                    {
+                        break;
+                    }
+                }
 
                 result.insert( currentId );
                 visited.insert( currentId );
@@ -445,7 +540,7 @@ struct ROUTING_BOARD::IMPL
             terminal.position = trace.start;
             terminal.layers = trace.layers;
             terminal.trackWidth = 2 * trace.radius;
-            item.terminals.push_back( { terminal, NO_PAD, trace.end } );
+            item.terminals.push_back( { terminal, NO_PAD, trace.end, {} } );
         }
     }
 
@@ -943,7 +1038,7 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
             copper.layers = pad.layers;
             state.addShape( item, copper );
         }
-        item.terminals.push_back( { pad, i, {} } );
+        item.terminals.push_back( { pad, i, {}, {} } );
     }
     for( const auto& copper : snapshot.obstacles )
     {
@@ -989,7 +1084,7 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
                 pad.position = copper.start;
                 pad.layers = { layer };
                 pad.trackWidth = 2 * copper.radius;
-                item.terminals.push_back( { pad, NO_PAD, copper.end } );
+                item.terminals.push_back( { pad, NO_PAD, copper.end, {} } );
             }
         }
     }
@@ -1000,6 +1095,31 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
         item.area = std::make_shared<const ROUTING_OBSTACLE>( area );
         item.normal.kind = NORMAL_CONTACT_ITEM::KIND::AREA;
         state.addShape( item, area );
+
+        // ConductionArea.getTraceConnectionShape() is the complete area tree
+        // shape, unlike Pin/DrillItem which is intentionally a centre point.
+        // Reuse one known on-copper synthetic anchor only to seed room
+        // completion and to carry a host pad index; target attachment itself
+        // uses connectionArea below, never this sample coordinate.
+        const auto anchor = std::find_if(
+                snapshot.pads.begin(), snapshot.pads.end(), [&]( const ROUTING_PAD& pad )
+                {
+                    return pad.netCode == area.netCode && pad.isPlaneTarget
+                           && std::any_of(
+                                   pad.layers.begin(), pad.layers.end(), [&]( int layer )
+                                   {
+                                       return std::find( area.layers.begin(),
+                                                         area.layers.end(), layer )
+                                              != area.layers.end();
+                                   } )
+                           && CONTACT_GEOMETRY::ContainsArea( area, pad.position );
+                } );
+        if( anchor != snapshot.pads.end() )
+        {
+            ROUTING_PAD terminalPad = *anchor;
+            item.terminals.push_back(
+                    { std::move( terminalPad ), NO_PAD, {}, item.area } );
+        }
     }
     state.reindex();
 }
@@ -1112,7 +1232,7 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                 terminal.position = from.point;
                 terminal.layers = { layer };
                 terminal.trackWidth = edgeWidth;
-                item.terminals.push_back( { terminal, NO_PAD, std::nullopt } );
+                item.terminals.push_back( { terminal, NO_PAD, std::nullopt, {} } );
             }
             item.route = route;
             item.route->nodes = { from, to };
@@ -1158,7 +1278,7 @@ void ROUTING_BOARD::AddRoute( const ROUTING_CONNECTION& route )
                 terminal.position = traceFrom.point;
                 terminal.layers = { traceFrom.layer };
                 terminal.trackWidth = edgeWidth;
-                item.terminals.push_back( { terminal, NO_PAD, traceTo.point } );
+                item.terminals.push_back( { terminal, NO_PAD, traceTo.point, {} } );
             }
             item.route = route;
             item.route->nodes.assign( route.nodes.begin() + static_cast<std::ptrdiff_t>( edge ),
@@ -1407,10 +1527,9 @@ std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
                 terminal.padIndex = representative->second;
         }
 
-        // ConductionArea is one connectable source Item even though KiCad
-        // exposes its exact interior through deterministic plane targets.
-        // Keep those samples grouped under that one identity so fanout's
-        // small-set branch uses source item cardinality.
+        // ConductionArea is one connectable source Item. A synthetic target
+        // contributes only its stable host index/seed; the exact area region
+        // stored on the terminal is the actual target-door geometry.
         if( item.conductionArea && item.area )
         {
             for( std::size_t padIndex = 0; padIndex < m_impl->snapshot.pads.size(); ++padIndex )
@@ -1420,7 +1539,12 @@ std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
                     && CONTACT_GEOMETRY::ContainsArea( *item.area,
                                                        planeTarget.position ) )
                 {
-                    target.terminals.push_back( { planeTarget, padIndex, {} } );
+                    for( ROUTING_TERMINAL& terminal : target.terminals )
+                    {
+                        terminal.pad = planeTarget;
+                        terminal.padIndex = padIndex;
+                    }
+                    break;
                 }
             }
         }
@@ -1491,9 +1615,10 @@ ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::NormalConnectedSet( ITEM_ID id ) const
 }
 
 
-ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetConnectionItems( ITEM_ID id ) const
+ROUTING_BOARD::ITEM_ID_SET ROUTING_BOARD::GetConnectionItems(
+        ITEM_ID id, STOP_CONNECTION_OPTION stopOption ) const
 {
-    return m_impl->connectionItems( id );
+    return m_impl->connectionItems( id, stopOption );
 }
 
 

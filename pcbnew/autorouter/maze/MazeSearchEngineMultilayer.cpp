@@ -18,6 +18,20 @@
 
 namespace KICAD_AUTOROUTER
 {
+namespace
+{
+std::optional<ROUTER_POINT> nearestInRoomMultilayer(
+        const ROOM_TERMINAL& aTerminal, ROUTER_POINT aPoint,
+        const ROUTER_BOX& aRoom )
+{
+    if( aTerminal.connectionArea )
+        return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                *aTerminal.connectionArea, aTerminal.areaInset, aPoint, aRoom );
+    return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+            aTerminal.start, aTerminal.end, aPoint, aRoom );
+}
+}
+
 std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
         const std::vector<ROOM_LAYER>& layers, int net, double sectionOffset,
         const ROOM_VIA_SETTINGS& via, int maxExpanded, int& expanded,
@@ -257,10 +271,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     {
                         for( const ROUTER_POINT& toward : { target.start, target.end } )
                         {
-                            const auto candidate =
-                                    TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
-                                            start.start, start.end, toward,
-                                            room->shape->GetShape() );
+                            const auto candidate = nearestInRoomMultilayer(
+                                    start, toward, room->shape->GetShape() );
                             if( !candidate )
                                 continue;
                             const FLOAT_POINT point{
@@ -508,10 +520,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
         for( const auto& target : layer.targets )
         {
             ++targetId;
-            const auto targetPoint =
-                    TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
-                            target.start, target.end, from.Round(),
-                            current.room->shape->GetShape() );
+            const auto targetPoint = nearestInRoomMultilayer(
+                    target, from.Round(), current.room->shape->GetShape() );
             if( !targetPoint )
                 continue;
             const FLOAT_POINT to{ static_cast<double>( targetPoint->x ),

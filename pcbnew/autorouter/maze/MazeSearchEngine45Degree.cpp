@@ -30,6 +30,9 @@ std::optional<ROUTER_POINT> nearestInRoom45(
         const ROOM_TERMINAL& aTerminal, ROUTER_POINT aPoint,
         const INT_OCTAGON& aRoom )
 {
+    if( aTerminal.connectionArea )
+        return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                *aTerminal.connectionArea, aTerminal.areaInset, aPoint, aRoom );
     return TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
             aTerminal.start, aTerminal.end, aPoint, aRoom );
 }

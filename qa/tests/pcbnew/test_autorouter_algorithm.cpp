@@ -1821,12 +1821,19 @@ BOOST_AUTO_TEST_CASE( RoutesSinglePadToPlaneTarget )
     plane.layers = board.pads[1].layers;
     board.conductionAreas.push_back( plane );
 
+    AUTOROUTER_SETTINGS settings = makeSettings();
+    settings.enableFanout = false;
     ROUTING_PIPELINE pipeline;
-    const ROUTING_RESULT result = pipeline.Run( board, makeSettings(), {}, {} );
+    const ROUTING_RESULT result = pipeline.Run( board, settings, {}, {} );
 
     BOOST_REQUIRE( result.complete );
     BOOST_CHECK_EQUAL( result.metrics.totalConnections, 1 );
     BOOST_CHECK_EQUAL( result.metrics.routedConnections, 1 );
+    BOOST_REQUIRE_EQUAL( result.connections.size(), 1U );
+    BOOST_CHECK( result.connections.front().isPlaneConnection );
+    BOOST_CHECK( !result.connections.front().isFanoutConnection );
+    BOOST_CHECK_EQUAL( result.connections.front().nodes.back().point.x, 4550000 );
+    BOOST_CHECK( result.connections.front().nodes.back().point != board.pads[1].position );
 }
 
 
@@ -1915,6 +1922,17 @@ BOOST_AUTO_TEST_CASE( PlaneTargetOnPadLayerDoesNotCreateAnUnusedVia )
     BOOST_REQUIRE( result.complete );
     BOOST_CHECK_EQUAL( result.vias.size(), 0 );
     BOOST_CHECK_EQUAL( result.metrics.fanoutConnections, 1 );
+    BOOST_REQUIRE_EQUAL( result.connections.size(), 1U );
+    BOOST_REQUIRE_GE( result.connections.front().nodes.size(), 2U );
+    BOOST_CHECK( result.connections.front().isPlaneConnection );
+    // The synthetic pad at x=5 mm only identifies the host plane.  The
+    // source target is the finite ConductionArea, inset by the 0.05 mm trace
+    // radius, so the realized centre line attaches at its near edge instead
+    // of being forced through that synthetic coordinate.
+    BOOST_CHECK_EQUAL( result.connections.front().nodes.back().point.x, 4550000 );
+    BOOST_CHECK_GE( result.connections.front().nodes.back().point.y, 1050000 );
+    BOOST_CHECK_LE( result.connections.front().nodes.back().point.y, 1950000 );
+    BOOST_CHECK( result.connections.front().nodes.back().point != board.pads[1].position );
 }
 
 
@@ -3871,8 +3889,6 @@ BOOST_AUTO_TEST_CASE( RoutingBoardPreservesAndTransactionallyRemovesExactItemCha
 {
     auto board = makeBoard();
     auto settings = makeSettings();
-    board.pads[0].layers = { 0 };
-    board.pads[1].layers = { 1 };
 
     ROUTING_CONNECTION route;
     route.netCode = 1;
@@ -3899,6 +3915,18 @@ BOOST_AUTO_TEST_CASE( RoutingBoardPreservesAndTransactionallyRemovesExactItemCha
     BOOST_REQUIRE_EQUAL( ids.size(), 3U );
     const auto chain = copper.GetConnectionItems( ids[1] );
     BOOST_CHECK( chain == ROUTING_BOARD::ITEM_ID_SET( ids.begin(), ids.end() ) );
+    BOOST_CHECK( copper.GetConnectionItems(
+                         ids.front(), ROUTING_BOARD::STOP_CONNECTION_OPTION::VIA )
+                 == ROUTING_BOARD::ITEM_ID_SET{ ids.front() } );
+    BOOST_CHECK( copper.GetConnectionItems(
+                         ids.front(), ROUTING_BOARD::STOP_CONNECTION_OPTION::FANOUT_VIA )
+                 == chain );
+    const auto fromPadItem = copper.PadItem( 0 );
+    BOOST_REQUIRE( fromPadItem );
+    BOOST_CHECK( copper.GetConnectionItems( *fromPadItem ) == chain );
+    BOOST_CHECK( copper.GetConnectionItems(
+                         *fromPadItem, ROUTING_BOARD::STOP_CONNECTION_OPTION::VIA )
+                 == ROUTING_BOARD::ITEM_ID_SET{ ids.front() } );
 
     const auto traceItem = copper.ItemRoute( ids[0] );
     const auto viaItem = copper.ItemRoute( ids[1] );
@@ -3935,6 +3963,23 @@ BOOST_AUTO_TEST_CASE( RoutingBoardPreservesAndTransactionallyRemovesExactItemCha
     BOOST_CHECK( !copper.RemoveItems( invalid ) );
     BOOST_CHECK( copper.Connected( 0, 1 ) );
     BOOST_CHECK_EQUAL( copper.ItemCount(), count );
+
+    BOARD_SNAPSHOT fanoutBoard = board;
+    fanoutBoard.pads[0].layers = { 0 };
+    fanoutBoard.pads[1].layers = { 1 };
+    ROUTING_BOARD fanoutCopper( fanoutBoard, settings );
+    ROUTING_CONNECTION fanout = route;
+    fanout.isFanoutConnection = true;
+    fanoutCopper.AddRoute( fanout );
+    const auto fanoutIds = fanoutCopper.RouteItems( fanout );
+    BOOST_REQUIRE_EQUAL( fanoutIds.size(), 3U );
+    BOOST_CHECK( fanoutCopper.GetConnectionItems(
+                         fanoutIds.front(),
+                         ROUTING_BOARD::STOP_CONNECTION_OPTION::FANOUT_VIA )
+                 == ROUTING_BOARD::ITEM_ID_SET{ fanoutIds.front() } );
+    BOOST_CHECK( fanoutCopper.GetConnectionItems(
+                         fanoutIds.front(), ROUTING_BOARD::STOP_CONNECTION_OPTION::NONE )
+                 == ROUTING_BOARD::ITEM_ID_SET( fanoutIds.begin(), fanoutIds.end() ) );
 }
 
 BOOST_AUTO_TEST_CASE( OccupancyItemRemovalKeepsOnlyExactForkSurvivorsAndRollsBack )
@@ -7784,6 +7829,87 @@ BOOST_AUTO_TEST_CASE( MazeRipupCostUsesWidthDetourFanoutAndPassRandomization )
     const double randomizedDetour = detour * ( 0.5 + 0.25 * 0.25 );
     BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context, 0.25 ),
                        std::max( static_cast<int>( 40000.0 / randomizedDetour ), 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( ConductionAreaTargetDoorUsesTheInsetFiniteRegionAndHoles )
+{
+    ROUTING_OBSTACLE rectangle;
+    rectangle.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    rectangle.box = { 700, 200, 1000, 800 };
+    const ROUTER_BOX room{ 0, 0, 1200, 1000 };
+    const auto rectanglePoint =
+            TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                    rectangle, 50, { 100, 500 }, room );
+    BOOST_REQUIRE( rectanglePoint );
+    BOOST_CHECK( *rectanglePoint == ROUTER_POINT( { 750, 500 } ) );
+    ROUTING_OBSTACLE polygon;
+    polygon.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    polygon.polygon = { { 0, 0 }, { 1000, 0 }, { 1000, 1000 }, { 0, 1000 } };
+    polygon.polygonHoles = {
+        { { 400, 400 }, { 400, 600 }, { 600, 600 }, { 600, 400 } } };
+    const auto polygonPoint =
+            TARGET_ITEM_EXPANSION_DOOR::NearestIntegralPointInRoom(
+                    polygon, 0, { 500, 500 }, room );
+    BOOST_REQUIRE( polygonPoint );
+    BOOST_CHECK( CONTACT_GEOMETRY::ContainsArea( polygon, *polygonPoint ) );
+    BOOST_CHECK( polygonPoint->x <= 400 || polygonPoint->x >= 600
+                 || polygonPoint->y <= 400 || polygonPoint->y >= 600 );
+
+    auto area = std::make_shared<const ROUTING_OBSTACLE>( rectangle );
+    ROOM_TERMINAL start;
+    start.start = start.end = { 100, 500 };
+    start.owner = 0;
+    ROOM_TERMINAL target;
+    target.start = target.end = { 850, 500 };
+    target.owner = 1;
+    target.treeBounds = rectangle.box;
+    target.connectionArea = area;
+    target.areaInset = 50;
+    const std::vector<ROOM_TERMINAL> starts{ start };
+    const std::vector<ROOM_TERMINAL> targets{ target };
+    int expanded = 0;
+    ROOM_SEARCH_METRICS metrics;
+    const auto path = MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
+            room, {}, 0, 1, starts, targets, 50, 1, 1, 100,
+            expanded, metrics );
+    BOOST_REQUIRE( path );
+    BOOST_REQUIRE_GE( path->points.size(), 2U );
+    BOOST_CHECK( path->points.front() == ROUTER_POINT( { 100, 500 } ) );
+    BOOST_CHECK( path->points.back() == ROUTER_POINT( { 750, 500 } ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( RoutingBoardExposesOneExactConductionAreaTargetItem )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    board.pads[1].isPlaneTarget = true;
+    board.nets[0].planeTargetIndices = { 1 };
+
+    ROUTING_OBSTACLE area;
+    area.kind = ROUTER_OBSTACLE_KIND::RECTANGLE;
+    area.netCode = 1;
+    area.layers = { 0 };
+    area.box = { 4200000, 1000000, 5500000, 2000000 };
+    board.conductionAreas.push_back( area );
+
+    ROUTING_BOARD copper( board, makeSettings() );
+    const auto targets = copper.UnconnectedTargetItems( 0, 1 );
+    BOOST_REQUIRE_EQUAL( targets.size(), 1U );
+    BOOST_CHECK_EQUAL( targets.front().bounds.minX, area.box.minX );
+    BOOST_CHECK_EQUAL( targets.front().bounds.minY, area.box.minY );
+    BOOST_CHECK_EQUAL( targets.front().bounds.maxX, area.box.maxX );
+    BOOST_CHECK_EQUAL( targets.front().bounds.maxY, area.box.maxY );
+    BOOST_REQUIRE_EQUAL( targets.front().terminals.size(), 1U );
+
+    const ROUTING_TERMINAL& terminal = targets.front().terminals.front();
+    BOOST_CHECK_EQUAL( terminal.padIndex, 1U );
+    BOOST_CHECK_EQUAL( terminal.pad.position.x, board.pads[1].position.x );
+    BOOST_CHECK_EQUAL( terminal.pad.position.y, board.pads[1].position.y );
+    BOOST_REQUIRE( terminal.connectionArea );
+    BOOST_CHECK( terminal.connectionArea->kind == ROUTER_OBSTACLE_KIND::RECTANGLE );
+    BOOST_CHECK_EQUAL( terminal.connectionArea->box.minX, area.box.minX );
+    BOOST_CHECK_EQUAL( terminal.connectionArea->box.maxX, area.box.maxX );
 }
 
 

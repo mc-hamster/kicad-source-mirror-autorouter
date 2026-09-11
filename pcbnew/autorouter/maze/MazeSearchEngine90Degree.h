@@ -57,6 +57,11 @@ struct ROOM_TERMINAL
     // connection shape remains start..end; Freerouting deliberately uses the
     // larger search-tree shape only for its admissible destination bound.
     ROUTER_BOX treeBounds{ 1, 1, 0, 0 };
+    // Non-null only for ConductionArea. The locator intersects this exact
+    // region with the reached room and insets it by the physical trace radius,
+    // just as FoundConnectionLocator does for a two-dimensional target.
+    std::shared_ptr<const ROUTING_OBSTACLE> connectionArea;
+    std::int64_t areaInset = 0;
 };
 
 struct ROOM_PATH

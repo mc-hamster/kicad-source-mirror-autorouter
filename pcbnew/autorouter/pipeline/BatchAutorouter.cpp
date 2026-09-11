@@ -1332,10 +1332,19 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             }
             else if( targetIsPlane && !source.isExactTarget )
             {
-                // Post-refill repair can request an exact island anchor. That
-                // host-only subproblem must retain its specified start point;
-                // it is not a general connected-set search request.
+                // Plane routing searches from the selected item's complete
+                // connected set to its complete unconnected item set.  The
+                // latter includes the ConductionArea itself, whose terminal
+                // carries the exact finite filled region rather than one of
+                // the adapter's synthetic sampling coordinates.
                 starts = aOccupancy.Board()->Terminals( routeSourceIndex );
+                const auto unconnected = aOccupancy.Board()->UnconnectedTargetItems(
+                        routeSourceIndex, aNet.netCode );
+                for( const ROUTING_BOARD::TARGET_ITEM& item : unconnected )
+                {
+                    destinations.insert( destinations.end(), item.terminals.begin(),
+                                         item.terminals.end() );
+                }
             }
             else if( aNet.planeTargetIndices.empty() )
             {

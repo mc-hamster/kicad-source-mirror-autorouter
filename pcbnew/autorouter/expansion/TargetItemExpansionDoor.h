@@ -78,6 +78,21 @@ public:
             const ROUTER_POINT& aStart, const ROUTER_POINT& aEnd,
             const ROUTER_POINT& aFrom, const PLANAR::SIMPLEX& aRoom );
 
+    /** ConductionArea target-door variant. The exact filled polygon (including
+     * holes) is inset by the physical trace radius before room intersection;
+     * unlike a Pin target, it is never collapsed to a sampled centre point. */
+    static std::optional<ROUTER_POINT> NearestIntegralPointInRoom(
+            const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+            const ROUTER_POINT& aFrom, const ROUTER_BOX& aRoom );
+
+    static std::optional<ROUTER_POINT> NearestIntegralPointInRoom(
+            const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+            const ROUTER_POINT& aFrom, const PLANAR::INT_OCTAGON& aRoom );
+
+    static std::optional<ROUTER_POINT> NearestIntegralPointInRoom(
+            const ROUTING_OBSTACLE& aArea, std::int64_t aInset,
+            const ROUTER_POINT& aFrom, const PLANAR::SIMPLEX& aRoom );
+
     /**
      * Return a bounded set of exact lattice points which represents an
      * integral segment in an orthogonal room decomposition.

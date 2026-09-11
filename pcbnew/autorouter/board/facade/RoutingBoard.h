@@ -31,6 +31,14 @@ public:
         AREA
     };
 
+    /** Source Item.StopConnectionOption declaration order. */
+    enum class STOP_CONNECTION_OPTION
+    {
+        NONE,
+        FANOUT_VIA,
+        VIA
+    };
+
     /** Read-only source-item view used by Connection.get(). */
     struct ITEM_INFO
     {
@@ -96,10 +104,13 @@ public:
     int FirstCommonLayer( ITEM_ID aFirst, ITEM_ID aSecond ) const;
     ITEM_ID_SET NormalContactsAt( ITEM_ID aTrace, ROUTER_POINT aPoint ) const;
     ITEM_ID_SET NormalConnectedSet( ITEM_ID aItem ) const;
-    /** Direct translation of Item.getConnectionItems(StopConnectionOption.NONE).
-     * Returns routable trace/drill items up to the next terminal, stub or fork.
+    /** Direct translation of Item.getConnectionItems(StopConnectionOption).
+     * Returns routable trace/drill items up to the next terminal, stub or fork;
+     * optional via boundaries are not included unless they are the start item.
      */
-    ITEM_ID_SET GetConnectionItems( ITEM_ID aItem ) const;
+    ITEM_ID_SET GetConnectionItems(
+            ITEM_ID aItem,
+            STOP_CONNECTION_OPTION aStopOption = STOP_CONNECTION_OPTION::NONE ) const;
     /** Exact conduction-area identities containing a same-net point. */
     ITEM_ID_SET ConductionAreaContactsAt( int aNetCode, ROUTER_NODE aPoint ) const;
     std::optional<ITEM_INFO> GetItemInfo( ITEM_ID aItem ) const;

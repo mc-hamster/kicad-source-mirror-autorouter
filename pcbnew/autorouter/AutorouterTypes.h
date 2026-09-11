@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -345,6 +346,10 @@ struct ROUTING_TERMINAL
     // A connected trace is a target region, not just its endpoints. Its start
     // is pad.position; padIndex identifies a real pad in that copper component.
     std::optional<ROUTER_POINT> segmentEnd;
+    // Exact ConductionArea connection region. Pins and vias deliberately
+    // remain point targets, matching DrillItem.getTraceConnectionShape().
+    // The detached snapshot owns this immutable value through shared storage.
+    std::shared_ptr<const struct ROUTING_OBSTACLE> connectionArea;
 };
 
 
