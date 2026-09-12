@@ -27,6 +27,8 @@
 #include "../geometry/planar/FloatLine.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -86,6 +88,32 @@ void appendLayers( std::vector<int>& aDestination, const LSET& aLayers )
 bool contains( const std::vector<std::string>& aValues, const std::string& aValue )
 {
     return std::find( aValues.begin(), aValues.end(), aValue ) != aValues.end();
+}
+
+
+double specctraSixSignificantCoordinate( std::int64_t aCoordinate )
+{
+    // DSN::POINT and DSN::POLYGON_PATH serialize coordinates with "%.6g".
+    // The reader parses that text before multiplying micrometres onto its
+    // 0.1-um integer board lattice.  Preserve that lossy boundary here: using
+    // KiCad's full-IU polygon directly can differ by one source coordinate at
+    // a half-unit vertex and changes the expansion-room search order.
+    constexpr double IU_PER_MICROMETRE = 1000.0;
+    const double external = static_cast<double>( aCoordinate )
+                            / IU_PER_MICROMETRE;
+    std::array<char, 64> text{};
+    const auto written = std::to_chars( text.data(), text.data() + text.size(),
+                                        external, std::chars_format::general, 6 );
+    if( written.ec != std::errc() )
+        return static_cast<double>( aCoordinate );
+
+    double parsed = external;
+    const auto read = std::from_chars( text.data(), written.ptr, parsed,
+                                       std::chars_format::general );
+    if( read.ec != std::errc() || read.ptr != written.ptr )
+        return static_cast<double>( aCoordinate );
+
+    return parsed * IU_PER_MICROMETRE;
 }
 
 
@@ -1060,8 +1088,8 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                          localPolygon.Outline( 0 ).CPoints() )
                     {
                         const ROUTER_POINT sourceLocal = FLOAT_POINT{
-                                static_cast<double>( localCorner.x ),
-                                static_cast<double>( localCorner.y ) }
+                                specctraSixSignificantCoordinate( localCorner.x ),
+                                specctraSixSignificantCoordinate( localCorner.y ) }
                                 .RoundToSourceGridYDown();
                         VECTOR2I corner( static_cast<int>( sourceLocal.x ),
                                          static_cast<int>( sourceLocal.y ) );

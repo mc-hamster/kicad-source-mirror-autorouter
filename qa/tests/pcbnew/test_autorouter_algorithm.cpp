@@ -4769,6 +4769,47 @@ BOOST_AUTO_TEST_CASE( KiCadAdapterUsesExactSpecctraRoundedRectanglePolygon )
 }
 
 
+BOOST_AUTO_TEST_CASE( KiCadAdapterRoundsRotatedRoundRectLikeSpecctraReader )
+{
+    // D4 pad 1 from the regulated-power-supply parity fixture.  The exported
+    // 250.95-um roundrect has half-source-unit vertices.  Specctra rounds the
+    // local polygon before applying the 90-degree component transform; doing
+    // those operations in the opposite order changes the room boundary by
+    // one or two Freerouting coordinates.
+    BOARD board;
+    auto* footprint = new FOOTPRINT( &board );
+    board.Add( footprint );
+    auto* pad = new PAD( footprint );
+    pad->SetAttribute( PAD_ATTRIB::SMD );
+    pad->SetLayerSet( LSET( { F_Cu } ) );
+    pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::ROUNDRECT );
+    pad->SetSize( PADSTACK::ALL_LAYERS, { 2200000, 2200000 } );
+    pad->SetRoundRectCornerRadius( PADSTACK::ALL_LAYERS, 250000 );
+    pad->SetPosition( { 173600000, 95680000 } );
+    pad->SetOrientation( EDA_ANGLE( 90, DEGREES_T ) );
+    footprint->Add( pad );
+
+    KICAD_BOARD_ADAPTER adapter( &board );
+    const auto snapshot = adapter.CreateSnapshot( adapter.CreateDefaultSettings() );
+    BOOST_REQUIRE( snapshot );
+    BOOST_REQUIRE_EQUAL( snapshot->obstacles.size(), 1 );
+    const auto& rounded = snapshot->obstacles.front();
+    BOOST_REQUIRE( rounded.kind == ROUTER_OBSTACLE_KIND::POLYGON );
+    const auto simplex = PLANAR::SIMPLEX::FromConvexPolygon( rounded.polygon );
+    BOOST_REQUIRE( simplex );
+    const auto octagon = simplex->BoundingOctagon();
+    BOOST_REQUIRE( octagon );
+    BOOST_CHECK_EQUAL( octagon->leftX, 172499000 );
+    BOOST_CHECK_EQUAL( octagon->bottomY, 94579000 );
+    BOOST_CHECK_EQUAL( octagon->rightX, 174700900 );
+    BOOST_CHECK_EQUAL( octagon->topY, 96780900 );
+    BOOST_CHECK_EQUAL( octagon->upperLeftDiagonalX, 75865100 );
+    BOOST_CHECK_EQUAL( octagon->lowerRightDiagonalX, 79974900 );
+    BOOST_CHECK_EQUAL( octagon->lowerLeftDiagonalX, 267225000 );
+    BOOST_CHECK_EQUAL( octagon->upperRightDiagonalX, 271334800 );
+}
+
+
 BOOST_AUTO_TEST_CASE( FanoutPinOrderMatchesPinnedJavaComponents )
 {
     std::ifstream input( KI_TEST::GetPcbnewTestDataDir() + "/autorouter/fanout-search-a11c0a42.txt" );

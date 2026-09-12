@@ -12,6 +12,32 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
+## Latest decision-stream milestone — Specctra six-significant-digit boundary
+
+The regulated-power-supply fixture's first strict decision mismatch moved from
+assignment **0 to assignment 824**.  The native adapter had reconstructed the
+same roundrect polygon that KiCad gives its Specctra exporter, but then retained
+full integer-IU precision.  The actual DSN boundary is lossy: polygon points are
+serialized with `%.6g`, parsed as decimal coordinates and only then rounded
+onto Freerouting's 0.1-um board lattice.  For D4's rotated roundrect, the native
+shortcut moved five octagonal supports by one or two source coordinates and
+changed the first room door by 0.2 um.
+
+The adapter now reproduces that six-significant-digit serialization boundary
+before Java-compatible local-coordinate rounding and component rotation.  A
+focused D4 regression checks all eight source-visible octagonal supports.  The
+regulated fixture remains electrically complete after host repair with zero
+new KiCad DRC reports; its first 824 normalized assignments now match the
+pinned reference before the next independently classified divergence.  The BJT
+fixture still matches all **1,960/1,960** normalized assignments with exact
+costs and transformed geometry, routes 16/16 with 152.435 mm of track, and
+introduces no KiCad DRC reports.
+
+This checkpoint passes **279/279 native autorouter cases** (1,166,741
+assertions) and all **28 Python parity-harness tests**.  Progress is reported by
+these first-divergence and acceptance gates rather than a subjective global
+percentage.
+
 ## Latest decision-stream milestone — exact BJT costs and source item sets
 
 The stripped BJT fixture now matches the pinned development reference for all
