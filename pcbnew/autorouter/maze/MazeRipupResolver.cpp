@@ -27,6 +27,7 @@
 #include <cmath>
 #include <limits>
 
+#include "../board/facade/RoutingBoard.h"
 #include "../path/Connection.h"
 
 
@@ -45,6 +46,48 @@ double MAZE_RIPUP_RESOLVER::FanoutViaRipupCostFactor(
 }
 
 
+double MAZE_RIPUP_RESOLVER::FanoutViaRipupCostFactor(
+        const ROUTING_BOARD& aBoard, std::uint64_t aTraceItem,
+        std::int64_t aFallbackTraceHalfWidth )
+{
+    const auto trace = aBoard.GetItemInfo( aTraceItem );
+    if( !trace || trace->kind != ROUTING_BOARD::ITEM_KIND::TRACE )
+        return 1.0;
+
+    // MazeRipupResolver.calcFanoutViaRipupCostFactor tests each PolylineTrace
+    // endpoint independently and protects only an endpoint with exactly one
+    // normal contact.  A route-level isFanoutConnection flag is intentionally
+    // insufficient: ordinary traces immediately adjacent to a one-layer pin
+    // receive the same source protection.
+    for( const ROUTER_POINT endpoint : { trace->first, trace->last } )
+    {
+        const ROUTING_BOARD::ITEM_ID_SET contacts =
+                aBoard.NormalContactsAt( aTraceItem, endpoint );
+        if( contacts.size() != 1 )
+            continue;
+
+        const auto contact = aBoard.GetItemInfo( *contacts.begin() );
+        if( !contact )
+            continue;
+
+        const bool singleLayerPin = contact->pin && !contact->layers.empty()
+                && contact->layers.front() == contact->layers.back();
+        const bool shoveFixedTwoCornerTrace =
+                contact->kind == ROUTING_BOARD::ITEM_KIND::TRACE
+                && contact->fixedState == ROUTER_FIXED_STATE::SHOVE_FIXED
+                && contact->traceCornerCount == 2;
+        if( singleLayerPin || shoveFixedTwoCornerTrace )
+        {
+            const std::int64_t halfWidth = trace->traceHalfWidth > 0
+                    ? trace->traceHalfWidth : aFallbackTraceHalfWidth;
+            return FanoutViaRipupCostFactor( halfWidth, trace->traceLength );
+        }
+    }
+
+    return 1.0;
+}
+
+
 int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
                                      std::size_t aEdgeIndex,
                                      std::int64_t aFallbackTraceHalfWidth,
@@ -52,7 +95,10 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
                                      double aRandomNumber,
                                      const std::vector<std::int64_t>&
                                              aAdditionalViaTraceHalfWidths,
-                                     const CONNECTION* aTopologyConnection ) const
+                                     const CONNECTION* aTopologyConnection,
+                                     double aCoordinateScale,
+                                     const ROUTING_BOARD* aBoard,
+                                     std::uint64_t aObstacleItem ) const
 {
     if( !aConnection.complete || !HasValidEdgeStyles( aConnection )
         || aEdgeIndex + 1 >= aConnection.nodes.size() )
@@ -71,15 +117,30 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
                                             : aFallbackTraceHalfWidth );
     };
 
+    const double coordinateScale =
+            std::isfinite( aCoordinateScale ) && aCoordinateScale > 0
+                    ? aCoordinateScale : 1.0;
     double costFactor = 1.0;
     double fanoutFactor = 1.0;
     const bool preserveFanoutProtection =
             !aContext.removeUnconnectedVias
             && aContext.ripupCosts <= aContext.startRipupCosts * 2;
+    const auto sourceItem = aBoard && aObstacleItem != 0
+            ? aBoard->GetItemInfo( aObstacleItem ) : std::nullopt;
     if( !isVia )
     {
-        costFactor = static_cast<double>( edgeHalfWidth( aEdgeIndex ) );
-        if( preserveFanoutProtection && aConnection.isFanoutConnection )
+        const std::int64_t traceHalfWidth = sourceItem
+                        && sourceItem->kind == ROUTING_BOARD::ITEM_KIND::TRACE
+                        && sourceItem->traceHalfWidth > 0
+                ? sourceItem->traceHalfWidth : edgeHalfWidth( aEdgeIndex );
+        costFactor = static_cast<double>( traceHalfWidth )
+                     / coordinateScale;
+        if( preserveFanoutProtection && aBoard && sourceItem )
+        {
+            fanoutFactor = FanoutViaRipupCostFactor(
+                    *aBoard, aObstacleItem, traceHalfWidth );
+        }
+        else if( preserveFanoutProtection && aConnection.isFanoutConnection )
         {
             const long double dx = static_cast<long double>( to.point.x ) - from.point.x;
             const long double dy = static_cast<long double>( to.point.y ) - from.point.y;
@@ -91,13 +152,45 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
     else
     {
         int contactCount = 0;
-        if( aEdgeIndex > 0
+        if( aBoard && sourceItem
+            && sourceItem->kind == ROUTING_BOARD::ITEM_KIND::DRILL )
+        {
+            bool lookIfFanoutVia = preserveFanoutProtection;
+            for( std::uint64_t contactId : aBoard->GetNormalContacts( aObstacleItem ) )
+            {
+                const auto contact = aBoard->GetItemInfo( contactId );
+                if( !contact || contact->kind != ROUTING_BOARD::ITEM_KIND::TRACE
+                    || contact->fixedState >= ROUTER_FIXED_STATE::USER_FIXED )
+                {
+                    return -1;
+                }
+
+                ++contactCount;
+                costFactor = std::max(
+                        costFactor,
+                        static_cast<double>( std::max<std::int64_t>(
+                                1, contact->traceHalfWidth ) ) / coordinateScale );
+                if( lookIfFanoutVia && !aContext.isFanout )
+                {
+                    const double currentFactor = FanoutViaRipupCostFactor(
+                            *aBoard, contactId, contact->traceHalfWidth );
+                    if( currentFactor > 1.0 )
+                    {
+                        fanoutFactor = currentFactor;
+                        lookIfFanoutVia = false;
+                    }
+                }
+            }
+        }
+        else if( aEdgeIndex > 0
             && aConnection.nodes[aEdgeIndex - 1].layer
                        == aConnection.nodes[aEdgeIndex].layer )
         {
             ++contactCount;
-            costFactor = std::max( costFactor,
-                                   static_cast<double>( edgeHalfWidth( aEdgeIndex - 1 ) ) );
+            costFactor = std::max(
+                    costFactor,
+                    static_cast<double>( edgeHalfWidth( aEdgeIndex - 1 ) )
+                            / coordinateScale );
             if( preserveFanoutProtection && aConnection.isFanoutConnection
                 && !aContext.isFanout )
             {
@@ -106,20 +199,29 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
                         edgeHalfWidth( aEdgeIndex - 1 ), connection.TraceLength() );
             }
         }
-        if( aEdgeIndex + 1 < aConnection.nodes.size() - 1
+        if( !( aBoard && sourceItem
+               && sourceItem->kind == ROUTING_BOARD::ITEM_KIND::DRILL )
+            && aEdgeIndex + 1 < aConnection.nodes.size() - 1
             && aConnection.nodes[aEdgeIndex + 1].layer
                        == aConnection.nodes[aEdgeIndex + 2].layer )
         {
             ++contactCount;
-            costFactor = std::max( costFactor,
-                                   static_cast<double>( edgeHalfWidth( aEdgeIndex + 1 ) ) );
+            costFactor = std::max(
+                    costFactor,
+                    static_cast<double>( edgeHalfWidth( aEdgeIndex + 1 ) )
+                            / coordinateScale );
         }
-        for( const std::int64_t halfWidth : aAdditionalViaTraceHalfWidths )
+        if( !( aBoard && sourceItem
+               && sourceItem->kind == ROUTING_BOARD::ITEM_KIND::DRILL ) )
         {
-            ++contactCount;
-            costFactor = std::max( costFactor,
-                                   static_cast<double>( std::max<std::int64_t>( 1,
-                                                                                halfWidth ) ) );
+            for( const std::int64_t halfWidth : aAdditionalViaTraceHalfWidths )
+            {
+                ++contactCount;
+                costFactor = std::max(
+                        costFactor,
+                        static_cast<double>( std::max<std::int64_t>( 1, halfWidth ) )
+                                / coordinateScale );
+            }
         }
         if( fanoutFactor <= 1.0 )
             costFactor *= 0.5 * std::max( contactCount - 1, 0 );
@@ -131,7 +233,7 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
         const CONNECTION routeConnection = CONNECTION::FromRoute( aConnection );
         const CONNECTION& connection = aTopologyConnection ? *aTopologyConnection
                                                            : routeConnection;
-        detour = std::max( connection.Detour(), 1e-12 );
+        detour = std::max( connection.Detour( coordinateScale ), 1e-12 );
     }
 
     if( aContext.ripupPassNo >= 4 && aContext.ripupPassNo % 3 != 0 )
@@ -140,12 +242,21 @@ int MAZE_RIPUP_RESOLVER::CheckRipup( const ROUTING_CONNECTION& aConnection,
         detour *= 0.5 + random * random;
     }
 
-    double cost = std::max( 0, aContext.ripupCosts ) * costFactor / detour
-                  * fanoutFactor;
-    constexpr int maximum = std::numeric_limits<int>::max() / 100;
-    if( !std::isfinite( cost ) || cost >= maximum )
-        return maximum;
-    return std::clamp( static_cast<int>( cost ), 1, maximum );
+    // MazeRipupResolver performs the narrowing cast in Freerouting's source
+    // coordinate space. Casting only after multiplying by the KiCad-IU scale
+    // retains a fractional source cost and changes equal-cost queue ordering.
+    const double sourceCost = std::max( 0, aContext.ripupCosts )
+                              * costFactor / detour * fanoutFactor;
+    constexpr int maximumSourceCost = std::numeric_limits<int>::max() / 100;
+    const int sourceResult = !std::isfinite( sourceCost )
+            || sourceCost >= maximumSourceCost
+            ? maximumSourceCost
+            : std::clamp( static_cast<int>( sourceCost ), 1, maximumSourceCost );
+    const long double nativeResult = static_cast<long double>( sourceResult )
+                                     * coordinateScale;
+    return nativeResult >= std::numeric_limits<int>::max()
+            ? std::numeric_limits<int>::max()
+            : std::max( static_cast<int>( nativeResult ), 1 );
 }
 
 } // namespace KICAD_AUTOROUTER

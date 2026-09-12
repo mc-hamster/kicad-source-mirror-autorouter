@@ -8,6 +8,7 @@
 #include "../AutorouterDebug.h"
 #include "MazeExpansionEngine.h"
 #include "MazeRipupResolver.h"
+#include "RoomCostSpace.h"
 #include "MazeSearchEngine45Degree.h"
 #include "MazeSearchEngineAnyAngle.h"
 #include "MazeTraceShover.h"
@@ -885,6 +886,7 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
 
     const std::int64_t radius = netTrackRadius( net );
     const std::int64_t candidateCompensation = traceClearanceCompensation( net );
+    const ROOM_COST_SPACE costSpace( BOARD_OUTLINE::SearchBounds( m_board ) );
     MAZE_RIPUP_RESOLVER resolver;
     MAZE_RIPUP_RESOLVER::CONTEXT context;
     context.startRipupCosts = std::max( 0, m_settings.startRipupCost );
@@ -1313,14 +1315,19 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                 entry.traceTreeExpansion = expansion;
             }
             std::optional<CONNECTION> topologyConnection;
+            ROUTING_BOARD::ITEM_ID obstacleItem = 0;
             if( routeItems.size() == routeItemCount )
+            {
+                obstacleItem = routeItems[edgeItemOrdinals[edge]];
                 topologyConnection = CONNECTION::Get(
-                        *m_occupancy.Board(), routeItems[edgeItemOrdinals[edge]] );
+                        *m_occupancy.Board(), obstacleItem );
+            }
 
             const int ripupCost = resolver.CheckRipup(
                     connection, edge, netTrackRadius( connection.netCode ), context,
                     nextDouble(), additionalViaTraceHalfWidths,
-                    topologyConnection ? &*topologyConnection : nullptr );
+                    topologyConnection ? &*topologyConnection : nullptr,
+                    costSpace.Scale(), m_occupancy.Board(), obstacleItem );
             if( ripupCost >= 0 )
             {
                 std::uint64_t sourceObjectId = 0;

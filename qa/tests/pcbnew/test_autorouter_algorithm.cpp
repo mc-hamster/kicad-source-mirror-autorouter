@@ -8896,6 +8896,58 @@ BOOST_AUTO_TEST_CASE( ConductionIslandsAndHolesAreNotVirtualConnections )
     BOOST_CHECK( !copper.Connected( 0, 1 ) );
 }
 
+BOOST_AUTO_TEST_CASE( FanoutItemSetsUseSourceNormalContactsNotPhysicalCopperOverlap )
+{
+    BOARD_SNAPSHOT board = makeBoard();
+    AUTOROUTER_SETTINGS settings = makeSettings();
+
+    // Pad 0 is a one-layer SMD pin whose centre lies in a thermal-style void.
+    // Its copper annulus still overlaps the surrounding same-net area, so the
+    // KiCad physical-connectivity graph joins it to pad 1 through that area.
+    // Freerouting ConductionArea.getNormalContacts(), however, tests the pin
+    // centre and therefore leaves pad 0 out of the source connected set.
+    board.pads[0].layers = { 0 };
+    board.pads[0].isSmd = true;
+    board.pads[1].layers = { 0, 1 };
+
+    ROUTING_PAD planeTarget = board.pads[0];
+    planeTarget.position = { 4000000, 1500000 };
+    planeTarget.isPlaneTarget = true;
+    planeTarget.layers = { 0 };
+    board.pads.push_back( planeTarget );
+    board.nets[0].planeTargetIndices = { 2 };
+
+    ROUTING_OBSTACLE area;
+    area.netCode = 1;
+    area.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+    area.layers = { 0 };
+    area.polygon = { { 500000, 500000 }, { 5500000, 500000 },
+                     { 5500000, 2500000 }, { 500000, 2500000 } };
+    area.polygonHoles = { { { 950000, 1450000 }, { 1050000, 1450000 },
+                            { 1050000, 1550000 }, { 950000, 1550000 } } };
+    board.conductionAreas.push_back( area );
+
+    ROUTING_BOARD copper( board, settings );
+    BOOST_REQUIRE( copper.Connected( 0, 1 ) );
+    BOOST_CHECK( !copper.ConnectedSetTouchesOtherLayer( 0, 0 ) );
+
+    const auto terminals = copper.Terminals( 0 );
+    BOOST_REQUIRE_EQUAL( terminals.size(), 1U );
+    BOOST_CHECK_EQUAL( terminals.front().padIndex, 0U );
+
+    const auto targets = copper.UnconnectedTargetItems( 0, 1 );
+    BOOST_CHECK( std::any_of(
+            targets.begin(), targets.end(), []( const ROUTING_BOARD::TARGET_ITEM& target )
+            {
+                return std::any_of(
+                        target.terminals.begin(), target.terminals.end(),
+                        []( const ROUTING_TERMINAL& terminal )
+                        {
+                            return static_cast<bool>( terminal.connectionArea );
+                        } );
+            } ) );
+}
+
 BOOST_AUTO_TEST_CASE( PipelineRoutesToRetainedTraceInterior )
 {
     auto board = makeBoard();
@@ -9724,6 +9776,31 @@ BOOST_AUTO_TEST_CASE( MazeRipupCostUsesWidthDetourFanoutAndPassRandomization )
     BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context ),
                        std::max( static_cast<int>( 10000.0 / detour ), 1 ) );
 
+    // Production geometry is retained in KiCad IU while Freerouting narrows
+    // the cost to int in source-coordinate space. Both DETOUR_ADD and that
+    // narrowing boundary must be scaled, not just the final floating value.
+    constexpr double sourceCoordinateScale = 100.0;
+    ROUTING_CONNECTION scaledTrace = trace;
+    for( ROUTER_NODE& node : scaledTrace.nodes )
+    {
+        node.point.x *= static_cast<std::int64_t>( sourceCoordinateScale );
+        node.point.y *= static_cast<std::int64_t>( sourceCoordinateScale );
+    }
+    for( ROUTING_EDGE_STYLE& style : scaledTrace.edgeStyles )
+        style.trackWidth *= static_cast<std::int64_t>( sourceCoordinateScale );
+    const double scaledDetour = CONNECTION::FromRoute( scaledTrace ).Detour(
+            sourceCoordinateScale );
+    BOOST_CHECK_CLOSE( scaledDetour, detour, 1e-12 );
+    const int expectedScaledRipup =
+            std::max( static_cast<int>( 10000.0 / detour ), 1 )
+            * static_cast<int>( sourceCoordinateScale );
+    BOOST_CHECK_EQUAL(
+            resolver.CheckRipup(
+                    scaledTrace, 0,
+                    static_cast<std::int64_t>( 50 * sourceCoordinateScale ),
+                    context, 0.0, {}, nullptr, sourceCoordinateScale ),
+            expectedScaledRipup );
+
     trace.isFanoutConnection = true;
     const double protection = MAZE_RIPUP_RESOLVER::FanoutViaRipupCostFactor(
             100, std::hypot( 500.0, 500.0 ) );
@@ -9736,6 +9813,66 @@ BOOST_AUTO_TEST_CASE( MazeRipupCostUsesWidthDetourFanoutAndPassRandomization )
     const double randomizedDetour = detour * ( 0.5 + 0.25 * 0.25 );
     BOOST_CHECK_EQUAL( resolver.CheckRipup( trace, 0, 50, context, 0.25 ),
                        std::max( static_cast<int>( 40000.0 / randomizedDetour ), 1 ) );
+}
+
+
+BOOST_AUTO_TEST_CASE( MazeRipupFanoutProtectionUsesExactEndpointContacts )
+{
+    auto board = makeBoard();
+    board.pads[0].layers = { 0 };
+    auto settings = makeSettings();
+    ROUTING_BOARD copper( board, settings );
+
+    ROUTING_CONNECTION trace;
+    trace.netCode = 1;
+    trace.complete = true;
+    trace.nodes = { { board.pads[0].position, 0 },
+                    { { board.pads[0].position.x + 1000,
+                        board.pads[0].position.y }, 0 } };
+    trace.edgeStyles = { ROUTING_EDGE_STYLE{} };
+    trace.edgeStyles.front().trackWidth = 200;
+    copper.AddRoute( trace );
+    const auto traceItems = copper.RouteItems( trace );
+    BOOST_REQUIRE_EQUAL( traceItems.size(), 1U );
+
+    const auto traceInfo = copper.GetItemInfo( traceItems.front() );
+    BOOST_REQUIRE( traceInfo );
+    BOOST_CHECK_EQUAL( traceInfo->traceCornerCount, 2U );
+    BOOST_CHECK_EQUAL( traceInfo->traceHalfWidth, 100 );
+    const auto pinItem = copper.PadItem( 0 );
+    BOOST_REQUIRE( pinItem );
+    const auto pinInfo = copper.GetItemInfo( *pinItem );
+    BOOST_REQUIRE( pinInfo );
+    BOOST_CHECK( pinInfo->pin );
+    BOOST_REQUIRE_EQUAL( pinInfo->layers.size(), 1U );
+
+    const double factor = MAZE_RIPUP_RESOLVER::FanoutViaRipupCostFactor(
+            copper, traceItems.front(), 100 );
+    BOOST_CHECK_CLOSE( factor, 200.0, 1e-12 );
+
+    MAZE_RIPUP_RESOLVER resolver;
+    MAZE_RIPUP_RESOLVER::CONTEXT context;
+    context.ripupCosts = 100;
+    context.startRipupCosts = 100;
+    context.ripupPassNo = 1;
+    trace.isFanoutConnection = false;
+    BOOST_CHECK_EQUAL(
+            resolver.CheckRipup( trace, 0, 100, context, 0.0, {}, nullptr,
+                                  1.0, &copper, traceItems.front() ),
+            2000000 );
+
+    // A through-hole/multilayer pin is not protected by the source method.
+    auto throughHoleBoard = makeBoard();
+    ROUTING_BOARD throughHoleCopper( throughHoleBoard, settings );
+    trace.nodes.front() = { throughHoleBoard.pads[0].position, 0 };
+    trace.nodes.back() = { { throughHoleBoard.pads[0].position.x + 1000,
+                             throughHoleBoard.pads[0].position.y }, 0 };
+    throughHoleCopper.AddRoute( trace );
+    const auto throughHoleItems = throughHoleCopper.RouteItems( trace );
+    BOOST_REQUIRE_EQUAL( throughHoleItems.size(), 1U );
+    BOOST_CHECK_EQUAL( MAZE_RIPUP_RESOLVER::FanoutViaRipupCostFactor(
+                               throughHoleCopper, throughHoleItems.front(), 100 ),
+                       1.0 );
 }
 
 

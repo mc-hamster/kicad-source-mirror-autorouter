@@ -47,11 +47,15 @@ public:
         int                      netCode = 0;
         std::size_t              padIndex = std::numeric_limits<std::size_t>::max();
         ITEM_KIND                kind = ITEM_KIND::UNKNOWN;
+        /** True only for a physical source Pin, not a generated DrillItem/via. */
+        bool                     pin = false;
         bool                     routable = false;
         ROUTER_FIXED_STATE       fixedState = ROUTER_FIXED_STATE::SYSTEM_FIXED;
         ROUTER_POINT             first;
         ROUTER_POINT             last;
         std::vector<int>         layers;
+        std::int64_t             traceHalfWidth = 0;
+        std::size_t              traceCornerCount = 0;
         double                   traceLength = 0.0;
     };
 
@@ -93,7 +97,7 @@ public:
     void RetireSyntheticPad( std::size_t aPad );
 
     bool Connected( std::size_t aFirstPad, std::size_t aSecondPad ) const;
-    /** True when the pad's physical same-net component reaches another copper layer. */
+    /** True when Pin.getConnectedSet(net) reaches another copper layer. */
     bool ConnectedSetTouchesOtherLayer( std::size_t aPad, int aLayer ) const;
     std::vector<std::vector<std::size_t>> ConnectedPadGroups( int aNetCode ) const;
     int CountMissing( const ROUTING_NET& aNet ) const;

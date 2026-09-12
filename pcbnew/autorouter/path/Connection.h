@@ -57,7 +57,13 @@ public:
     std::size_t         ItemCount() const { return m_itemCount; }
     const std::vector<std::uint64_t>& Items() const { return m_items; }
     double              TraceLength() const { return m_traceLength; }
-    double              Detour() const;
+    /**
+     * Freerouting's DETOUR_ADD is 100 coordinates in the source board's
+     * coordinate space. Native items remain in KiCad IU, so callers which
+     * compare route costs with the source must supply the native-IU scale of
+     * one source coordinate.
+     */
+    double              Detour( double aCoordinateScale = 1.0 ) const;
 
 private:
     int          m_netCode = 0;

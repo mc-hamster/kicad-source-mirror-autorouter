@@ -200,7 +200,7 @@ std::optional<CONNECTION> CONNECTION::Get( const ROUTING_BOARD& aBoard,
 }
 
 
-double CONNECTION::Detour() const
+double CONNECTION::Detour( double aCoordinateScale ) const
 {
     if( !m_hasStartPoint || !m_hasEndPoint )
         return static_cast<double>( std::numeric_limits<int>::max() );
@@ -208,8 +208,12 @@ double CONNECTION::Detour() const
     if( m_itemCount == 0 )
         return 0.0;
 
-    constexpr double detourAdd = 100.0;
+    constexpr double sourceDetourAdd = 100.0;
     constexpr double detourItemCost = 0.1;
+    const double coordinateScale =
+            std::isfinite( aCoordinateScale ) && aCoordinateScale > 0
+                    ? aCoordinateScale : 1.0;
+    const double detourAdd = sourceDetourAdd * coordinateScale;
     const double minimum = distance( m_startPoint, m_endPoint );
     return ( m_traceLength + detourAdd ) / ( minimum + detourAdd )
            + detourItemCost * static_cast<double>( m_itemCount - 1 );

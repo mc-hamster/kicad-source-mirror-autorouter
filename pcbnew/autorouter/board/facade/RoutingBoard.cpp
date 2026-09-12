@@ -1656,19 +1656,24 @@ bool ROUTING_BOARD::Connected( std::size_t first, std::size_t second ) const
 
 bool ROUTING_BOARD::ConnectedSetTouchesOtherLayer( std::size_t pad, int layer ) const
 {
-    const auto roots = m_impl->padRoots( pad );
-    if( roots.empty() )
+    const auto padItem = m_impl->pads.find( pad );
+    if( padItem == m_impl->pads.end() )
         return false;
 
-    m_impl->updateComponents();
+    // RoutingBoard.fanout() uses Pin.getConnectedSet(), whose recursion follows
+    // source normal contacts.  The broader KiCad physical-overlap component is
+    // deliberately not equivalent: a thermal spoke can overlap a pin's copper
+    // while the ConductionArea excludes its centre, so Freerouting does not
+    // treat that area (or a through-hole pad elsewhere on it) as the pin's
+    // connected set.  Using padRoots() here skipped legitimate GND fanout work.
+    const ITEM_ID_SET connected = NormalConnectedSet( padItem->second );
     if( autorouterDebugEnabled() )
     {
         std::ostringstream description;
         description << "CONNECTED_SET pad=" << pad << " source_layer=" << layer;
-        for( const auto& [id, item] : m_impl->items )
+        for( ITEM_ID id : connected )
         {
-            if( !roots.contains( m_impl->components.at( id ) ) )
-                continue;
+            const auto& item = m_impl->items.at( id );
             description << " {id=" << id << ",pad=" << item.pad
                         << ",area=" << item.conductionArea << ",layers=";
             for( const auto& shape : item.shapes )
@@ -1681,17 +1686,15 @@ bool ROUTING_BOARD::ConnectedSetTouchesOtherLayer( std::size_t pad, int layer ) 
         autorouterDebugLog( description.str() );
     }
     return std::any_of(
-            m_impl->items.begin(), m_impl->items.end(),
-            [&]( const auto& aEntry )
+            connected.begin(), connected.end(),
+            [&]( ITEM_ID id )
             {
-                const auto& [id, item] = aEntry;
-                if( !roots.contains( m_impl->components.at( id ) ) )
-                    return false;
+                const auto& item = m_impl->items.at( id );
 
                 const auto otherLayer = std::find_if(
-                        item.shapes.begin(), item.shapes.end(),
-                        [&]( const auto& aShape ) { return aShape.layer != layer; } );
-                if( otherLayer == item.shapes.end() )
+                        item.normal.layers.begin(), item.normal.layers.end(),
+                        [&]( int aItemLayer ) { return aItemLayer != layer; } );
+                if( otherLayer == item.normal.layers.end() )
                     return false;
 
                 if( autorouterDebugEnabled() )
@@ -1700,7 +1703,7 @@ bool ROUTING_BOARD::ConnectedSetTouchesOtherLayer( std::size_t pad, int layer ) 
                             "CONNECTED_SET_OTHER_LAYER pad=" + std::to_string( pad )
                             + " source_layer=" + std::to_string( layer )
                             + " item=" + std::to_string( id )
-                            + " item_layer=" + std::to_string( otherLayer->layer )
+                            + " item_layer=" + std::to_string( *otherLayer )
                             + " item_pad=" + std::to_string( item.pad )
                             + " conduction_area=" + std::to_string( item.conductionArea )
                             + " dynamic=" + std::to_string( item.dynamic ) );
@@ -1738,7 +1741,11 @@ int ROUTING_BOARD::CountMissing( const ROUTING_NET& net ) const
 
 std::vector<ROUTING_TERMINAL> ROUTING_BOARD::Terminals( std::size_t pad ) const
 {
-    const auto roots = m_impl->padRoots( pad );
+    const auto padItem = m_impl->pads.find( pad );
+    if( padItem == m_impl->pads.end() )
+        return {};
+
+    const ITEM_ID_SET connected = NormalConnectedSet( padItem->second );
     std::vector<ROUTING_TERMINAL> result;
     // Item.getConnectedSet() returns a TreeSet in descending insertion-id
     // order.  Terminal seeding is observable when two doors have equal cost,
@@ -1747,7 +1754,7 @@ std::vector<ROUTING_TERMINAL> ROUTING_BOARD::Terminals( std::size_t pad ) const
          ++itemEntry )
     {
         const auto& [id, item] = *itemEntry;
-        if( !roots.contains( m_impl->components.at( id ) ) )
+        if( !connected.contains( id ) )
             continue;
         for( std::size_t shapeIndex = 0; shapeIndex < item.terminals.size(); ++shapeIndex )
         {
@@ -1765,12 +1772,12 @@ std::vector<ROUTING_TERMINAL> ROUTING_BOARD::Terminals( std::size_t pad ) const
 std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
         std::size_t pad, int net ) const
 {
-    const auto sourceRoots = m_impl->padRoots( pad );
     std::vector<TARGET_ITEM> result;
-    if( sourceRoots.empty() || net <= 0 )
+    const auto padItem = m_impl->pads.find( pad );
+    if( padItem == m_impl->pads.end() || net <= 0 )
         return result;
 
-    m_impl->updateComponents();
+    const ITEM_ID_SET sourceConnected = NormalConnectedSet( padItem->second );
 
     // A maze target that happens to be a trace or via still has to identify
     // the real pad component it will join.  Use the lowest pad index as the
@@ -1778,10 +1785,13 @@ std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
     std::map<ITEM_ID, std::size_t> representativePad;
     for( const auto& [padIndex, itemId] : m_impl->pads )
     {
-        const ITEM_ID root = m_impl->components.at( itemId );
-        auto [entry, inserted] = representativePad.emplace( root, padIndex );
-        if( !inserted )
-            entry->second = std::min( entry->second, padIndex );
+        for( ITEM_ID connectedId : NormalConnectedSet( itemId ) )
+        {
+            auto [entry, inserted] = representativePad.emplace(
+                    connectedId, padIndex );
+            if( !inserted )
+                entry->second = std::min( entry->second, padIndex );
+        }
     }
 
     // Item.compareTo() orders the reference TreeSet by descending insertion
@@ -1793,8 +1803,7 @@ std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
         if( item.net != net )
             continue;
 
-        const ITEM_ID root = m_impl->components.at( id );
-        if( sourceRoots.contains( root ) )
+        if( sourceConnected.contains( id ) )
             continue;
 
         TARGET_ITEM target;
@@ -1815,7 +1824,7 @@ std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
         }
 
         target.terminals = item.terminals;
-        const auto representative = representativePad.find( root );
+        const auto representative = representativePad.find( id );
         for( std::size_t shapeIndex = 0; shapeIndex < target.terminals.size(); ++shapeIndex )
         {
             ROUTING_TERMINAL& terminal = target.terminals[shapeIndex];
@@ -1959,6 +1968,7 @@ std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id )
     result.id = item.id;
     result.netCode = item.net;
     result.padIndex = item.pad;
+    result.pin = item.pad != NO_PAD;
     result.routable = item.routable;
     result.fixedState = item.fixedState;
     result.first = item.normal.first;
@@ -1968,6 +1978,9 @@ std::optional<ROUTING_BOARD::ITEM_INFO> ROUTING_BOARD::GetItemInfo( ITEM_ID id )
     {
     case NORMAL_CONTACT_ITEM::KIND::TRACE:
         result.kind = ITEM_KIND::TRACE;
+        result.traceHalfWidth = item.trace
+                ? std::max<std::int64_t>( 0, item.trace->radius ) : 0;
+        result.traceCornerCount = item.traceCorners.size();
         for( std::size_t i = 1; i < item.traceCorners.size(); ++i )
         {
             const long double dx = static_cast<long double>( item.traceCorners[i].x )

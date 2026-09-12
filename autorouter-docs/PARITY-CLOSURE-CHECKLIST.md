@@ -12,6 +12,43 @@ The development source and release baseline are different revisions; match
 algorithm decisions against the former and measure release quality against the
 latter. Never modify the protected reference checkout or build inside it.
 
+## Latest decision-stream milestone — exact BJT costs and source item sets
+
+The stripped BJT fixture now matches the pinned development reference for all
+**1,960 normalized room-frontier assignments**, including strict parent
+context, transformed geometry and exact costs (zero source-unit tolerance).
+Both engines route all 16 connections with zero new KiCad DRC reports, zero
+vias and 152.435 mm of track.  Two translation errors were removed to reach
+that gate: `Connection.DETOUR_ADD` and integer narrowing now occur in source
+coordinate space, and fanout-via rip-up protection now inspects the exact two
+trace endpoints and their normal contacts instead of trusting a route-level
+fanout flag.
+
+Fanout scheduling now also uses `Item.getConnectedSet()`-equivalent normal
+contacts for its start terminals, other-layer skip and unconnected target-item
+set.  The prior native code used KiCad's broader physical-copper component for
+those source APIs.  On a thermal-connected plane this could incorrectly join a
+pin through copper that does not contain the pin centre, skip the pin's fanout,
+and remove the finite `ConductionArea` from the destination heuristic.  A
+dedicated thermal-void regression preserves the intentional distinction:
+physical connectivity remains the final KiCad acceptance truth, while source
+normal contacts drive Freerouting's routing decisions.
+
+On the 555 fixture these corrections move the first strict normalized mismatch
+from assignment 0 to assignment 34.  That mismatch is now classified as an
+**input/rule adaptation difference**, not an unexamined core decision: KiCad
+applies the FID3 pad's explicit 0.75 mm local clearance, while the generated DSN
+does not serialize that local clearance and the pinned reference therefore uses
+the 0.20 mm default.  Native room bounds are consequently 0.55 mm farther from
+the fiducial.  The native result is 12/12 complete with zero new KiCad DRC
+reports; the reference output has ten new KiCad DRC reports.  The native port
+must not discard the host rule merely to make this stream byte-identical.
+
+This checkpoint passes **278/278 native autorouter cases** and all **28 Python
+parity-harness tests**.  These are objective gates, not a new global completion
+percentage; the unchecked broad-corpus, optimizer, resource and GUI gates below
+remain open.
+
 ## Latest core milestone — exact refill islands and in-place via optimization
 
 KiCad filled-zone islands are now retained as separate finite target areas

@@ -33,6 +33,7 @@ namespace KICAD_AUTOROUTER
 {
 
 class CONNECTION;
+class ROUTING_BOARD;
 
 class MAZE_RIPUP_RESOLVER
 {
@@ -60,10 +61,18 @@ public:
                     std::int64_t aFallbackTraceHalfWidth, const CONTEXT& aContext,
                     double aRandomNumber = 0.0,
                     const std::vector<std::int64_t>& aAdditionalViaTraceHalfWidths = {},
-                    const CONNECTION* aTopologyConnection = nullptr ) const;
+                    const CONNECTION* aTopologyConnection = nullptr,
+                    double aCoordinateScale = 1.0,
+                    const ROUTING_BOARD* aBoard = nullptr,
+                    std::uint64_t aObstacleItem = 0 ) const;
 
     static double FanoutViaRipupCostFactor( std::int64_t aTraceHalfWidth,
                                             double aTraceLength );
+
+    /** Direct translation of calcFanoutViaRipupCostFactor(Trace). */
+    static double FanoutViaRipupCostFactor( const ROUTING_BOARD& aBoard,
+                                            std::uint64_t aTraceItem,
+                                            std::int64_t aFallbackTraceHalfWidth = 0 );
 };
 
 } // namespace KICAD_AUTOROUTER
