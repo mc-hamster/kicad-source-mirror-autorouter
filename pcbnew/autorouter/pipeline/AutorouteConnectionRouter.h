@@ -27,11 +27,26 @@ namespace KICAD_AUTOROUTER
 {
 
 class ROUTING_OCCUPANCY;
+class ROUTING_BOARD;
 
 /** Freerouting equivalent: autoroute/pipeline/AutorouteConnectionRouter. */
 class AUTOROUTE_CONNECTION_ROUTER
 {
 public:
+    struct TERMINAL_SETS
+    {
+        std::vector<ROUTING_TERMINAL> starts;
+        std::vector<ROUTING_TERMINAL> destinations;
+    };
+
+    /** Translate Item.getConnectedSet()/getUnconnectedSet() into maze
+     * terminals while preserving source item order and route direction.
+     */
+    static TERMINAL_SETS TerminalSetsForItem( const ROUTING_BOARD& aBoard,
+                                               std::size_t aItemPad,
+                                               int aNetCode,
+                                               bool aContainsPlane );
+
     static std::optional<ROUTING_CONNECTION>
     Route( const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,
            const ROUTING_PAD& aSource, const ROUTING_PAD& aTarget, int aRetry,

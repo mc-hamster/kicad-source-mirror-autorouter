@@ -2,6 +2,7 @@
  * Lines remain integer; corners are exact rationals, including after cutout.
  */
 #pragma once
+#include "FloatLine.h"
 #include "Line.h"
 #include <cmath>
 #include <memory>
@@ -21,6 +22,10 @@ public:
     static POLYLINE FromPoints( const std::vector<ROUTER_POINT>& aPoints );
     bool Empty() const { return lines.size() < 3; }
     POINT Corner( std::size_t i ) const { return lines.at( i ).Intersection( lines.at( i + 1 ) ).value(); }
+    /** Freerouting Polyline.cornerApprox: intersect the two integer support
+     * lines in double precision instead of converting the exact rational
+     * corner.  The distinction is observable in outward floor/ceil bounds. */
+    FLOAT_POINT CornerApprox( std::size_t aIndex ) const;
     POINT FirstCorner() const { return Corner( 0 ); }
     POINT LastCorner() const { return Corner( lines.size() - 2 ); }
     std::size_t CornerCount() const { return lines.empty() ? 0 : lines.size() - 1; }

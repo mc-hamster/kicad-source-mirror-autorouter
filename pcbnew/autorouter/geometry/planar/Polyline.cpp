@@ -89,6 +89,32 @@ POLYLINE POLYLINE::FromPoints( const std::vector<ROUTER_POINT>& points )
     return POLYLINE( std::move( result ) );
 }
 
+
+FLOAT_POINT POLYLINE::CornerApprox( std::size_t aIndex ) const
+{
+    if( lines.size() < 2 )
+    {
+        return { static_cast<double>( std::numeric_limits<std::int32_t>::max() ),
+                 static_cast<double>( std::numeric_limits<std::int32_t>::max() ) };
+    }
+
+    const std::size_t index = std::min( aIndex, lines.size() - 2 );
+    const auto asFloatLine = []( const LINE& aLine )
+    {
+        return FLOAT_LINE{ { static_cast<double>( aLine.a.x ),
+                             static_cast<double>( aLine.a.y ) },
+                           { static_cast<double>( aLine.b.x ),
+                             static_cast<double>( aLine.b.y ) } };
+    };
+    const auto intersection = asFloatLine( lines[index] ).Intersection(
+            asFloatLine( lines[index + 1] ) );
+    if( intersection )
+        return *intersection;
+    return { static_cast<double>( std::numeric_limits<std::int32_t>::max() ),
+             static_cast<double>( std::numeric_limits<std::int32_t>::max() ) };
+}
+
+
 POLYLINE POLYLINE::Reverse() const
 {
     std::vector<LINE> result;
@@ -313,7 +339,7 @@ double POLYLINE::LengthApprox( int aRequestedFromCorner,
                              static_cast<int>( lines.size() ) - 2 );
     double result = 0;
     for( int index = from; index < to; ++index )
-        result += std::sqrt( Corner( index + 1 ).DistanceSquared( Corner( index ) ) );
+        result += CornerApprox( index + 1 ).Distance( CornerApprox( index ) );
     return result;
 }
 
@@ -336,23 +362,22 @@ std::optional<ROUTER_BOX> POLYLINE::BoundingBox(
     const int to = std::min( requestedTo, static_cast<int>( lines.size() ) - 2 );
     if( from > to )
         return {};
-    std::optional<ROUTER_BOX> result;
+    double left = std::numeric_limits<std::int32_t>::max();
+    double bottom = left;
+    double right = std::numeric_limits<std::int32_t>::min();
+    double top = right;
     for( int index = from; index <= to; ++index )
     {
-        const auto cornerBounds = Corner( index ).SurroundingBox();
-        if( !cornerBounds )
-            return {};
-        if( !result )
-            result = cornerBounds;
-        else
-        {
-            result->minX = std::min( result->minX, cornerBounds->minX );
-            result->minY = std::min( result->minY, cornerBounds->minY );
-            result->maxX = std::max( result->maxX, cornerBounds->maxX );
-            result->maxY = std::max( result->maxY, cornerBounds->maxY );
-        }
+        const FLOAT_POINT corner = CornerApprox( index );
+        left = std::min( left, corner.x );
+        bottom = std::min( bottom, corner.y );
+        right = std::max( right, corner.x );
+        top = std::max( top, corner.y );
     }
-    return result;
+    return ROUTER_BOX{ static_cast<std::int64_t>( std::floor( left ) ),
+                       static_cast<std::int64_t>( std::floor( bottom ) ),
+                       static_cast<std::int64_t>( std::ceil( right ) ),
+                       static_cast<std::int64_t>( std::ceil( top ) ) };
 }
 
 
@@ -377,8 +402,9 @@ std::optional<INT_OCTAGON> POLYLINE::BoundingOctagon(
     double lowerLeft = left, upperRight = right;
     for( int index = from; index <= to; ++index )
     {
-        const double x = Corner( index ).X();
-        const double y = Corner( index ).Y();
+        const FLOAT_POINT corner = CornerApprox( index );
+        const double x = corner.x;
+        const double y = corner.y;
         left = std::min( left, x );
         bottom = std::min( bottom, y );
         right = std::max( right, x );
@@ -408,8 +434,9 @@ std::optional<std::pair<double, double>> POLYLINE::NearestPointApprox(
     std::pair<double, double> nearest{};
     for( std::size_t index = 0; index < CornerCount(); ++index )
     {
-        const double x = Corner( index ).X();
-        const double y = Corner( index ).Y();
+        const FLOAT_POINT corner = CornerApprox( index );
+        const double x = corner.x;
+        const double y = corner.y;
         const double distance = std::hypot( x - aX, y - aY );
         if( distance < minimum )
         {
@@ -425,10 +452,12 @@ std::optional<std::pair<double, double>> POLYLINE::NearestPointApprox(
                                             projection.second - aY );
         if( distance >= minimum )
             continue;
-        const double firstX = Corner( index - 1 ).X();
-        const double firstY = Corner( index - 1 ).Y();
-        const double secondX = Corner( index ).X();
-        const double secondY = Corner( index ).Y();
+        const FLOAT_POINT first = CornerApprox( index - 1 );
+        const FLOAT_POINT second = CornerApprox( index );
+        const double firstX = first.x;
+        const double firstY = first.y;
+        const double secondX = second.x;
+        const double secondY = second.y;
         const double segmentLength = std::hypot( secondX - firstX,
                                                  secondY - firstY );
         if( std::hypot( projection.first - firstX, projection.second - firstY )
@@ -533,7 +562,9 @@ std::vector<SIMPLEX> POLYLINE::OffsetShapes(
         std::vector<LINE> dogEarLines;
         LINE currentLine = offsetLines[1];
         LINE checkLine = nextTurn > 0 ? offsetLines[2] : offsetLines[0];
-        const auto checkCorner = approximate( Corner( index ) );
+        const FLOAT_POINT checkCornerPoint = CornerApprox( index );
+        const auto checkCorner = std::pair<double, double>{
+                checkCornerPoint.x, checkCornerPoint.y };
         const double checkDistance = 2.0 * aHalfWidth * aHalfWidth;
         LINE temporaryCurrentDirection = nextDirection;
         bool directionChanged = false;
@@ -541,7 +572,8 @@ std::vector<SIMPLEX> POLYLINE::OffsetShapes(
         for( int nextIndex = index + 2;
              nextIndex < static_cast<int>( lines.size() ) - 1; ++nextIndex )
         {
-            if( distanceSquared( approximate( Corner( nextIndex - 1 ) ), checkCorner )
+            const FLOAT_POINT nextCorner = CornerApprox( nextIndex - 1 );
+            if( distanceSquared( { nextCorner.x, nextCorner.y }, checkCorner )
                 > checkDistance )
             {
                 break;
@@ -570,7 +602,9 @@ std::vector<SIMPLEX> POLYLINE::OffsetShapes(
             }
         }
 
-        const auto previousCheckCorner = approximate( Corner( index - 1 ) );
+        const FLOAT_POINT previousCheckCornerPoint = CornerApprox( index - 1 );
+        const auto previousCheckCorner = std::pair<double, double>{
+                previousCheckCornerPoint.x, previousCheckCornerPoint.y };
         checkLine = previousTurn > 0 ? offsetLines[2] : offsetLines[0];
         currentLine = offsetLines[3];
         temporaryCurrentDirection = previousDirection;
@@ -578,7 +612,8 @@ std::vector<SIMPLEX> POLYLINE::OffsetShapes(
         cornerToCheck.reset();
         for( int previousIndex = index - 2; previousIndex >= 1; --previousIndex )
         {
-            if( distanceSquared( approximate( Corner( previousIndex ) ),
+            const FLOAT_POINT previousCorner = CornerApprox( previousIndex );
+            if( distanceSquared( { previousCorner.x, previousCorner.y },
                                  previousCheckCorner ) > checkDistance )
             {
                 break;

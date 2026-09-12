@@ -1079,81 +1079,18 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
 
     std::vector<ROUTING_CONNECTION> newConnections;
     std::size_t                     newConnectionCount = 0;
-    bool                            newConnectionsFlushed = false;
     const auto flushNewConnections = [&]()
     {
-        if( newConnectionsFlushed )
+        if( newConnections.empty() )
             return;
 
-        newConnectionCount = newConnections.size();
         aConnections.insert( aConnections.end(),
                              std::make_move_iterator( newConnections.begin() ),
                              std::make_move_iterator( newConnections.end() ) );
-        newConnectionsFlushed = true;
+        newConnections.clear();
     };
     if( aNet.connections.empty() )
         return true;
-
-    std::map<std::size_t, std::size_t> parent;
-    for( std::size_t index : aNet.padIndices )
-        parent.emplace( index, index );
-    std::set<std::size_t> activePads;
-
-    // Keep the successful part of a multi-pad net across negotiated-congestion
-    // passes.  Freerouting retries the unresolved connection items while the
-    // connected set and its already legal copper remain in place.  Throwing
-    // away the whole net here made a large net (notably the Arduino board's
-    // ground net) oscillate: every retry paid to rediscover hundreds of good
-    // paths before it could make progress on the one blocked edge.
-
-    auto findRoot = [&]( std::size_t aIndex )
-    {
-        std::size_t root = aIndex;
-        while( parent[root] != root )
-            root = parent[root];
-
-        while( parent[aIndex] != aIndex )
-        {
-            const std::size_t next = parent[aIndex];
-            parent[aIndex] = root;
-            aIndex = next;
-        }
-
-        return root;
-    };
-
-    auto unite = [&]( std::size_t aLeft, std::size_t aRight )
-    {
-        const std::size_t leftRoot = findRoot( aLeft );
-        const std::size_t rightRoot = findRoot( aRight );
-        if( leftRoot != rightRoot )
-            parent[rightRoot] = leftRoot;
-    };
-
-    // The disjoint-set is only a routing-order view of actual copper contacts.
-    // Rebuild after every insertion/rip-up; endpoint labels are not connectivity.
-    auto refreshContacts = [&]()
-    {
-        parent.clear();
-        activePads.clear();
-        for( std::size_t index : aNet.padIndices )
-            parent[index] = index;
-        for( const auto& [from, to] : aNet.connections )
-        {
-            parent.try_emplace( from, from );
-            parent.try_emplace( to, to );
-        }
-        for( const auto& group : aOccupancy.Board()->ConnectedPadGroups( aNet.netCode ) )
-        {
-            for( std::size_t index : group )
-            {
-                parent.try_emplace( index, index );
-                unite( group.front(), index );
-                activePads.insert( index );
-            }
-        }
-    };
-    refreshContacts();
 
     // The source router consumes its natural board-item order. The KiCad
     // adapter's ratsnest edge order is the stable native representation of
@@ -1166,8 +1103,22 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
     // item at a time. Model that item by its real pad representative and let
     // the worker contact graph supply its complete connected/unconnected
     // sets. A ratsnest edge is only a fallback when no item was requested
-    // (the isolated fanout stage and data-only callers).
-    if( aPreferredPad != std::numeric_limits<std::size_t>::max() )
+    // (the isolated fanout stage and data-only callers).  Post-refill repair
+    // is the deliberate exception: its exact synthetic endpoints identify
+    // two particular KiCad zone islands.  Replacing that edge with the
+    // preferred real pad's broad plane target set can route copper that never
+    // joins those islands and then report the exact ratsnest edge missing.
+    const bool exactRepairTask = std::any_of(
+            pendingConnections.begin(), pendingConnections.end(),
+            [&]( const auto& aConnection )
+            {
+                return ( aConnection.first < aBoard.pads.size()
+                         && aBoard.pads[aConnection.first].isExactTarget )
+                       || ( aConnection.second < aBoard.pads.size()
+                            && aBoard.pads[aConnection.second].isExactTarget );
+            } );
+    if( aPreferredPad != std::numeric_limits<std::size_t>::max()
+        && !exactRepairTask )
     {
         if( aPreferredPad >= aBoard.pads.size()
             || aBoard.pads[aPreferredPad].netCode != aNet.netCode )
@@ -1241,25 +1192,12 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                 aBoard.pads[targetIndex].isFanoutTarget
                 && aBoard.pads[targetIndex].fanoutSourcePadIndex == sourceIndex;
 
-        // Select the connected component independently of ratsnest ordering.
-        // For ordinary nets it becomes the destination set below, matching
-        // upstream's unconnected-set -> connected-set search direction.
-        if( !targetIsPlane )
-        {
-            parent.try_emplace( sourceIndex, sourceIndex );
-            parent.try_emplace( targetIndex, targetIndex );
-
-            const bool sourceConnected = activePads.contains( sourceIndex );
-            const bool targetConnected = activePads.contains( targetIndex );
-
-            if( !sourceConnected && targetConnected )
-                std::swap( routeSourceIndex, routeTargetIndex );
-            else if( sourceConnected && targetConnected
-                     && findRoot( sourceIndex ) == findRoot( targetIndex ) )
-            {
-                continue;
-            }
-        }
+        // The scheduled item remains the anchor even when another component
+        // already contains routed copper.  AutorouteConnectionRouter derives
+        // both sets from that exact Item; it never swaps to whichever side of
+        // a ratsnest edge happens to look more connected.  Such a swap reverses
+        // start/destination room construction and changes maze ordering even
+        // though the eventual electrical connection would be equivalent.
 
         ROUTING_PAD source = aBoard.pads[routeSourceIndex];
         if( source.isFanoutTarget && source.fanoutTargetLayer >= 0 )
@@ -1380,27 +1318,17 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
                 // latter includes the ConductionArea itself, whose terminal
                 // carries the exact finite filled region rather than one of
                 // the adapter's synthetic sampling coordinates.
-                starts = aOccupancy.Board()->Terminals( routeSourceIndex );
-                const auto unconnected = aOccupancy.Board()->UnconnectedTargetItems(
-                        routeSourceIndex, aNet.netCode );
-                for( const ROUTING_BOARD::TARGET_ITEM& item : unconnected )
-                {
-                    destinations.insert( destinations.end(), item.terminals.begin(),
-                                         item.terminals.end() );
-                }
+                auto sets = AUTOROUTE_CONNECTION_ROUTER::TerminalSetsForItem(
+                        *aOccupancy.Board(), routeSourceIndex, aNet.netCode, true );
+                starts = std::move( sets.starts );
+                destinations = std::move( sets.destinations );
             }
             else if( aNet.planeTargetIndices.empty() )
             {
-                const std::size_t connectedRoot = findRoot( routeSourceIndex );
-                destinations = aOccupancy.Board()->Terminals( routeSourceIndex );
-                std::set<std::size_t> visited{ connectedRoot };
-                for( std::size_t index : aNet.padIndices )
-                {
-                    if( index >= aBoard.pads.size() || !visited.insert( findRoot( index ) ).second )
-                        continue;
-                    auto terminals = aOccupancy.Board()->Terminals( index );
-                    starts.insert( starts.end(), terminals.begin(), terminals.end() );
-                }
+                auto sets = AUTOROUTE_CONNECTION_ROUTER::TerminalSetsForItem(
+                        *aOccupancy.Board(), routeSourceIndex, aNet.netCode, false );
+                starts = std::move( sets.starts );
+                destinations = std::move( sets.destinations );
             }
 
             // An empty explicit set selects the ordinary pair/synthetic
@@ -1409,6 +1337,30 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             if( destinationAttempts.empty()
                 && ( !requestedFanoutTask || !destinations.empty() ) )
                 destinationAttempts.push_back( destinations );
+
+            {
+                const auto describeTerminals = []( const auto& aTerminals )
+                {
+                    std::ostringstream result;
+                    bool first = true;
+                    for( const ROUTING_TERMINAL& terminal : aTerminals )
+                    {
+                        if( !first )
+                            result << ';';
+                        first = false;
+                        result << terminal.padIndex << '@'
+                               << terminal.pad.position.x << ','
+                               << terminal.pad.position.y;
+                    }
+                    return result.str();
+                };
+                autorouterDecisionLog(
+                        "ROUTE_TERMINAL_SETS",
+                        { { "route_source", std::to_string( routeSourceIndex ) },
+                          { "route_target", std::to_string( routeTargetIndex ) },
+                          { "starts", describeTerminals( starts ) },
+                          { "destinations", describeTerminals( destinations ) } } );
+            }
 
             for( std::size_t destinationAttempt = 0;
                  destinationAttempt < destinationAttempts.size() && !connection;
@@ -1743,12 +1695,44 @@ bool BATCH_AUTOROUTER::routeNet( const BOARD_SNAPSHOT& aBoard,
             ++aRipups;
         }
 
-        newConnections.push_back( std::move( *connection ) );
+        // AutoroutePassRunner starts changed-area marking before every item,
+        // and AutorouteConnectionRouter runs optChangedArea after a successful
+        // insertion.  Capture every part of this atomic edit before publishing
+        // the new route so the next queued item sees the same tightened copper
+        // as Freerouting rather than the raw locator polyline.
+        CHANGED_AREA changedArea(
+                TRACE_TIGHTENER::LayerCount( aBoard, aSettings ) );
+        TRACE_TIGHTENER::MarkConnection(
+                changedArea, *connection, aBoard, aSettings );
+        for( const ROUTING_CONNECTION& conflict : conflicts )
+            TRACE_TIGHTENER::MarkConnection(
+                    changedArea, conflict, aBoard, aSettings );
+        for( const auto& shove : inserted.shoved )
+        {
+            TRACE_TIGHTENER::MarkConnection(
+                    changedArea, shove.original, aBoard, aSettings );
+            TRACE_TIGHTENER::MarkConnection(
+                    changedArea, shove.replacement, aBoard, aSettings );
+            for( const ROUTING_CONNECTION_REPLACEMENT& contact : shove.materializedContacts )
+            {
+                TRACE_TIGHTENER::MarkConnection(
+                        changedArea, contact.original, aBoard, aSettings );
+                TRACE_TIGHTENER::MarkConnection(
+                        changedArea, contact.replacement, aBoard, aSettings );
+            }
+            for( const ROUTING_CONNECTION& bridge : shove.bridges )
+                TRACE_TIGHTENER::MarkConnection(
+                        changedArea, bridge, aBoard, aSettings );
+        }
 
-        refreshContacts();
+        newConnections.push_back( std::move( *connection ) );
+        ++newConnectionCount;
+        flushNewConnections();
+        TRACE_TIGHTENER( aBoard, aSettings, aOccupancy )
+                .OptChangedArea( changedArea, aConnections, 0, aCancel, 1000 );
 
         if( aMaximumNewConnections > 0
-            && static_cast<int>( newConnections.size() ) >= aMaximumNewConnections )
+            && static_cast<int>( newConnectionCount ) >= aMaximumNewConnections )
         {
             break;
         }
@@ -2381,9 +2365,20 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 // NO_UNCONNECTED_NETS when no real item of the net remains
                 // outside that set.  Synthetic landing pads are a native
                 // planning detail and must not make either condition false.
-                if( sourceLayer < 0
-                    || occupancy.Board()->ConnectedSetTouchesOtherLayer( pin, sourceLayer ) )
+                const bool touchesOtherLayer = sourceLayer >= 0
+                        && occupancy.Board()->ConnectedSetTouchesOtherLayer( pin, sourceLayer );
+                if( sourceLayer < 0 || touchesOtherLayer )
                 {
+                    if( autorouterDebugEnabled() )
+                    {
+                        autorouterDebugLog(
+                                "FANOUT_PIN_SKIP component="
+                                + std::to_string( taskPad.componentId ) + " pin="
+                                + std::to_string( taskPad.pinIndex ) + " net="
+                                + std::to_string( taskNet.netCode )
+                                + ( sourceLayer < 0 ? " reason=no-source-layer"
+                                                  : " reason=connected-set-other-layer" ) );
+                    }
                     continue;
                 }
 
@@ -2393,6 +2388,15 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 // check can skip a legal source fanout or retain false work.
                 if( occupancy.Board()->UnconnectedTargetItems( pin, taskNet.netCode ).empty() )
                 {
+                    if( autorouterDebugEnabled() )
+                    {
+                        autorouterDebugLog(
+                                "FANOUT_PIN_SKIP component="
+                                + std::to_string( taskPad.componentId ) + " pin="
+                                + std::to_string( taskPad.pinIndex ) + " net="
+                                + std::to_string( taskNet.netCode )
+                                + " reason=no-unconnected-items" );
+                    }
                     continue;
                 }
 
@@ -2709,6 +2713,18 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
                 DESIGN_RULES_CHECKER::CountViolations( board, aSettings, candidate );
         candidate.complete = candidate.metrics.unroutedConnections == 0
                              && candidate.metrics.drcViolations == 0;
+        if( autorouterDebugEnabled() )
+        {
+            autorouterDebugLog(
+                    "CHECKPOINT routed="
+                    + std::to_string( candidate.metrics.routedConnections ) + "/"
+                    + std::to_string( candidate.metrics.totalConnections )
+                    + " unrouted="
+                    + std::to_string( candidate.metrics.unroutedConnections )
+                    + " drc=" + std::to_string( candidate.metrics.drcViolations )
+                    + " segments=" + std::to_string( candidate.segments.size() )
+                    + " vias=" + std::to_string( candidate.vias.size() ) );
+        }
         return candidate;
     };
 
@@ -2740,7 +2756,21 @@ ROUTING_RESULT BATCH_AUTOROUTER::Run( const BOARD_SNAPSHOT& aBoard,
     {
         const std::optional<ROUTING_RESULT> best = history.Best();
         if( best )
+        {
+            if( autorouterDebugEnabled() )
+            {
+                autorouterDebugLog(
+                        "RESTORE_CHECKPOINT routed="
+                        + std::to_string( best->metrics.routedConnections ) + "/"
+                        + std::to_string( best->metrics.totalConnections )
+                        + " unrouted="
+                        + std::to_string( best->metrics.unroutedConnections )
+                        + " drc=" + std::to_string( best->metrics.drcViolations )
+                        + " segments=" + std::to_string( best->segments.size() )
+                        + " vias=" + std::to_string( best->vias.size() ) );
+            }
             restoreCheckpoint( *best );
+        }
     };
 
     auto refreshFailedNets = [&]()

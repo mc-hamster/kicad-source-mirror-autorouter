@@ -28,20 +28,25 @@ namespace KICAD_AUTOROUTER
 class FREE_SPACE_EXPANSION_ROOM : public EXPANSION_ROOM
 {
 public:
-    FREE_SPACE_EXPANSION_ROOM( int aId, int aLayer, ROUTER_BOX aShape ) :
-            EXPANSION_ROOM( aId, aLayer, aShape, false )
+    FREE_SPACE_EXPANSION_ROOM( int aId, int aLayer, ROUTER_BOX aShape,
+                               std::uint64_t aSearchObjectId = 0 ) :
+            EXPANSION_ROOM( aId, aLayer, aShape, false, aSearchObjectId )
     {
     }
 
     FREE_SPACE_EXPANSION_ROOM( int aId, int aLayer,
-                               PLANAR::INT_OCTAGON aShape ) :
-            EXPANSION_ROOM( aId, aLayer, std::move( aShape ), false )
+                               PLANAR::INT_OCTAGON aShape,
+                               std::uint64_t aSearchObjectId = 0 ) :
+            EXPANSION_ROOM( aId, aLayer, std::move( aShape ), false,
+                            aSearchObjectId )
     {
     }
 
     FREE_SPACE_EXPANSION_ROOM( int aId, int aLayer,
-                               PLANAR::SIMPLEX aShape ) :
-            EXPANSION_ROOM( aId, aLayer, std::move( aShape ), false )
+                               PLANAR::SIMPLEX aShape,
+                               std::uint64_t aSearchObjectId = 0 ) :
+            EXPANSION_ROOM( aId, aLayer, std::move( aShape ), false,
+                            aSearchObjectId )
     {
     }
 };

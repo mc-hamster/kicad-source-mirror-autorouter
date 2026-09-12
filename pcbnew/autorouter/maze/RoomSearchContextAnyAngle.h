@@ -59,7 +59,7 @@ public:
             room->shape = std::make_unique<OBSTACLE_EXPANSION_ROOM>(
                     id, layer, shape, obstacle.group,
                     std::max( obstacle.ripupCost, 1 ), obstacle.shape.shapeIndex,
-                    obstacle.traceInfo );
+                    obstacle.traceInfo, obstacle.netCode );
             room->complete = true;
             ROOM* raw = room.get();
             byId.emplace( id, raw );
@@ -236,8 +236,13 @@ public:
                 if( neighbour.entry.isRoom )
                 {
                     const auto found = byId.find( neighbour.entry.objectId );
-                    if( found != byId.end() )
+                    if( found != byId.end()
+                        && SORTED_ROOM_NEIGHBOURS::InsertDoorOk(
+                                result->shape.get(), found->second->shape.get(),
+                                neighbour.intersection ) )
+                    {
                         door( result, found->second );
+                    }
                 }
             }
             for( const auto& gap : gaps )

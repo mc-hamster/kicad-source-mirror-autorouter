@@ -937,6 +937,35 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                 saveCandidate( { std::move( effective ) } );
             };
 
+            const auto considerViaMove = [&]( ROUTING_CONNECTION aCandidate )
+            {
+                if( aCancel && aCancel() )
+                    return;
+
+                aCandidate.complete = true;
+                aCandidate.netCode = original.netCode;
+                aCandidate.fromPadIndex = original.fromPadIndex;
+                aCandidate.toPadIndex = original.toPadIndex;
+                aCandidate.isPlaneConnection = original.isPlaneConnection;
+                aCandidate.isFanoutConnection = original.isFanoutConnection;
+                aCandidate.sourceBoardItemIds = original.sourceBoardItemIds;
+                promoteChangedAutorouterCopper( aCandidate, original );
+
+                // ViaOptimizer does not feed a newly found path through
+                // InsertFoundConnectionAlgo.  DrillItemMover mutates the
+                // existing Via and its one/two contacting PolylineTraces in
+                // place, after repositionVia has checked both replacement
+                // trace segments.  Candidates() already performs those exact
+                // geometry checks against the post-removal board.  Sending
+                // this value through the found-connection inserter can add a
+                // forced pin-exit dogleg and turn a shorter source mutation
+                // into a longer, behaviorally different route.
+                ROUTING_OCCUPANCY::TRANSACTION candidateTransaction( m_occupancy );
+                m_occupancy.Add( aCandidate );
+                relocateSyntheticEnds( aCandidate );
+                saveCandidate( { std::move( aCandidate ) } );
+            };
+
             // Pull-tight remains useful when the complete maze cannot find a
             // better route inside its bounded work budget.  It is evaluated
             // through the same strict insertion and contact checks as a full
@@ -956,7 +985,7 @@ int BATCH_OPTIMIZER::Optimize( std::vector<ROUTING_CONNECTION>& aConnections,
                                             *m_occupancy.Board(), search,
                                             movableViaEdges, aCancel ) )
             {
-                consider( std::move( viaCandidate ) );
+                considerViaMove( std::move( viaCandidate ) );
             }
 
             // The source reruns BatchAutorouter after deleting the exact item

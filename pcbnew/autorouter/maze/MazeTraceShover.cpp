@@ -15,8 +15,11 @@
 #include <limits>
 
 #include "MazeSearchEngine.h"
+#include "../AutorouterDebug.h"
+#include "../board/optimize/TraceTightener45.h"
 #include "../expansion/ExpansionDoor.h"
 #include "../expansion/ObstacleExpansionRoom.h"
+#include "../path/FoundConnectionLocator45Degree.h"
 
 
 namespace KICAD_AUTOROUTER
@@ -28,6 +31,46 @@ namespace
 FLOAT_POINT asFloat( ROUTER_POINT aPoint )
 {
     return { static_cast<double>( aPoint.x ), static_cast<double>( aPoint.y ) };
+}
+
+
+std::optional<FLOAT_LINE> sourcePolarLineSegment(
+        const PLANAR::SIMPLEX& aShape, FLOAT_POINT aFromPoint )
+{
+    auto polar = aShape.PolarLineSegment( aFromPoint );
+    if( polar )
+    {
+        // Freerouting routes in a y-up coordinate system while KiCad stores
+        // the reflected y-down geometry.  Reflection exchanges the source's
+        // left-most and right-most polar corners.  SIMPLEX intentionally
+        // retains coordinate-local semantics for its geometry oracle, so
+        // reverse only at this routing integration boundary.
+        *polar = polar->Opposite();
+    }
+    return polar;
+}
+
+
+std::optional<FLOAT_LINE> sourceDiagonalCornerSegment(
+        const PLANAR::SIMPLEX& aShape )
+{
+    auto diagonal = aShape.DiagonalCornerSegment();
+    if( diagonal )
+    {
+        // One-dimensional source door shapes order their endpoints by x and
+        // then by y in Freerouting's y-up board coordinates.  Reflection into
+        // KiCad leaves the x ordering unchanged, but reverses the tie-break
+        // for a vertical segment.  Preserve those source endpoint labels
+        // because checkShoveTraceLine associates section zero with diagonal.a
+        // and the final section with diagonal.b.
+        if( diagonal->a.x > diagonal->b.x
+            || ( diagonal->a.x == diagonal->b.x
+                 && diagonal->a.y < diagonal->b.y ) )
+        {
+            *diagonal = diagonal->Opposite();
+        }
+    }
+    return diagonal;
 }
 
 
@@ -78,8 +121,8 @@ std::optional<FLOAT_LINE> oneDimensionalShoveSegment(
     const auto gravity = fromRoom->GetSimplex().CentreOfGravity();
     const FLOAT_POINT fromPoint{ gravity.first, gravity.second };
     const PLANAR::SIMPLEX doorShape = aFromDoor.GetSimplexShape();
-    const auto polar = doorShape.PolarLineSegment( fromPoint );
-    const auto diagonal = doorShape.DiagonalCornerSegment();
+    const auto polar = sourcePolarLineSegment( doorShape, fromPoint );
+    const auto diagonal = sourceDiagonalCornerSegment( doorShape );
     if( !polar || !diagonal )
         return std::nullopt;
 
@@ -113,7 +156,7 @@ bool sectionCanStartShove(
         bool aShoveToTheLeft, double aTraceWidthTolerance )
 {
     const PLANAR::SIMPLEX doorShape = aFromDoor.GetSimplexShape();
-    const auto diagonal = doorShape.DiagonalCornerSegment();
+    const auto diagonal = sourceDiagonalCornerSegment( doorShape );
     if( !diagonal )
         return false;
 
@@ -130,7 +173,8 @@ bool sectionCanStartShove(
         return false;
 
     const auto gravity = fromRoom->GetSimplex().CentreOfGravity();
-    const auto polar = doorShape.PolarLineSegment( { gravity.first, gravity.second } );
+    const auto polar = sourcePolarLineSegment(
+            doorShape, { gravity.first, gravity.second } );
     if( !polar )
         return false;
 
@@ -141,8 +185,37 @@ bool sectionCanStartShove(
     if( sections.empty() || aFromSection >= sections.size() )
         return false;
 
-    const double checkDistance = aCompensatedTraceHalfWidth + 5;
+    // Java's literal five is measured in Freerouting board coordinates.  The
+    // native geometry is stored in KiCad IU, so scale the tolerance at this
+    // adapter boundary just like TRACE_WIDTH_TOLERANCE.
+    const double checkDistance = aCompensatedTraceHalfWidth
+                                 + 5 * FREEROUTING_COORDINATE_UNIT_IU;
     const double checkDistanceSquared = checkDistance * checkDistance;
+    autorouterDecisionLog(
+            "TRACE_SHOVE_SECTION_CHECK",
+            { { "side", aShoveToTheLeft ? "LEFT" : "RIGHT" },
+              { "swapped", swapped ? "true" : "false" },
+              { "section", std::to_string( aFromSection ) },
+              { "section_count", std::to_string( sections.size() ) },
+              { "diagonal",
+                std::to_string( diagonal->a.x ) + ','
+                        + std::to_string( diagonal->a.y ) + ','
+                        + std::to_string( diagonal->b.x ) + ','
+                        + std::to_string( diagonal->b.y ) },
+              { "polar",
+                std::to_string( polar->a.x ) + ','
+                        + std::to_string( polar->a.y ) + ','
+                        + std::to_string( polar->b.x ) + ','
+                        + std::to_string( polar->b.y ) },
+              { "entry_to_a",
+                std::to_string( std::min(
+                        aShapeEntry.a.DistanceSquared( diagonal->a ),
+                        aShapeEntry.b.DistanceSquared( diagonal->a ) ) ) },
+              { "entry_to_b",
+                std::to_string( std::min(
+                        aShapeEntry.a.DistanceSquared( diagonal->b ),
+                        aShapeEntry.b.DistanceSquared( diagonal->b ) ) ) },
+              { "limit", std::to_string( checkDistanceSquared ) } } );
     if( ( aShoveToTheLeft && !swapped )
         || ( !aShoveToTheLeft && swapped ) )
     {
@@ -183,6 +256,73 @@ double lengthBetween( const ROUTING_CONNECTION& aConnection, std::size_t aFirst,
     }
 
     return length;
+}
+
+
+bool isOrthogonalEdge( ROUTER_POINT aStart, ROUTER_POINT aEnd )
+{
+    return aStart.x == aEnd.x || aStart.y == aEnd.y;
+}
+
+
+bool isFortyFiveDegreeEdge( ROUTER_POINT aStart, ROUTER_POINT aEnd )
+{
+    const std::int64_t dx = std::abs( aEnd.x - aStart.x );
+    const std::int64_t dy = std::abs( aEnd.y - aStart.y );
+
+    // Exact rational support-line intersections can round to adjacent KiCad
+    // integer coordinates.  Freerouting still treats that one-unit residue
+    // as fixed 45-degree geometry; classifying it as any-angle here lets the
+    // fallback visibility simplifier replace a valid neckdown by an oblique
+    // chord that the source could never create.
+    return dx == 0 || dy == 0 || std::abs( dx - dy ) <= 1;
+}
+
+
+bool replaceSpanWithCorner( ROUTING_CONNECTION& aConnection,
+                            std::size_t aFirst, std::size_t aLast,
+                            ROUTER_POINT aCorner )
+{
+    if( aFirst >= aLast || aLast >= aConnection.nodes.size()
+        || !CanCollapseRouteEdges( aConnection, aFirst, aLast - 1 ) )
+    {
+        return false;
+    }
+
+    if( aCorner == aConnection.nodes[aFirst].point
+        || aCorner == aConnection.nodes[aLast].point )
+    {
+        return CollapseRouteNodes( aConnection, aFirst, aLast );
+    }
+
+    const ROUTING_EDGE_STYLE style = EdgeStyle( aConnection, aFirst );
+    std::vector<ROUTER_NODE> nodes;
+    nodes.reserve( aConnection.nodes.size() - ( aLast - aFirst ) + 2 );
+    nodes.insert( nodes.end(), aConnection.nodes.begin(),
+                  aConnection.nodes.begin() + static_cast<std::ptrdiff_t>( aFirst + 1 ) );
+    nodes.push_back( { aCorner, aConnection.nodes[aFirst].layer } );
+    nodes.insert( nodes.end(),
+                  aConnection.nodes.begin() + static_cast<std::ptrdiff_t>( aLast ),
+                  aConnection.nodes.end() );
+
+    if( !aConnection.edgeStyles.empty() )
+    {
+        std::vector<ROUTING_EDGE_STYLE> styles;
+        styles.reserve( nodes.size() - 1 );
+        styles.insert( styles.end(), aConnection.edgeStyles.begin(),
+                       aConnection.edgeStyles.begin()
+                               + static_cast<std::ptrdiff_t>( aFirst ) );
+        styles.push_back( style );
+        styles.push_back( style );
+        styles.insert( styles.end(),
+                       aConnection.edgeStyles.begin()
+                               + static_cast<std::ptrdiff_t>( aLast ),
+                       aConnection.edgeStyles.end() );
+        aConnection.edgeStyles = std::move( styles );
+    }
+
+    aConnection.nodes = std::move( nodes );
+    return true;
 }
 
 } // namespace
@@ -231,6 +371,12 @@ bool MAZE_TRACE_SHOVER::CheckShoveTraceLine(
                     aCompensatedTraceHalfWidth, aShoveToTheLeft,
                     aTraceWidthTolerance ) )
         {
+            autorouterDecisionLog(
+                    "TRACE_SHOVE_REJECT",
+                    { { "reason", "section_start" },
+                      { "side", aShoveToTheLeft ? "LEFT" : "RIGHT" },
+                      { "door_id", std::to_string( aFromDoor.GetId() ) },
+                      { "section", std::to_string( aFromSection ) } } );
             return false;
         }
 
@@ -238,7 +384,15 @@ bool MAZE_TRACE_SHOVER::CheckShoveTraceLine(
                 aFromDoor, *info, aObstacleRoom.GetShapeIndex(),
                 aCompensatedTraceHalfWidth, aShoveToTheLeft );
         if( !shoveSegment )
+        {
+            autorouterDecisionLog(
+                    "TRACE_SHOVE_REJECT",
+                    { { "reason", "shove_segment" },
+                      { "side", aShoveToTheLeft ? "LEFT" : "RIGHT" },
+                      { "door_id", std::to_string( aFromDoor.GetId() ) },
+                      { "section", std::to_string( aFromSection ) } } );
             return false;
+        }
     }
 
     const FLOAT_POINT fromCorner = shoveSegment->a;
@@ -250,6 +404,15 @@ bool MAZE_TRACE_SHOVER::CheckShoveTraceLine(
         if( !info->maxShoveLength )
             return true;
         shoveWidth = info->maxShoveLength( *shoveSegment, aShoveToTheLeft );
+        autorouterDecisionLog(
+                "TRACE_SHOVE_SEGMENT",
+                { { "side", aShoveToTheLeft ? "LEFT" : "RIGHT" },
+                  { "segment",
+                    std::to_string( shoveSegment->a.x ) + ','
+                            + std::to_string( shoveSegment->a.y ) + ','
+                            + std::to_string( shoveSegment->b.x ) + ','
+                            + std::to_string( shoveSegment->b.y ) },
+                  { "shove_width", std::to_string( shoveWidth ) } } );
         if( shoveWidth <= 0 )
             return true;
 
@@ -260,10 +423,18 @@ bool MAZE_TRACE_SHOVER::CheckShoveTraceLine(
 
     const FLOAT_LINE shoveLine{ fromCorner, toCorner };
     const PLANAR::SIMPLEX fromDoorShape = aFromDoor.GetSimplexShape();
+    const auto fromDoorDiagonal = sourceDiagonalCornerSegment( fromDoorShape );
     const double fromDoorCompareDistance =
             aFromDoor.GetDimension() == 2 || segmentIsPoint
                     ? std::numeric_limits<double>::infinity()
-                    : toCorner.DistanceSquared( fromDoorShape.CornerApprox( 0 ) );
+                    // A one-dimensional door's source corner zero is the
+                    // first diagonal endpoint.  Reflection into KiCad's
+                    // y-down coordinates reverses that endpoint label; using
+                    // the coordinate-local CornerApprox( 0 ) truncates a
+                    // shove exactly at the first forward door.
+                    : fromDoorDiagonal
+                              ? toCorner.DistanceSquared( fromDoorDiagonal->a )
+                              : std::numeric_limits<double>::infinity();
 
     for( EXPANSION_DOOR* door : aObstacleRoom.GetDoors() )
     {
@@ -303,7 +474,7 @@ bool MAZE_TRACE_SHOVER::CheckShoveTraceLine(
             continue;
         }
 
-        const auto polar = doorShape.PolarLineSegment( fromCorner );
+        const auto polar = sourcePolarLineSegment( doorShape, fromCorner );
         if( !polar )
             continue;
         const FLOAT_POINT nearest =
@@ -340,10 +511,26 @@ bool MAZE_TRACE_SHOVER::CheckShoveTraceLine(
 bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
                                  const MAZE_SEARCH_ENGINE& aSearch )
 {
-    bool changedAny = false;
+    bool changedAny = TRACE_TIGHTENER_45::PullTight( aConnection, aSearch );
+
+    bool fixedDirection = true;
+    for( std::size_t edge = 1; edge < aConnection.nodes.size(); ++edge )
+    {
+        if( aConnection.nodes[edge - 1].layer == aConnection.nodes[edge].layer
+            && !isFortyFiveDegreeEdge( aConnection.nodes[edge - 1].point,
+                                       aConnection.nodes[edge].point ) )
+        {
+            fixedDirection = false;
+            break;
+        }
+    }
+
+    // TraceTightener45 is authoritative for fixed-direction copper.  Retain
+    // the older visibility simplifier only for an any-angle connection; it
+    // cannot reproduce the support-line ordering used by the source.
     bool changed = true;
 
-    while( changed && aConnection.nodes.size() > 2 )
+    while( !fixedDirection && changed && aConnection.nodes.size() > 2 )
     {
         changed = false;
 
@@ -354,12 +541,9 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
             {
                 const ROUTER_NODE& start = aConnection.nodes[first];
                 const ROUTER_NODE& end = aConnection.nodes[last];
-                const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
-                        ? nullptr : &aConnection.edgeStyles[first];
 
                 if( start.layer != end.layer
-                    || !CanCollapseRouteEdges( aConnection, first, last - 1 )
-                    || !aSearch.CanInsertSegment( aConnection.netCode, start, end, style ) )
+                    || !CanCollapseRouteEdges( aConnection, first, last - 1 ) )
                 {
                     continue;
                 }
@@ -368,11 +552,114 @@ bool MAZE_TRACE_SHOVER::Shorten( ROUTING_CONNECTION& aConnection,
                 const long double dx = static_cast<long double>( end.point.x ) - start.point.x;
                 const long double dy = static_cast<long double>( end.point.y ) - start.point.y;
                 const double directLength = std::sqrt( static_cast<double>( dx * dx + dy * dy ) );
-
-                if( directLength + 1.0 < oldLength )
+                const __int128 exactDx = static_cast<__int128>( end.point.x ) - start.point.x;
+                const __int128 exactDy = static_cast<__int128>( end.point.y ) - start.point.y;
+                const __int128 exactLengthSquared = exactDx * exactDx + exactDy * exactDy;
+                bool straightRun = true;
+                for( std::size_t node = first + 1; node < last; ++node )
                 {
-                    if( !CollapseRouteNodes( aConnection, first, last ) )
-                        continue;
+                    const __int128 pointDx = static_cast<__int128>(
+                                                        aConnection.nodes[node].point.x )
+                                                   - start.point.x;
+                    const __int128 pointDy = static_cast<__int128>(
+                                                        aConnection.nodes[node].point.y )
+                                                   - start.point.y;
+                    const __int128 dot = pointDx * exactDx + pointDy * exactDy;
+                    straightRun = straightRun
+                                  && pointDx * exactDy == pointDy * exactDx
+                                  && dot >= 0 && dot <= exactLengthSquared;
+                }
+
+                bool sourceOrthogonal = true;
+                bool sourceFortyFive = true;
+                for( std::size_t edge = first + 1; edge <= last; ++edge )
+                {
+                    sourceOrthogonal = sourceOrthogonal
+                                       && isOrthogonalEdge(
+                                               aConnection.nodes[edge - 1].point,
+                                               aConnection.nodes[edge].point );
+                    sourceFortyFive = sourceFortyFive
+                                      && isFortyFiveDegreeEdge(
+                                              aConnection.nodes[edge - 1].point,
+                                              aConnection.nodes[edge].point );
+                }
+
+                // TraceTightener90/45 repositions support lines; neither can
+                // replace a fixed-direction trace by an arbitrary-angle chord.
+                // The previous native line-of-sight simplifier did exactly
+                // that, producing geometry which the next maze item could
+                // never see in the pinned source.  Preserve the observed
+                // source direction family.  Any-angle input retains the old
+                // direct shortcut.
+                if( ( sourceOrthogonal && isOrthogonalEdge( start.point, end.point ) )
+                    || ( !sourceOrthogonal && sourceFortyFive
+                         && isFortyFiveDegreeEdge( start.point, end.point ) )
+                    || !sourceFortyFive )
+                {
+                    // PolylineTrace.normalize removes forward collinear
+                    // corners even when Euclidean length is unchanged.  This
+                    // is essential after an aggregate terminal span: the raw
+                    // penultimate locator corner may be inside the plated
+                    // hole, while the normalized edge ends at its centre.
+                    ROUTING_CONNECTION candidate = aConnection;
+                    if( ( straightRun || directLength + 1.0 < oldLength )
+                        && CollapseRouteNodes( candidate, first, last )
+                        && aSearch.CanInsertTraceSpan( candidate ) )
+                    {
+                        aConnection = std::move( candidate );
+                        changed = true;
+                        changedAny = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                const auto tryFixedDirectionCorner = [&]( bool aHorizontalFirst )
+                {
+                    const FLOAT_POINT cornerFloat =
+                            FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
+                                    asFloat( start.point ), asFloat( end.point ),
+                                    aHorizontalFirst, sourceOrthogonal );
+                    const ROUTER_POINT corner = cornerFloat.Round();
+                    const long double firstDx = static_cast<long double>( corner.x )
+                                                - start.point.x;
+                    const long double firstDy = static_cast<long double>( corner.y )
+                                                - start.point.y;
+                    const long double secondDx = static_cast<long double>( end.point.x )
+                                                 - corner.x;
+                    const long double secondDy = static_cast<long double>( end.point.y )
+                                                 - corner.y;
+                    const double replacementLength =
+                            std::sqrt( static_cast<double>( firstDx * firstDx
+                                                            + firstDy * firstDy ) )
+                            + std::sqrt( static_cast<double>( secondDx * secondDx
+                                                              + secondDy * secondDy ) );
+                    const bool sameSingleCorner = last == first + 2
+                                                  && aConnection.nodes[first + 1].point
+                                                             == corner;
+                    // Source pull-tight may choose either fixed-direction
+                    // corner, but only when it shortens the route.  Allowing
+                    // equal-length exchanges makes the two alternatives
+                    // oscillate forever.
+                    if( sameSingleCorner || replacementLength + 1.0 >= oldLength )
+                    {
+                        return false;
+                    }
+
+                    ROUTING_CONNECTION candidate = aConnection;
+                    if( !replaceSpanWithCorner(
+                                candidate, first, last, corner )
+                        || !aSearch.CanInsertTraceSpan( candidate ) )
+                    {
+                        return false;
+                    }
+                    aConnection = std::move( candidate );
+                    return true;
+                };
+
+                if( tryFixedDirectionCorner( true )
+                    || tryFixedDirectionCorner( false ) )
+                {
                     changed = true;
                     changedAny = true;
                     break;

@@ -37,7 +37,8 @@ namespace KICAD_AUTOROUTER
 class DRILL_PAGE_ARRAY
 {
 public:
-    DRILL_PAGE_ARRAY( const ROUTER_BOX& aBounds, std::int64_t aMaxPageWidth );
+    DRILL_PAGE_ARRAY( const ROUTER_BOX& aBounds, std::int64_t aMaxPageWidth,
+                      std::int64_t aCoordinateUnit = 1 );
 
     const std::vector<DRILL_PAGE>& Pages() const { return m_pages; }
     std::vector<DRILL_PAGE*>       OverlappingPages( const ROUTER_BOX& aShape );

@@ -23,21 +23,61 @@
 namespace KICAD_AUTOROUTER
 {
 
+namespace
+{
+
+PLANAR::INT_OCTAGON reflectY( const PLANAR::INT_OCTAGON& aOctagon )
+{
+    if( aOctagon.IsEmpty() )
+        return aOctagon;
+
+    return { aOctagon.leftX, -aOctagon.topY,
+             aOctagon.rightX, -aOctagon.bottomY,
+             aOctagon.lowerLeftDiagonalX, aOctagon.upperRightDiagonalX,
+             aOctagon.upperLeftDiagonalX, aOctagon.lowerRightDiagonalX };
+}
+
+
+PLANAR::INT_OCTAGON intersectOctagons(
+        const PLANAR::INT_OCTAGON& aFirst,
+        const PLANAR::INT_OCTAGON& aSecond,
+        std::int64_t aCoordinateUnit,
+        bool aYDownCoordinates )
+{
+    if( !aYDownCoordinates )
+        return aFirst.IntersectionOnGrid( aSecond, aCoordinateUnit );
+
+    // IntOctagon.normalize() contains observable floor/ceil tie breaking.
+    // Freerouting performs it in y-up source coordinates, so reflect before
+    // intersecting rather than normalizing an equivalent y-down shape.
+    return reflectY( reflectY( aFirst ).IntersectionOnGrid(
+            reflectY( aSecond ), aCoordinateUnit ) );
+}
+
+} // namespace
+
 ROUTER_BOX TARGET_ITEM_EXPANSION_DOOR::GetShape() const
 {
+    if( m_treeOctagon && FirstRoom() && !FirstRoom()->UsesGeneralShape() )
+        return GetOctagonShape().BoundingBox();
+
     return GetSimplexShape().BoundingBox().value_or( INT_BOX::Empty() );
 }
 
 
 PLANAR::INT_OCTAGON TARGET_ITEM_EXPANSION_DOOR::GetOctagonShape() const
 {
-    if( !FirstRoom() || INT_BOX::Dimension( m_treeBounds ) < 0 )
+    if( !FirstRoom()
+        || ( !m_treeOctagon && INT_BOX::Dimension( m_treeBounds ) < 0 ) )
         return PLANAR::INT_OCTAGON::Empty();
 
     if( !FirstRoom()->UsesGeneralShape() )
     {
-        return FirstRoom()->GetOctagon().Intersection(
-                PLANAR::INT_OCTAGON::FromBox( m_treeBounds ) );
+        const PLANAR::INT_OCTAGON itemShape = m_treeOctagon
+                ? *m_treeOctagon
+                : PLANAR::INT_OCTAGON::FromBox( m_treeBounds );
+        return intersectOctagons( FirstRoom()->GetOctagon(), itemShape,
+                                  m_coordinateUnit, m_yDownCoordinates );
     }
 
     return GetSimplexShape().BoundingOctagon().value_or(
@@ -47,13 +87,21 @@ PLANAR::INT_OCTAGON TARGET_ITEM_EXPANSION_DOOR::GetOctagonShape() const
 
 PLANAR::SIMPLEX TARGET_ITEM_EXPANSION_DOOR::GetSimplexShape() const
 {
-    if( !FirstRoom() || INT_BOX::Dimension( m_treeBounds ) < 0 )
+    if( !FirstRoom()
+        || ( !m_treeOctagon && INT_BOX::Dimension( m_treeBounds ) < 0 ) )
         return PLANAR::SIMPLEX::Empty();
 
     // Target items can legitimately have a point or line tree shape in
     // data-only tests and for zero-width connection shapes.  FromBox mirrors
     // IntBox.toSimplex for those lower-dimensional cases; Box is deliberately
     // restricted to a full-dimensional convex region.
+    if( m_treeOctagon )
+    {
+        const auto itemShape = m_treeOctagon->ToSimplex();
+        return itemShape ? itemShape->Intersection( FirstRoom()->GetSimplex() )
+                         : PLANAR::SIMPLEX::Empty();
+    }
+
     return PLANAR::SIMPLEX::FromBox( m_treeBounds ).Intersection(
             FirstRoom()->GetSimplex() );
 }

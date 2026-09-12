@@ -10,6 +10,8 @@
 namespace KICAD_AUTOROUTER
 {
 
+class EXPANSION_ROOM;
+
 /** Counter-clockwise neighbour topology for unrestricted-angle Simplex rooms.
  *
  * The source class also owns expansion-room allocation and target-item doors.
@@ -37,6 +39,21 @@ public:
     SORTED_ROOM_NEIGHBOURS(
             PLANAR::SIMPLEX aRoom,
             const std::vector<SHAPE_TREE_ENTRY>& aEntries );
+
+    /** Source SortedRoomNeighbours.insertDoorOk().  Existing completed-room
+     * neighbours use this guard before creating a one-dimensional door.  In
+     * particular, an end shape of a movable PolylineTrace may only be entered
+     * through a door parallel to the trace; a perpendicular corner door can
+     * enter the wrong branch of a fork and corrupt rip-up/shove traversal. */
+    static bool InsertDoorOk( EXPANSION_ROOM* aFirstRoom,
+                              EXPANSION_ROOM* aSecondRoom,
+                              const ROUTER_BOX& aDoorShape );
+    static bool InsertDoorOk( EXPANSION_ROOM* aFirstRoom,
+                              EXPANSION_ROOM* aSecondRoom,
+                              const PLANAR::INT_OCTAGON& aDoorShape );
+    static bool InsertDoorOk( EXPANSION_ROOM* aFirstRoom,
+                              EXPANSION_ROOM* aSecondRoom,
+                              const PLANAR::SIMPLEX& aDoorShape );
 
     const std::vector<NEIGHBOUR>& Neighbours() const { return m_neighbours; }
 

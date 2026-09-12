@@ -65,6 +65,15 @@ public:
 
     static INT_OCTAGON Empty();
     static INT_OCTAGON FromBox( const ROUTER_BOX& aBox );
+    /** Smallest octagonal envelope of an integral line segment.
+     *
+     * This is LineSegment.boundingOctagon() from Freerouting.  Keeping a
+     * one-dimensional trace connection shape one-dimensional is observable:
+     * start-room completion uses the whole segment, not a collection of
+     * endpoint samples.
+     */
+    static INT_OCTAGON FromSegment( ROUTER_POINT aStart,
+                                    ROUTER_POINT aEnd );
 
     bool IsEmpty() const;
     bool IsNormalized() const;
@@ -81,6 +90,13 @@ public:
     double MaxWidth() const;
     double MinWidth() const;
     INT_OCTAGON Offset( double aDistance ) const;
+    /** Apply source Java rounding on a coarser host-coordinate lattice.
+     *
+     * Freerouting rounds both the orthogonal and sqrt(2)-scaled offset in its
+     * integer board unit.  KiCad IU are finer than that unit, so doing the
+     * irrational multiplication in IU produces a different support line.
+     */
+    INT_OCTAGON OffsetOnGrid( double aDistance, std::int64_t aGrid ) const;
     INT_OCTAGON Enlarge( double aOffset ) const { return Offset( aOffset ); }
 
     bool Contains( ROUTER_POINT aPoint ) const;
@@ -93,6 +109,14 @@ public:
     INT_OCTAGON Union( const INT_OCTAGON& aOther ) const;
     INT_OCTAGON Intersection( const INT_OCTAGON& aOther ) const;
     INT_OCTAGON Normalize() const;
+
+    /** Normalize after evaluating Freerouting's integer arithmetic on a
+     * coarser host-coordinate lattice.  Every support is first expressed in
+     * source units, so ceil/floor at diagonal intersections happens before
+     * scaling back to KiCad IU. */
+    INT_OCTAGON NormalizeOnGrid( std::int64_t aGrid ) const;
+    INT_OCTAGON IntersectionOnGrid( const INT_OCTAGON& aOther,
+                                    std::int64_t aGrid ) const;
 
     /** Divide this outer octagon minus aCutout into Freerouting's ordered
      * convex pieces. A non-overlap returns only this shape; an area overlap

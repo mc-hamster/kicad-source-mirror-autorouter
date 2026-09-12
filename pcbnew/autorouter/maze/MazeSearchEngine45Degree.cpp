@@ -132,6 +132,7 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
         bool roomRipped = false;
         MAZE_ADJUSTMENT adjustment = MAZE_ADJUSTMENT::NONE;
         bool alreadyChecked = false;
+        const ROOM_TERMINAL* startTerminal = nullptr;
     };
     constexpr std::size_t NONE = std::numeric_limits<std::size_t>::max();
     std::deque<STATE> states;
@@ -229,10 +230,12 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                 continue;
             const FLOAT_POINT point{ static_cast<double>( attachment->x ),
                                      static_cast<double>( attachment->y ) };
-            push( { room, nullptr, 0, { point, point }, 0, distance( point ),
-                    NONE, start.owner, {},
-                    static_cast<std::uint32_t>( startIndex + 1 ), 0, {}, false,
-                    MAZE_ADJUSTMENT::NONE, false } );
+            STATE seed{ room, nullptr, 0, { point, point }, 0,
+                        distance( point ), NONE, start.owner, {},
+                        static_cast<std::uint32_t>( startIndex + 1 ), 0, {},
+                        false, MAZE_ADJUSTMENT::NONE, false };
+            seed.startTerminal = &start;
+            push( seed );
         }
     }
 
@@ -241,6 +244,28 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
         const std::size_t index = open.begin()->second;
         open.erase( open.begin() );
         const STATE current = states[index];
+        autorouterDecisionLog(
+                "ROOM45_POP",
+                { { "state", std::to_string( index ) },
+                  { "room_id", current.room
+                                           ? std::to_string(
+                                                     current.room->shape->GetId() )
+                                           : "" },
+                  { "obstacle", current.room
+                                            && current.room->shape->IsObstacle()
+                                    ? "true" : "false" },
+                  { "door_id", current.door
+                                           ? std::to_string( current.door->GetId() )
+                                           : "" },
+                  { "section", std::to_string( current.section ) },
+                  { "target", current.target ? "true" : "false" },
+                  { "already_checked",
+                    current.alreadyChecked ? "true" : "false" },
+                  { "occupied", current.door
+                                          && occupied.contains(
+                                                     { current.door,
+                                                       current.section } )
+                                    ? "true" : "false" } } );
         if( current.target )
         {
             ROOM_PATH path{ {}, current.owner, *current.target, {}, 0 };
@@ -266,6 +291,27 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             {
                 const STATE& from = states[entries[entry - 1]];
                 const STATE& to = states[entries[entry]];
+                FLOAT_LINE locatorEntry = to.entry;
+                if( to.door )
+                {
+                    // FoundConnectionLocator45Degree does not reuse the
+                    // projected maze entry.  Its BacktrackElement retains the
+                    // door section number and calculateNextTraceCorners()
+                    // obtains the original, shrunken section again.  The
+                    // projection may be shorter at an acute neighbouring
+                    // room; carrying it into the locator shifts the routed
+                    // centreline even though the maze decisions match.
+                    const auto rawSections = to.door->GetSectionSegments(
+                            aSectionOffset,
+                            FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                            std::numeric_limits<std::size_t>::max(), true );
+                    if( to.section >= rawSections.size() )
+                    {
+                        corridor.clear();
+                        break;
+                    }
+                    locatorEntry = rawSections[to.section];
+                }
                 const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
                         from.room ? from.room->shape.get() : nullptr );
                 const bool obstacleRipped = obstacle
@@ -277,12 +323,26 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                         to.door ? std::optional<INT_OCTAGON>(
                                           to.door->GetOctagonShape() )
                                 : std::nullopt,
-                        to.entry,
+                        locatorEntry,
                         obstacleRipped } );
             }
+            if( corridor.size() + 1 != entries.size() )
+                continue;
+            const ROOM_TERMINAL* startTerminal =
+                    states[entries.front()].startTerminal;
             const auto located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
                     states[entries.front()].entry.Middle().Round(), corridor,
-                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU );
+                    aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU,
+                    false, static_cast<std::int64_t>(
+                                   FREEROUTING_COORDINATE_UNIT_IU ),
+                    [startTerminal]( ROUTER_POINT aFrom,
+                                     const INT_OCTAGON& aRoom )
+                            -> std::optional<ROUTER_POINT>
+                    {
+                        if( !startTerminal )
+                            return std::nullopt;
+                        return nearestInRoom45( *startTerminal, aFrom, aRoom );
+                    } );
             if( !located )
                 continue;
             path.points = *located;
@@ -313,6 +373,18 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                 && current.door->IsSmallFor45DegreeTrace(
                         2 * ( aSectionOffset
                               + FREEROUTING_TRACE_WIDTH_TOLERANCE_IU ) );
+        autorouterDecisionLog(
+                "ROOM45_EXPAND_STATE",
+                { { "room_id", std::to_string(
+                                           current.room->shape->GetId() ) },
+                  { "obstacle",
+                    current.room->shape->IsObstacle() ? "true" : "false" },
+                  { "door_id", current.door
+                                           ? std::to_string( current.door->GetId() )
+                                           : "" },
+                  { "door_small", currentDoorIsSmall ? "true" : "false" },
+                  { "door_count", std::to_string(
+                                             current.room->shape->GetDoors().size() ) } } );
         if( currentDoorIsSmall )
         {
             EXPANSION_ROOM* fromRoom =
@@ -385,6 +457,12 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             const ROUTER_BOX fromDoorBounds = current.door
                                                     ? current.door->GetShape()
                                                     : ROUTER_BOX{};
+            STATE nextState{ next, aDoor, aSection, aShapeEntry, g,
+                             g + distance( to ), index, current.owner, {}, 0,
+                             aAddCost, rippedGroup, roomRipped, aAdjustment,
+                             false };
+            nextState.startTerminal = current.startTerminal;
+            const bool pushed = push( nextState );
             autorouterDecisionLog(
                     "RAW_SECTION_ASSIGN",
                     { { "net", std::to_string( aNet ) },
@@ -405,10 +483,9 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
                       { "from_door_bounds",
                         current.door ? autorouterDecisionBounds( fromDoorBounds ) : "" },
                       { "expansion_value", std::to_string( g ) },
-                      { "sorting_value", std::to_string( g + distance( to ) ) } } );
-            return push( { next, aDoor, aSection, aShapeEntry, g,
-                           g + distance( to ), index, current.owner, {}, 0,
-                           aAddCost, rippedGroup, roomRipped, aAdjustment, false } );
+                      { "sorting_value", std::to_string( nextState.f ) },
+                      { "pushed", pushed ? "true" : "false" } } );
+            return pushed;
         };
 
         for( std::size_t targetIndex = 0; targetIndex < aTargets.size(); ++targetIndex )
@@ -421,11 +498,14 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_45_DEGREE::FindConnection(
             const FLOAT_POINT to{ static_cast<double>( point->x ),
                                   static_cast<double>( point->y ) };
             const double g = current.g + cost( from, to );
-            somethingExpanded = push( { nullptr, nullptr, 0, { to, to }, g, g, index,
-                    current.owner, target.owner,
-                    static_cast<std::uint32_t>( aStarts.size() + targetIndex + 1 ),
-                    0, {}, current.roomRipped, MAZE_ADJUSTMENT::NONE, false } )
-                    || somethingExpanded;
+            STATE targetState{ nullptr, nullptr, 0, { to, to }, g, g, index,
+                               current.owner, target.owner,
+                               static_cast<std::uint32_t>(
+                                       aStarts.size() + targetIndex + 1 ),
+                               0, {}, current.roomRipped,
+                               MAZE_ADJUSTMENT::NONE, false };
+            targetState.startTerminal = current.startTerminal;
+            somethingExpanded = push( targetState ) || somethingExpanded;
         }
 
         // The source first tries to reach same-side doors by shoving a

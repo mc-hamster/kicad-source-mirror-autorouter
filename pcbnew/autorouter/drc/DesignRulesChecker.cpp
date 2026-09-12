@@ -393,22 +393,6 @@ std::int64_t endpointMargin( const BOARD_SNAPSHOT& aBoard, int aNetCode,
 }
 
 
-bool isPadEndpoint( const BOARD_SNAPSHOT& aBoard, int aNetCode,
-                    const ROUTER_POINT& aPoint )
-{
-    const ROUTING_NET* net = findNet( aBoard, aNetCode );
-    if( !net )
-        return false;
-
-    return std::any_of( net->padIndices.begin(), net->padIndices.end(),
-                        [&]( std::size_t aPadIndex )
-                        {
-                            return aPadIndex < aBoard.pads.size()
-                                   && aBoard.pads[aPadIndex].position == aPoint;
-                        } );
-}
-
-
 bool segmentInsideBoard( const BOARD_SNAPSHOT& aBoard, const ROUTER_POINT& aStart,
                          const ROUTER_POINT& aEnd, int aNetCode, std::int64_t aTrackRadius,
                          std::int64_t aStartMargin, std::int64_t aEndMargin,
@@ -710,15 +694,12 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
 
         for( const ROUTING_OBSTACLE& obstacle : aBoard.obstacles )
         {
-            const bool ownPadHole =
-                    obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
-                    && isPadEndpoint( aBoard, segment.netCode, obstacle.start )
-                    && ( obstacle.start == segment.start || obstacle.start == segment.end );
-            const bool existingSameNetViaHole =
-                    obstacle.isHole && obstacle.isExistingRoute
-                    && !obstacle.boardItemId.empty();
-            if( ( obstacle.netCode == segment.netCode && !obstacle.isKeepout
-                  && ( !obstacle.isHole || ownPadHole || existingSameNetViaHole ) )
+            // Freerouting Item.isTraceObstacle(net) ignores every item which
+            // contains the routed net. A plated drill is part of that item's
+            // contact geometry for traces; via checks below still enforce
+            // hole-to-hole clearance.
+            if( ( obstacle.netCode != 0 && obstacle.netCode == segment.netCode
+                  && !obstacle.isKeepout )
                 || !obstacle.blocksTracks
                 || isRemoved( removedIds, obstacle.boardItemId ) )
             {
@@ -732,6 +713,20 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
             {
                 ++violations;
                 ++segmentObstacleViolations;
+                if( autorouterDebugEnabled() )
+                {
+                    std::ostringstream message;
+                    message << "drc segment obstacle net=" << segment.netCode
+                            << " segment=(" << segment.start.x << ',' << segment.start.y
+                            << ")->(" << segment.end.x << ',' << segment.end.y
+                            << ") layer=" << segment.layer
+                            << " obstacleNet=" << obstacle.netCode << " kind="
+                            << static_cast<int>( obstacle.kind ) << " hole="
+                            << obstacle.isHole << " obstacle=(" << obstacle.start.x
+                            << ',' << obstacle.start.y << ")->(" << obstacle.end.x
+                            << ',' << obstacle.end.y << ')';
+                    autorouterDebugLog( message.str() );
+                }
             }
         }
 
@@ -744,22 +739,29 @@ int DESIGN_RULES_CHECKER::CountViolations( const BOARD_SNAPSHOT& aBoard,
             if( obstacle.isMirroredToObstacleModel )
                 continue;
 
-            const bool ownPadHole =
-                    obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
-                    && isPadEndpoint( aBoard, segment.netCode, obstacle.start )
-                    && ( obstacle.start == segment.start || obstacle.start == segment.end );
-            const bool existingSameNetViaHole =
-                    obstacle.isHole && obstacle.isExistingRoute
-                    && !obstacle.boardItemId.empty();
             if( isRemoved( removedIds, obstacle.boardItemId ) || !obstacle.blocksTracks
-                || ( obstacle.netCode == segment.netCode
-                     && ( !obstacle.isHole || ownPadHole || existingSameNetViaHole ) ) )
+                || ( obstacle.netCode != 0 && obstacle.netCode == segment.netCode
+                     && !obstacle.isKeepout ) )
                 continue;
 
             if( segmentVsObstacle( segment, radius, obstacle, aBoard ) )
             {
                 ++violations;
                 ++segmentObstacleViolations;
+                if( autorouterDebugEnabled() )
+                {
+                    std::ostringstream message;
+                    message << "drc removable segment obstacle net="
+                            << segment.netCode << " segment=(" << segment.start.x
+                            << ',' << segment.start.y << ")->(" << segment.end.x
+                            << ',' << segment.end.y << ") layer=" << segment.layer
+                            << " obstacleNet=" << obstacle.netCode << " kind="
+                            << static_cast<int>( obstacle.kind ) << " hole="
+                            << obstacle.isHole << " obstacle=(" << obstacle.start.x
+                            << ',' << obstacle.start.y << ")->(" << obstacle.end.x
+                            << ',' << obstacle.end.y << ')';
+                    autorouterDebugLog( message.str() );
+                }
             }
         }
     }

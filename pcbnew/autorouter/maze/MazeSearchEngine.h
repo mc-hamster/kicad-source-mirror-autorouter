@@ -39,6 +39,7 @@
 #include "../board/facade/RoutingBoard.h"
 #include "AutorouteControl.h"
 #include "MazeExpansionEngine.h"
+#include "MazeSearchEngine45Degree.h"
 #include "MazeSearchEngine90Degree.h"
 
 
@@ -176,6 +177,15 @@ public:
      */
     bool CanInsertSegment( int aNetCode, const ROUTER_NODE& aStart, const ROUTER_NODE& aEnd,
                            const ROUTING_EDGE_STYLE* aStyle = nullptr ) const;
+    /** Strict forced-polyline preflight with source terminal-contact semantics.
+     *
+     * A rounded corner may lie inside the plated drill of a pad when the
+     * complete span continues to that pad centre.  Freerouting validates the
+     * complete Polyline against the owning Pin; checking each edge as an
+     * unrelated segment would reject that legal approach.  No other same-net
+     * hole is exempted.
+     */
+    bool CanInsertTraceSpan( const ROUTING_CONNECTION& aConnection ) const;
     /** Source RoutingBoard.checkTraceSegment() adapter.
      *
      * Returns the physical length, in KiCad IU, of the longest ordinary-width
@@ -197,6 +207,14 @@ public:
             bool aAttachesToSmd = false ) const;
     std::int64_t ResolveTrackWidth( int aNetCode,
                                     const ROUTING_EDGE_STYLE& aStyle ) const;
+    /** KiCad manufacturing lower bound for every emitted copper segment.
+     *
+     * Freerouting's fanout micro-neckdown fallback may intentionally reduce a
+     * trace below the net's ordinary width.  The native integration must not
+     * reduce it below the board-setup minimum because such a proposal cannot
+     * pass the host DRC transaction.
+     */
+    std::int64_t MinimumTrackWidth() const { return m_board.minimumTrackWidth; }
     std::optional<PIN_ENTRY_STYLE> PinEntryStyle( std::size_t aPadIndex,
                                                   const ROUTER_NODE& aNode,
                                                   int aNetCode,
@@ -216,7 +234,9 @@ public:
     std::optional<ROUTING_CONNECTION> SpringOverConnection(
             const ROUTING_CONNECTION& aConnection,
             const std::vector<ROUTING_CONNECTION>& aTransientObstacles,
-            const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+            const ROUTER_CANCEL_CALLBACK& aCancel,
+            const ROUTING_SHOVE_DIRECTION* aDirection = nullptr,
+            bool aReturnUnchanged = false ) const;
     /**
      * Relocate one mutable via away from transient worker copper.  A complete
      * isolated source via can be translated directly; generated worker
@@ -246,6 +266,11 @@ public:
     const ROOM_SEARCH_METRICS& LastRoomSearchMetrics() const { return m_roomMetrics; }
 
 private:
+    /** Return the room tree's source-Item view of routed copper.  Occupancy
+     * keeps compound insertion records for transactional removal, whereas
+     * Freerouting builds obstacle rooms from the normalized PolylineTrace and
+     * DrillItem objects which currently live on RoutingBoard. */
+    std::vector<ROUTING_CONNECTION> roomRouteItems() const;
     std::vector<SHAPE_TREE_ENTRY> roomObstacles( int aNet, int aLayer, bool aForVia,
                                                bool aSkipGeneralConvex,
                                                bool aSourceTraceRooms,
@@ -258,6 +283,13 @@ private:
             int aNet, int aLayer, bool aForVia, int aRetry, bool aFanout,
             bool aSourceTraceRooms,
             const ROUTER_CANCEL_CALLBACK& aCancel ) const;
+    /** Reconstruct Item.getTreeShape(searchTree, treeEntryNo) for the exact
+     * fixed-direction terminal door.  The result is rounded and offset on
+     * Freerouting's source lattice rather than around the fractional KiCad
+     * host bounding box. */
+    std::optional<PLANAR::INT_OCTAGON> terminalTreeOctagon(
+            const ROUTING_TERMINAL& aTerminal, int aLayer,
+            std::int64_t aClearanceCompensation ) const;
     /** The rectangular room/frontier cannot faithfully represent an arbitrary
      * convex contour. A layer which contains one stays on the exact visibility
      * fallback; other physical layers may still use rooms.  Drill candidates
@@ -276,6 +308,10 @@ private:
             const ROUTER_CANCEL_CALLBACK& aCancel,
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress ) const;
     mutable ROOM_SEARCH_METRICS m_roomMetrics;
+    // ShapeSearchTree is board/AutorouteEngine state in Freerouting, not
+    // connection-local maze state.  Retaining its mutation topology is needed
+    // for deterministic room and door ordering on every route after the first.
+    mutable PERSISTENT_45_DEGREE_TREE_STATE m_persistent45Tree;
     // Negotiated attempts keep movable copper in the tree as explicit
     // ObstacleExpansionRooms.  Free rooms still route around it; entering one
     // pays the source-shaped pass/detour/fanout-protection cost.  Final exact

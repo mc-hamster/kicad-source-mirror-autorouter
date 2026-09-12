@@ -46,6 +46,12 @@ struct ROOM_RIPUP_OBSTACLE
     // unsupported mutable geometry deliberately retain an empty pointer and
     // fall through to ordinary paid rip-up.
     std::shared_ptr<const MAZE_TRACE_ROOM_INFO> traceInfo;
+    // Source Item.sharesNet() identity for obstacle-to-obstacle doors.
+    int netCode = 0;
+    // SearchTreeObject.getId() of the underlying source-style board item.
+    // ObstacleExpansionRoom's own encoded/internal id is deliberately not
+    // used when SortedRoomNeighbours orders overlapping tree entries.
+    std::uint64_t sourceObjectId = 0;
 };
 
 struct ROOM_TERMINAL
@@ -69,6 +75,16 @@ struct ROOM_TERMINAL
             traceExitRestrictions;
     // BoardRules.pinEdgeToTurnDist + compensatedTraceHalfWidth.
     double traceExitOffset = 0;
+    // Source Item/tree-entry identity used by AutorouteEngine.init().  Owner
+    // remains the electrical pad returned with the final connection.
+    std::uint64_t itemId = 0;
+    std::size_t treeEntryIndex = std::numeric_limits<std::size_t>::max();
+    // Exact ShapeSearchTree45Degree tree shape for this item entry.  KiCad
+    // pad centres can lie between Freerouting's 0.1-um source coordinates;
+    // retaining only treeBounds would preserve that host fraction and move a
+    // TargetItemExpansionDoor by one source unit.  Other search modes leave
+    // this empty and retain their established exact SIMPLEX/AABB paths.
+    std::optional<PLANAR::INT_OCTAGON> treeOctagon;
 };
 
 struct ROOM_PATH

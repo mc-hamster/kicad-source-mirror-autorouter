@@ -99,7 +99,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
     const double rows = std::ceil( ( static_cast<double>( via.bounds.maxY ) - via.bounds.minY ) / via.pageWidth );
     if( columns * rows > maxExpanded )
         return std::nullopt;
-    DRILL_PAGE_ARRAY pages( via.bounds, via.pageWidth );
+    DRILL_PAGE_ARRAY pages( via.bounds, via.pageWidth,
+                            FREEROUTING_COORDINATE_UNIT_IU );
     if( via.stopAtFirstDrill )
         pages.AddFanoutCandidates( via.fanoutCenter, via.fanoutMinDistance,
                                    via.fanoutMaxDistance );
@@ -566,6 +567,19 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayer
                     {
                         valid = false;
                         break;
+                    }
+                    if( after.door )
+                    {
+                        const auto rawSections = after.door->GetSectionSegments(
+                                sectionOffset,
+                                FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                                std::numeric_limits<std::size_t>::max(), true );
+                        if( after.section >= rawSections.size() )
+                        {
+                            valid = false;
+                            break;
+                        }
+                        entry = rawSections[after.section];
                     }
                     const auto* beforeObstacle =
                             dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(

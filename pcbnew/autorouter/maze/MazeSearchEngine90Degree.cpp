@@ -128,11 +128,21 @@ bool RoomIsThick( const EXPANSION_ROOM& aRoom,
     }
 
     // ObstacleExpansionRoom.roomShapeIsThick() compares the compensated
-    // obstacle half-width with the incoming compensated trace half-width.
-    // Native obstacle rooms already contain that compensation, so their
-    // minimum full width is the equivalent data available at this boundary.
+    // PolylineTrace half-width with the incoming compensated trace
+    // half-width.  Preserve that item-level value: an octagonal tree shape's
+    // minimum width is smaller for diagonal trace segments and is therefore
+    // not an equivalent substitute.
     if( aRoom.IsObstacle() )
     {
+        const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
+                &aRoom );
+        if( obstacle && obstacle->GetTraceInfo()
+            && obstacle->GetTraceInfo()->compensatedHalfWidth > 0 )
+        {
+            return obstacle->GetTraceInfo()->compensatedHalfWidth
+                   >= aCompensatedTraceHalfWidth;
+        }
+
         const double width = aRoom.UsesGeneralShape()
                                      ? aRoom.GetSimplex().MinWidth()
                                      : aRoom.GetOctagon().MinWidth();
@@ -401,6 +411,20 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                 {
                     const auto& from = states[entries[i - 1]];
                     const auto& to = states[entries[i]];
+                    FLOAT_LINE locatorEntry = to.entry;
+                    if( to.door )
+                    {
+                        const auto rawSections = to.door->GetSectionSegments(
+                                aSectionOffset,
+                                FREEROUTING_TRACE_WIDTH_TOLERANCE_IU, 0,
+                                std::numeric_limits<std::size_t>::max(), true );
+                        if( to.section >= rawSections.size() )
+                        {
+                            corridor.clear();
+                            break;
+                        }
+                        locatorEntry = rawSections[to.section];
+                    }
                     const auto* obstacle = dynamic_cast<const OBSTACLE_EXPANSION_ROOM*>(
                             from.room ? from.room->shape.get() : nullptr );
                     const bool obstacleRipped = obstacle
@@ -412,8 +436,10 @@ std::optional<ROOM_PATH> MAZE_SEARCH_ENGINE_90_DEGREE::FindConnection(
                             to.door ? std::optional<PLANAR::INT_OCTAGON>(
                                               to.door->GetOctagonShape() )
                                     : std::nullopt,
-                            to.entry, obstacleRipped } );
+                            locatorEntry, obstacleRipped } );
                 }
+                if( corridor.size() + 1 != entries.size() )
+                    continue;
                 located = FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
                         states[entries.front()].entry.Middle().Round(), corridor,
                         aSectionOffset, FREEROUTING_TRACE_WIDTH_TOLERANCE_IU,

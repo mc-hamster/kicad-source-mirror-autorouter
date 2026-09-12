@@ -138,22 +138,37 @@ std::int64_t pinEdgeToTurnDistance( const BOARD_SNAPSHOT& aBoard )
                    ? 0 : std::max<std::int64_t>( 0, result );
 }
 
+ROUTER_POINT sourceGridPoint( ROUTER_POINT aPoint )
+{
+    return FLOAT_POINT{ static_cast<double>( aPoint.x ),
+                        static_cast<double>( aPoint.y ) }.RoundToSourceGridYDown();
+}
+
+
+std::int64_t sourceGridCoordinate( std::int64_t aCoordinate )
+{
+    return sourceGridPoint( { aCoordinate, 0 } ).x;
+}
+
+
 INT_OCTAGON octagonalEnvelope( const std::vector<ROUTER_POINT>& aPoints,
                                std::int64_t aExpansion )
 {
     if( aPoints.empty() )
         return INT_OCTAGON::Empty();
 
-    std::int64_t left = aPoints.front().x;
+    const ROUTER_POINT firstPoint = sourceGridPoint( aPoints.front() );
+    std::int64_t left = firstPoint.x;
     std::int64_t right = left;
-    std::int64_t bottom = aPoints.front().y;
+    std::int64_t bottom = firstPoint.y;
     std::int64_t top = bottom;
-    std::int64_t upperLeft = aPoints.front().x - aPoints.front().y;
+    std::int64_t upperLeft = firstPoint.x - firstPoint.y;
     std::int64_t lowerRight = upperLeft;
-    std::int64_t lowerLeft = aPoints.front().x + aPoints.front().y;
+    std::int64_t lowerLeft = firstPoint.x + firstPoint.y;
     std::int64_t upperRight = lowerLeft;
-    for( const ROUTER_POINT& point : aPoints )
+    for( const ROUTER_POINT& inputPoint : aPoints )
     {
+        const ROUTER_POINT point = sourceGridPoint( inputPoint );
         left = std::min( left, point.x );
         right = std::max( right, point.x );
         bottom = std::min( bottom, point.y );
@@ -164,7 +179,12 @@ INT_OCTAGON octagonalEnvelope( const std::vector<ROUTER_POINT>& aPoints,
         upperRight = std::max( upperRight, point.x + point.y );
     }
     return INT_OCTAGON( left, bottom, right, top, upperLeft, lowerRight,
-                        lowerLeft, upperRight ).Normalize().Offset( aExpansion );
+                        lowerLeft, upperRight ).NormalizeOnGrid(
+                                static_cast<std::int64_t>(
+                                        FREEROUTING_COORDINATE_UNIT_IU ) ).OffsetOnGrid(
+                                aExpansion,
+                                static_cast<std::int64_t>(
+                                        FREEROUTING_COORDINATE_UNIT_IU ) );
 }
 
 
@@ -172,10 +192,71 @@ INT_OCTAGON octagonalEnvelope( const ROUTING_OBSTACLE& aObstacle,
                                std::int64_t aExpansion )
 {
     if( aObstacle.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
-        return INT_OCTAGON::FromBox( aObstacle.box ).Offset( aExpansion );
+    {
+        const ROUTER_POINT minimum = FLOAT_POINT{
+                static_cast<double>( aObstacle.box.minX ),
+                static_cast<double>( aObstacle.box.minY ) }.RoundToSourceGridYDown();
+        const ROUTER_POINT maximum = FLOAT_POINT{
+                static_cast<double>( aObstacle.box.maxX ),
+                static_cast<double>( aObstacle.box.maxY ) }.RoundToSourceGridYDown();
+        return INT_OCTAGON::FromBox( { minimum.x, minimum.y,
+                                      maximum.x, maximum.y } ).OffsetOnGrid(
+                aExpansion,
+                static_cast<std::int64_t>( FREEROUTING_COORDINATE_UNIT_IU ) );
+    }
     if( aObstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT )
         return octagonalEnvelope( { aObstacle.start, aObstacle.end }, aExpansion );
     return octagonalEnvelope( aObstacle.polygon, aExpansion );
+}
+
+
+std::optional<INT_OCTAGON> sourceDrillItemTreeOctagon(
+        const ROUTING_OBSTACLE& aCopper,
+        std::int64_t aClearanceCompensation )
+{
+    const std::int64_t unit = static_cast<std::int64_t>(
+            FREEROUTING_COORDINATE_UNIT_IU );
+    const std::int64_t clearance = sourceGridCoordinate(
+            std::max<std::int64_t>( 0, aClearanceCompensation ) );
+
+    // ShapeSearchTree45Degree.calculateTreeShapes(DrillItem) first builds the
+    // physical shape's bounding octagon.  An IntBox remains an IntBox to
+    // avoid corner cut-offs; circles and paths retain their asymmetric source
+    // floor/ceil supports before the clearance share is applied.
+    if( aCopper.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
+    {
+        const ROUTER_BOX sourceBox{
+            sourceGridCoordinate( aCopper.box.minX ),
+            sourceGridCoordinate( aCopper.box.minY ),
+            sourceGridCoordinate( aCopper.box.maxX ),
+            sourceGridCoordinate( aCopper.box.maxY )
+        };
+        return SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemBox(
+                sourceBox, clearance );
+    }
+
+    if( aCopper.kind == ROUTER_OBSTACLE_KIND::SEGMENT
+        && aCopper.radius > 0 )
+    {
+        const std::int64_t radius = sourceGridCoordinate( aCopper.radius );
+        if( aCopper.start == aCopper.end )
+        {
+            return SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemCircle(
+                    sourceGridPoint( aCopper.start ), radius, clearance, unit );
+        }
+
+        return octagonalEnvelope( { aCopper.start, aCopper.end }, 0 )
+                .OffsetOnGrid( radius, unit )
+                .OffsetOnGrid( clearance, unit );
+    }
+
+    if( aCopper.kind == ROUTER_OBSTACLE_KIND::POLYGON
+        && !aCopper.polygon.empty() )
+    {
+        return octagonalEnvelope( aCopper, clearance );
+    }
+
+    return std::nullopt;
 }
 
 bool isAxisAlignedRectangle( const std::vector<ROUTER_POINT>& aPolygon )
@@ -214,6 +295,7 @@ bool isGeneralConvexRoomObstacle( const ROUTING_OBSTACLE& aObstacle, int aNet,
                                   bool aForVia )
 {
     if( aObstacle.kind != ROUTER_OBSTACLE_KIND::POLYGON || aObstacle.isHole
+        || aObstacle.isPad
         || !( aForVia ? aObstacle.blocksVias : aObstacle.blocksTracks )
         || !aObstacle.polygonHoles.empty() || aObstacle.radius != 0
         || isAxisAlignedRectangle( aObstacle.polygon )
@@ -230,6 +312,7 @@ bool isGeneralPolygonRoomObstacle( const ROUTING_OBSTACLE& aObstacle, int aNet,
                                    bool aForVia )
 {
     return aObstacle.kind == ROUTER_OBSTACLE_KIND::POLYGON && !aObstacle.isHole
+           && !aObstacle.isPad
            && ( aForVia ? aObstacle.blocksVias : aObstacle.blocksTracks )
            && aObstacle.radius == 0 && aObstacle.polygon.size() >= 3
            && ( aObstacle.netCode != aNet || aObstacle.isKeepout );
@@ -326,42 +409,6 @@ bool areaTouchesVia( const ROUTING_OBSTACLE& aArea, ROUTER_POINT aCenter,
 }
 
 
-void removeGeneratedCollinearNodes( ROUTING_CONNECTION& aConnection,
-                                    const MAZE_SEARCH_ENGINE& aSearch )
-{
-    // FoundConnectionLocator normalizes corners while it walks one complete
-    // source backtrack chain.  The native multilayer adapter reconstructs a
-    // same-layer chain one corridor step at a time so it must perform that
-    // harmless normalization at the adapter boundary.  This is done before
-    // insertion, where no branch contact can live on an intermediate node.
-    for( std::size_t middle = 1; middle + 1 < aConnection.nodes.size(); )
-    {
-        const ROUTER_NODE& first = aConnection.nodes[middle - 1];
-        const ROUTER_NODE& current = aConnection.nodes[middle];
-        const ROUTER_NODE& last = aConnection.nodes[middle + 1];
-        const long double firstDx = static_cast<long double>( current.point.x ) - first.point.x;
-        const long double firstDy = static_cast<long double>( current.point.y ) - first.point.y;
-        const long double lastDx = static_cast<long double>( last.point.x ) - current.point.x;
-        const long double lastDy = static_cast<long double>( last.point.y ) - current.point.y;
-        const bool forwardCollinear = firstDx * lastDy == firstDy * lastDx
-                                      && firstDx * lastDx + firstDy * lastDy >= 0;
-        const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
-                                                  ? nullptr
-                                                  : &aConnection.edgeStyles[middle - 1];
-        if( first.layer == current.layer && current.layer == last.layer
-            && forwardCollinear
-            && CanCollapseRouteEdges( aConnection, middle - 1, middle )
-            && aSearch.CanInsertSegment( aConnection.netCode, first, last, style )
-            && CollapseRouteNodes( aConnection, middle - 1, middle + 1 ) )
-        {
-            if( middle > 1 )
-                --middle;
-            continue;
-        }
-        ++middle;
-    }
-}
-
 } // namespace
 
 
@@ -375,6 +422,84 @@ bool MAZE_SEARCH_ENGINE::hasGeneralConvexRoomGeometry( int aNet, int aLayer ) co
     }
 
     return false;
+}
+
+
+std::optional<INT_OCTAGON> MAZE_SEARCH_ENGINE::terminalTreeOctagon(
+        const ROUTING_TERMINAL& aTerminal, int aLayer,
+        std::int64_t aClearanceCompensation ) const
+{
+    if( aTerminal.segmentEnd )
+    {
+        // PolylineTrace has one tree entry for each segment.  The native
+        // terminal already identifies that exact segment, so reconstruct its
+        // compensated tree octagon rather than retaining a host AABB.
+        const std::int64_t expansion =
+                std::max<std::int64_t>( 0, aTerminal.pad.trackWidth / 2 )
+                + std::max<std::int64_t>( 0, aClearanceCompensation );
+        return octagonalEnvelope(
+                { aTerminal.pad.position, *aTerminal.segmentEnd }, expansion );
+    }
+
+    // ConductionArea uses its exact finite polygon through connectionArea;
+    // reducing it to one convex octagon would fill holes or disjoint regions.
+    if( aTerminal.connectionArea )
+        return std::nullopt;
+
+    const auto geometry = std::find_if(
+            aTerminal.pad.layerGeometry.begin(),
+            aTerminal.pad.layerGeometry.end(),
+            [&]( const ROUTING_PAD::LAYER_GEOMETRY& aGeometry )
+            {
+                return aGeometry.layer == aLayer;
+            } );
+    if( geometry == aTerminal.pad.layerGeometry.end()
+        || geometry->copperShapeIndices.size() != 1 )
+    {
+        return std::nullopt;
+    }
+
+    const std::size_t shapeIndex = geometry->copperShapeIndices.front();
+    if( shapeIndex >= m_board.obstacles.size() )
+        return std::nullopt;
+
+    const ROUTING_OBSTACLE& copper = m_board.obstacles[shapeIndex];
+    if( !copper.isPad
+        || ( !copper.layers.empty()
+             && std::find( copper.layers.begin(), copper.layers.end(), aLayer )
+                        == copper.layers.end() ) )
+    {
+        return std::nullopt;
+    }
+
+    return sourceDrillItemTreeOctagon(
+            copper, std::max<std::int64_t>( 0, aClearanceCompensation ) );
+}
+
+
+std::vector<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::roomRouteItems() const
+{
+    std::vector<ROUTING_CONNECTION> result;
+
+    // AddStatic records are deliberately absent from RoutingBoard's mutable
+    // item graph.  They are original host PolylineTrace/DrillItem objects and
+    // therefore precede newly inserted items in source insertion-id order.
+    for( const ROUTING_CONNECTION& connection : m_occupancy.Connections() )
+    {
+        if( connection.isExistingBoardRoute && !connection.isAutorouterOwned )
+            result.push_back( connection );
+    }
+
+    if( m_occupancy.Board() )
+    {
+        std::vector<ROUTING_CONNECTION> items =
+                m_occupancy.Board()->ItemRoutes();
+        result.insert( result.end(),
+                       std::make_move_iterator( items.begin() ),
+                       std::make_move_iterator( items.end() ) );
+    }
+
+    return result;
 }
 
 
@@ -403,26 +528,76 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
 
         const auto contextual = ContextualObstacleClearance(
                 aObstacle, net, aLayer );
+        const std::int64_t pair = aObstacle.netCode != 0 && aObstacle.netCode != net
+                ? edgePairClearance( net, aObstacle.netCode, aLayer, 0,
+                                     aObstacle.clearance )
+                : std::max( netClearance( net ), aObstacle.clearance );
         const std::int64_t clearance = contextual
                 ? *contextual
-                : aObstacle.netCode != 0 && aObstacle.netCode != net
-                        ? std::max( edgePairClearance( net, aObstacle.netCode,
-                                                      aLayer, 0,
-                                                      aObstacle.clearance ),
-                                    aObstacle.clearance )
-                        : std::max( netClearance( net ), aObstacle.clearance );
-        return aObstacle.radius + std::max<std::int64_t>(
+                : pair;
+        const std::int64_t result = aObstacle.radius + std::max<std::int64_t>(
                 0, clearance - candidateCompensation );
+        autorouterDecisionLog(
+                "SOURCE_TREE_OBSTACLE_EXPANSION",
+                { { "layer", std::to_string( aLayer ) },
+                  { "obstacle_net", std::to_string( aObstacle.netCode ) },
+                  { "kind", std::to_string( static_cast<int>( aObstacle.kind ) ) },
+                  { "is_pad", aObstacle.isPad ? "true" : "false" },
+                  { "item", aObstacle.boardItemId },
+                  { "radius", std::to_string( aObstacle.radius ) },
+                  { "obstacle_clearance", std::to_string( aObstacle.clearance ) },
+                  { "pair_clearance", std::to_string( pair ) },
+                  { "contextual_clearance", contextual ? std::to_string( *contextual ) : "" },
+                  { "candidate_compensation", std::to_string( candidateCompensation ) },
+                  { "expansion", std::to_string( result ) } } );
+        return result;
     };
     std::vector<SHAPE_TREE_ENTRY> entries;
     int id = 1;
+    // ShapeSearchTree construction walks BasicBoard's undoable item store in
+    // reverse insertion order.  A KiCad pad contributes one detached copper
+    // obstacle per layer (and a separate manufacturing-hole record), so use
+    // boardItemId to recover the single source Item identity before assigning
+    // the observable tree insertion order.
+    std::vector<std::uint64_t> sourceItemOrder(
+            m_board.obstacles.size(),
+            std::numeric_limits<std::uint64_t>::max() );
+    std::unordered_map<std::string, std::uint64_t> sourceOrderByItem;
+    std::uint64_t nextSourceOrder = 0;
+    for( std::size_t reverse = m_board.obstacles.size(); reverse > 0; --reverse )
+    {
+        const std::size_t index = reverse - 1;
+        const ROUTING_OBSTACLE& obstacle = m_board.obstacles[index];
+        const std::string key = obstacle.boardItemId.empty()
+                ? std::string( "#" ) + std::to_string( index )
+                : obstacle.boardItemId;
+        const auto [item, inserted] = sourceOrderByItem.emplace(
+                key, nextSourceOrder );
+        if( inserted )
+            ++nextSourceOrder;
+        sourceItemOrder[index] = item->second;
+    }
+    std::uint64_t currentTreeInsertionOrder =
+            std::numeric_limits<std::uint64_t>::max();
+    int currentTreeShapeIndex = 0;
+    int currentTreeNet = 0;
+    std::shared_ptr<const std::vector<ROUTING_TRACE_INSERTION_STEP>>
+            currentTraceInsertionSteps;
+    std::int64_t currentTraceTreeExpansion = -1;
     auto addOctagon = [&]( INT_OCTAGON shape,
                            std::optional<PLANAR::SIMPLEX> simplex = std::nullopt )
     {
         shape = shape.Normalize();
         if( shape.Dimension() >= 0 )
-            entries.push_back( { shape.BoundingBox(), id++, 0, aLayer, 0,
+        {
+            entries.push_back( { shape.BoundingBox(), id++, 0, aLayer,
+                                 currentTreeNet,
                                  false, true, shape, std::move( simplex ) } );
+            entries.back().treeInsertionOrder = currentTreeInsertionOrder;
+            entries.back().shapeIndex = currentTreeShapeIndex++;
+            entries.back().traceInsertionSteps = currentTraceInsertionSteps;
+            entries.back().traceTreeExpansion = currentTraceTreeExpansion;
+        }
     };
     auto add = [&]( ROUTER_BOX box, std::int64_t expansion )
     {
@@ -445,11 +620,13 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     std::move( simplex ) );
     };
 
-    // BasicBoard inserts BoardOutline before ordinary board items.  Keep that
-    // source order because equal-area tree insertion ties are observable in
-    // completed-room and door ordering.
+    // ShapeSearchTree inserts BoardOutline after the reverse walk of ordinary
+    // board items.  Equal-area insertion ties are observable in completed-room
+    // and door ordering, so this is topology rather than cosmetic metadata.
     auto outlineEntries = BOARD_OUTLINE::CalculateTreeShapes(
             m_board, aLayer, candidateCompensation, id );
+    for( SHAPE_TREE_ENTRY& entry : outlineEntries )
+        entry.treeInsertionOrder = nextSourceOrder;
     entries.insert( entries.end(),
                     std::make_move_iterator( outlineEntries.begin() ),
                     std::make_move_iterator( outlineEntries.end() ) );
@@ -459,6 +636,11 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         if( aCancel && aCancel() )
             return {};
         const auto& obstacle = m_board.obstacles[index];
+        currentTreeInsertionOrder = sourceItemOrder[index];
+        currentTreeShapeIndex = 0;
+        currentTreeNet = obstacle.isKeepout ? 0 : obstacle.netCode;
+        currentTraceInsertionSteps.reset();
+        currentTraceTreeExpansion = -1;
         if( !( aForVia ? obstacle.blocksVias : obstacle.blocksTracks ) )
             continue;
 
@@ -472,7 +654,8 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         if( !aForVia && obstacle.isHole && obstacle.netCode != 0 )
             continue;
 
-        if( obstacle.netCode == net && !obstacle.isKeepout )
+        if( obstacle.netCode == net && !obstacle.isKeepout
+            && !( aSourceTraceRooms && !aForVia ) )
         {
             const bool ownHole = obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
                                  && endpointRadius( net, obstacle.start ) >= 0;
@@ -489,8 +672,11 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
         // compensated half width while walking the selected room corridor.
         // Keep complete-centre expansion for the paths whose source locator
         // has not yet replaced their established native locator.
-        const std::int64_t expansion = ( aSourceTraceRooms && !aForVia
-                ? sourceTraceTreeExpansion( obstacle )
+        const bool sourceTraceShape = aSourceTraceRooms && !aForVia;
+        const std::int64_t sourceExpansion = sourceTraceShape
+                ? sourceTraceTreeExpansion( obstacle ) : 0;
+        const std::int64_t expansion = ( sourceTraceShape
+                ? sourceExpansion
                 : obstacleExpansionRadius(
                         obstacle, net, aLayer, aForVia, radius, drillRadius ) ) + 1;
         if( isGeneralPolygonRoomObstacle( obstacle, net, aForVia )
@@ -524,8 +710,47 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
             // corner cut-offs by offsetting an IntBox as an IntBox.  Calling
             // INT_OCTAGON::Offset here would chamfer the rectangular pad and
             // can change an orthogonal room restraint into a diagonal one.
+            const ROUTER_BOX sourceBox{
+                sourceGridCoordinate( obstacle.box.minX ),
+                sourceGridCoordinate( obstacle.box.minY ),
+                sourceGridCoordinate( obstacle.box.maxX ),
+                sourceGridCoordinate( obstacle.box.maxY )
+            };
             addOctagon( SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemBox(
-                                obstacle.box, expansion ) );
+                                sourceBox, sourceGridCoordinate( expansion ) ) );
+        }
+        else if( sourceTraceShape
+                 && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
+                 && obstacle.radius > 0 )
+        {
+            // ShapeSearchTree45Degree.calculateTreeShapes(DrillItem) first
+            // obtains the physical Circle/Path bounding octagon and only then
+            // applies clearance compensation.  Combining both radii changes
+            // a Circle's deliberately asymmetric floor/ceil diagonal support.
+            const std::int64_t sourceRadius = sourceGridCoordinate(
+                    obstacle.radius );
+            const std::int64_t sourceClearance = sourceGridCoordinate(
+                    std::max<std::int64_t>( 0,
+                                            sourceExpansion - obstacle.radius ) );
+            const std::int64_t sourceUnit = static_cast<std::int64_t>(
+                    FREEROUTING_COORDINATE_UNIT_IU );
+            if( obstacle.start == obstacle.end )
+            {
+                addOctagon(
+                        SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemCircle(
+                                sourceGridPoint( obstacle.start ), sourceRadius,
+                                sourceClearance, sourceUnit ) );
+            }
+            else
+            {
+                // PolygonPath.transformToBoardRel() offsets the endpoint
+                // octagon by half the path width; the tree applies clearance
+                // in a second operation.
+                addOctagon( octagonalEnvelope(
+                                    { obstacle.start, obstacle.end }, 0 )
+                                    .OffsetOnGrid( sourceRadius, sourceUnit )
+                                    .OffsetOnGrid( sourceClearance, sourceUnit ) );
+            }
         }
         else
         {
@@ -535,13 +760,29 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
     }
     // Every attempt sees current copper, including through-via copper on
     // intermediate layers. No stale per-net tree survives add/remove/rip-up.
-    const auto& routes = m_occupancy.Connections();
+    const std::vector<ROUTING_CONNECTION> routes = roomRouteItems();
     for( std::size_t routeIndex = 0; routeIndex < routes.size(); ++routeIndex )
     {
         if( aCancel && aCancel() )
             return {};
 
         const ROUTING_CONNECTION& connection = routes[routeIndex];
+        currentTreeInsertionOrder = nextSourceOrder + 1 + routeIndex;
+        currentTreeNet = routes[routeIndex].netCode;
+        currentTraceInsertionSteps = connection.traceInsertionSteps.empty()
+                ? nullptr
+                : std::make_shared<const std::vector<ROUTING_TRACE_INSERTION_STEP>>(
+                          connection.traceInsertionSteps );
+        if( currentTraceInsertionSteps )
+        {
+            autorouterDecisionLog(
+                    "TRACE_REPLAY_AVAILABLE",
+                    { { "net", std::to_string( connection.netCode ) },
+                      { "route_index", std::to_string( routeIndex ) },
+                      { "tree_order", std::to_string( currentTreeInsertionOrder ) },
+                      { "steps", std::to_string(
+                                             currentTraceInsertionSteps->size() ) } } );
+        }
 
         if( connection.netCode == net )
         {
@@ -554,11 +795,18 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                                 + netViaDrillRadius( net )
                                 + m_board.holeToHoleClearance + 1 );
                     }
-            continue;
+            // A compensated Freerouting ShapeSearchTree contains same-net
+            // PolylineTrace leaves too; leaf semantics ignore them during
+            // completion. Omitting them changes tree topology for all later
+            // foreign-net searches. Retain the legacy skip outside the exact
+            // source-tree path and for drill-page construction.
+            if( !aSourceTraceRooms || aForVia )
+                continue;
         }
         for( std::size_t i = 1; i < connection.nodes.size(); ++i )
         {
             const std::size_t edge = i - 1;
+            currentTreeShapeIndex = static_cast<int>( edge );
             const bool representedByRipupRoom = aRipupObstacles
                     && std::any_of( aRipupObstacles->begin(), aRipupObstacles->end(),
                                     [&]( const ROOM_RIPUP_OBSTACLE& aObstacle )
@@ -608,7 +856,13 @@ std::vector<SHAPE_TREE_ENTRY> MAZE_SEARCH_ENGINE::roomObstacles(
                     expansion = std::max( expansion, drillRadius
                             + otherDrillRadius + m_board.holeToHoleClearance );
             }
-            addSegment( from.point, to.point, expansion + 1 );
+            currentTraceTreeExpansion = expansion;
+            // PolylineTrace.calculateTreeShapes offsets by the exact
+            // compensated half-width. Equality at the requested clearance is
+            // legal; an extra native IU invents a different one-dimensional
+            // door and changes the next maze frontier.
+            addSegment( from.point, to.point,
+                        expansion + ( aSourceTraceRooms && !aForVia ? 0 : 1 ) );
         }
     }
     if( aForVia && !m_settings.allowViaInSmdPad )
@@ -659,7 +913,7 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                / static_cast<double>( 1ULL << 53 );
     };
 
-    const auto& routes = m_occupancy.Connections();
+    const std::vector<ROUTING_CONNECTION> routes = roomRouteItems();
     std::size_t nextItemGroup = 0;
     for( std::size_t routeIndex = 0; routeIndex < routes.size(); ++routeIndex )
     {
@@ -725,6 +979,12 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
             info->clearance = style.clearance > 0
                                       ? style.clearance
                                       : netClearance( connection.netCode );
+            info->compensatedHalfWidth = info->halfWidth
+                    + std::max<std::int64_t>(
+                            0,
+                            edgePairClearance( net, connection.netCode,
+                                               aLayer, 0, info->clearance )
+                                    - candidateCompensation );
             info->sourceStyleMatches =
                     info->halfWidth == radius
                     && info->clearance == netClearance( net );
@@ -749,88 +1009,124 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     if( fullLength < 0.1 )
                         return std::numeric_limits<double>::infinity();
 
+                    const ROUTER_NODE start{ aLine.a.Round(), aLayer };
+                    const ROUTER_NODE requestedEnd{ aLine.b.Round(), aLayer };
+
+                    // MazeTraceShover first asks RoutingBoard.checkTraceSegment
+                    // for the prefix which is clear of *non-shovable* items.
+                    // That query ignores movable traces and vias; removing the
+                    // currently detected conflict set and calling the ordinary
+                    // all-obstacle predicate is not equivalent because another
+                    // movable item can still reject the segment.  Preserve both
+                    // source one-coordinate safety margins: the first is
+                    // applied inside CheckTraceSegmentLength(), and the second
+                    // is applied here before changeLengthApprox().
+                    const double immutableLength = CheckTraceSegmentLength(
+                            net, start, requestedEnd, &candidateStyle );
+                    double availableLength = fullLength;
+                    bool segmentShortened = false;
+                    if( std::isfinite( immutableLength ) )
+                    {
+                        availableLength = std::min(
+                                fullLength,
+                                immutableLength
+                                        - FREEROUTING_COORDINATE_UNIT_IU );
+                        if( availableLength <= 0 )
+                            return 0;
+                        segmentShortened = availableLength + 0.5 < fullLength;
+                    }
+
                     const auto canShovePrefix = [&]( double aLength )
                     {
+                        const bool fullProbe =
+                                aLength + 0.5 >= availableLength;
+                        const auto traceProbe = [&]( const char* aResult,
+                                                     std::size_t aConflictCount = 0 )
+                        {
+                            if( fullProbe )
+                                autorouterDecisionLog(
+                                        "TRACE_SHOVE_PREFIX",
+                                        { { "result", aResult },
+                                          { "side",
+                                            aShoveToTheLeft ? "LEFT" : "RIGHT" },
+                                          { "length", std::to_string( aLength ) },
+                                          { "conflicts",
+                                            std::to_string( aConflictCount ) } } );
+                        };
                         if( aCancel && aCancel() )
+                        {
+                            traceProbe( "cancelled" );
                             return false;
+                        }
 
-                        const FLOAT_POINT end = aLength + 0.5 >= fullLength
-                                ? aLine.b
+                        const FLOAT_POINT end = aLength + 0.5 >= availableLength
+                                ? ( segmentShortened
+                                            ? aLine.a.ChangeLength(
+                                                      aLine.b, availableLength )
+                                            : aLine.b )
                                 : aLine.a.ChangeLength( aLine.b, aLength );
                         ROUTING_CONNECTION candidate;
                         candidate.netCode = net;
-                        candidate.nodes = { { aLine.a.Round(), aLayer },
+                        candidate.nodes = { start,
                                             { end.Round(), aLayer } };
                         candidate.complete = true;
                         candidate.edgeStyles = { candidateStyle };
                         if( candidate.nodes.front() == candidate.nodes.back() )
+                        {
+                            traceProbe( "point" );
                             return false;
+                        }
 
                         const std::vector<ROUTING_CONNECTION> conflicts =
                                 FindConflictingConnections( candidate );
                         if( conflicts.empty() )
-                            return false;
-
-                        // checkTraceSegment(..., onlyNotShovable=true) first
-                        // verifies the straight candidate against immutable
-                        // geometry while ignoring the mutable conflict set.
                         {
-                            ROUTING_OCCUPANCY::TRANSACTION restore( m_occupancy );
-                            for( const ROUTING_CONNECTION& conflict : conflicts )
-                                m_occupancy.Remove( conflict );
-                            if( !CanInsertSegment(
-                                        net, candidate.nodes.front(),
-                                        candidate.nodes.back(), &candidateStyle ) )
-                            {
-                                return false;
-                            }
+                            traceProbe( "no_conflicts" );
+                            return true;
                         }
 
                         ROUTING_OCCUPANCY::TRANSACTION restore( m_occupancy );
                         const auto inserted = FOUND_CONNECTION_INSERTER::Insert(
                                 candidate, conflicts, m_occupancy, *this,
-                                aCancel, false );
+                                aCancel, false, nullptr );
                         if( inserted.state
                             != FOUND_CONNECTION_INSERTER::STATE::INSERTED )
                         {
+                            traceProbe( "forced_insert_failed",
+                                        conflicts.size() );
                             return false;
                         }
 
-                        // TraceShover.check is directional.  The current
-                        // forced-insertion primitive evaluates both contours;
-                        // accept it for this side only when every displaced
-                        // item stays on that requested side of the oriented
-                        // shove line.
-                        const int requestedSide = aShoveToTheLeft ? 1 : -1;
-                        for( const auto& shoved : inserted.shoved )
-                        {
-                            bool reachesRequestedSide = false;
-                            for( const ROUTER_NODE& node : shoved.replacement.nodes )
-                            {
-                                const FLOAT_POINT point{
-                                        static_cast<double>( node.point.x ),
-                                        static_cast<double>( node.point.y ) };
-                                const int side = point.SideOf( aLine.a, aLine.b );
-                                if( side == -requestedSide )
-                                    return false;
-                                reachesRequestedSide = reachesRequestedSide
-                                                       || side == requestedSide;
-                            }
-                            if( !reachesRequestedSide )
-                                return false;
-                        }
-                        return !inserted.shoved.empty();
+                        // ShapeEntrySide's LEFT/RIGHT flag selects the
+                        // topological entry side of the incoming trace shape;
+                        // it is not a fixed half-plane for every replacement
+                        // corner.  A polyline bend can make two consecutive
+                        // source-approved shoves displace their trace pieces
+                        // onto opposite determinant sides of parallel shove
+                        // segments.  sectionCanStartShove() already enforces
+                        // the source entry-side rule.  Requiring every new
+                        // contour corner to share one global sign here was an
+                        // extra native restriction and rejected those legal
+                        // bends.
+                        const bool result = !inserted.shoved.empty();
+                        traceProbe( result ? "success" : "not_shoved",
+                                    conflicts.size() );
+                        return result;
                     };
 
-                    if( canShovePrefix( fullLength ) )
-                        return std::numeric_limits<double>::infinity();
+                    if( canShovePrefix( availableLength ) )
+                    {
+                        return segmentShortened
+                                ? availableLength
+                                : std::numeric_limits<double>::infinity();
+                    }
 
                     // Both source checks return the longest usable prefix.
                     // Preserve that partial-progress contract with a bounded
                     // integral binary search rather than collapsing every
                     // blocked endpoint into an all-or-nothing result.
                     double low = 0;
-                    double high = fullLength;
+                    double high = availableLength;
                     for( int iteration = 0; iteration < 24 && high - low > 1; ++iteration )
                     {
                         const double middle = std::floor( ( low + high ) / 2 );
@@ -997,17 +1293,25 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
             }
 
             const INT_OCTAGON octagon = octagonalEnvelope(
-                    { from.point, to.point }, expansion + 1 );
+                    { from.point, to.point }, expansion );
             std::optional<PLANAR::SIMPLEX> simplex;
             if( from.point != to.point )
                 simplex = PLANAR::SIMPLEX::FromExpandedSegment(
-                        from.point, to.point, expansion + 1 );
+                        from.point, to.point, expansion );
             else
                 simplex = octagon.ToSimplex();
             SHAPE_TREE_ENTRY entry{ octagon.BoundingBox(), 0,
                                     static_cast<int>( edge ), aLayer,
                                     connection.netCode, false, true, octagon,
                                     std::move( simplex ) };
+            entry.treeInsertionOrder = m_board.obstacles.size() + 1 + routeIndex;
+            if( !connection.traceInsertionSteps.empty() )
+            {
+                entry.traceInsertionSteps = std::make_shared<
+                        const std::vector<ROUTING_TRACE_INSERTION_STEP>>(
+                                connection.traceInsertionSteps );
+                entry.traceTreeExpansion = expansion;
+            }
             std::optional<CONNECTION> topologyConnection;
             if( routeItems.size() == routeItemCount )
                 topologyConnection = CONNECTION::Get(
@@ -1018,8 +1322,21 @@ std::vector<ROOM_RIPUP_OBSTACLE> MAZE_SEARCH_ENGINE::roomRipupObstacles(
                     nextDouble(), additionalViaTraceHalfWidths,
                     topologyConnection ? &*topologyConnection : nullptr );
             if( ripupCost >= 0 )
+            {
+                std::uint64_t sourceObjectId = 0;
+                if( routeItems.size() == routeItemCount )
+                    sourceObjectId = m_occupancy.Board()->SourceObjectId(
+                            routeItems[edgeItemOrdinals[edge]] );
+                else if( m_occupancy.Board() )
+                    sourceObjectId = static_cast<std::uint64_t>(
+                            m_occupancy.Board()->ItemCount() + edgeGroups[edge] + 1 );
+                else
+                    sourceObjectId = ( std::uint64_t{ 1 } << 32 )
+                                     + edgeGroups[edge];
                 result.push_back( { std::move( entry ), edgeGroups[edge], ripupCost,
-                                    routeIndex, edgeTraceInfo[edge] } );
+                                    routeIndex, edgeTraceInfo[edge],
+                                    connection.netCode, sourceObjectId } );
+            }
         }
     }
     return result;
@@ -1054,16 +1371,23 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                     continue;
                 const auto start = terminal.pad.position;
                 const auto end = terminal.segmentEnd.value_or( start );
+                const auto treeOctagon = terminalTreeOctagon(
+                        terminal, layer.layerId, compensation );
                 result.push_back( { start, end, terminal.padIndex,
-                                    terminalTreeBounds( terminal, layer.layerId,
-                                                        compensation ),
+                                    treeOctagon
+                                            ? treeOctagon->BoundingBox()
+                                            : terminalTreeBounds(
+                                                      terminal, layer.layerId,
+                                                      compensation ),
                                     terminal.connectionArea,
                                     terminal.connectionArea ? radius : 0,
                                     terminalTraceExitRestrictions(
                                             terminal, layer.layerId ),
                                     static_cast<double>( edgeToTurn
                                                          + std::max<std::int64_t>(
-                                                                 1, radius + compensation ) ) } );
+                                                                 1, radius + compensation ) ),
+                                    terminal.itemId, terminal.treeEntryIndex,
+                                    treeOctagon } );
             }
             return result;
         };
@@ -1092,6 +1416,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         // existing dialog's direction penalty is mapped here, not substituted
         // into the legacy queue's incompatible grid-normalized heuristic.
         const auto [horizontal, vertical] = layer.TraceCosts( m_settings.traceLengthCost );
+        ROUTER_ANGLE_RESTRICTION angleRestriction = anyAngle
+                ? ROUTER_ANGLE_RESTRICTION::ANY_ANGLE
+                : ROUTER_ANGLE_RESTRICTION::FORTYFIVE_DEGREE;
         auto path = anyAngle
                 ? MAZE_SEARCH_ENGINE_ANY_ANGLE::FindConnection(
                         bounds, entries, layer.layerId, net, starts, targets,
@@ -1125,6 +1452,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
                     static_cast<double>( std::max( 0, m_settings.bendCost ) )
                             * std::max( 1, m_settings.gridStepIU ), ripupEntries,
                     sourceTraceRooms );
+            if( path )
+                angleRestriction = ROUTER_ANGLE_RESTRICTION::NINETY_DEGREE;
         }
         if( !path )
             continue;
@@ -1133,6 +1462,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findRoomConnection(
         found.fromPadIndex = path->startOwner;
         found.toPadIndex = path->targetOwner;
         found.complete = true;
+        found.insertionBacktracksFromTarget = true;
+        found.angleRestriction = angleRestriction;
         found.cost = path->ripupCost;
         for( const auto& point : path->points )
             found.nodes.push_back( { point, layer.layerId } );
@@ -1321,9 +1652,16 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
     if( via.transitionsEnabled && viaLayers.empty() )
         return std::nullopt;
 
-    const auto viaMargin = m_board.edgeClearance + maximumViaRadius + 1;
-    via.bounds = { m_board.bounds.minX + viaMargin, m_board.bounds.minY + viaMargin,
-                   m_board.bounds.maxX - viaMargin, m_board.bounds.maxY - viaMargin };
+    // AutorouteEngine constructs DrillPageArray over RoutingBoard.boundingBox.
+    // It does not pre-inset the page lattice by a via radius or edge
+    // clearance.  BoardOutline's compensated tree shapes cut the unusable
+    // perimeter out of each page, and the ordered ViaRule/host DRC preflight
+    // remains the final authority for every resulting centroid.  Insetting
+    // here moved every page centroid off Freerouting's integer lattice (and,
+    // after conversion back from KiCad IU, often off the 0.1 um source grid),
+    // which made locator backtracking disagree with the selected drill and
+    // prevented otherwise empty multilayer boards from routing.
+    via.bounds = bounds;
     via.pageWidth = std::max<std::int64_t>( 10000, 10 * maximumViaRadius );
     via.attachSmd = via.attachSmd
                     || std::any_of( profiles.begin(), profiles.end(),
@@ -1391,44 +1729,15 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         if( fanoutTarget->fanoutSourcePadIndex < m_board.pads.size() )
             via.fanoutCenter = m_board.pads[fanoutTarget->fanoutSourcePadIndex].position;
 
-        const auto targetWithinFanoutEnvelope = [&]( const ROUTING_TERMINAL& aTarget )
-        {
-            if( aTarget.pad.isSmd || aTarget.pad.isPlaneTarget
-                || via.fanoutMaxDistance <= 0 )
-            {
-                return true;
-            }
-
-            const ROUTER_POINT end = aTarget.segmentEnd.value_or( aTarget.pad.position );
-            const long double dx = static_cast<long double>( end.x )
-                                   - aTarget.pad.position.x;
-            const long double dy = static_cast<long double>( end.y )
-                                   - aTarget.pad.position.y;
-            const long double lengthSquared = dx * dx + dy * dy;
-            long double t = 0;
-            if( lengthSquared > 0 )
-            {
-                t = ( ( static_cast<long double>( via.fanoutCenter.x )
-                        - aTarget.pad.position.x ) * dx
-                      + ( static_cast<long double>( via.fanoutCenter.y )
-                          - aTarget.pad.position.y ) * dy ) / lengthSquared;
-                t = std::clamp( t, 0.0L, 1.0L );
-            }
-            const long double x = aTarget.pad.position.x + t * dx;
-            const long double y = aTarget.pad.position.y + t * dy;
-            const long double fromCenterX = x - via.fanoutCenter.x;
-            const long double fromCenterY = y - via.fanoutCenter.y;
-            return std::hypotl( fromCenterX, fromCenterY )
-                   <= static_cast<long double>( via.fanoutMaxDistance );
-        };
-        via.allowDirectFanoutTarget = !targets.empty()
-                && std::all_of(
-                        targets.begin(), targets.end(),
-                        [&]( const ROUTING_TERMINAL& aTarget )
-                        {
-                            return isOnPadLayer( aTarget.pad, via.fanoutSourceLayer )
-                                   && targetWithinFanoutEnvelope( aTarget );
-                        } );
+        // RoutingBoard.fanout() changes only the drill termination rule.  A
+        // real destination item remains a legal target door regardless of
+        // how far it is from the source pin; the configured escape envelope
+        // constrains candidate drill locations, not ordinary pad-to-pad
+        // completion.  Requiring every item in a large mixed-layer target set
+        // to lie inside that envelope suppressed all direct targets and made
+        // the native router choose a local via even when Freerouting reached a
+        // nearby same-layer pad first.
+        via.allowDirectFanoutTarget = !targets.empty();
     }
     const auto started = std::chrono::steady_clock::now();
     // RoutingBoard.fanout() uses the same 45-degree room/door/drill frontier
@@ -1445,10 +1754,15 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             {
                 return hasGeneralConvexRoomGeometry( net, aLayer );
             } );
-    // Fanout and plane termination still depend on their existing complete-
-    // centre room envelopes.  Ordinary fixed-direction routing is now paired
-    // with the source-width locator and therefore uses source tree semantics.
-    const bool sourceTraceRooms = !plane && fanoutTarget == nullptr;
+    // RoutingBoard.fanout() constructs the same compensated ShapeSearchTree
+    // as ordinary autorouting.  Its only semantic difference is terminating
+    // at the first legal drill, so fanout must retain the obstacle-side
+    // clearance share and carry the candidate's compensated half-width in the
+    // locator too.  Expanding every obstacle by the complete centre radius
+    // shrinks the very first fanout room by one trace half-width and changes
+    // door section counts.  Plane targets remain on the complete-centre path
+    // until their finite-area target-door semantics are translated.
+    const bool sourceTraceRooms = !plane;
     int nextObstacleId = 1;
     for( int id : physical )
     {
@@ -1483,16 +1797,23 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                 if( !isOnPadLayer( t.pad, id ) )
                     continue;
                 const auto a = t.pad.position, b = t.segmentEnd.value_or( a );
+                const auto treeOctagon = terminalTreeOctagon(
+                        t, id, compensation );
                 if( exactFrontier || aTarget || a.x == b.x || a.y == b.y )
                     output.push_back( { a, b, t.padIndex,
-                                        terminalTreeBounds( t, id, compensation ),
+                                        treeOctagon
+                                                ? treeOctagon->BoundingBox()
+                                                : terminalTreeBounds(
+                                                          t, id, compensation ),
                                         t.connectionArea,
                                         t.connectionArea ? radius : 0,
                                         terminalTraceExitRestrictions( t, id ),
                                         static_cast<double>( edgeToTurn
                                                              + std::max<std::int64_t>(
                                                                      1, radius
-                                                                                + compensation ) ) } );
+                                                                                + compensation ) ),
+                                        t.itemId, t.treeEntryIndex,
+                                        treeOctagon } );
                 else
                 {
                     ROUTING_TERMINAL first = t;
@@ -1503,11 +1824,13 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
                     output.push_back( { a, a, t.padIndex,
                                         terminalTreeBounds( first, id, compensation ),
                                         t.connectionArea,
-                                        t.connectionArea ? radius : 0, {}, 0 } );
+                                        t.connectionArea ? radius : 0, {}, 0,
+                                        t.itemId, t.treeEntryIndex, {} } );
                     output.push_back( { b, b, t.padIndex,
                                         terminalTreeBounds( second, id, compensation ),
                                         t.connectionArea,
-                                        t.connectionArea ? radius : 0, {}, 0 } );
+                                        t.connectionArea ? radius : 0, {}, 0,
+                                        t.itemId, t.treeEntryIndex, {} } );
                 }
             }
         };
@@ -1534,7 +1857,7 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
             ? MAZE_SEARCH_ENGINE_45_DEGREE::FindMultilayerConnection(
                       layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
-                      cancel, progress, sourceTraceRooms )
+                      cancel, progress, sourceTraceRooms, &m_persistent45Tree )
             : MAZE_SEARCH_ENGINE_90_DEGREE::FindMultilayerConnection(
                       layers, net, std::max<std::int64_t>( 1, radius + compensation ), via,
                       m_settings.maxExpandedNodes, expanded, m_roomMetrics,
@@ -1548,37 +1871,31 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::findMultilayerRoomConnecti
         found.edgeStyles = path->edgeStyles;
         found.cost = path->ripupCost;
         found.isFanoutConnection = fanoutTarget != nullptr;
+        found.angleRestriction = anyAngleFrontier
+                ? ROUTER_ANGLE_RESTRICTION::ANY_ANGLE
+                : exactFrontier
+                ? ROUTER_ANGLE_RESTRICTION::FORTYFIVE_DEGREE
+                : ROUTER_ANGLE_RESTRICTION::NINETY_DEGREE;
+
+        // Public native routes remain start-to-target. The source inserter is
+        // order-sensitive and consumes this maze result from the destination
+        // back toward the start; carry that lifecycle explicitly rather than
+        // reversing the public connection and its pad ownership here.
+        found.insertionBacktracksFromTarget = true;
+
         bool legal = assignViaStyles( found );
-        if( legal )
-            removeGeneratedCollinearNodes( found, *this );
-        if( legal )
-            MAZE_TRACE_SHOVER::Shorten( found, *this );
-        for( std::size_t i = 1; i < found.nodes.size() && legal; ++i )
-        {
-            const std::size_t edge = i - 1;
-            const bool isVia = i > 0 && found.nodes[edge].layer != found.nodes[i].layer;
-            const ROUTING_EDGE_STYLE* style = isVia ? &found.edgeStyles[edge] : nullptr;
-            legal = CanUseSegment( net, found.nodes[edge], found.nodes[i], isVia, style );
-            if( !legal && autorouterDebugEnabled() )
-            {
-                const auto& from = found.nodes[edge];
-                const auto& to = found.nodes[i];
-                std::ostringstream message;
-                message << "ROOM_DRILL_PATH_REJECTED net=" << net << " edge=" << edge
-                        << " from=(" << from.point.x << ',' << from.point.y << ",L"
-                        << from.layer << ") to=(" << to.point.x << ',' << to.point.y
-                        << ",L" << to.layer << ") via=" << isVia
-                        << " start_allowed="
-                        << isPointAllowed( from.point, from.layer, net, isVia,
-                                           endpointRadius( net, from.point ) )
-                        << " end_allowed="
-                        << isPointAllowed( to.point, to.layer, net, isVia,
-                                           endpointRadius( net, to.point ) )
-                        << " ripup_cost=" << path->ripupCost
-                        << " ripped_groups=" << path->rippedObstacleGroups.size();
-                autorouterDebugLog( message.str() );
-            }
-        }
+        // FoundConnectionLocator emits every rounded room/door corner and the
+        // source forced inserter consumes that sequence incrementally.  Do not
+        // run a speculative line-of-sight simplifier here: even a geometrically
+        // legal shortcut changes the private board seen by the next routing
+        // item and bypasses the source insertion/pull-tight lifecycle.
+        // The source does not run a second whole-route legality preflight after
+        // locating the backtrack path. FoundConnectionInserter consumes each
+        // span on the transactional board, where forced insertion can rewind,
+        // spring over, neck down, or reject it without publishing partial
+        // copper. Returning the located path here preserves that lifecycle;
+        // pre-rejecting a rounded door-boundary point skips a source-legal
+        // forced insertion before it can perform those corrections.
         if( legal && !( cancel && cancel() ) )
         {
             AUTOROUTE_CONTROL control( m_settings, net, retry, plane,

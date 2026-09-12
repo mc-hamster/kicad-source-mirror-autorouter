@@ -66,6 +66,19 @@ public:
         std::vector<ROUTING_TERMINAL> terminals;
     };
 
+    /** Stable source Item identity captured before a route-level replacement.
+     *
+     * Freerouting's optimizers mutate a PolylineTrace/DrillItem in place, so
+     * its Item.getId() continues to determine ShapeTree and door ordering. The
+     * native bridge sometimes has to express the same edit as remove + add;
+     * this record lets that adapter restore the source identity afterwards.
+     */
+    struct SOURCE_ITEM_IDENTITY
+    {
+        std::uint64_t      sourceObjectId = 0;
+        ROUTING_CONNECTION geometry;
+    };
+
     ROUTING_BOARD( const BOARD_SNAPSHOT& aSnapshot, const AUTOROUTER_SETTINGS& aSettings );
     ~ROUTING_BOARD();
     ROUTING_BOARD( const ROUTING_BOARD& ) = delete;
@@ -124,6 +137,16 @@ public:
     std::optional<ROUTING_CONNECTION> ItemRoute( ITEM_ID aItem ) const;
     /** Current mutable item geometry in source insertion-ID order. */
     std::vector<ROUTING_CONNECTION> ItemRoutes() const;
+    /** Capture source Item identities before a native remove + add adapter. */
+    std::vector<SOURCE_ITEM_IDENTITY> CaptureRouteSourceIdentities(
+            const ROUTING_CONNECTION& aRoute ) const;
+    /** Match replacement pieces to their source geometry and restore the
+     * identities that Freerouting would retain through in-place mutation. */
+    void RestoreRouteSourceIdentities(
+            const ROUTING_CONNECTION& aReplacement,
+            const std::vector<SOURCE_ITEM_IDENTITY>& aIdentities );
+    /** SearchTreeObject.getId() equivalent for one worker item. */
+    std::uint64_t SourceObjectId( ITEM_ID aItem ) const;
     /** Remove only the supplied mutable items. Fixed/unknown IDs reject the
      * complete operation; callers use TRANSACTION for speculative edits.
      */

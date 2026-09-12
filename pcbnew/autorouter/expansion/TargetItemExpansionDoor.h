@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -68,16 +69,27 @@ public:
                                 std::size_t aPadIndex,
                                 const ROUTER_POINT& aStart,
                                 const ROUTER_POINT& aEnd,
-                                ROUTER_BOX aTreeBounds ) :
+                                ROUTER_BOX aTreeBounds,
+                                std::size_t aTreeEntryIndex =
+                                        std::numeric_limits<std::size_t>::max(),
+                                std::optional<PLANAR::INT_OCTAGON> aTreeOctagon = {},
+                                std::int64_t aCoordinateUnit = 1,
+                                bool aYDownCoordinates = false ) :
             EXPANSION_DOOR( aRoom, nullptr, 2, false ),
             m_itemId( aItemId ),
             m_padIndex( aPadIndex ),
             m_target( aStart ),
             m_targetEnd( aEnd ),
-            m_treeBounds( aTreeBounds )
+            m_treeBounds( aTreeBounds ),
+            m_treeEntryIndex( aTreeEntryIndex ),
+            m_treeOctagon( std::move( aTreeOctagon ) ),
+            m_coordinateUnit( std::max<std::int64_t>( 1, aCoordinateUnit ) ),
+            m_yDownCoordinates( aYDownCoordinates )
     {
     }
 
+    int ItemId() const { return m_itemId; }
+    std::size_t TreeEntryIndex() const { return m_treeEntryIndex; }
     std::size_t PadIndex() const { return m_padIndex; }
     const ROUTER_POINT& Target() const { return m_target; }
     const ROUTER_POINT& TargetEnd() const { return m_targetEnd; }
@@ -159,6 +171,10 @@ private:
     ROUTER_POINT m_target;
     ROUTER_POINT m_targetEnd;
     ROUTER_BOX   m_treeBounds;
+    std::size_t  m_treeEntryIndex;
+    std::optional<PLANAR::INT_OCTAGON> m_treeOctagon;
+    std::int64_t m_coordinateUnit;
+    bool         m_yDownCoordinates;
 };
 
 } // namespace KICAD_AUTOROUTER

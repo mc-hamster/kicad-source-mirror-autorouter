@@ -21,6 +21,7 @@
 #include "FoundConnectionLocator45Degree.h"
 #include "../AutorouterDebug.h"
 #include "../maze/MazeSearchEngine.h"
+#include "../maze/MazeTraceShover.h"
 
 #include <algorithm>
 #include <cmath>
@@ -36,11 +37,45 @@ namespace KICAD_AUTOROUTER
 namespace
 {
 
+std::string formatConnectionForDebug( const char* aStage,
+                                      const ROUTING_CONNECTION& aConnection )
+{
+    std::ostringstream log;
+    log << "INSERT_CONNECTION stage=" << aStage
+        << " net=" << aConnection.netCode
+        << " nodes=" << aConnection.nodes.size();
+    for( std::size_t index = 0; index < aConnection.nodes.size(); ++index )
+    {
+        const ROUTER_NODE& node = aConnection.nodes[index];
+        log << " {i=" << index << ",x=" << node.point.x << ",y=" << node.point.y
+            << ",layer=" << node.layer;
+        if( index > 0 )
+        {
+            const ROUTING_EDGE_STYLE& style = EdgeStyle( aConnection, index - 1 );
+            log << ",width=" << style.trackWidth << ",clearance=" << style.clearance;
+        }
+        log << '}';
+    }
+    return log.str();
+}
+
+
+void reverseConnection( ROUTING_CONNECTION& aConnection )
+{
+    std::reverse( aConnection.nodes.begin(), aConnection.nodes.end() );
+    std::reverse( aConnection.edgeStyles.begin(), aConnection.edgeStyles.end() );
+    std::swap( aConnection.fromPadIndex, aConnection.toPadIndex );
+}
+
+
 bool strictlyInsertable( const ROUTING_CONNECTION& aConnection,
                          const MAZE_SEARCH_ENGINE& aEngine )
 {
     if( !HasValidEdgeStyles( aConnection ) )
         return false;
+
+    if( aEngine.CanInsertTraceSpan( aConnection ) )
+        return true;
 
     for( std::size_t index = 1; index < aConnection.nodes.size(); ++index )
     {
@@ -49,11 +84,26 @@ bool strictlyInsertable( const ROUTING_CONNECTION& aConnection,
         if( !aEngine.CanInsertSegment( aConnection.netCode, aConnection.nodes[index - 1],
                                        aConnection.nodes[index], style ) )
         {
+            if( autorouterDebugEnabled() )
+            {
+                const ROUTER_NODE& from = aConnection.nodes[index - 1];
+                const ROUTER_NODE& to = aConnection.nodes[index];
+                autorouterDebugLog(
+                        "INSERT_SEGMENT_BLOCKED net="
+                        + std::to_string( aConnection.netCode ) + " edge="
+                        + std::to_string( index - 1 ) + " from=("
+                        + std::to_string( from.point.x ) + ','
+                        + std::to_string( from.point.y ) + ",L"
+                        + std::to_string( from.layer ) + ") to=("
+                        + std::to_string( to.point.x ) + ','
+                        + std::to_string( to.point.y ) + ",L"
+                        + std::to_string( to.layer ) + ')' );
+            }
             return false;
         }
     }
 
-    return true;
+    return false;
 }
 
 
@@ -100,6 +150,7 @@ std::optional<ROUTING_CONNECTION> tryTerminalNeckdown(
     std::vector<ROUTING_EDGE_STYLE> narrowStyles;
     const auto appendNarrowStyle = [&]( std::int64_t aWidth )
     {
+        aWidth = std::max( aWidth, aEngine.MinimumTrackWidth() );
         if( aWidth <= 0 || aWidth >= normalWidth )
             return;
         ROUTING_EDGE_STYLE style = oldStyle;
@@ -223,6 +274,52 @@ std::optional<ROUTING_CONNECTION> tryTerminalNeckdown(
 }
 
 
+std::optional<ROUTING_CONNECTION> tryFanoutMicroNeckdown(
+        const ROUTING_CONNECTION& aConnection, std::size_t aBlockedEdge,
+        const MAZE_SEARCH_ENGINE& aEngine )
+{
+    if( !aConnection.isFanoutConnection || aBlockedEdge == 0
+        || aBlockedEdge >= aConnection.nodes.size()
+        || !HasValidEdgeStyles( aConnection ) )
+    {
+        return {};
+    }
+
+    const ROUTER_NODE& first = aConnection.nodes[aBlockedEdge - 1];
+    const ROUTER_NODE& last = aConnection.nodes[aBlockedEdge];
+    if( first.layer != last.layer || first.point == last.point )
+        return {};
+
+    const ROUTING_EDGE_STYLE& oldStyle = EdgeStyle( aConnection, aBlockedEdge - 1 );
+    const std::int64_t normalWidth = aEngine.ResolveTrackWidth(
+            aConnection.netCode, oldStyle );
+    for( const std::int64_t width : {
+                 std::max<std::int64_t>( 1, normalWidth * 3 / 4 ),
+                 std::max<std::int64_t>( 1, normalWidth * 3 / 5 ),
+                 std::max<std::int64_t>( 1, normalWidth / 2 ) } )
+    {
+        // Freerouting owns its board rules and can commit the raw 3/4, 3/5
+        // or 1/2 width.  Here the final owner is KiCad: accepting a width
+        // below BOARD_DESIGN_SETTINGS::m_TrackMinWidth only postpones an
+        // inevitable transaction rejection and can make an otherwise valid
+        // route appear to finish with new DRC errors.  Clamp before
+        // deduplication/insertion while preserving source candidate order.
+        const std::int64_t safeWidth = std::max(
+                width, aEngine.MinimumTrackWidth() );
+        if( safeWidth >= normalWidth )
+            continue;
+
+        ROUTING_CONNECTION result = aConnection;
+        EnsureEdgeStyles( result );
+        result.edgeStyles[aBlockedEdge - 1].trackWidth = safeWidth;
+        if( strictlyInsertable( result, aEngine ) )
+            return result;
+    }
+
+    return {};
+}
+
+
 std::optional<ROUTING_CONNECTION> tryNeckdown( const ROUTING_CONNECTION& aConnection,
                                                 std::size_t aBlockedEdge,
                                                 const MAZE_SEARCH_ENGINE& aEngine,
@@ -245,12 +342,34 @@ std::optional<ROUTING_CONNECTION> tryNeckdown( const ROUTING_CONNECTION& aConnec
     // FoundConnectionInserter.insertFanoutMicroNeckdown() runs only after
     // both source pin-width attempts failed. Keep that order so an exact
     // pad-derived neckdown wins over the generic fanout escape widths.
-    if( atStart )
-        if( auto result = tryTerminalNeckdown( aConnection, aBlockedEdge, true, aEngine, true ) )
-            return result;
+    if( aConnection.isFanoutConnection )
+    {
+        if( atStart )
+            if( auto result = tryTerminalNeckdown(
+                        aConnection, aBlockedEdge, true, aEngine, true ) )
+            {
+                return result;
+            }
 
-    if( atEnd )
-        return tryTerminalNeckdown( aConnection, aBlockedEdge, false, aEngine, true );
+        if( atEnd )
+            if( auto result = tryTerminalNeckdown(
+                        aConnection, aBlockedEdge, false, aEngine, true ) )
+            {
+                return result;
+            }
+    }
+
+    // insertFanoutMicroNeckdown() is not restricted to a physical terminal
+    // edge.  It is called after every failed two-corner fanout insertion and
+    // can therefore narrow an intermediate locator segment before the next
+    // longer spring-over retry.  This matters when the normal-width path is
+    // legal in the compensated search tree but needs a short 3/4-width
+    // segment to reproduce the source insertion exactly.
+    if( auto result = tryFanoutMicroNeckdown(
+                aConnection, aBlockedEdge, aEngine ) )
+    {
+        return result;
+    }
 
     return {};
 }
@@ -268,6 +387,9 @@ ROUTING_CONNECTION connectionSlice( const ROUTING_CONNECTION& aConnection,
                                     std::size_t aFirstNode, std::size_t aLastNode )
 {
     ROUTING_CONNECTION result = aConnection;
+    // A slice is a transient trace/via item, not another owner of the complete
+    // connection's mutation journal.
+    result.traceInsertionSteps.clear();
     result.nodes.assign( aConnection.nodes.begin() + static_cast<std::ptrdiff_t>( aFirstNode ),
                          aConnection.nodes.begin()
                                  + static_cast<std::ptrdiff_t>( aLastNode + 1 ) );
@@ -286,17 +408,103 @@ ROUTING_CONNECTION connectionSlice( const ROUTING_CONNECTION& aConnection,
 
 
 bool appendConnection( ROUTING_CONNECTION& aDestination,
-                       const ROUTING_CONNECTION& aSource )
+                       const ROUTING_CONNECTION& aSource,
+                       std::optional<std::size_t>* aNormalizedSplitNode = nullptr )
 {
     if( aSource.nodes.empty() || !HasValidEdgeStyles( aSource ) )
         return false;
 
+    std::size_t firstSourceNode = 0;
     if( aDestination.nodes.empty() )
+    {
         aDestination.nodes.push_back( aSource.nodes.front() );
+    }
     else if( aDestination.nodes.back() != aSource.nodes.front() )
-        return false;
+    {
+        // FoundConnectionInserter deliberately rewinds one source corner
+        // after a two-corner forced insertion fails.  The copper inserted by
+        // the preceding call is not rolled back: the next, longer polyline
+        // begins one corner before its existing keep point and normalize()
+        // removes that leading cycle/stub.  Represent the same union as one
+        // path by joining at the retained keep point when it is an exact
+        // corner of the longer span.
+        const auto sourceJoin = std::find( aSource.nodes.begin(), aSource.nodes.end(),
+                                           aDestination.nodes.back() );
 
-    for( std::size_t edge = 0; edge + 1 < aSource.nodes.size(); ++edge )
+        if( sourceJoin != aSource.nodes.end() )
+        {
+            firstSourceNode = static_cast<std::size_t>(
+                    sourceJoin - aSource.nodes.begin() );
+
+            // PolylineTrace.normalize() splits a newly inserted trace at the
+            // first geometric overlap with existing same-net copper.  A
+            // forced-insertion rewind commonly starts one corner before the
+            // existing endpoint, so that overlap can begin in the interior
+            // of the new trace's first segment rather than at one of its
+            // explicit corners.  Retain that source item boundary: pullTight
+            // is applied only to the newly normalized suffix.
+            const auto pointOnSegment = []( const ROUTER_POINT& aPoint,
+                                            const ROUTER_POINT& aStart,
+                                            const ROUTER_POINT& aEnd )
+            {
+                using WIDE = __int128_t;
+                const WIDE dx = WIDE( aEnd.x ) - aStart.x;
+                const WIDE dy = WIDE( aEnd.y ) - aStart.y;
+                const WIDE px = WIDE( aPoint.x ) - aStart.x;
+                const WIDE py = WIDE( aPoint.y ) - aStart.y;
+                if( dx * py != dy * px )
+                    return false;
+                return aPoint.x >= std::min( aStart.x, aEnd.x )
+                       && aPoint.x <= std::max( aStart.x, aEnd.x )
+                       && aPoint.y >= std::min( aStart.y, aEnd.y )
+                       && aPoint.y <= std::max( aStart.y, aEnd.y );
+            };
+            const auto liesOnRewoundPrefix = [&]( const ROUTER_POINT& aPoint )
+            {
+                for( std::size_t edge = 0; edge < firstSourceNode; ++edge )
+                    if( pointOnSegment( aPoint, aSource.nodes[edge].point,
+                                       aSource.nodes[edge + 1].point ) )
+                        return true;
+                return false;
+            };
+
+            if( aNormalizedSplitNode && firstSourceNode > 0 )
+            {
+                std::size_t split = aDestination.nodes.size() - 1;
+                while( split > 0
+                       && liesOnRewoundPrefix( aDestination.nodes[split - 1].point ) )
+                {
+                    --split;
+                }
+                *aNormalizedSplitNode = split;
+            }
+        }
+        else
+        {
+            // A spring-over retry may replace, rather than merely overlap,
+            // the previously accepted approach.  The source board mutates
+            // that aggregate PolylineTrace in place: when the longer retry
+            // starts at an earlier retained corner, the old suffix is
+            // discarded and the replacement span becomes authoritative.
+            // Mirror that union on the private native candidate before it is
+            // published to the occupancy transaction.
+            const auto destinationJoin = std::find(
+                    aDestination.nodes.begin(), aDestination.nodes.end(),
+                    aSource.nodes.front() );
+
+            if( destinationJoin == aDestination.nodes.end() )
+                return false;
+
+            const std::size_t keepNode = static_cast<std::size_t>(
+                    destinationJoin - aDestination.nodes.begin() );
+            aDestination.nodes.resize( keepNode + 1 );
+
+            if( !aDestination.edgeStyles.empty() )
+                aDestination.edgeStyles.resize( keepNode );
+        }
+    }
+
+    for( std::size_t edge = firstSourceNode; edge + 1 < aSource.nodes.size(); ++edge )
     {
         aDestination.nodes.push_back( aSource.nodes[edge + 1] );
         aDestination.edgeStyles.push_back( EdgeStyle( aSource, edge ) );
@@ -312,8 +520,9 @@ bool appendConnection( ROUTING_CONNECTION& aDestination,
  * allowed to consume another source corner; when the failed span started at
  * the previously accepted corner, the source rewinds one corner so its next
  * spring-over sees enough approach geometry to repair a compensated-clearance
- * violation.  The accepted prefix is therefore represented here by exact
- * original-corner checkpoints and is truncated on the same rewind.
+ * violation.  The already inserted prefix remains present.  The longer span
+ * overlaps it at the retained keep point and normalization removes the
+ * resulting leading stub/cycle.
  *
  * Freerouting mutates its private RoutingBoard after every successful span and
  * relies on the caller's board snapshot for rollback.  The native worker keeps
@@ -329,14 +538,8 @@ INCREMENTAL_INSERTION buildIncrementalConnection(
     ROUTING_CONNECTION result = aConnection;
     result.nodes.clear();
     result.edgeStyles.clear();
+    result.traceInsertionSteps.clear();
     result.nodes.push_back( aConnection.nodes.front() );
-
-    // Map each accepted original corner to the corresponding last node in the
-    // reconstructed route.  Wrapped spans can add any number of intermediate
-    // corners, so an original-index decrement cannot be implemented by merely
-    // popping one result node.
-    std::vector<std::size_t> resultNodeAtOriginal( aConnection.nodes.size(), 0 );
-    resultNodeAtOriginal.front() = 0;
 
     std::size_t edge = 0;
     while( edge + 1 < aConnection.nodes.size() )
@@ -366,7 +569,6 @@ INCREMENTAL_INSERTION buildIncrementalConnection(
                 outcome.blockedEdge = edge + 1;
                 return outcome;
             }
-            resultNodeAtOriginal[edge + 1] = result.nodes.size() - 1;
             ++edge;
             continue;
         }
@@ -401,9 +603,26 @@ INCREMENTAL_INSERTION buildIncrementalConnection(
             ROUTING_CONNECTION span = connectionSlice( aConnection, fromCornerNo,
                                                         currentCornerNo );
             std::optional<ROUTING_CONNECTION> accepted;
-            if( strictlyInsertable( span, aEngine ) )
+            const char* acceptedBy = "none";
+
+            // RoutingBoard.insertForcedTracePolyline() always calls
+            // TraceShover.springOverObstacles() on the isolated new span
+            // before combining it with the same-net trace at fromCorner.
+            // This is not merely a fallback for a failed clearance check: a
+            // short span whose endpoint lies inside foreign copper must fail
+            // here even when a segment-only predicate would accept the
+            // endpoint as a contact.  Returning an unchanged path is
+            // therefore distinct from spring-over failure for this caller.
+            std::optional<ROUTING_CONNECTION> prepared =
+                    aEngine.SpringOverConnection( span, {}, aCancel, nullptr, true );
+
+            ROUTING_CONNECTION insertionProbe = result;
+            if( prepared && appendConnection( insertionProbe, *prepared )
+                && strictlyInsertable( insertionProbe, aEngine ) )
             {
-                accepted = std::move( span );
+                acceptedBy = SameRouteGeometry( *prepared, span )
+                                     ? "direct" : "spring_over";
+                accepted = std::move( prepared );
             }
             else
             {
@@ -424,15 +643,24 @@ INCREMENTAL_INSERTION buildIncrementalConnection(
                 // insertion and only when that endpoint really is a pin of
                 // the complete connection.  A local ResultItem boundary is
                 // not sufficient evidence of a physical pad.
-                if( span.nodes.size() == 2 && blockedInSpan != 0 )
+                if( span.nodes.size() == 2 )
                 {
-                    accepted = tryNeckdown( span, blockedInSpan, aEngine,
+                    // insertForcedTracePolyline() can return its first corner
+                    // when the compensated segment predicate succeeds but
+                    // spring-over of the physical obstacle shapes cannot
+                    // preserve the normal-width span.  Freerouting still
+                    // tries terminal/fanout neckdown in that case; requiring
+                    // CanInsertSegment() to identify a blocked edge skipped
+                    // the retry because that predicate intentionally sees
+                    // only the compensated broad phase.
+                    const std::size_t neckdownEdge = blockedInSpan != 0
+                            ? blockedInSpan : 1;
+                    accepted = tryNeckdown( span, neckdownEdge, aEngine,
                                             fromCornerNo == 0,
                                             currentCornerNo + 1 == aConnection.nodes.size() );
+                    if( accepted )
+                        acceptedBy = "neckdown";
                 }
-
-                if( !accepted )
-                    accepted = aEngine.SpringOverConnection( span, aCancel );
 
                 if( aCancel && aCancel() )
                 {
@@ -440,20 +668,92 @@ INCREMENTAL_INSERTION buildIncrementalConnection(
                     return outcome;
                 }
 
-                if( accepted && !strictlyInsertable( *accepted, aEngine ) )
-                    accepted.reset();
+                if( accepted )
+                {
+                    insertionProbe = result;
+                    if( !appendConnection( insertionProbe, *accepted )
+                        || !strictlyInsertable( insertionProbe, aEngine ) )
+                    {
+                        accepted.reset();
+                    }
+                }
             }
 
             if( accepted )
             {
-                if( !appendConnection( result, *accepted ) )
+                ROUTING_TRACE_INSERTION_STEP replayStep;
+                replayStep.insertedSpan.nodes = accepted->nodes;
+                replayStep.insertedSpan.edgeStyles = accepted->edgeStyles;
+                if( autorouterDebugEnabled() )
+                {
+                    std::ostringstream log;
+                    log << "INSERT_SPAN net=" << aConnection.netCode
+                        << " from_corner=" << fromCornerNo
+                        << " to_corner=" << currentCornerNo
+                        << " accepted_by=" << acceptedBy
+                        << " result_nodes=" << accepted->nodes.size();
+                    autorouterDebugLog( log.str() );
+                }
+                std::optional<std::size_t> normalizedSplit;
+                if( !appendConnection( result, *accepted, &normalizedSplit ) )
                 {
                     outcome.blockedEdge = currentCornerNo;
                     return outcome;
                 }
+                replayStep.normalizedSplitNode = normalizedSplit;
+                replayStep.combinedBeforeTighten.nodes = result.nodes;
+                replayStep.combinedBeforeTighten.edgeStyles = result.edgeStyles;
+
+                // RoutingBoard.insertForcedTracePolyline() combines the new
+                // span with copper ending at its first corner, normalizes the
+                // combined PolylineTrace and calls pullTight before returning
+                // the accepted endpoint.  Delaying this until the complete
+                // found connection has been assembled changes the obstacle
+                // seen by the next batch item.  Keep the same incremental
+                // mutation order on the private native candidate; Shorten
+                // retains both endpoints, including the source keep-point at
+                // currentCornerNo.
+                // normalize() may have split this insertion into a new source
+                // trace item.  Freerouting selects the item at the accepted
+                // endpoint and tightens only that item; tightening the whole
+                // concatenated native connection moves the already-finished
+                // prefix and changes the board seen by the next net.
+                if( normalizedSplit && *normalizedSplit + 1 < result.nodes.size() )
+                {
+                    ROUTING_CONNECTION suffix = result;
+                    suffix.nodes.assign(
+                            result.nodes.begin()
+                                    + static_cast<std::ptrdiff_t>( *normalizedSplit ),
+                            result.nodes.end() );
+                    if( !result.edgeStyles.empty() )
+                    {
+                        suffix.edgeStyles.assign(
+                                result.edgeStyles.begin()
+                                        + static_cast<std::ptrdiff_t>( *normalizedSplit ),
+                                result.edgeStyles.end() );
+                    }
+                    MAZE_TRACE_SHOVER::Shorten( suffix, aEngine );
+                    result.nodes.resize( *normalizedSplit + 1 );
+                    if( !result.edgeStyles.empty() )
+                        result.edgeStyles.resize( *normalizedSplit );
+                    if( !appendConnection( result, suffix ) )
+                    {
+                        outcome.blockedEdge = currentCornerNo;
+                        return outcome;
+                    }
+                }
+                else
+                {
+                    MAZE_TRACE_SHOVER::Shorten( result, aEngine );
+                }
+                replayStep.tightenedResult.nodes = result.nodes;
+                replayStep.tightenedResult.edgeStyles = result.edgeStyles;
+                result.traceInsertionSteps.push_back( std::move( replayStep ) );
+                if( autorouterDebugEnabled() )
+                    autorouterDebugLog( formatConnectionForDebug(
+                            "incremental_pull_tight", result ) );
 
                 fromCornerNo = currentCornerNo;
-                resultNodeAtOriginal[currentCornerNo] = result.nodes.size() - 1;
                 continue;
             }
 
@@ -468,13 +768,19 @@ INCREMENTAL_INSERTION buildIncrementalConnection(
                     && currentCornerNo == fromCornerNo + 1 )
                 {
                     --fromCornerNo;
-                    const std::size_t keepNode = resultNodeAtOriginal[fromCornerNo];
-                    result.nodes.resize( keepNode + 1 );
-                    result.edgeStyles.resize( keepNode );
                 }
                 continue;
             }
 
+            if( autorouterDebugEnabled() )
+            {
+                std::ostringstream log;
+                log << "INSERT_SPAN net=" << aConnection.netCode
+                    << " from_corner=" << fromCornerNo
+                    << " to_corner=" << currentCornerNo
+                    << " accepted_by=none final=true";
+                autorouterDebugLog( log.str() );
+            }
             outcome.blockedEdge = currentCornerNo;
             return outcome;
         }
@@ -503,7 +809,8 @@ tryShoveGeneratedConnections( const ROUTING_CONNECTION& aCandidate,
                               const std::vector<ROUTING_CONNECTION>& aVictims,
                               ROUTING_OCCUPANCY& aOccupancy,
                               const MAZE_SEARCH_ENGINE& aEngine,
-                              const ROUTER_CANCEL_CALLBACK& aCancel )
+                              const ROUTER_CANCEL_CALLBACK& aCancel,
+                              const ROUTING_SHOVE_DIRECTION* aShoveDirection )
 {
     // TraceShover has a source recursion guard of 20. This maps mutable
     // generated worker routes, including an unfixed generated fanout escape;
@@ -624,7 +931,8 @@ tryShoveGeneratedConnections( const ROUTING_CONNECTION& aCandidate,
 
         const std::vector<ROUTING_CONNECTION> obstacles = movementObstacles( aVictim );
         ROUTING_VIA_SHOVE_PLAN plan;
-        if( auto moved = aEngine.SpringOverConnection( aVictim, obstacles, aCancel ) )
+        if( auto moved = aEngine.SpringOverConnection(
+                    aVictim, obstacles, aCancel, aShoveDirection ) )
         {
             plan.replacement = std::move( *moved );
         }
@@ -766,8 +1074,12 @@ tryShoveGeneratedConnections( const ROUTING_CONNECTION& aCandidate,
 FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
         const ROUTING_CONNECTION& connection, const std::vector<ROUTING_CONNECTION>& ripups,
         ROUTING_OCCUPANCY& occupancy, const MAZE_SEARCH_ENGINE& engine,
-        const ROUTER_CANCEL_CALLBACK& requestedCancel, bool allowRipupFallback )
+        const ROUTER_CANCEL_CALLBACK& requestedCancel, bool allowRipupFallback,
+        const ROUTING_SHOVE_DIRECTION* shoveDirection )
 {
+    if( autorouterDebugEnabled() )
+        autorouterDebugLog( formatConnectionForDebug( "input", connection ) );
+
     bool cancelled = false;
     const ROUTER_CANCEL_CALLBACK cancel = [&]
     {
@@ -779,6 +1091,20 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
         return { STATE::INVALID };
     if( cancel && cancel() )
         return { STATE::CANCELLED };
+
+    ROUTING_CONNECTION sourceOrdered = connection;
+    if( sourceOrdered.insertionBacktracksFromTarget )
+    {
+        reverseConnection( sourceOrdered );
+        // FoundConnectionLocator emits the corridor in backtrack order.  The
+        // Java inserter materialises its PolylineTrace in the opposite
+        // (target-to-start insertion) order and that order subsequently
+        // defines the item's shape indices and obstacle-room IDs.  Once the
+        // native proposal has been canonicalised it is ordinary board copper;
+        // retaining this flag would reverse it again during optimization.
+        sourceOrdered.insertionBacktracksFromTarget = false;
+    }
+
     ROUTING_OCCUPANCY::TRANSACTION transaction( occupancy );
     for( const auto& victim : ripups )
     {
@@ -794,33 +1120,51 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
             return { STATE::CANCELLED };
 
     }
-    if( connection.nodes.size() == 1
-        && !engine.CanInsertSegment( connection.netCode, connection.nodes[0], connection.nodes[0] ) )
+    if( sourceOrdered.nodes.size() == 1
+        && !engine.CanInsertSegment( sourceOrdered.netCode, sourceOrdered.nodes[0],
+                                     sourceOrdered.nodes[0] ) )
         return { STATE::BLOCKED };
     std::optional<ROUTING_CONNECTION> replacement;
     std::size_t blockedEdge = 0;
-    if( connection.nodes.size() > 1 )
+    if( sourceOrdered.nodes.size() > 1 )
     {
-        INCREMENTAL_INSERTION rebuilt = buildIncrementalConnection( connection, engine, cancel );
+        INCREMENTAL_INSERTION rebuilt = buildIncrementalConnection( sourceOrdered, engine, cancel );
         if( rebuilt.cancelled )
             return { STATE::CANCELLED, rebuilt.blockedEdge };
         if( !rebuilt.connection )
             return { STATE::BLOCKED, rebuilt.blockedEdge };
 
+        if( autorouterDebugEnabled() )
+            autorouterDebugLog( formatConnectionForDebug( "rebuilt", *rebuilt.connection ) );
+
         blockedEdge = rebuilt.blockedEdge;
-        if( !SameRouteGeometry( *rebuilt.connection, connection ) )
+        if( !SameRouteGeometry( *rebuilt.connection, sourceOrdered )
+            || !rebuilt.connection->traceInsertionSteps.empty() )
             replacement = std::move( rebuilt.connection );
     }
 
-    const ROUTING_CONNECTION& candidate = replacement ? *replacement : connection;
+    const ROUTING_CONNECTION& candidate = replacement ? *replacement : sourceOrdered;
+    const bool canonicalOrderChanged = connection.insertionBacktracksFromTarget;
+    const auto publishedConnection = [&]() -> std::optional<ROUTING_CONNECTION>
+    {
+        if( replacement )
+            return *replacement;
+        if( canonicalOrderChanged )
+            return sourceOrdered;
+        return std::nullopt;
+    };
+    if( autorouterDebugEnabled() )
+        autorouterDebugLog( formatConnectionForDebug( "candidate", candidate ) );
     if( !ripups.empty() )
     {
-        if( auto shoved = tryShoveGeneratedConnections( candidate, ripups, occupancy, engine, cancel ) )
+        if( auto shoved = tryShoveGeneratedConnections(
+                    candidate, ripups, occupancy, engine, cancel,
+                    shoveDirection ) )
         {
             if( cancel && cancel() )
                 return { STATE::CANCELLED };
 
-            RESULT result{ STATE::INSERTED, 0, std::move( replacement ) };
+            RESULT result{ STATE::INSERTED, 0, publishedConnection() };
             result.shoved = std::move( *shoved );
             transaction.Commit();
             return result;
@@ -851,7 +1195,7 @@ FOUND_CONNECTION_INSERTER::RESULT FOUND_CONNECTION_INSERTER::Insert(
     if( cancel && cancel() )
         return { STATE::CANCELLED };
     transaction.Commit();
-    return { STATE::INSERTED, 0, std::move( replacement ) };
+    return { STATE::INSERTED, 0, publishedConnection() };
 }
 
 

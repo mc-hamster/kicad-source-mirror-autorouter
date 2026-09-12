@@ -126,6 +126,12 @@ bool insertable( const ROUTING_CONNECTION& aCandidate, const MAZE_SEARCH_ENGINE&
 
     for( std::size_t edge = 1; edge < aCandidate.nodes.size(); ++edge )
     {
+        // Moving a drill onto the adjacent trace corner intentionally reduces
+        // that trace to zero length.  DrillItemMover performs this mutation
+        // before pull-tight; the vanished trace is not an insertion failure.
+        if( aCandidate.nodes[edge - 1] == aCandidate.nodes[edge] )
+            continue;
+
         if( !aSearch.CanInsertSegment( aCandidate.netCode, aCandidate.nodes[edge - 1],
                                        aCandidate.nodes[edge],
                                        &aCandidate.edgeStyles[edge - 1] ) )

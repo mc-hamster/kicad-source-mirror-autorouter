@@ -16,7 +16,12 @@ namespace KICAD_AUTOROUTER
 namespace
 {
 
-constexpr double CRITICAL_INTEGER = 33554432.0;
+// Freerouting's Limits.CRIT_INT is expressed in source routing units.  The
+// native engine stores geometry in KiCad IU, so retain the same physical
+// range at this adapter boundary rather than rejecting ordinary board
+// coordinates above 33.5 mm.
+constexpr double CRITICAL_INTEGER =
+        33554432.0 * FREEROUTING_COORDINATE_UNIT_IU;
 
 std::int64_t javaRound( double aValue )
 {
@@ -117,6 +122,45 @@ double FLOAT_POINT::WeightedDistance(
 ROUTER_POINT FLOAT_POINT::Round() const
 {
     return { javaRound( x ), javaRound( y ) };
+}
+
+
+ROUTER_POINT FLOAT_POINT::RoundToGridJava( std::int64_t aGrid ) const
+{
+    if( aGrid <= 1 )
+        return Round();
+    const auto roundOnGrid = [&]( double aValue )
+    {
+        const long double unit = aGrid;
+        const long double rounded = std::floor(
+                static_cast<long double>( aValue ) / unit + 0.5L ) * unit;
+        return static_cast<std::int64_t>( std::clamp(
+                rounded,
+                static_cast<long double>( std::numeric_limits<std::int64_t>::min() ),
+                static_cast<long double>( std::numeric_limits<std::int64_t>::max() ) ) );
+    };
+    return { roundOnGrid( x ), roundOnGrid( y ) };
+}
+
+
+ROUTER_POINT FLOAT_POINT::RoundToGridJavaYDown( std::int64_t aGrid ) const
+{
+    const ROUTER_POINT source = FLOAT_POINT{ x, -y }.RoundToGridJava( aGrid );
+    return { source.x, -source.y };
+}
+
+
+ROUTER_POINT FLOAT_POINT::RoundToSourceGrid() const
+{
+    return RoundToGridJava( static_cast<std::int64_t>(
+            FREEROUTING_COORDINATE_UNIT_IU ) );
+}
+
+
+ROUTER_POINT FLOAT_POINT::RoundToSourceGridYDown() const
+{
+    return RoundToGridJavaYDown( static_cast<std::int64_t>(
+            FREEROUTING_COORDINATE_UNIT_IU ) );
 }
 
 

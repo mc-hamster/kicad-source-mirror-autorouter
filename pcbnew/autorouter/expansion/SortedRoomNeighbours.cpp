@@ -5,6 +5,10 @@
  */
 #include "SortedRoomNeighbours.h"
 
+#include "ExpansionRoom.h"
+#include "ObstacleExpansionRoom.h"
+#include "../maze/MazeTraceShover.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -30,7 +34,151 @@ std::optional<LINE> roundedLine( const POINT& aFirst, const POINT& aSecond )
         return std::nullopt;
     return LINE( first, second );
 }
+
+
+std::optional<LINE> firstDoorLine( const ROUTER_BOX& aShape )
+{
+    if( INT_BOX::Dimension( aShape ) != 1 )
+        return std::nullopt;
+
+    if( aShape.minX != aShape.maxX )
+        return LINE( { aShape.minX, aShape.minY },
+                     { aShape.maxX, aShape.minY } );
+    if( aShape.minY != aShape.maxY )
+        return LINE( { aShape.minX, aShape.minY },
+                     { aShape.minX, aShape.maxY } );
+    return std::nullopt;
+}
+
+
+std::optional<LINE> firstDoorLine( const PLANAR::INT_OCTAGON& aShape )
+{
+    if( aShape.Dimension() != 1 )
+        return std::nullopt;
+
+    const ROUTER_POINT first = aShape.Corner( 0 );
+    for( int index = 1; index < 8; ++index )
+    {
+        if( aShape.Corner( index ) != first )
+            return aShape.BorderLine( index - 1 );
+    }
+    return std::nullopt;
+}
+
+
+std::optional<LINE> firstDoorLine( const SIMPLEX& aShape )
+{
+    if( aShape.Dimension() != 1 || aShape.Borders().empty()
+        || !aShape.CornerIsBounded( 0 ) )
+    {
+        return std::nullopt;
+    }
+
+    const POINT& first = aShape.Corner( 0 );
+    for( std::size_t index = 1; index < aShape.Borders().size(); ++index )
+    {
+        if( aShape.CornerIsBounded( index ) && aShape.Corner( index ) != first )
+            return aShape.Borders()[index - 1];
+    }
+    return std::nullopt;
+}
+
+
+bool obstacleAllowsDoor( const OBSTACLE_EXPANSION_ROOM& aRoom,
+                         const std::optional<LINE>& aDoorLine )
+{
+    const auto& info = aRoom.GetTraceInfo();
+    if( !info )
+        return true;
+
+    if( !aDoorLine )
+        return false;
+
+    // SortedRoomNeighbours.insertDoorOk() only applies the parallel-door
+    // restriction when the obstacle room still names the first or last tree
+    // shape of the *current* PolylineTrace.  Room indices can be stale after
+    // pull-tight or shove mutation; a stale index is deliberately allowed
+    // through here and MazeTraceShover then returns false so the maze delays
+    // occupation and requeues the same section with paid rip-up.  Rejecting
+    // stale metadata here made that source lifecycle unreachable and forced
+    // every search to take a geometric detour instead.
+    if( aRoom.GetShapeIndex() < 0
+        || static_cast<std::size_t>( aRoom.GetShapeIndex() )
+                   < info->firstShapeIndex )
+    {
+        return true;
+    }
+
+    const std::size_t local = static_cast<std::size_t>( aRoom.GetShapeIndex() )
+                              - info->firstShapeIndex;
+    if( local + 1 >= info->corners.size() )
+        return true;
+
+    // Inner trace rooms are deliberately enterable from either side.  The
+    // source applies the parallel-door restriction only to the first and last
+    // tree shape of a PolylineTrace item.
+    if( local != 0 && local + 2 != info->corners.size() )
+        return true;
+
+    if( info->corners[local] == info->corners[local + 1] )
+        return false;
+
+    return LINE( info->corners[local], info->corners[local + 1] )
+            .Parallel( *aDoorLine );
+}
+
+
+template <typename SHAPE>
+bool insertDoorOk( EXPANSION_ROOM* aFirstRoom, EXPANSION_ROOM* aSecondRoom,
+                   const SHAPE& aDoorShape )
+{
+    if( !aFirstRoom || !aSecondRoom || aFirstRoom->DoorExists( aSecondRoom ) )
+        return false;
+
+    auto* firstObstacle = dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( aFirstRoom );
+    auto* secondObstacle = dynamic_cast<OBSTACLE_EXPANSION_ROOM*>( aSecondRoom );
+    if( firstObstacle && secondObstacle )
+    {
+        // Source Item.sharesNet().  A native obstacle group is one source
+        // item; netCode extends the same rule to distinct same-net items.
+        return firstObstacle->GetGroup() == secondObstacle->GetGroup()
+               || ( firstObstacle->GetNetCode() != 0
+                    && firstObstacle->GetNetCode()
+                               == secondObstacle->GetNetCode() );
+    }
+
+    if( !firstObstacle && !secondObstacle )
+        return true;
+
+    const std::optional<LINE> doorLine = firstDoorLine( aDoorShape );
+    return ( !firstObstacle || obstacleAllowsDoor( *firstObstacle, doorLine ) )
+           && ( !secondObstacle || obstacleAllowsDoor( *secondObstacle, doorLine ) );
+}
 } // namespace
+
+
+bool SORTED_ROOM_NEIGHBOURS::InsertDoorOk(
+        EXPANSION_ROOM* aFirstRoom, EXPANSION_ROOM* aSecondRoom,
+        const ROUTER_BOX& aDoorShape )
+{
+    return insertDoorOk( aFirstRoom, aSecondRoom, aDoorShape );
+}
+
+
+bool SORTED_ROOM_NEIGHBOURS::InsertDoorOk(
+        EXPANSION_ROOM* aFirstRoom, EXPANSION_ROOM* aSecondRoom,
+        const PLANAR::INT_OCTAGON& aDoorShape )
+{
+    return insertDoorOk( aFirstRoom, aSecondRoom, aDoorShape );
+}
+
+
+bool SORTED_ROOM_NEIGHBOURS::InsertDoorOk(
+        EXPANSION_ROOM* aFirstRoom, EXPANSION_ROOM* aSecondRoom,
+        const PLANAR::SIMPLEX& aDoorShape )
+{
+    return insertDoorOk( aFirstRoom, aSecondRoom, aDoorShape );
+}
 
 
 const POINT& SORTED_ROOM_NEIGHBOURS::NEIGHBOUR::FirstCorner(

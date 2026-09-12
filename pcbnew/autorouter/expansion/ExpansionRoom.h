@@ -29,8 +29,12 @@ class EXPANSION_DOOR;
 class EXPANSION_ROOM : public EXPANDABLE_OBJECT
 {
 public:
-    EXPANSION_ROOM( int aId, int aLayer, ROUTER_BOX aShape, bool aObstacle = false ) :
+    EXPANSION_ROOM( int aId, int aLayer, ROUTER_BOX aShape, bool aObstacle = false,
+                    std::uint64_t aSearchObjectId = 0 ) :
             m_id( aId ),
+            m_searchObjectId( aSearchObjectId == 0
+                                      ? static_cast<std::uint64_t>( aId )
+                                      : aSearchObjectId ),
             m_layer( aLayer ),
             m_shape( aShape ),
             m_octagon( PLANAR::INT_OCTAGON::FromBox( aShape ) ),
@@ -41,8 +45,11 @@ public:
     }
 
     EXPANSION_ROOM( int aId, int aLayer, PLANAR::INT_OCTAGON aShape,
-                    bool aObstacle = false ) :
+                    bool aObstacle = false, std::uint64_t aSearchObjectId = 0 ) :
             m_id( aId ),
+            m_searchObjectId( aSearchObjectId == 0
+                                      ? static_cast<std::uint64_t>( aId )
+                                      : aSearchObjectId ),
             m_layer( aLayer ),
             m_shape( aShape.BoundingBox() ),
             m_octagon( std::move( aShape ) ),
@@ -53,8 +60,11 @@ public:
     }
 
     EXPANSION_ROOM( int aId, int aLayer, PLANAR::SIMPLEX aShape,
-                    bool aObstacle = false ) :
+                    bool aObstacle = false, std::uint64_t aSearchObjectId = 0 ) :
             m_id( aId ),
+            m_searchObjectId( aSearchObjectId == 0
+                                      ? static_cast<std::uint64_t>( aId )
+                                      : aSearchObjectId ),
             m_layer( aLayer ),
             m_shape( aShape.BoundingBox().value_or( INT_BOX::Empty() ) ),
             m_octagon( aShape.BoundingOctagon().value_or(
@@ -79,6 +89,9 @@ public:
     bool UsesGeneralShape() const { return m_generalShape; }
     int               GetLayer() const { return m_layer; }
     int               GetId() const override { return m_id; }
+    /** SearchTreeObject.getId(), which is a separate identity domain from
+     * the internal room handle for obstacle rooms. */
+    std::uint64_t      GetSearchObjectId() const { return m_searchObjectId; }
     bool              IsObstacle() const { return m_obstacle; }
     virtual bool      IsCompleteFreeSpace() const { return false; }
     bool              Contains( const ROUTER_POINT& aPoint ) const
@@ -115,6 +128,7 @@ public:
 
 private:
     int                         m_id;
+    std::uint64_t               m_searchObjectId;
     int                         m_layer;
     ROUTER_BOX                  m_shape;
     PLANAR::INT_OCTAGON         m_octagon;

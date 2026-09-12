@@ -16,6 +16,42 @@ using PLANAR::INT_OCTAGON;
 
 namespace
 {
+INT_OCTAGON reflectY( const INT_OCTAGON& aOctagon )
+{
+    if( aOctagon.IsEmpty() )
+        return aOctagon;
+
+    return { aOctagon.leftX, -aOctagon.topY,
+             aOctagon.rightX, -aOctagon.bottomY,
+             aOctagon.lowerLeftDiagonalX, aOctagon.upperRightDiagonalX,
+             aOctagon.upperLeftDiagonalX, aOctagon.lowerRightDiagonalX };
+}
+
+
+INT_OCTAGON normalizeForCoordinates( const INT_OCTAGON& aOctagon,
+                                     std::int64_t aCoordinateUnit,
+                                     bool aYDownCoordinates )
+{
+    if( !aYDownCoordinates )
+        return aOctagon.NormalizeOnGrid( aCoordinateUnit );
+
+    return reflectY( reflectY( aOctagon ).NormalizeOnGrid( aCoordinateUnit ) );
+}
+
+
+INT_OCTAGON intersectionForCoordinates( const INT_OCTAGON& aFirst,
+                                        const INT_OCTAGON& aSecond,
+                                        std::int64_t aCoordinateUnit,
+                                        bool aYDownCoordinates )
+{
+    if( !aYDownCoordinates )
+        return aFirst.IntersectionOnGrid( aSecond, aCoordinateUnit );
+
+    return reflectY( reflectY( aFirst ).IntersectionOnGrid(
+            reflectY( aSecond ), aCoordinateUnit ) );
+}
+
+
 std::string octagonSupports( const INT_OCTAGON& aOctagon )
 {
     return std::to_string( aOctagon.leftX ) + ','
@@ -31,19 +67,21 @@ std::string octagonSupports( const INT_OCTAGON& aOctagon )
 
 MIN_AREA_TREE::HANDLE SHAPE_SEARCH_TREE_45_DEGREE::Insert( SHAPE_TREE_ENTRY aEntry )
 {
-    INT_OCTAGON shape = aEntry.BoundingOctagon().Normalize();
+    INT_OCTAGON shape = normalizeForCoordinates( aEntry.BoundingOctagon(),
+                                                  m_coordinateUnit,
+                                                  m_yDownCoordinates );
     if( shape.Dimension() < 0 )
         return MIN_AREA_TREE::NONE;
     aEntry.shape = shape.BoundingBox();
     aEntry.octagon = shape;
-    return m_tree.Insert( aEntry );
+    return m_tree->Insert( aEntry );
 }
 
 
 std::vector<SHAPE_TREE_ENTRY> SHAPE_SEARCH_TREE_45_DEGREE::Overlaps(
         const INT_OCTAGON& aShape ) const
 {
-    auto result = m_tree.Overlaps( aShape.BoundingBox() );
+    auto result = m_tree->Overlaps( aShape );
     std::erase_if( result, [&]( const SHAPE_TREE_ENTRY& aEntry )
     {
         return !aEntry.BoundingOctagon().Intersects( aShape );
@@ -59,12 +97,18 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
         const ROUTER_CANCEL_CALLBACK& aCancel ) const
 {
     std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> result;
-    if( m_tree.Size() == 0 || aRoom.containedShape.Dimension() < 0 )
+    // AutorouteEngine's production tree always contains BoardOutline.  The
+    // data-only native frontier also supports a deliberately empty obstacle
+    // set; in that compatibility case the finite search bounds themselves
+    // are the one complete free room.
+    if( aRoom.containedShape.Dimension() < 0 )
         return result;
 
     INT_OCTAGON startShape = INT_OCTAGON::FromBox( m_bounds );
     if( aRoom.shape.Dimension() >= 0 )
-        startShape = aRoom.shape.Intersection( startShape );
+        startShape = intersectionForCoordinates( aRoom.shape, startShape,
+                                                  m_coordinateUnit,
+                                                  m_yDownCoordinates );
     if( startShape.Dimension() < 0 )
         return result;
 
@@ -75,8 +119,8 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
               { "net", std::to_string( aNet ) },
               { "room_supports", octagonSupports( startShape ) },
               { "contained_supports", octagonSupports( aRoom.containedShape ) } } );
-    ROUTER_BOX bounding = startShape.BoundingBox();
-    const bool finished = m_tree.Visit( bounding, [&]( const SHAPE_TREE_ENTRY& aEntry )
+    INT_OCTAGON bounding = startShape;
+    const bool finished = m_tree->Visit( bounding, [&]( const SHAPE_TREE_ENTRY& aEntry )
     {
         if( aCancel && aCancel() )
             return false;
@@ -98,27 +142,29 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
                   { "obstacle_supports", octagonSupports( obstacle ) },
                   { "candidate_count", std::to_string( result.size() ) } } );
         std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> next;
-        ROUTER_BOX nextBounding = INT_BOX::Empty();
+        INT_OCTAGON nextBounding = INT_OCTAGON::Empty();
         for( const auto& room : result )
         {
             if( room.shape.Overlaps( obstacle ) )
             {
                 if( aEntry.isRoom && aIgnoreShape )
                 {
-                    const INT_OCTAGON intersection = room.shape.Intersection( obstacle );
+                    const INT_OCTAGON intersection = intersectionForCoordinates(
+                            room.shape, obstacle, m_coordinateUnit,
+                            m_yDownCoordinates );
                     if( intersection.IsContainedIn( *aIgnoreShape ) )
                     {
                         if( !room.shape.IsContainedIn( *aIgnoreShape ) )
                         {
                             next.push_back( room );
-                            nextBounding = INT_BOX::Union( nextBounding,
-                                                          room.shape.BoundingBox() );
+                            nextBounding = nextBounding.Union( room.shape );
                         }
                         continue;
                     }
                 }
 
-                auto restrained = RestrainShape( room, obstacle );
+                auto restrained = RestrainShape( room, obstacle, m_coordinateUnit,
+                                                  m_yDownCoordinates );
                 autorouterDecisionLog(
                         "COMPLETE_SHAPE_RESTRAIN",
                         { { "layer", std::to_string( aRoom.layer ) },
@@ -141,14 +187,13 @@ SHAPE_SEARCH_TREE_45_DEGREE::CompleteShape(
                               { "output_supports", octagonSupports( candidate.shape ) },
                               { "output_contained_supports",
                                 octagonSupports( candidate.containedShape ) } } );
-                    nextBounding = INT_BOX::Union( nextBounding,
-                                                  candidate.shape.BoundingBox() );
+                    nextBounding = nextBounding.Union( candidate.shape );
                     next.push_back( candidate );
                 }
             }
             else
             {
-                nextBounding = INT_BOX::Union( nextBounding, room.shape.BoundingBox() );
+                nextBounding = nextBounding.Union( room.shape );
                 next.push_back( room );
             }
         }
@@ -220,8 +265,24 @@ double SHAPE_SEARCH_TREE_45_DEGREE::signedLineDistance(
 
 std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM>
 SHAPE_SEARCH_TREE_45_DEGREE::RestrainShape(
-        const INCOMPLETE_45_DEGREE_EXPANSION_ROOM& aRoom, const INT_OCTAGON& aObstacle )
+        const INCOMPLETE_45_DEGREE_EXPANSION_ROOM& aRoom, const INT_OCTAGON& aObstacle,
+        std::int64_t aCoordinateUnit, bool aYDownCoordinates )
 {
+    if( aYDownCoordinates )
+    {
+        const INCOMPLETE_45_DEGREE_EXPANSION_ROOM reflectedRoom{
+            reflectY( aRoom.shape ), aRoom.layer, reflectY( aRoom.containedShape )
+        };
+        auto reflectedResult = RestrainShape( reflectedRoom, reflectY( aObstacle ),
+                                               aCoordinateUnit, false );
+        for( auto& candidate : reflectedResult )
+        {
+            candidate.shape = reflectY( candidate.shape );
+            candidate.containedShape = reflectY( candidate.containedShape );
+        }
+        return reflectedResult;
+    }
+
     std::vector<INCOMPLETE_45_DEGREE_EXPANSION_ROOM> result;
     const INT_OCTAGON contained = aRoom.containedShape;
     if( contained.IsEmpty() )
@@ -243,7 +304,8 @@ SHAPE_SEARCH_TREE_45_DEGREE::RestrainShape(
 
     if( cutLineDistance >= 0 )
     {
-        result.push_back( { CalcOutsideRestrainedShape( aObstacle, restrainingLine, room ),
+        result.push_back( { CalcOutsideRestrainedShape( aObstacle, restrainingLine, room,
+                                                        aCoordinateUnit ),
                             aRoom.layer, contained } );
         return result;
     }
@@ -276,22 +338,25 @@ SHAPE_SEARCH_TREE_45_DEGREE::RestrainShape(
         return result;
 
     const INT_OCTAGON restrained = CalcOutsideRestrainedShape(
-            aObstacle, restrainingLine, room );
+            aObstacle, restrainingLine, room, aCoordinateUnit );
     if( restrained.Dimension() == 2 )
     {
-        const INT_OCTAGON newContained = contained.Intersection( restrained );
+        const INT_OCTAGON newContained = contained.IntersectionOnGrid(
+                restrained, aCoordinateUnit );
         if( newContained.Dimension() > 0 )
             result.push_back( { restrained, aRoom.layer, newContained } );
     }
 
     const INT_OCTAGON restPiece = CalcInsideRestrainedShape(
-            aObstacle, restrainingLine, room );
+            aObstacle, restrainingLine, room, aCoordinateUnit );
     if( restPiece.Dimension() >= 2 )
     {
-        const INT_OCTAGON restContained = contained.Intersection( restPiece );
+        const INT_OCTAGON restContained = contained.IntersectionOnGrid(
+                restPiece, aCoordinateUnit );
         if( restContained.Dimension() >= 0 )
         {
-            auto rest = RestrainShape( { restPiece, aRoom.layer, restContained }, aObstacle );
+            auto rest = RestrainShape( { restPiece, aRoom.layer, restContained },
+                                       aObstacle, aCoordinateUnit, false );
             result.insert( result.end(), rest.begin(), rest.end() );
         }
     }
@@ -300,7 +365,8 @@ SHAPE_SEARCH_TREE_45_DEGREE::RestrainShape(
 
 
 INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::CalcOutsideRestrainedShape(
-        const INT_OCTAGON& aObstacle, int aObstacleLine, const INT_OCTAGON& aRoom )
+        const INT_OCTAGON& aObstacle, int aObstacleLine, const INT_OCTAGON& aRoom,
+        std::int64_t aCoordinateUnit )
 {
     INT_OCTAGON result = aRoom;
     switch( aObstacleLine )
@@ -315,12 +381,13 @@ INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::CalcOutsideRestrainedShape(
     case 7: result.upperRightDiagonalX = aObstacle.lowerLeftDiagonalX; break;
     default: throw std::out_of_range( "45-degree obstacle line index" );
     }
-    return result.Normalize();
+    return result.NormalizeOnGrid( aCoordinateUnit );
 }
 
 
 INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::CalcInsideRestrainedShape(
-        const INT_OCTAGON& aObstacle, int aObstacleLine, const INT_OCTAGON& aRoom )
+        const INT_OCTAGON& aObstacle, int aObstacleLine, const INT_OCTAGON& aRoom,
+        std::int64_t aCoordinateUnit )
 {
     INT_OCTAGON result = aRoom;
     switch( aObstacleLine )
@@ -335,7 +402,7 @@ INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::CalcInsideRestrainedShape(
     case 7: result.lowerLeftDiagonalX = aObstacle.lowerLeftDiagonalX; break;
     default: throw std::out_of_range( "45-degree obstacle line index" );
     }
-    return result.Normalize();
+    return result.NormalizeOnGrid( aCoordinateUnit );
 }
 
 
@@ -347,6 +414,33 @@ INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemBox(
         aBox.maxX + aDistance, aBox.maxY + aDistance
     };
     return INT_OCTAGON::FromBox( expanded );
+}
+
+
+INT_OCTAGON SHAPE_SEARCH_TREE_45_DEGREE::OffsetDrillItemCircle(
+        ROUTER_POINT aCenter, std::int64_t aRadius,
+        std::int64_t aClearance, std::int64_t aCoordinateUnit )
+{
+    const std::int64_t unit = std::max<std::int64_t>( 1, aCoordinateUnit );
+    const long double sourceRadius = static_cast<long double>( aRadius ) / unit;
+    const long double corner = ( std::sqrt( 2.0L ) - 1.0L ) * sourceRadius;
+    const std::int64_t floorCorner = static_cast<std::int64_t>(
+            std::floor( corner ) ) * unit;
+    const std::int64_t ceilCorner = static_cast<std::int64_t>(
+            std::ceil( corner ) ) * unit;
+
+    const std::int64_t left = aCenter.x - aRadius;
+    const std::int64_t right = aCenter.x + aRadius;
+    const std::int64_t bottom = aCenter.y - aRadius;
+    const std::int64_t top = aCenter.y + aRadius;
+    const INT_OCTAGON circle(
+            left, bottom, right, top,
+            left - ( aCenter.y + floorCorner ),
+            right - ( aCenter.y - ceilCorner ),
+            left + ( aCenter.y - floorCorner ),
+            right + ( aCenter.y + ceilCorner ) );
+
+    return circle.OffsetOnGrid( aClearance, unit );
 }
 
 
@@ -387,12 +481,16 @@ SHAPE_SEARCH_TREE_45_DEGREE::divideLargeRoom(
             const std::int64_t leftX = roomBox.minX + x * sectionWidth;
             const std::int64_t rightX = x == xCount - 1 ? roomBox.maxX
                                                          : leftX + sectionWidth;
-            const INT_OCTAGON section = aRooms.front().shape.Intersection(
-                    INT_OCTAGON::FromBox( { leftX, lowerY, rightX, upperY } ) );
+            const INT_OCTAGON section = intersectionForCoordinates(
+                    aRooms.front().shape,
+                    INT_OCTAGON::FromBox( { leftX, lowerY, rightX, upperY } ),
+                    m_coordinateUnit, m_yDownCoordinates );
             if( section.Dimension() != 2 )
                 continue;
             result.push_back( { section, aRooms.front().layer,
-                                section.Intersection( aRooms.front().containedShape ) } );
+                                intersectionForCoordinates(
+                                        section, aRooms.front().containedShape,
+                                        m_coordinateUnit, m_yDownCoordinates ) } );
         }
     }
     return result;

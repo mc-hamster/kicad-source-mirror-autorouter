@@ -7,6 +7,7 @@
 #include "../expansion/CompleteFreeSpaceExpansionRoom.h"
 #include "../expansion/ExpansionDoor.h"
 #include "../expansion/ObstacleExpansionRoom.h"
+#include "../expansion/SortedRoomNeighbours.h"
 #include "../expansion/SortedOrthogonalRoomNeighbours.h"
 #include <map>
 #include <memory>
@@ -52,7 +53,7 @@ public:
             room->shape = std::make_unique<OBSTACLE_EXPANSION_ROOM>(
                     id, layer, obstacle.shape.shape, obstacle.group,
                     std::max( obstacle.ripupCost, 1 ), obstacle.shape.shapeIndex,
-                    obstacle.traceInfo );
+                    obstacle.traceInfo, obstacle.netCode );
             room->complete = true;
             ROOM* raw = room.get();
             byId.emplace( id, raw );
@@ -225,8 +226,19 @@ public:
             // Existing complete-room doors are inserted in object-ID order,
             // before incomplete gaps, as in calculateNeighbours.
             for( const auto& e : entries )
-                if( e.isRoom )
-                    door( result, byId.at( e.objectId ) );
+            {
+                if( !e.isRoom )
+                    continue;
+                ROOM* neighbour = byId.at( e.objectId );
+                const ROUTER_BOX intersection = INT_BOX::Intersection(
+                        seed.GetShape(), neighbour->shape->GetShape() );
+                if( SORTED_ROOM_NEIGHBOURS::InsertDoorOk(
+                            result->shape.get(), neighbour->shape.get(),
+                            intersection ) )
+                {
+                    door( result, neighbour );
+                }
+            }
             for( const auto& gap : sorted.IncompleteRooms( tree.Bounds(), layer ) )
                 door( result, incomplete( gap ) );
             tree.Insert( { seed.GetShape(), id, 0, layer, 0, true, true } );

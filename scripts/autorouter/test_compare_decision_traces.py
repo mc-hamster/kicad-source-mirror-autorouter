@@ -61,6 +61,31 @@ class DecisionTraceComparatorTest(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
         self.assertEqual("MATCH", json.loads(completed.stdout)["status"])
 
+    def test_geometry_conversion_outward_rounds_half_source_units(self):
+        native = [{
+            "sequence": 0,
+            "event": "RAW_SECTION_ASSIGN",
+            "fields": {
+                "net": "2", "net_name": "Net-(Q2-B)",
+                "selected_section": "0", "from_section": "0",
+                "backtrack_section": "0", "add_costs": "0", "adjustment": "NONE",
+                "room_ripped": "false", "door_dimension": "1",
+                "from_door_dimension": "2",
+                # Exact native bounds are x=[1480489, 1480920] and
+                # y=[651819.5, 652250] in source-coordinate units.
+                "door_bounds": "148048900,65181950,148092000,65225000",
+                "from_door_bounds": "100,200,300,400",
+            },
+        }]
+        reference = reference_net() + reference_line(
+            0, "1480489,-652250,1480920,-651819"
+        )
+        completed = self.run_compare(
+            reference, native, "--strict-context", "--geometry"
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        self.assertEqual("MATCH", json.loads(completed.stdout)["status"])
+
     def test_reports_first_structural_divergence(self):
         native = []
         for sequence, section in enumerate((0, 2)):
@@ -96,6 +121,34 @@ class DecisionTraceComparatorTest(unittest.TestCase):
         report = json.loads(completed.stdout)
         self.assertEqual("MATCH", report["status"])
         self.assertEqual("net_name", report["keys"][0])
+
+    def test_costs_are_opt_in_and_scaled_to_reference_units(self):
+        native = [{
+            "sequence": 0,
+            "event": "RAW_SECTION_ASSIGN",
+            "fields": {
+                "net": "2", "net_name": "Net-(Q2-B)", "selected_section": "0",
+                "add_costs": "9570784", "adjustment": "NONE", "door_dimension": "1",
+            },
+        }]
+        reference = reference_net() + reference_line(0, "10,-40,30,-20").replace(
+            "add_costs=0", "add_costs=95507"
+        )
+
+        structural = self.run_compare(reference, native)
+        self.assertEqual(0, structural.returncode, structural.stdout + structural.stderr)
+
+        exact_cost = self.run_compare(reference, native, "--costs")
+        self.assertEqual(1, exact_cost.returncode)
+        exact_report = json.loads(exact_cost.stdout)
+        self.assertEqual("95507", exact_report["reference_context"][0]["add_costs"])
+        self.assertEqual("95707.84", exact_report["native_context"][0]["add_costs"])
+
+        tolerant_cost = self.run_compare(
+            reference, native, "--costs", "--cost-tolerance-reference-units", "201"
+        )
+        self.assertEqual(0, tolerant_cost.returncode,
+                         tolerant_cost.stdout + tolerant_cost.stderr)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "../geometry/planar/FloatLine.h"
 #include "../geometry/planar/IntOctagon.h"
 
@@ -52,6 +54,9 @@ struct OCTAGONAL_CORRIDOR_STEP
 class FOUND_CONNECTION_LOCATOR_45_DEGREE
 {
 public:
+    using START_ENDPOINT_LOCATOR = std::function<std::optional<ROUTER_POINT>(
+            ROUTER_POINT, const PLANAR::INT_OCTAGON& )>;
+
     static FLOAT_POINT CalculateAdditionalCorner( FLOAT_POINT aFrom, FLOAT_POINT aTo,
                                                    bool aHorizontalFirst, bool aOrthogonal );
     static std::optional<std::vector<ROUTER_POINT>> LocateRectangular(
@@ -60,7 +65,10 @@ public:
     static std::optional<std::vector<ROUTER_POINT>> LocateOctagonal(
             ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps,
             double aCompensatedTraceHalfWidth = 0,
-            double aTraceWidthTolerance = 2, bool aOrthogonal = false );
+            double aTraceWidthTolerance = 2, bool aOrthogonal = false,
+            std::int64_t aCoordinateUnitIU = static_cast<std::int64_t>(
+                    FREEROUTING_COORDINATE_UNIT_IU ),
+            START_ENDPOINT_LOCATOR aStartEndpointLocator = {} );
 };
 
 } // namespace KICAD_AUTOROUTER

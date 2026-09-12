@@ -14,6 +14,7 @@ the board.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import json
 import re
 import sys
@@ -113,11 +114,37 @@ def transformed_bounds(value: str, scale: int, invert_y: bool) -> str:
     if len(coordinates) != 4 or scale <= 0:
         raise ValueError(f"invalid native bounds or scale: {value}, {scale}")
     min_x, min_y, max_x, max_y = coordinates
-    xs = [round(min_x / scale), round(max_x / scale)]
-    ys = [round(min_y / scale), round(max_y / scale)]
+
+    # Freerouting's IntBox is an outward-rounded envelope.  Native decision
+    # traces retain exact KiCad-IU rational bounds, including half-source-unit
+    # values.  Python round() uses nearest-even and can therefore contract an
+    # envelope by one source coordinate.  Preserve the source floor/ceil
+    # contract explicitly; y reflection also exchanges the lower/upper roles.
+    def floor_scaled(coordinate: int) -> int:
+        return coordinate // scale
+
+    def ceil_scaled(coordinate: int) -> int:
+        return -((-coordinate) // scale)
+
+    source_min_x = floor_scaled(min_x)
+    source_max_x = ceil_scaled(max_x)
     if invert_y:
-        ys = [-value for value in ys]
-    return f"{min(xs)},{min(ys)},{max(xs)},{max(ys)}"
+        source_min_y = floor_scaled(-max_y)
+        source_max_y = ceil_scaled(-min_y)
+    else:
+        source_min_y = floor_scaled(min_y)
+        source_max_y = ceil_scaled(max_y)
+    return f"{source_min_x},{source_min_y},{source_max_x},{source_max_y}"
+
+
+def transformed_cost(value: str, scale: int) -> str:
+    if scale <= 0:
+        raise ValueError(f"invalid native cost scale: {scale}")
+    try:
+        result = Decimal(value) / Decimal(scale)
+    except InvalidOperation as error:
+        raise ValueError(f"invalid native cost: {value}") from error
+    return format(result.normalize(), "f")
 
 
 def projected(event: dict[str, str], keys: list[str], *, native: bool,
@@ -127,7 +154,27 @@ def projected(event: dict[str, str], keys: list[str], *, native: bool,
         for key in ("door_bounds", "from_door_bounds"):
             if key in result and result[key] not in ("", "<missing>"):
                 result[key] = transformed_bounds(result[key], scale, invert_y)
+        if "add_costs" in result and result["add_costs"] not in ("", "<missing>"):
+            result["add_costs"] = transformed_cost(result["add_costs"], scale)
     return result
+
+
+def events_match(reference: dict[str, str], native: dict[str, str],
+                 cost_tolerance: Decimal) -> bool:
+    if reference.keys() != native.keys():
+        return False
+    for key, reference_value in reference.items():
+        native_value = native[key]
+        if key != "add_costs":
+            if reference_value != native_value:
+                return False
+            continue
+        try:
+            if abs(Decimal(reference_value) - Decimal(native_value)) > cost_tolerance:
+                return False
+        except InvalidOperation:
+            return False
+    return True
 
 
 def main() -> int:
@@ -138,6 +185,14 @@ def main() -> int:
     parser.add_argument("--net-name")
     parser.add_argument("--strict-context", action="store_true")
     parser.add_argument("--geometry", action="store_true")
+    parser.add_argument(
+        "--costs", action="store_true",
+        help="also compare add_costs after converting native IU to reference units",
+    )
+    parser.add_argument(
+        "--cost-tolerance-reference-units", type=Decimal, default=Decimal(0),
+        help="absolute add_costs tolerance used with --costs (default: 0)",
+    )
     parser.add_argument("--native-units-per-reference-unit", type=int, default=100)
     parser.add_argument("--no-invert-native-y", action="store_true")
     parser.add_argument("--max-events", type=int, default=0)
@@ -157,7 +212,15 @@ def main() -> int:
         reference = reference[:args.max_events]
         native = native[:args.max_events]
 
-    keys = ["net_name", "selected_section", "add_costs", "adjustment", "door_dimension"]
+    if args.cost_tolerance_reference_units < 0:
+        parser.error("--cost-tolerance-reference-units must be non-negative")
+
+    # Cost is intentionally opt-in.  It includes geometry-dependent detour
+    # ratios and is therefore useful for classifying numeric drift only after
+    # the stable decision stream agrees.
+    keys = ["net_name", "selected_section", "adjustment", "door_dimension"]
+    if args.costs:
+        keys.append("add_costs")
     if args.strict_context:
         keys += ["from_section", "backtrack_section", "room_ripped", "from_door_dimension"]
     if args.geometry:
@@ -172,7 +235,8 @@ def main() -> int:
                    for event in native]
 
     mismatch = next((index for index, pair in enumerate(zip(reference_view, native_view))
-                     if pair[0] != pair[1]), None)
+                     if not events_match(pair[0], pair[1],
+                                         args.cost_tolerance_reference_units)), None)
     if mismatch is None and len(reference_view) != len(native_view):
         mismatch = min(len(reference_view), len(native_view))
     report: dict[str, object] = {
@@ -182,6 +246,10 @@ def main() -> int:
         "native_events": len(native_view),
         "first_divergence": mismatch,
     }
+    if args.costs:
+        report["cost_tolerance_reference_units"] = str(
+            args.cost_tolerance_reference_units
+        )
     if mismatch is not None:
         start = max(0, mismatch - max(0, args.context))
         end = mismatch + max(0, args.context) + 1

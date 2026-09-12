@@ -446,27 +446,84 @@ std::optional<PLANAR::SIMPLEX> sourcePhysicalTileShape(
 
 std::optional<std::pair<PLANAR::SIMPLEX, PLANAR::SIMPLEX>> sourceSpringOverShapes(
         const PLANAR::SIMPLEX& aPhysicalShape, std::int64_t aMovingRadius,
-        std::int64_t aClearance )
+        std::int64_t aClearance,
+        ROUTER_ANGLE_RESTRICTION aAngleRestriction )
 {
     // TraceShover.springOver enlarges in two half-clearance steps when the
     // search tree does not pre-compensate clearances.  The detached KiCad
     // worker stores an exact resolved clearance instead of a compensated tree,
-    // so this is the applicable source branch.  The second result carries the
-    // source's additional one-coordinate wrap margin.
-    const double halfClearance = 0.5 * std::max<std::int64_t>( 0, aClearance );
+    // so this is the applicable source branch. BasicBoard.clearanceValue(...)
+    // asks ClearanceMatrix for its safety-margin form here; KiCad's resolved
+    // rule value intentionally does not contain that Freerouting-only margin.
+    // The second result also carries the source's additional one-coordinate
+    // wrap margin (one DSN coordinate, not one KiCad IU).
+    const std::int64_t effectiveClearance = saturatedAdd(
+            std::max<std::int64_t>( 0, aClearance ),
+            FREEROUTING_CLEARANCE_SAFETY_MARGIN_IU );
+    const double halfClearance = 0.5 * effectiveClearance;
     const auto enlargeSymmetrically = [&]( double aMargin )
             -> std::optional<PLANAR::SIMPLEX>
     {
-        const auto first = aPhysicalShape.Enlarge( aMargin + halfClearance );
-        if( !first || first->IsEmpty() )
-            return {};
-        return first->Enlarge( halfClearance );
+        std::optional<PLANAR::SIMPLEX> enlarged;
+
+        // ShapeSearchTree45Degree retains boxes and octagons as regular
+        // integer tiles.  Their Java enlarge() implementation rounds the
+        // orthogonal and sqrt(2)-scaled supports in source coordinates after
+        // EACH half-clearance step.  Repeating SIMPLEX::Enlarge in KiCad IU
+        // instead produced off-grid contours (for example 76825031 instead
+        // of 76825000) and changed the next room's door ordering.
+        if( aPhysicalShape.IsIntBox() || aPhysicalShape.IsIntOctagon() )
+        {
+            const auto physicalOctagon = aPhysicalShape.BoundingOctagon();
+            if( !physicalOctagon )
+                return {};
+
+            const std::int64_t sourceUnit = static_cast<std::int64_t>(
+                    FREEROUTING_COORDINATE_UNIT_IU );
+            const auto offsetOctagon = physicalOctagon
+                    ->OffsetOnGrid( aMargin + halfClearance, sourceUnit )
+                    .OffsetOnGrid( halfClearance, sourceUnit );
+            if( offsetOctagon.IsEmpty() )
+                return {};
+
+            if( aAngleRestriction == ROUTER_ANGLE_RESTRICTION::NINETY_DEGREE )
+                enlarged = PLANAR::SIMPLEX::Box( offsetOctagon.BoundingBox() );
+            else
+                enlarged = offsetOctagon.ToSimplex();
+        }
+        else
+        {
+            const auto first = aPhysicalShape.Enlarge( aMargin + halfClearance );
+            if( !first || first->IsEmpty() )
+                return {};
+            enlarged = first->Enlarge( halfClearance );
+            if( !enlarged || enlarged->IsEmpty() )
+                return {};
+
+            if( aAngleRestriction == ROUTER_ANGLE_RESTRICTION::FORTYFIVE_DEGREE )
+            {
+                const auto octagon = enlarged->BoundingOctagon();
+                if( !octagon )
+                    return {};
+                enlarged = octagon->ToSimplex();
+            }
+            else if( aAngleRestriction == ROUTER_ANGLE_RESTRICTION::NINETY_DEGREE )
+            {
+                const auto box = enlarged->BoundingBox();
+                if( !box )
+                    return {};
+                enlarged = PLANAR::SIMPLEX::Box( *box );
+            }
+        }
+
+        return enlarged;
     };
 
     const auto check = enlargeSymmetrically(
             static_cast<double>( std::max<std::int64_t>( 0, aMovingRadius ) ) );
     const auto offset = enlargeSymmetrically(
-            static_cast<double>( std::max<std::int64_t>( 0, aMovingRadius ) ) + 1.0 );
+            static_cast<double>( std::max<std::int64_t>( 0, aMovingRadius ) )
+                    + FREEROUTING_COORDINATE_UNIT_IU );
     if( !check || !offset || check->IsEmpty() || offset->IsEmpty() )
         return {};
     return std::pair{ *check, *offset };
@@ -1648,19 +1705,11 @@ bool MAZE_SEARCH_ENGINE::isPointAllowed( const ROUTER_POINT& aPoint, int aLayer,
         {
             continue;
         }
-        const bool sameNetPadHole =
-                obstacle.isHole && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
-                && endpointRadius( aNetCode, obstacle.start ) >= 0;
-        const bool ownPadHole = sameNetPadHole && obstacle.start == aPoint;
-        // KiCad permits same-net copper to pass over the drill of an already
-        // placed same-net via.  Keep the drill as a real obstacle for foreign
-        // nets and for new vias (hole-to-hole clearance), but do not make an
-        // existing routed via strand an artificial wall for same-net tracks.
-        const bool existingSameNetViaHole =
-                !aForVia && obstacle.isHole && obstacle.isExistingRoute
-                && !obstacle.boardItemId.empty();
+        // Item.isTraceObstacle(net) in the pinned source ignores every item
+        // which contains the routed net. Preserve same-net copper sharing for
+        // vias too, but never waive drill-to-drill clearance for a new via.
         if( obstacle.netCode != 0 && obstacle.netCode == aNetCode && !obstacle.isKeepout
-            && ( !obstacle.isHole || ( !aForVia && ownPadHole ) || existingSameNetViaHole ) )
+            && ( !aForVia || !obstacle.isHole ) )
             continue;
 
         if( aForVia && !obstacle.blocksVias )
@@ -1918,18 +1967,8 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
         {
             continue;
         }
-        // A same-net through-hole pad is an electrical connection surface, so
-        // a trace may pass through its centre.  A same-net drill that is not
-        // represented by a pad remains a manufacturing obstacle.
-        const bool ownPadHole = endpointRadius( aNetCode, obstacle.start ) >= 0
-                                && obstacle.isHole
-                                && obstacle.kind == ROUTER_OBSTACLE_KIND::SEGMENT
-                                && ( obstacle.start == aStart || obstacle.start == aEnd );
-        const bool existingSameNetViaHole =
-                !aForVia && obstacle.isHole && obstacle.isExistingRoute
-                && !obstacle.boardItemId.empty();
         if( obstacle.netCode != 0 && obstacle.netCode == aNetCode && !obstacle.isKeepout
-            && ( !obstacle.isHole || ( !aForVia && ownPadHole ) || existingSameNetViaHole ) )
+            && ( !aForVia || !obstacle.isHole ) )
             continue;
 
         if( aForVia ? !obstacle.blocksVias : !obstacle.blocksTracks )
@@ -2000,7 +2039,9 @@ bool MAZE_SEARCH_ENGINE::isSegmentAllowedFromKnownStart(
             }
 
             if( segmentIntersectsPolygonWithHoles( aStart, aEnd, obstacle, radius ) )
+            {
                 return false;
+            }
         }
     }
 
@@ -2147,6 +2188,55 @@ bool MAZE_SEARCH_ENGINE::CanInsertSegment( int net, const ROUTER_NODE& start,
     const auto clearance = style ? std::max<std::int64_t>( 0, style->clearance ) : 0;
     return isSegmentAllowed( start.point, end.point, start.layer, net, false, radius, radius,
                              radius, clearance );
+}
+
+
+bool MAZE_SEARCH_ENGINE::CanInsertTraceSpan(
+        const ROUTING_CONNECTION& aConnection ) const
+{
+    if( aConnection.netCode <= 0 || aConnection.nodes.empty()
+        || !HasValidEdgeStyles( aConnection ) )
+    {
+        return false;
+    }
+
+    struct RESTORE
+    {
+        bool& flag;
+        bool value;
+        ~RESTORE() { flag = value; }
+    } restore{ m_allowRipupOccupancy, m_allowRipupOccupancy };
+    m_allowRipupOccupancy = false;
+
+    if( aConnection.nodes.size() == 1 )
+    {
+        return isPointAllowed( aConnection.nodes.front().point,
+                               aConnection.nodes.front().layer,
+                               aConnection.netCode, false,
+                               endpointRadius( aConnection.netCode,
+                                               aConnection.nodes.front().point ) );
+    }
+
+    for( std::size_t edge = 1; edge < aConnection.nodes.size(); ++edge )
+    {
+        const ROUTER_NODE& start = aConnection.nodes[edge - 1];
+        const ROUTER_NODE& end = aConnection.nodes[edge];
+        const ROUTING_EDGE_STYLE* style = aConnection.edgeStyles.empty()
+                ? nullptr : &aConnection.edgeStyles[edge - 1];
+        if( start.layer != end.layer )
+        {
+            if( !CanUseSegment( aConnection.netCode, start, end, true, style ) )
+                return false;
+            continue;
+        }
+
+        if( !CanInsertSegment( aConnection.netCode, start, end, style ) )
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 
@@ -2569,7 +2659,9 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
 std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
         const ROUTING_CONNECTION& connection,
         const std::vector<ROUTING_CONNECTION>& transientObstacles,
-        const ROUTER_CANCEL_CALLBACK& cancel ) const
+        const ROUTER_CANCEL_CALLBACK& cancel,
+        const ROUTING_SHOVE_DIRECTION* direction,
+        bool returnUnchanged ) const
 {
     if( connection.nodes.size() < 2 || !HasValidEdgeStyles( connection ) ) return {};
     ROUTING_CONNECTION result = connection;
@@ -2672,7 +2764,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
             if( !physicalShape )
                 continue;
             const auto shapes = sourceSpringOverShapes(
-                    *physicalShape, movingRadius, clearance );
+                    *physicalShape, movingRadius, clearance,
+                    connection.angleRestriction );
             if( !shapes )
                 continue;
 
@@ -2751,7 +2844,8 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
                 if( !physicalShape )
                     continue;
                 const auto shapes = sourceSpringOverShapes(
-                        *physicalShape, movingRadius, clearance );
+                        *physicalShape, movingRadius, clearance,
+                        connection.angleRestriction );
                 if( !shapes )
                     continue;
                 obstacles.push_back( { id, physicalObstacleBounds( transientObstacle ),
@@ -2762,7 +2856,25 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
         const auto path = PLANAR::POLYLINE::FromPoints( points );
         if( path.Empty() )
             return {};
-        auto wrapped = TRACE_SHOVER::SpringOverObstacles( path, obstacles, cancel );
+        auto wrapped = TRACE_SHOVER::SpringOverObstacles(
+                path, obstacles, cancel, 20, direction );
+        if( autorouterDebugEnabled() )
+        {
+            std::ostringstream log;
+            log << "SPRING_OVER_RESULT net=" << connection.netCode
+                << " input_points=" << points.size()
+                << " obstacles=" << obstacles.size()
+                << " cancelled=" << wrapped.cancelled
+                << " has_polyline=" << wrapped.polyline.has_value();
+            if( wrapped.polyline )
+            {
+                const auto debugCorners = wrapped.polyline->IntegralCorners();
+                log << " same_endpoints=" << wrapped.polyline->HasSameEndpoints( path )
+                    << " integral=" << debugCorners.has_value()
+                    << " output_points=" << ( debugCorners ? debugCorners->size() : 0 );
+            }
+            autorouterDebugLog( log.str() );
+        }
         if( wrapped.cancelled || !wrapped.polyline ) return {};
         // The pinned spring-over method can lose an endpoint on a looping
         // input. Preserve its oracle output, but NEVER accept that mutation.
@@ -2775,7 +2887,13 @@ std::optional<ROUTING_CONNECTION> MAZE_SEARCH_ENGINE::SpringOverConnection(
                 return {};
         edge = lastEdge;
     }
-    if( SameRouteGeometry( result, connection ) ) return {};
+    if( SameRouteGeometry( result, connection ) && !returnUnchanged )
+    {
+        if( autorouterDebugEnabled() )
+            autorouterDebugLog( "SPRING_OVER_UNCHANGED net="
+                                + std::to_string( connection.netCode ) );
+        return {};
+    }
     // Preserve endpoint identities, via transitions and metadata. Cost belongs
     // to the original search; geometric quality is evaluated from actual nodes.
     return result;
@@ -3643,8 +3761,10 @@ MAZE_SEARCH_ENGINE::FindConnection( const ROUTING_PAD& aStart, const ROUTING_PAD
     m_roomMetrics = {};
     ROUTING_TERMINAL defaultStart;
     defaultStart.pad = aStart;
+    defaultStart.connectionArea = aStart.connectionArea;
     ROUTING_TERMINAL defaultTarget;
     defaultTarget.pad = aTarget;
+    defaultTarget.connectionArea = aTarget.connectionArea;
     const std::vector<ROUTING_TERMINAL> starts = aStarts.empty()
             ? std::vector<ROUTING_TERMINAL>{ defaultStart } : aStarts;
     const std::vector<ROUTING_TERMINAL> targets = aTargets.empty()

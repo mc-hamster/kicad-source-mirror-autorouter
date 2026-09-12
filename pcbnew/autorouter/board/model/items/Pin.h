@@ -105,7 +105,8 @@ public:
                                       const ROUTING_PAD& aPin, bool aAtStart,
                                       std::int64_t aTraceWidth,
                                       std::int64_t aClearance,
-                                      double aEdgeToTurnDistance )
+                                      double aEdgeToTurnDistance,
+                                      double aCoordinateUnit = 1.0 )
     {
         if( aConnection.nodes.size() < 2 || aTraceWidth <= 0 )
             return true;
@@ -144,7 +145,8 @@ public:
                 static_cast<long double>( direction.y ) );
         const double additional = std::max(
                 std::max( 0.0, aEdgeToTurnDistance ),
-                static_cast<double>( std::max<std::int64_t>( 0, aClearance ) ) + 1.0 );
+                static_cast<double>( std::max<std::int64_t>( 0, aClearance ) )
+                        + std::max( 1.0, aCoordinateUnit ) );
         const double preserveLength = restriction->minLength
                                       + static_cast<double>( aTraceWidth ) / 2.0
                                       + additional;
@@ -165,10 +167,11 @@ public:
                                         bool aAtStart,
                                         std::int64_t aTraceWidth,
                                         std::int64_t aClearance,
-                                        double aEdgeToTurnDistance )
+                                        double aEdgeToTurnDistance,
+                                        double aCoordinateUnit = 1.0 )
     {
         if( CheckConnectionToPin( aConnection, aPin, aAtStart, aTraceWidth,
-                                  aClearance, aEdgeToTurnDistance )
+                                  aClearance, aEdgeToTurnDistance, aCoordinateUnit )
             || aConnection.nodes.size() < 2 || !HasValidEdgeStyles( aConnection )
             || aEdgeToTurnDistance < 0 )
         {
@@ -195,7 +198,8 @@ public:
 
         const double additional = std::max(
                 std::max( 0.0, aEdgeToTurnDistance ),
-                static_cast<double>( std::max<std::int64_t>( 0, aClearance ) ) + 1.0 );
+                static_cast<double>( std::max<std::int64_t>( 0, aClearance ) )
+                        + std::max( 1.0, aCoordinateUnit ) );
 
         // A native connection may continue through a via, while the source
         // operation changes exactly one PolylineTrace.  Restrict the shape
@@ -216,6 +220,7 @@ public:
         if( tracePolyline.Empty() )
             return false;
 
+        bool pinShapeAlreadyOffset = false;
         const auto pinShape = [&]() -> std::optional<PLANAR::SIMPLEX>
         {
             if( geometry->copperShapeIndices.size() != 1 )
@@ -234,6 +239,45 @@ public:
             }
             if( copper.kind == ROUTER_OBSTACLE_KIND::RECTANGLE )
                 return PLANAR::SIMPLEX::FromBox( copper.box );
+            if( copper.kind == ROUTER_OBSTACLE_KIND::SEGMENT
+                && copper.radius > 0 )
+            {
+                // PolygonPath.transformToBoardRel() first builds the exact
+                // endpoint octagon and offsets it by half the path width.
+                // PolylineTrace.correctConnectionToPin() then offsets that
+                // IntOctagon by trace half-width plus its pin clearance. Do
+                // both operations on the source-coordinate lattice so an
+                // oval KiCad pad produces the same SHOVE_FIXED exit endpoint
+                // as the Specctra path consumed by Freerouting.
+                constexpr std::int64_t unit =
+                        static_cast<std::int64_t>(
+                                FREEROUTING_COORDINATE_UNIT_IU );
+                const ROUTER_POINT first = FLOAT_POINT{
+                        static_cast<double>( copper.start.x ),
+                        static_cast<double>( copper.start.y ) }
+                                                   .RoundToSourceGridYDown();
+                const ROUTER_POINT second = FLOAT_POINT{
+                        static_cast<double>( copper.end.x ),
+                        static_cast<double>( copper.end.y ) }
+                                                    .RoundToSourceGridYDown();
+                PLANAR::INT_OCTAGON octagon(
+                        std::min( first.x, second.x ),
+                        std::min( first.y, second.y ),
+                        std::max( first.x, second.x ),
+                        std::max( first.y, second.y ),
+                        std::min( first.x - first.y, second.x - second.y ),
+                        std::max( first.x - first.y, second.x - second.y ),
+                        std::min( first.x + first.y, second.x + second.y ),
+                        std::max( first.x + first.y, second.x + second.y ) );
+                octagon = octagon.NormalizeOnGrid( unit )
+                                  .OffsetOnGrid( copper.radius, unit )
+                                  .OffsetOnGrid(
+                                          static_cast<double>( aTraceWidth ) / 2.0
+                                                  + additional,
+                                          unit );
+                pinShapeAlreadyOffset = true;
+                return octagon.ToSimplex();
+            }
             if( copper.kind == ROUTER_OBSTACLE_KIND::POLYGON )
                 return PLANAR::SIMPLEX::FromConvexPolygon( copper.polygon );
             return {};
@@ -241,8 +285,10 @@ public:
         if( !pinShape || pinShape->IsEmpty() || !pinShape->IsBounded() )
             return false;
 
-        auto offsetPinShape = pinShape->Offset(
-                static_cast<double>( aTraceWidth ) / 2.0 + additional );
+        auto offsetPinShape = pinShapeAlreadyOffset
+                ? pinShape
+                : pinShape->Offset(
+                          static_cast<double>( aTraceWidth ) / 2.0 + additional );
         if( !offsetPinShape || offsetPinShape->IsEmpty()
             || !offsetPinShape->IsBounded() )
         {
@@ -389,12 +435,17 @@ public:
         }
 
         ROUTING_EDGE_STYLE exitStyle = oriented.edgeStyles.front();
-        exitStyle.trackWidth = aTraceWidth;
-        exitStyle.clearance = std::max<std::int64_t>( 0, aClearance );
         exitStyle.fixedState = ROUTER_FIXED_STATE::SHOVE_FIXED;
         ROUTING_EDGE_STYLE borderStyle = oriented.edgeStyles[entryLineIndex - 1];
-        borderStyle.trackWidth = aTraceWidth;
-        borderStyle.clearance = std::max<std::int64_t>( 0, aClearance );
+
+        // Keep inherited width/clearance metadata inherited.  A zero value is
+        // the native representation of the netclass value and is therefore
+        // semantically equal to the adjacent original edge.  Materialising
+        // the same value only on the newly-created border edge split one
+        // source PolylineTrace into different style runs, preventing the
+        // recursive TraceTightener45 pass from smoothing the corrected
+        // pad-entry dogleg.  Only the source's new fixed-state boundary is a
+        // real style change here.
 
         std::vector<ROUTER_NODE> nodes{ pinNode };
         std::vector<ROUTING_EDGE_STYLE> styles;
@@ -432,7 +483,7 @@ public:
         aConnection.edgeStyles = std::move( styles );
 
         return CheckConnectionToPin( aConnection, aPin, aAtStart, aTraceWidth,
-                                     aClearance, aEdgeToTurnDistance );
+                                     aClearance, aEdgeToTurnDistance, aCoordinateUnit );
     }
 };
 

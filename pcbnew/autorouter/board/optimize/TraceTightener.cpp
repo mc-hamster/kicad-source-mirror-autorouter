@@ -73,7 +73,9 @@ std::int64_t resolvedPinClearance( const BOARD_SNAPSHOT& aBoard,
         result = std::max( result, net->clearance );
     if( const auto* geometry = PIN::LayerGeometry( aPin, aLayer ) )
         result = std::max( result, geometry->clearance );
-    return result;
+    // BasicBoard.clearanceValue() requests ClearanceMatrix.getValue(...,
+    // true), which appends the source's 16-coordinate DRC safety margin.
+    return saturatedAdd( result, FREEROUTING_CLEARANCE_SAFETY_MARGIN_IU );
 }
 
 
@@ -107,7 +109,8 @@ int pinConnectionViolationCount( const BOARD_SNAPSHOT& aBoard,
         const std::int64_t clearance = resolvedPinClearance(
                 aBoard, aConnection, edge, pin, pinNode.layer );
         if( !PIN::CheckConnectionToPin( aConnection, pin, aAtStart, width,
-                                        clearance, edgeToTurn ) )
+                                        clearance, edgeToTurn,
+                                        FREEROUTING_COORDINATE_UNIT_IU ) )
         {
             ++result;
         }
@@ -137,7 +140,7 @@ std::optional<ROUTING_CONNECTION> correctPinConnections(
                 aBoard, result, edge, pin, pinNode.layer );
         changed = PIN::CorrectConnectionToPin(
                           result, pin, aBoard, aAtStart, width, clearance,
-                          edgeToTurn )
+                          edgeToTurn, FREEROUTING_COORDINATE_UNIT_IU )
                   || changed;
     };
 
@@ -454,6 +457,9 @@ bool TRACE_TIGHTENER::OptChangedArea(
                     continue;
 
                 const ROUTING_CONNECTION original = *current;
+                const auto sourceIdentities =
+                        m_occupancy.Board()->CaptureRouteSourceIdentities(
+                                original );
                 const auto groups = m_occupancy.Board()->ConnectedPadGroups(
                         original.netCode );
                 const int missingBefore = missingCount( m_board, *m_occupancy.Board() );
@@ -479,6 +485,15 @@ bool TRACE_TIGHTENER::OptChangedArea(
                     && pinConnectionViolationCount( m_board, *corrected )
                                < originalPinViolations )
                 {
+                    // PolylineTrace.pullTight() does not stop after
+                    // correctConnectionToPin().  It recursively invokes the
+                    // same TraceTightener on the corrected polyline before
+                    // returning, so a legal pad-entry dogleg is immediately
+                    // converted to the shortest legal fixed-direction path.
+                    // Keeping correction and tightening as independent
+                    // candidates retained the intermediate 90-degree corner
+                    // and changed all subsequent room/door geometry.
+                    MAZE_TRACE_SHOVER::Shorten( *corrected, search );
                     candidates.push_back( std::move( *corrected ) );
                 }
 
@@ -516,6 +531,8 @@ bool TRACE_TIGHTENER::OptChangedArea(
                     continue;
 
                 m_occupancy.Add( *best );
+                m_occupancy.Board()->RestoreRouteSourceIdentities(
+                        *best, sourceIdentities );
                 if( missingCount( m_board, *m_occupancy.Board() ) > missingBefore
                     || !preservesPadGroups( groups, *m_occupancy.Board() ) )
                 {

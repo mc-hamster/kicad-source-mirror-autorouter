@@ -30,7 +30,8 @@ public:
 
     SORTED_45_DEGREE_ROOM_NEIGHBOURS(
             PLANAR::INT_OCTAGON aRoom,
-            const std::vector<SHAPE_TREE_ENTRY>& aEntries );
+            const std::vector<SHAPE_TREE_ENTRY>& aEntries,
+            std::int64_t aCoordinateUnit = 1 );
 
     const std::vector<NEIGHBOUR>& Neighbours() const { return m_neighbours; }
     const std::array<bool, 8>& EdgeInteriorTouchesObstacle() const { return m_edgeTouches; }
@@ -53,7 +54,8 @@ public:
     static PLANAR::INT_OCTAGON RemoveNotTouchingBorderLinesWithinBounds(
             const PLANAR::INT_OCTAGON& aRoom,
             const std::array<bool, 8>& aEdgeTouches,
-            const PLANAR::INT_OCTAGON& aBounds );
+            const PLANAR::INT_OCTAGON& aBounds,
+            std::int64_t aCoordinateUnit );
 
     /** Source calculateNewIncompleteRooms branches, without room/door object
      * allocation.  Returned shapes are ready for the caller's ownership
@@ -100,6 +102,7 @@ private:
 
     PLANAR::INT_OCTAGON m_room;
     std::vector<SHAPE_TREE_ENTRY> m_inputEntries;
+    std::int64_t m_coordinateUnit = 1;
     std::array<bool, 8> m_edgeTouches{};
     std::vector<NEIGHBOUR> m_neighbours;
 };

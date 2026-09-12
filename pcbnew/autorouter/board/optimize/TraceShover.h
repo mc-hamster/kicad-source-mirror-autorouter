@@ -29,6 +29,7 @@ public:
     static RESULT SpringOverObstacles( const PLANAR::POLYLINE& aPolyline,
                                        const std::vector<OBSTACLE>& aObstacles,
                                        const ROUTER_CANCEL_CALLBACK& aCancel = {},
-                                       int aMaxRecursionDepth = 20 );
+                                       int aMaxRecursionDepth = 20,
+                                       const ROUTING_SHOVE_DIRECTION* aDirection = nullptr );
 };
 } // namespace KICAD_AUTOROUTER

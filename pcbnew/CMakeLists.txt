@@ -406,6 +406,7 @@ if( CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" )
         autorouter/geometry/planar/Simplex.cpp
         autorouter/geometry/planar/IntOctagon.cpp
         autorouter/board/optimize/TraceShover.cpp autorouter/board/optimize/TraceTightener.cpp
+        autorouter/board/optimize/TraceTightener45.cpp
         autorouter/board/optimize/ViaOptimizer.cpp APPEND
                   PROPERTY COMPILE_OPTIONS -ffp-contract=off )
 elseif( MSVC )
@@ -415,6 +416,7 @@ elseif( MSVC )
         autorouter/geometry/planar/Simplex.cpp
         autorouter/geometry/planar/IntOctagon.cpp
         autorouter/board/optimize/TraceShover.cpp autorouter/board/optimize/TraceTightener.cpp
+        autorouter/board/optimize/TraceTightener45.cpp
         autorouter/board/optimize/ViaOptimizer.cpp APPEND
                   PROPERTY COMPILE_OPTIONS /fp:strict )
 endif()
@@ -479,6 +481,7 @@ set( PCBNEW_CLASS_SRCS
     autorouter/board/state/ChangedArea.cpp
     autorouter/board/optimize/TraceShover.cpp
     autorouter/board/optimize/TraceTightener.cpp
+    autorouter/board/optimize/TraceTightener45.cpp
     autorouter/board/optimize/ViaOptimizer.cpp
     autorouter/path/FoundConnectionInserter.cpp
     autorouter/path/FoundConnectionLocator.cpp

@@ -54,6 +54,12 @@ struct MAZE_TRACE_ROOM_INFO
     std::size_t firstShapeIndex = 0;
     std::int64_t halfWidth = 0;
     std::int64_t clearance = 0;
+    /** Exact PolylineTrace half-width after search-tree clearance
+     * compensation.  MazeSearchEngine.roomShapeIsThick() compares this
+     * value directly with the candidate's compensated half-width; deriving
+     * it from an octagon's minimum width is not equivalent for diagonal
+     * trace shapes. */
+    std::int64_t compensatedHalfWidth = 0;
     bool sourceStyleMatches = false;
     std::function<double( const FLOAT_LINE&, bool )> maxShoveLength;
 };

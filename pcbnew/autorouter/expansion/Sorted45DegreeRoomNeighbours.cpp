@@ -12,14 +12,17 @@ namespace KICAD_AUTOROUTER
 using PLANAR::INT_OCTAGON;
 
 SORTED_45_DEGREE_ROOM_NEIGHBOURS::SORTED_45_DEGREE_ROOM_NEIGHBOURS(
-        INT_OCTAGON aRoom, const std::vector<SHAPE_TREE_ENTRY>& aEntries ) :
+        INT_OCTAGON aRoom, const std::vector<SHAPE_TREE_ENTRY>& aEntries,
+        std::int64_t aCoordinateUnit ) :
         m_room( std::move( aRoom ) ),
-        m_inputEntries( aEntries )
+        m_inputEntries( aEntries ),
+        m_coordinateUnit( std::max<std::int64_t>( 1, aCoordinateUnit ) )
 {
     for( const SHAPE_TREE_ENTRY& entry : aEntries )
     {
         const INT_OCTAGON shape = entry.BoundingOctagon();
-        const INT_OCTAGON intersection = m_room.Intersection( shape );
+        const INT_OCTAGON intersection = m_room.IntersectionOnGrid(
+                shape, m_coordinateUnit );
         // A completed free-space room deliberately overlaps its predecessor
         // through a two-dimensional door.  Freerouting keeps that room in the
         // sorted boundary-neighbour cycle; omitting it merges the two gaps on
@@ -90,7 +93,8 @@ std::array<bool, 8>
 SORTED_45_DEGREE_ROOM_NEIGHBOURS::EdgeInteriorTouchesObstacleForYDownCoordinates() const
 {
     const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
-            reflectY( m_room ), reflectedEntries( m_inputEntries ) );
+            reflectY( m_room ), reflectedEntries( m_inputEntries ),
+            m_coordinateUnit );
     std::array<bool, 8> result{};
     for( int sourceSide = 0; sourceSide < 8; ++sourceSide )
         result[( 4 - sourceSide + 8 ) % 8] =
@@ -104,7 +108,8 @@ SORTED_45_DEGREE_ROOM_NEIGHBOURS::IncompleteRoomsForYDownCoordinates(
         const INT_OCTAGON& aBoardBounds, int aLayer ) const
 {
     const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
-            reflectY( m_room ), reflectedEntries( m_inputEntries ) );
+            reflectY( m_room ), reflectedEntries( m_inputEntries ),
+            m_coordinateUnit );
     return reflectY( sourceOrder.IncompleteRooms(
             reflectY( aBoardBounds ), aLayer ) );
 }
@@ -115,7 +120,8 @@ SORTED_45_DEGREE_ROOM_NEIGHBOURS::ObstacleIncompleteRoomsForYDownCoordinates(
         const INT_OCTAGON& aBoardBounds, int aLayer ) const
 {
     const SORTED_45_DEGREE_ROOM_NEIGHBOURS sourceOrder(
-            reflectY( m_room ), reflectedEntries( m_inputEntries ) );
+            reflectY( m_room ), reflectedEntries( m_inputEntries ),
+            m_coordinateUnit );
     return reflectY( sourceOrder.ObstacleIncompleteRooms(
             reflectY( aBoardBounds ), aLayer ) );
 }
@@ -271,10 +277,12 @@ void SORTED_45_DEGREE_ROOM_NEIGHBOURS::insertIncompleteRoom(
     const INT_OCTAGON shape = INT_OCTAGON(
             aLeftX, aBottomY, aRightX, aTopY,
             aUpperLeftDiagonalX, aLowerRightDiagonalX,
-            aLowerLeftDiagonalX, aUpperRightDiagonalX ).Normalize();
+            aLowerLeftDiagonalX, aUpperRightDiagonalX ).NormalizeOnGrid(
+                    m_coordinateUnit );
     if( shape.Dimension() != 2 )
         return;
-    const INT_OCTAGON contained = m_room.Intersection( shape );
+    const INT_OCTAGON contained = m_room.IntersectionOnGrid(
+            shape, m_coordinateUnit );
     if( !contained.IsEmpty() && contained.Dimension() > 0 )
         aResult.push_back( { shape, aLayer, contained } );
 }
@@ -761,8 +769,8 @@ SORTED_45_DEGREE_ROOM_NEIGHBOURS::ObstacleIncompleteRooms(
         bool insertRoom;
         if( m_neighbours.size() == 2 )
         {
-            const INT_OCTAGON intersection = next.intersection.Intersection(
-                    previous->intersection );
+            const INT_OCTAGON intersection = next.intersection.IntersectionOnGrid(
+                    previous->intersection, m_coordinateUnit );
             if( intersection.IsEmpty() )
                 insertRoom = true;
             else if( intersection.Dimension() >= 1 )
@@ -808,9 +816,9 @@ INT_OCTAGON SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLines(
 INT_OCTAGON
 SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLinesWithinBounds(
         const INT_OCTAGON& aRoom, const std::array<bool, 8>& aEdgeTouches,
-        const INT_OCTAGON& aBounds )
+        const INT_OCTAGON& aBounds, std::int64_t aCoordinateUnit )
 {
-    return INT_OCTAGON(
+    const INT_OCTAGON yDownShape(
             aEdgeTouches[6] ? aRoom.leftX : aBounds.leftX,
             aEdgeTouches[0] ? aRoom.bottomY : aBounds.bottomY,
             aEdgeTouches[2] ? aRoom.rightX : aBounds.rightX,
@@ -822,7 +830,16 @@ SORTED_45_DEGREE_ROOM_NEIGHBOURS::RemoveNotTouchingBorderLinesWithinBounds(
             aEdgeTouches[7] ? aRoom.lowerLeftDiagonalX
                             : aBounds.lowerLeftDiagonalX,
             aEdgeTouches[3] ? aRoom.upperRightDiagonalX
-                            : aBounds.upperRightDiagonalX ).Normalize();
+                            : aBounds.upperRightDiagonalX );
+
+    // tryRemoveEdgeLine() runs after the production board has been reflected
+    // into KiCad's y-down coordinates.  IntOctagon.normalize() contains four
+    // asymmetric floor/ceil tie-breaks, so normalizing directly after that
+    // reflection changes a half-coordinate boundary by one source unit.
+    // Execute this source operation on the source lattice and then reflect
+    // the result back, as the surrounding neighbour lifecycle already does.
+    return reflectY( reflectY( yDownShape ).NormalizeOnGrid(
+            std::max<std::int64_t>( 1, aCoordinateUnit ) ) );
 }
 
 } // namespace KICAD_AUTOROUTER

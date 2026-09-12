@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 #include <geometry/shape_circle.h>
@@ -18,6 +19,7 @@
 #include <geometry/shape_segment.h>
 
 #include "../../rules/ViaRule.h"
+#include "../../AutorouterDebug.h"
 #include "../model/items/NormalContacts.h"
 #include "../../geometry/planar/ContactGeometry.h"
 #include "../../geometry/planar/Polyline.h"
@@ -77,6 +79,61 @@ std::shared_ptr<const SHAPE> shape( const ROUTING_OBSTACLE& aCopper )
         addEdges( hole );
     return expanded;
 }
+
+
+long double sharedCentrelineLength( const ROUTING_CONNECTION& aLeft,
+                                    const ROUTING_CONNECTION& aRight )
+{
+    using WIDE = __int128_t;
+    long double result = 0;
+    for( std::size_t leftEdge = 1; leftEdge < aLeft.nodes.size(); ++leftEdge )
+    {
+        const ROUTER_NODE& a = aLeft.nodes[leftEdge - 1];
+        const ROUTER_NODE& b = aLeft.nodes[leftEdge];
+        if( a.layer != b.layer || a.point == b.point )
+            continue;
+
+        const WIDE abX = WIDE( b.point.x ) - a.point.x;
+        const WIDE abY = WIDE( b.point.y ) - a.point.y;
+        for( std::size_t rightEdge = 1; rightEdge < aRight.nodes.size(); ++rightEdge )
+        {
+            const ROUTER_NODE& c = aRight.nodes[rightEdge - 1];
+            const ROUTER_NODE& d = aRight.nodes[rightEdge];
+            if( c.layer != d.layer || c.layer != a.layer || c.point == d.point )
+                continue;
+
+            const WIDE cdX = WIDE( d.point.x ) - c.point.x;
+            const WIDE cdY = WIDE( d.point.y ) - c.point.y;
+            const WIDE acX = WIDE( c.point.x ) - a.point.x;
+            const WIDE acY = WIDE( c.point.y ) - a.point.y;
+            if( abX * cdY != abY * cdX || abX * acY != abY * acX )
+                continue;
+
+            const bool byX = std::abs( b.point.x - a.point.x )
+                             >= std::abs( b.point.y - a.point.y );
+            const std::int64_t a0 = byX ? a.point.x : a.point.y;
+            const std::int64_t a1 = byX ? b.point.x : b.point.y;
+            const std::int64_t c0 = byX ? c.point.x : c.point.y;
+            const std::int64_t c1 = byX ? d.point.x : d.point.y;
+            const std::int64_t overlap = std::max<std::int64_t>(
+                    0, std::min( std::max( a0, a1 ), std::max( c0, c1 ) )
+                               - std::max( std::min( a0, a1 ),
+                                           std::min( c0, c1 ) ) );
+            if( overlap == 0 )
+                continue;
+
+            const long double dx = static_cast<long double>( b.point.x )
+                                   - a.point.x;
+            const long double dy = static_cast<long double>( b.point.y )
+                                   - a.point.y;
+            const long double axis = std::abs( static_cast<long double>( a1 )
+                                               - a0 );
+            result += static_cast<long double>( overlap )
+                      * std::sqrt( dx * dx + dy * dy ) / axis;
+        }
+    }
+    return result;
+}
 }
 
 struct ROUTING_BOARD::IMPL
@@ -91,6 +148,10 @@ struct ROUTING_BOARD::IMPL
     struct ITEM
     {
         ITEM_ID id = 0;
+        // Stable equivalent of Freerouting Item.getId().  Native optimizer
+        // adapters may recreate the host-side item while the source mutates it
+        // in place, so this identity is deliberately separate from id.
+        std::uint64_t sourceObjectId = 0;
         int net = 0;
         std::size_t pad = NO_PAD;
         bool dynamic = false;
@@ -149,6 +210,7 @@ struct ROUTING_BOARD::IMPL
         const ITEM_ID id = nextId++;
         auto& result = items[id];
         result.id = id;
+        result.sourceObjectId = id;
         result.net = net;
         result.dynamic = dynamic;
         result.routable = dynamic;
@@ -233,6 +295,8 @@ struct ROUTING_BOARD::IMPL
                     {
                         items.at( first ).contacts.insert( pads.at( pad ) );
                         items.at( pads.at( pad ) ).contacts.insert( first );
+                        items.at( first ).normalContacts.insert( pads.at( pad ) );
+                        items.at( pads.at( pad ) ).normalContacts.insert( first );
                     }
                 }
             }
@@ -628,6 +692,8 @@ struct ROUTING_BOARD::IMPL
 
             ITEM piece = original;
             piece.id = replacements.empty() ? id : nextId++;
+            if( !replacements.empty() )
+                piece.sourceObjectId = piece.id;
             rebuildTraceGeometry(
                     piece,
                     std::vector<ROUTER_POINT>(
@@ -1048,6 +1114,11 @@ struct ROUTING_BOARD::IMPL
             {
                 const ITEM_ID current = pending.back();
                 pending.pop_back();
+                // This component cache answers host physical connectivity:
+                // any same-net copper overlap conducts.  Keep it deliberately
+                // separate from NormalConnectedSet(), which is the direct
+                // translation of Freerouting Item.getConnectedSet() and walks
+                // only endpoint/centre/area normal contacts.
                 for( auto contact : items.at( current ).contacts )
                 {
                     if( components.emplace( contact, id ).second )
@@ -1068,7 +1139,10 @@ struct ROUTING_BOARD::IMPL
         // A synthetic landing has no copper of its own. Resolve it only against
         // inserted/retained geometry, and never join layers via a virtual pad.
         const auto& terminal = snapshot.pads[pad];
-        const SHAPE_CIRCLE probe( point( terminal.position ), 0 );
+        const SHAPE_CIRCLE pointProbe( point( terminal.position ), 0 );
+        const std::shared_ptr<const SHAPE> areaProbe = terminal.connectionArea
+                ? shape( *terminal.connectionArea ) : nullptr;
+        const SHAPE* probe = areaProbe ? areaProbe.get() : &pointProbe;
         std::set<ITEM_ID> result;
         for( int layer : terminal.layers )
         {
@@ -1083,11 +1157,11 @@ struct ROUTING_BOARD::IMPL
                 const auto& item = items.at( part->owner );
                 if( item.net == terminal.netCode
                     && ( !terminal.isPlaneTarget || item.conductionArea )
-                    && part->geometry->Collide( &probe, 0 ) )
+                    && part->geometry->Collide( probe, 0 ) )
                     result.insert( components.at( item.id ) );
                 return true;
             };
-            tree->second->Query( &probe, 0, visitor );
+            tree->second->Query( probe, 0, visitor );
         }
         return result;
     }
@@ -1193,8 +1267,31 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
             }
         }
     }
+    // During post-refill repair KiCad gives us the actual disconnected filled
+    // islands as exact CN_ZONE_LAYER terminals.  The original Specctra-style
+    // ConductionArea for the zone outline is then too broad: retaining it
+    // would electrically join those islands before any repair trace exists.
+    // Replace only the affected net/layer areas with the exact host islands;
+    // ordinary initial routing continues to use the source ConductionArea.
+    std::set<std::pair<int, int>> exactAreaLayers;
+    for( const ROUTING_PAD& pad : snapshot.pads )
+    {
+        if( !pad.isExactTarget || !pad.connectionArea )
+            continue;
+        for( int layer : pad.layers )
+            exactAreaLayers.emplace( pad.netCode, layer );
+    }
+
     for( const auto& area : snapshot.conductionAreas )
     {
+        const bool supersededByExactIslands = std::any_of(
+                area.layers.begin(), area.layers.end(), [&]( int layer )
+                {
+                    return exactAreaLayers.contains( { area.netCode, layer } );
+                } );
+        if( supersededByExactIslands )
+            continue;
+
         auto& item = state.newItem( area.netCode );
         item.conductionArea = true;
         item.area = std::make_shared<const ROUTING_OBSTACLE>( area );
@@ -1225,6 +1322,21 @@ ROUTING_BOARD::ROUTING_BOARD( const BOARD_SNAPSHOT& snapshot,
             item.terminals.push_back(
                     { std::move( terminalPad ), NO_PAD, {}, item.area } );
         }
+    }
+
+    for( std::size_t padIndex = 0; padIndex < snapshot.pads.size(); ++padIndex )
+    {
+        const ROUTING_PAD& pad = snapshot.pads[padIndex];
+        if( !pad.isExactTarget || !pad.connectionArea )
+            continue;
+
+        auto& item = state.newItem( pad.netCode );
+        item.conductionArea = true;
+        item.area = pad.connectionArea;
+        item.normal.kind = NORMAL_CONTACT_ITEM::KIND::AREA;
+        state.addShape( item, *pad.connectionArea );
+        item.terminals.push_back( { pad, padIndex, {}, item.area } );
+        state.pads[padIndex] = item.id;
     }
     state.reindex();
 }
@@ -1549,6 +1661,25 @@ bool ROUTING_BOARD::ConnectedSetTouchesOtherLayer( std::size_t pad, int layer ) 
         return false;
 
     m_impl->updateComponents();
+    if( autorouterDebugEnabled() )
+    {
+        std::ostringstream description;
+        description << "CONNECTED_SET pad=" << pad << " source_layer=" << layer;
+        for( const auto& [id, item] : m_impl->items )
+        {
+            if( !roots.contains( m_impl->components.at( id ) ) )
+                continue;
+            description << " {id=" << id << ",pad=" << item.pad
+                        << ",area=" << item.conductionArea << ",layers=";
+            for( const auto& shape : item.shapes )
+                description << shape.layer << ',';
+            description << ",normal=";
+            for( ITEM_ID contact : item.normalContacts )
+                description << contact << ',';
+            description << '}';
+        }
+        autorouterDebugLog( description.str() );
+    }
     return std::any_of(
             m_impl->items.begin(), m_impl->items.end(),
             [&]( const auto& aEntry )
@@ -1557,9 +1688,24 @@ bool ROUTING_BOARD::ConnectedSetTouchesOtherLayer( std::size_t pad, int layer ) 
                 if( !roots.contains( m_impl->components.at( id ) ) )
                     return false;
 
-                return std::any_of( item.shapes.begin(), item.shapes.end(),
-                                    [&]( const auto& aShape )
-                                    { return aShape.layer != layer; } );
+                const auto otherLayer = std::find_if(
+                        item.shapes.begin(), item.shapes.end(),
+                        [&]( const auto& aShape ) { return aShape.layer != layer; } );
+                if( otherLayer == item.shapes.end() )
+                    return false;
+
+                if( autorouterDebugEnabled() )
+                {
+                    autorouterDebugLog(
+                            "CONNECTED_SET_OTHER_LAYER pad=" + std::to_string( pad )
+                            + " source_layer=" + std::to_string( layer )
+                            + " item=" + std::to_string( id )
+                            + " item_layer=" + std::to_string( otherLayer->layer )
+                            + " item_pad=" + std::to_string( item.pad )
+                            + " conduction_area=" + std::to_string( item.conductionArea )
+                            + " dynamic=" + std::to_string( item.dynamic ) );
+                }
+                return true;
             } );
 }
 
@@ -1594,14 +1740,22 @@ std::vector<ROUTING_TERMINAL> ROUTING_BOARD::Terminals( std::size_t pad ) const
 {
     const auto roots = m_impl->padRoots( pad );
     std::vector<ROUTING_TERMINAL> result;
-    for( const auto& [id, item] : m_impl->items )
+    // Item.getConnectedSet() returns a TreeSet in descending insertion-id
+    // order.  Terminal seeding is observable when two doors have equal cost,
+    // so preserve that source order just as UnconnectedTargetItems() does.
+    for( auto itemEntry = m_impl->items.rbegin(); itemEntry != m_impl->items.rend();
+         ++itemEntry )
     {
+        const auto& [id, item] = *itemEntry;
         if( !roots.contains( m_impl->components.at( id ) ) )
             continue;
-        for( auto terminal : item.terminals )
+        for( std::size_t shapeIndex = 0; shapeIndex < item.terminals.size(); ++shapeIndex )
         {
+            auto terminal = item.terminals[shapeIndex];
             if( terminal.padIndex == NO_PAD )
                 terminal.padIndex = pad;
+            terminal.itemId = id;
+            terminal.treeEntryIndex = shapeIndex;
             result.push_back( std::move( terminal ) );
         }
     }
@@ -1662,10 +1816,13 @@ std::vector<ROUTING_BOARD::TARGET_ITEM> ROUTING_BOARD::UnconnectedTargetItems(
 
         target.terminals = item.terminals;
         const auto representative = representativePad.find( root );
-        for( ROUTING_TERMINAL& terminal : target.terminals )
+        for( std::size_t shapeIndex = 0; shapeIndex < target.terminals.size(); ++shapeIndex )
         {
+            ROUTING_TERMINAL& terminal = target.terminals[shapeIndex];
             if( terminal.padIndex == NO_PAD && representative != representativePad.end() )
                 terminal.padIndex = representative->second;
+            terminal.itemId = id;
+            terminal.treeEntryIndex = shapeIndex;
         }
 
         // ConductionArea is one connectable source Item. A synthetic target
@@ -1881,11 +2038,129 @@ bool ROUTING_BOARD::RemoveItems( const ITEM_ID_SET& ids )
 
 std::vector<ROUTING_CONNECTION> ROUTING_BOARD::ItemRoutes() const
 {
-    std::vector<ROUTING_CONNECTION> result;
+    std::vector<const IMPL::ITEM*> ordered;
+    ordered.reserve( m_impl->items.size() );
     for( const auto& [id, item] : m_impl->items )
         if( item.dynamic && item.routable && item.route )
-            result.push_back( *item.route );
+            ordered.push_back( &item );
+    std::stable_sort( ordered.begin(), ordered.end(),
+                      []( const IMPL::ITEM* aLeft, const IMPL::ITEM* aRight )
+                      {
+                          return aLeft->sourceObjectId != aRight->sourceObjectId
+                                  ? aLeft->sourceObjectId < aRight->sourceObjectId
+                                  : aLeft->id < aRight->id;
+                      } );
+
+    std::vector<ROUTING_CONNECTION> result;
+    result.reserve( ordered.size() );
+    for( const IMPL::ITEM* item : ordered )
+        result.push_back( *item->route );
     return result;
+}
+
+
+std::vector<ROUTING_BOARD::SOURCE_ITEM_IDENTITY>
+ROUTING_BOARD::CaptureRouteSourceIdentities(
+        const ROUTING_CONNECTION& route ) const
+{
+    std::vector<SOURCE_ITEM_IDENTITY> result;
+    for( ITEM_ID id : RouteItems( route ) )
+    {
+        const auto item = m_impl->items.find( id );
+        if( item != m_impl->items.end() && item->second.dynamic
+            && item->second.routable && item->second.route )
+        {
+            result.push_back( { item->second.sourceObjectId,
+                                *item->second.route } );
+        }
+    }
+    std::stable_sort( result.begin(), result.end(),
+                      []( const SOURCE_ITEM_IDENTITY& aLeft,
+                          const SOURCE_ITEM_IDENTITY& aRight )
+                      { return aLeft.sourceObjectId < aRight.sourceObjectId; } );
+    return result;
+}
+
+
+void ROUTING_BOARD::RestoreRouteSourceIdentities(
+        const ROUTING_CONNECTION& replacement,
+        const std::vector<SOURCE_ITEM_IDENTITY>& identities )
+{
+    if( identities.empty() )
+        return;
+
+    std::vector<ITEM_ID> candidates = RouteItems( replacement );
+    std::set<ITEM_ID> used;
+    for( const SOURCE_ITEM_IDENTITY& identity : identities )
+    {
+        ITEM_ID best = 0;
+        long double bestOverlap = -1;
+        int bestSharedEndpoints = -1;
+        int bestSharedNodes = -1;
+        for( ITEM_ID candidateId : candidates )
+        {
+            if( used.contains( candidateId ) )
+                continue;
+            const auto candidate = m_impl->items.find( candidateId );
+            if( candidate == m_impl->items.end() || !candidate->second.route
+                || candidate->second.net != identity.geometry.netCode )
+            {
+                continue;
+            }
+
+            const ROUTING_CONNECTION& geometry = *candidate->second.route;
+            const long double overlap = sharedCentrelineLength(
+                    identity.geometry, geometry );
+            int sharedEndpoints = 0;
+            if( !identity.geometry.nodes.empty() && !geometry.nodes.empty() )
+            {
+                for( const ROUTER_NODE& endpoint :
+                     { identity.geometry.nodes.front(),
+                       identity.geometry.nodes.back() } )
+                {
+                    if( endpoint == geometry.nodes.front()
+                        || endpoint == geometry.nodes.back() )
+                    {
+                        ++sharedEndpoints;
+                    }
+                }
+            }
+            int sharedNodes = 0;
+            for( const ROUTER_NODE& node : identity.geometry.nodes )
+                if( std::find( geometry.nodes.begin(), geometry.nodes.end(), node )
+                    != geometry.nodes.end() )
+                    ++sharedNodes;
+
+            if( overlap > bestOverlap
+                || ( overlap == bestOverlap
+                     && ( sharedEndpoints > bestSharedEndpoints
+                          || ( sharedEndpoints == bestSharedEndpoints
+                               && ( sharedNodes > bestSharedNodes
+                                    || ( sharedNodes == bestSharedNodes
+                                         && ( best == 0
+                                              || candidateId < best ) ) ) ) ) ) )
+            {
+                best = candidateId;
+                bestOverlap = overlap;
+                bestSharedEndpoints = sharedEndpoints;
+                bestSharedNodes = sharedNodes;
+            }
+        }
+
+        if( best != 0 )
+        {
+            m_impl->items.at( best ).sourceObjectId = identity.sourceObjectId;
+            used.insert( best );
+        }
+    }
+    ++m_impl->revision;
+}
+
+
+std::uint64_t ROUTING_BOARD::SourceObjectId( ITEM_ID item ) const
+{
+    const auto found = m_impl->items.find( item );
+    return found == m_impl->items.end() ? 0 : found->second.sourceObjectId;
 }
 
 
@@ -1894,6 +2169,15 @@ std::vector<ROUTING_BOARD::ITEM_ID> ROUTING_BOARD::RouteItems( const ROUTING_CON
     for( const auto& record : m_impl->routes )
         if( SameRouteGeometry( record.connection, route ) )
             return record.items;
+
+    // ItemRoutes() returns normalized PolylineTrace/DrillItem geometry rather
+    // than the possibly multi-item insertion request stored in routes.  The
+    // source tree orders those item objects by their own insertion id, so keep
+    // that identity available after splitting and for imported host copper.
+    for( const auto& [id, item] : m_impl->items )
+        if( item.route && SameRouteGeometry( *item.route, route ) )
+            return { id };
+
     return {};
 }
 

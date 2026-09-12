@@ -19,10 +19,46 @@
 
 #include "AutorouteConnectionRouter.h"
 
+#include "../board/facade/RoutingBoard.h"
 #include "../maze/AutorouteEngine.h"
 
 namespace KICAD_AUTOROUTER
 {
+
+AUTOROUTE_CONNECTION_ROUTER::TERMINAL_SETS
+AUTOROUTE_CONNECTION_ROUTER::TerminalSetsForItem( const ROUTING_BOARD& aBoard,
+                                                   std::size_t aItemPad,
+                                                   int aNetCode,
+                                                   bool aContainsPlane )
+{
+    TERMINAL_SETS result;
+    std::vector<ROUTING_TERMINAL> connected = aBoard.Terminals( aItemPad );
+    std::vector<ROUTING_TERMINAL> unconnected;
+
+    for( const ROUTING_BOARD::TARGET_ITEM& item :
+         aBoard.UnconnectedTargetItems( aItemPad, aNetCode ) )
+    {
+        unconnected.insert( unconnected.end(), item.terminals.begin(),
+                            item.terminals.end() );
+    }
+
+    // AutorouteConnectionRouter.route(): ordinary routing expands from the
+    // complete unconnected set toward the selected item's connected set.
+    // Plane routing intentionally reverses those sets so the path starts at
+    // the selected item and terminates on the conduction area.
+    if( aContainsPlane )
+    {
+        result.starts = std::move( connected );
+        result.destinations = std::move( unconnected );
+    }
+    else
+    {
+        result.starts = std::move( unconnected );
+        result.destinations = std::move( connected );
+    }
+
+    return result;
+}
 
 std::optional<ROUTING_CONNECTION> AUTOROUTE_CONNECTION_ROUTER::Route(
         const BOARD_SNAPSHOT& aBoard, const AUTOROUTER_SETTINGS& aSettings,

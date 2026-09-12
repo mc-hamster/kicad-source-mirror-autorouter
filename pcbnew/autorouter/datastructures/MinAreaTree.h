@@ -33,14 +33,25 @@ struct SHAPE_TREE_ENTRY
     int net = 0;
     bool isRoom = false;
     bool obstacle = true;
-    // Exact 45-degree shape.  The minimum-area tree deliberately indexes its
-    // bounding box; ShapeSearchTree45Degree applies this shape as the exact
-    // narrow phase after traversal reaches a leaf.
+    // Exact 45-degree shape.  Freerouting's 45-degree minimum-area tree uses
+    // octagonal unions for insertion and traversal as well as for leaf tests.
     std::optional<PLANAR::INT_OCTAGON> octagon;
     // Exact arbitrary-angle convex shape.  The general ShapeSearchTree keeps
     // this representation through room restraint instead of silently
     // replacing non-45-degree supports with their octagonal envelope.
     std::optional<PLANAR::SIMPLEX> simplex;
+    // Source board-item insertion order.  Freerouting keeps one all-layer
+    // tree, so shapes of a multilayer item must be replayed together rather
+    // than grouped by the native layer context that consumes them.
+    std::uint64_t treeInsertionOrder = std::numeric_limits<std::uint64_t>::max();
+    bool boardOutline = false;
+    // Present only on final PolylineTrace leaves produced by the forced
+    // inserter. All leaves of that item share the immutable journal. The
+    // expansion is candidate-tree-specific and is attached per leaf because
+    // a neckdown can change width within one inserted connection.
+    std::shared_ptr<const std::vector<ROUTING_TRACE_INSERTION_STEP>>
+            traceInsertionSteps;
+    std::int64_t traceTreeExpansion = -1;
 
     bool IsTraceObstacle( int aNet ) const
     {
@@ -78,13 +89,21 @@ public:
 
     HANDLE Insert( const SHAPE_TREE_ENTRY& aEntry );
     bool Remove( HANDLE aHandle );
+    /** Change leaf identity/index without changing binary-tree topology.
+     * ShapeSearchTree.mergeEntries* transfers surviving Leaf objects between
+     * PolylineTrace instances in exactly this way. Geometry must remain
+     * identical because ancestor bounds are intentionally not rebuilt. */
+    bool UpdateEntry( HANDLE aHandle, const SHAPE_TREE_ENTRY& aEntry );
     std::size_t Size() const { return m_leafCount; }
 
     // The callback may shrink aQuery during traversal, as completeShape does.
     // It must not mutate the tree. False stops traversal (e.g. cancellation).
     bool Visit( ROUTER_BOX& aQuery,
                 const std::function<bool( const SHAPE_TREE_ENTRY& )>& aVisit ) const;
+    bool Visit( PLANAR::INT_OCTAGON& aQuery,
+                const std::function<bool( const SHAPE_TREE_ENTRY& )>& aVisit ) const;
     std::vector<SHAPE_TREE_ENTRY> Overlaps( ROUTER_BOX aQuery ) const;
+    std::vector<SHAPE_TREE_ENTRY> Overlaps( PLANAR::INT_OCTAGON aQuery ) const;
 
 private:
     struct NODE
@@ -94,6 +113,11 @@ private:
         HANDLE first = NONE;
         HANDLE second = NONE;
         std::optional<SHAPE_TREE_ENTRY> entry;
+        // Freerouting's 45-degree MinAreaTree uses IntOctagon for both the
+        // insertion-area heuristic and traversal pruning.  Keeping only its
+        // rectangular envelope changes the tree topology and therefore the
+        // observable obstacle visitation order during room completion.
+        std::optional<PLANAR::INT_OCTAGON> octagonBounds;
     };
     std::vector<NODE> m_nodes;
     HANDLE m_root = NONE;

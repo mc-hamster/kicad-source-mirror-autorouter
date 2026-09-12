@@ -23,6 +23,8 @@
 
 #include "KicadBoardAdapter.h"
 #include "../AutorouterDebug.h"
+#include "model/structure/BoardOutline.h"
+#include "../geometry/planar/FloatLine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -45,6 +47,7 @@
 #include <geometry/shape_line_chain.h>
 #include <geometry/shape_poly_set.h>
 #include <geometry/shape_segment.h>
+#include <convert_basic_shapes_to_polygon.h>
 #include <layer_ids.h>
 #include <netclass.h>
 #include <pad.h>
@@ -388,8 +391,25 @@ AUTOROUTER_SETTINGS KICAD_BOARD_ADAPTER::CreateDefaultSettings() const
     if( bounds.GetWidth() <= 0 || bounds.GetHeight() <= 0 )
         bounds = m_board->GetBoundingBox();
 
-    const double width = std::max<double>( 1.0, bounds.GetWidth() );
-    const double height = std::max<double>( 1.0, bounds.GetHeight() );
+    // RouterSettings.applyBoardSpecificOptimizations uses RoutingBoard.boundingBox,
+    // not the bare outline bounds.  The DSN reader rounds the boundary to the
+    // source coordinate grid and expands that box by 100 source units (100 um)
+    // on every side before deriving the preferred-direction costs.  The extra
+    // margin matters at the one-decimal rounding boundary: using KiCad's raw
+    // Edge.Cuts box made this board's F.Cu horizontal cost 2.3 instead of the
+    // source's 2.2 and changed the maze priority order after 31 assignments.
+    const std::int64_t sourceLeft = BOARD_OUTLINE::DsnRoundTripCoordinate(
+            static_cast<std::int64_t>( bounds.GetLeft() ) );
+    const std::int64_t sourceRight = BOARD_OUTLINE::DsnRoundTripCoordinate(
+            static_cast<std::int64_t>( bounds.GetRight() ) );
+    const std::int64_t sourceTop = BOARD_OUTLINE::DsnRoundTripCoordinateYDown(
+            static_cast<std::int64_t>( bounds.GetTop() ) );
+    const std::int64_t sourceBottom = BOARD_OUTLINE::DsnRoundTripCoordinateYDown(
+            static_cast<std::int64_t>( bounds.GetBottom() ) );
+    const double width = std::max<double>(
+            1.0, sourceRight - sourceLeft + 2 * BOARD_OUTLINE::BOUNDING_MARGIN_IU );
+    const double height = std::max<double>(
+            1.0, sourceBottom - sourceTop + 2 * BOARD_OUTLINE::BOUNDING_MARGIN_IU );
     const double horizontalExtra = 0.1 * std::round( 10.0 * width / height );
     const double verticalExtra = 0.1 * std::round( 10.0 * height / width );
     bool preferredHorizontal = width < height;
@@ -460,13 +480,16 @@ void KICAD_BOARD_ADAPTER::addBoardOutline( BOARD_SNAPSHOT& aSnapshot ) const
     if( !m_board )
         return;
 
-    const_cast<BOARD*>( m_board )->UpdateBoardOutline();
-    const PCB_BOARD_OUTLINE* outline = m_board->BoardOutline();
-
-    if( !outline || !outline->HasOutline() )
+    // Use the same outline-construction path as SPECCTRA_DB::BuiltBoardOutlines().
+    // BOARD::UpdateBoardOutline() additionally fractures the cached polygon;
+    // that is useful for rendering but changes arc-tessellation vertices by a
+    // few KiCad IU.  Those vertices are source-visible after DSN's 0.1 um
+    // quantization and alter BoardOutline tree shapes and room boundaries.
+    // Building the polygon directly also preserves the exporter's fallback
+    // for an inferable, imperfect Edge.Cuts contour.
+    SHAPE_POLY_SET polygons;
+    if( !const_cast<BOARD*>( m_board )->GetBoardPolygonOutlines( polygons, true ) )
         return;
-
-    const SHAPE_POLY_SET& polygons = outline->GetOutline();
 
     if( polygons.OutlineCount() > 0 )
     {
@@ -590,8 +613,8 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
     // consume all exits before the proposal refill.  Do not reserve a full
     // circle: dense IC pads legitimately occupy the directions in which
     // KiCad omitted a spoke.
-    auto thermalReservations = [&]( PAD* aPad, PCB_LAYER_ID aLayer,
-                                    std::int64_t aPadClearance )
+    [[maybe_unused]] auto thermalReservations = [&]( PAD* aPad, PCB_LAYER_ID aLayer,
+                                                     std::int64_t aPadClearance )
     {
         std::vector<ROUTING_OBSTACLE> result;
 
@@ -881,11 +904,17 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     static_cast<std::int64_t>( padBox.GetRight() ) + compensation,
                     static_cast<std::int64_t>( padBox.GetBottom() ) + compensation };
 
-            // Padstack.getTraceExitDirections() only restricts IntBox and
-            // IntOctagon shapes.  KiCad's Specctra exporter emits RECTANGLE
-            // as an IntBox; oval, rounded, chamfered, trapezoid and custom
-            // pads are paths/polygons and deliberately retain no restriction.
-            if( pad->GetShape( layerId ) == PAD_SHAPE::RECTANGLE
+            // Padstack.getTraceExitDirections() restricts IntBox and
+            // IntOctagon shapes. KiCad's Specctra exporter emits RECTANGLE as
+            // an IntBox and OVAL as a finite-width path; the latter is
+            // transformed by Freerouting into an IntOctagon.  Treating an
+            // oval as an unrestricted arbitrary path omitted the SHOVE_FIXED
+            // pin-exit trace which the source creates at common THT pads.
+            // Rounded, chamfered, trapezoid and custom polygon pads retain no
+            // restriction unless their exported shape is proven to simplify
+            // to an IntOctagon.
+            if( ( pad->GetShape( layerId ) == PAD_SHAPE::RECTANGLE
+                  || pad->GetShape( layerId ) == PAD_SHAPE::OVAL )
                 && minShapeWidth > 0 && maxShapeWidth > 0
                 && packagePins.contains( pad ) )
             {
@@ -987,43 +1016,59 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                 obstacle.box = box( padBox );
                 aSnapshot.obstacles.push_back( std::move( obstacle ) );
             }
-            else if( pad->GetShape( layerId ) == PAD_SHAPE::ROUNDRECT )
+            else if( pad->GetShape( layerId ) == PAD_SHAPE::ROUNDRECT
+                     || pad->GetShape( layerId ) == PAD_SHAPE::CHAMFERED_RECT )
             {
-                // Match the geometry which the KiCad Specctra exporter sends
-                // to Freerouting.  Specctra has no rounded-rectangle primitive,
-                // so export uses a 36-segment polygon and first grows the
-                // radius enough to compensate its inward chord error.  Using
-                // KiCad's exact swept rectangle here changed room borders by
-                // roughly one micrometre; adjacent pads then acquired spurious
-                // zero-dimensional contacts and the room/door graph diverged.
-                constexpr int segmentCount = 36;
+                // Use the exact construction in specctra_export.cpp.  The
+                // exported polygon is the geometry Freerouting receives; a
+                // swept four-corner approximation is close physically but can
+                // differ by one source unit after Java rounding, changing room
+                // doors and tie-break order.
+                constexpr int circleToSegmentsCount = 36;
                 int radius = pad->GetRoundRectCornerRadius( layerId );
-                const double correction = std::cos( M_PI / segmentCount );
-                const int extra = KiROUND( radius * ( 1.0 - correction ) );
-                VECTOR2I exportSize = shapeSize + VECTOR2I( 2 * extra, 2 * extra );
-                radius += extra;
+                const double correction = std::cos(
+                        M_PI / static_cast<double>( circleToSegmentsCount ) );
+                const int extraClearance = KiROUND(
+                        radius * ( 1.0 - correction ) );
+                const VECTOR2I exportSize = shapeSize
+                                             + VECTOR2I( 2 * extraClearance,
+                                                         2 * extraClearance );
+                radius += extraClearance;
+                const bool chamfered = pad->GetShape( layerId )
+                                       == PAD_SHAPE::CHAMFERED_RECT;
+                SHAPE_POLY_SET localPolygon;
+                TransformRoundChamferedRectToPolygon(
+                        localPolygon, VECTOR2I( 0, 0 ), exportSize, ANGLE_0,
+                        radius, pad->GetChamferRectRatio( layerId ),
+                        chamfered ? pad->GetChamferPositions( layerId ) : 0,
+                        0, pad->GetMaxError(), ERROR_INSIDE );
 
-                const VECTOR2I halfCore = exportSize / 2 - VECTOR2I( radius, radius );
-                obstacle.radius = radius;
-                if( halfCore.x <= 0 || halfCore.y <= 0 )
+                obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+                if( localPolygon.OutlineCount() > 0 )
                 {
-                    VECTOR2I halfLength( std::max( 0, halfCore.x ),
-                                         std::max( 0, halfCore.y ) );
-                    RotatePoint( halfLength, pad->GetOrientation() );
-                    obstacle.kind = ROUTER_OBSTACLE_KIND::SEGMENT;
-                    obstacle.start = point( shapePos - halfLength );
-                    obstacle.end = point( shapePos + halfLength );
-                }
-                else
-                {
-                    obstacle.kind = ROUTER_OBSTACLE_KIND::POLYGON;
-                    for( VECTOR2I corner : { VECTOR2I( -halfCore.x, -halfCore.y ),
-                                             VECTOR2I( halfCore.x, -halfCore.y ),
-                                             VECTOR2I( halfCore.x, halfCore.y ),
-                                             VECTOR2I( -halfCore.x, halfCore.y ) } )
+                    // The DSN reader rounds the component placement and each
+                    // local padstack vertex independently before applying the
+                    // component transform.  Rounding an already translated
+                    // absolute vertex is not equivalent for fractional-source
+                    // placements (for example 143.569888 mm).
+                    const ROUTER_POINT sourceShapePosition =
+                            FLOAT_POINT{
+                                    static_cast<double>( shapePos.x ),
+                                    static_cast<double>( shapePos.y ) }
+                                    .RoundToSourceGridYDown();
+                    for( const VECTOR2I& localCorner :
+                         localPolygon.Outline( 0 ).CPoints() )
                     {
+                        const ROUTER_POINT sourceLocal = FLOAT_POINT{
+                                static_cast<double>( localCorner.x ),
+                                static_cast<double>( localCorner.y ) }
+                                .RoundToSourceGridYDown();
+                        VECTOR2I corner( static_cast<int>( sourceLocal.x ),
+                                         static_cast<int>( sourceLocal.y ) );
                         RotatePoint( corner, pad->GetOrientation() );
-                        obstacle.polygon.push_back( point( shapePos + corner ) );
+                        obstacle.polygon.push_back(
+                                { sourceShapePosition.x + corner.x,
+                                  sourceShapePosition.y + corner.y } );
                     }
                 }
                 aSnapshot.obstacles.push_back( std::move( obstacle ) );
@@ -1057,10 +1102,13 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                 layerGeometry.back().copperShapeIndices.push_back( shapeIndex );
             }
 
-            auto thermal = thermalReservations( pad, layerId, clearance );
-            aSnapshot.obstacles.insert( aSnapshot.obstacles.end(),
-                                        std::make_move_iterator( thermal.begin() ),
-                                        std::make_move_iterator( thermal.end() ) );
+            // Do not insert KiCad's currently filled thermal spokes into the
+            // routing tree.  The Specctra design consumed by Freerouting
+            // carries the plane and pad, but not the host fill's transient
+            // spoke polygons.  Adding them here changes MinAreaTree topology
+            // and can make a same-net spoke constrain later foreign-net room
+            // completion even though that spoke will be regenerated around
+            // the proposed traces during KiCad's post-route zone refill.
         }
 
         if( pad->HasHole() )
@@ -1116,7 +1164,16 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             routingPad.componentId = it->second.first;
             routingPad.pinIndex = it->second.second;
         }
-        routingPad.position = point( pad->GetPosition() );
+        // Route from the point Freerouting actually receives through KiCad's
+        // Specctra export, not from the higher-resolution editor coordinate.
+        // The DSN reader rounds the transformed pin centre to its 0.1 um
+        // integer grid.  Keeping a fractional-source endpoint here can turn
+        // an otherwise vertical/45-degree final edge into an arbitrary-angle
+        // edge by a few IU, changing both pull-tight and the next room search.
+        routingPad.position = FLOAT_POINT{
+                static_cast<double>( pad->GetPosition().x ),
+                static_cast<double>( pad->GetPosition().y ) }
+                .RoundToSourceGridYDown();
         routingPad.layers = routeLayers;
         routingPad.netClass = className;
         routingPad.netClassPriority = netClass ? netClass->GetPriority() : 0;
@@ -1205,21 +1262,53 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                     if( !filled )
                         return;
 
-                    for( int region = 0; region < filled->OutlineCount(); ++region )
+                    // Reproduce the Specctra writer's area representation,
+                    // rather than importing KiCad's merged display fill
+                    // directly.  Freerouting receives one fractured zone
+                    // outline with (outline - fill) contours as windows.  In
+                    // particular, thermal spokes do not make the pad centre
+                    // part of the ConductionArea, so DrillItem normal-contact
+                    // traversal must not inherit KiCad's broader zone cluster.
+                    const SHAPE_POLY_SET* zoneOutline = zone->Outline();
+                    if( !zoneOutline || zoneOutline->OutlineCount() == 0 )
+                        return;
+
+                    SHAPE_POLY_SET fracturedOutline( *zoneOutline );
+                    fracturedOutline.Fracture();
+                    if( fracturedOutline.OutlineCount() != 1 )
+                        return;
+
+                    SHAPE_POLY_SET fill( *filled );
+                    fill.Unfracture();
+                    SHAPE_POLY_SET cutouts( *zoneOutline );
+                    cutouts.BooleanSubtract( fill );
+
+                    const auto appendSourceRounded = []( std::vector<ROUTER_POINT>& aTarget,
+                                                          const SHAPE_LINE_CHAIN& aChain )
                     {
-                        ROUTING_OBSTACLE area;
-                        area.kind = ROUTER_OBSTACLE_KIND::POLYGON;
-                        area.netCode = zone->GetNetCode();
-                        area.layers = { static_cast<int>( aLayer ) };
-                        appendPolygon( area.polygon, filled->Outline( region ) );
-                        for( int hole = 0; hole < filled->HoleCount( region ); ++hole )
+                        for( const VECTOR2I& corner : aChain.CPoints() )
                         {
-                            std::vector<ROUTER_POINT> points;
-                            appendPolygon( points, filled->CHole( region, hole ) );
-                            area.polygonHoles.push_back( std::move( points ) );
+                            aTarget.push_back(
+                                    FLOAT_POINT{ static_cast<double>( corner.x ),
+                                                 static_cast<double>( corner.y ) }
+                                            .RoundToSourceGridYDown() );
                         }
-                        aSnapshot.conductionAreas.push_back( std::move( area ) );
+                    };
+
+                    ROUTING_OBSTACLE area;
+                    area.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+                    area.netCode = zone->GetNetCode();
+                    area.layers = { static_cast<int>( aLayer ) };
+                    appendSourceRounded( area.polygon, fracturedOutline.COutline( 0 ) );
+                    for( int cutout = 0; cutout < cutouts.OutlineCount(); ++cutout )
+                    {
+                        std::vector<ROUTER_POINT> window;
+                        appendSourceRounded( window, cutouts.COutline( cutout ) );
+                        if( window.size() >= 3 )
+                            area.polygonHoles.push_back( std::move( window ) );
                     }
+                    if( area.polygon.size() >= 3 )
+                        aSnapshot.conductionAreas.push_back( std::move( area ) );
 
                     // Disabled trace layers still carry physical plane contacts.
                     if( !layerEnabled )
@@ -1271,10 +1360,14 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
         {
             std::vector<std::size_t> group;
             bool dependsOnAutorouterCopper = false;
+            bool dependsOnZoneCopper = false;
             for( const CN_ITEM* item : *cluster )
             {
                 if( !item->Valid() )
                     continue;
+
+                dependsOnZoneCopper = dependsOnZoneCopper
+                                      || item->Parent()->Type() == PCB_ZONE_T;
 
                 if( const auto* track = dynamic_cast<const PCB_TRACK*>( item->Parent() ) )
                 {
@@ -1294,7 +1387,15 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             // accept a physically disconnected repair proposal.  Skipping a
             // mixed cluster is conservative: fixed-source connectivity can be
             // rediscovered, whereas a false immutable union cannot be undone.
-            if( dependsOnAutorouterCopper )
+            // A Specctra conduction area is an item on one physical layer;
+            // connectivity is discovered from its exported polygon and
+            // windows.  KiCad's connectivity cluster may instead union all
+            // pads reached by a filled multi-layer zone, including thermal
+            // spokes and cross-layer connectivity that are not present in
+            // the DSN item graph.  Let ROUTING_BOARD reconstruct area/pad
+            // contacts geometrically rather than baking that broader host
+            // cluster into immutable pad connectivity.
+            if( dependsOnAutorouterCopper || dependsOnZoneCopper )
                 continue;
 
             std::sort( group.begin(), group.end() );
@@ -1302,6 +1403,16 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
             if( group.size() < 2 )
                 continue;
             const int netCode = aSnapshot.pads[group.front()].netCode;
+            const bool netHasFilledZone = std::any_of(
+                    m_board->Zones().begin(), m_board->Zones().end(),
+                    [&]( const ZONE* aZone )
+                    {
+                        return aZone && !aZone->GetIsRuleArea()
+                               && aZone->GetNetCode() == netCode && aZone->IsFilled();
+                    } );
+            if( netHasFilledZone )
+                continue;
+
             for( ROUTING_NET& net : aSnapshot.nets )
             {
                 if( net.netCode == netCode )
@@ -1408,28 +1519,51 @@ void KICAD_BOARD_ADAPTER::addPads( BOARD_SNAPSHOT& aSnapshot,
                 terminal.trackWidth = net.padIndices.empty() ? 150000
                         : aSnapshot.pads[net.padIndices.front()].trackWidth;
                 terminal.layers = { static_cast<int>( region->GetLayer() ) };
+                terminal.netClassPriority = net.netClassPriority;
+                terminal.clearance = net.clearance;
                 terminal.isPlaneTarget = true;
                 terminal.isExactTarget = true;
-                VECTOR2I landing = anchor->Pos();
-                // Move just inside this *specific* island, never toward an
-                // arbitrary same-net fill sample (which may be another island).
-                const int step = std::max<std::int64_t>( 1000, terminal.trackWidth / 2 );
-                bool found = false;
-                for( int radius : { step, 2 * step, 4 * step } )
+
+                // CN_ZONE_LAYER is KiCad's exact filled-island endpoint for
+                // this ratsnest edge.  Preserve the finite region just as
+                // Freerouting preserves ConductionArea.getTraceConnectionShape();
+                // reducing it to a locally sampled point can put the only
+                // target room inside a foreign pad's compensated tree shape.
+                const SHAPE_POLY_SET& island = region->GetOutline();
+                if( island.OutlineCount() == 1 )
                 {
-                    for( const VECTOR2I& direction : { VECTOR2I( 1, 0 ), VECTOR2I( 0, 1 ),
-                            VECTOR2I( -1, 0 ), VECTOR2I( 0, -1 ), VECTOR2I( 1, 1 ),
-                            VECTOR2I( -1, 1 ), VECTOR2I( -1, -1 ), VECTOR2I( 1, -1 ) } )
+                    ROUTING_OBSTACLE area;
+                    area.kind = ROUTER_OBSTACLE_KIND::POLYGON;
+                    area.netCode = net.netCode;
+                    area.layers = terminal.layers;
+                    const auto appendSourceRounded = []( std::vector<ROUTER_POINT>& aTarget,
+                                                          const SHAPE_LINE_CHAIN& aChain )
                     {
-                        const VECTOR2I candidate = anchor->Pos() + direction * radius;
-                        if( region->ContainsPoint( candidate )
-                            && region->GetOutline().Distance( candidate, true ) > step + 1000 )
-                        { landing = candidate; found = true; break; }
+                        for( const VECTOR2I& corner : aChain.CPoints() )
+                        {
+                            aTarget.push_back(
+                                    FLOAT_POINT{ static_cast<double>( corner.x ),
+                                                 static_cast<double>( corner.y ) }
+                                            .RoundToSourceGridYDown() );
+                        }
+                    };
+                    appendSourceRounded( area.polygon, island.COutline( 0 ) );
+                    for( int hole = 0; hole < island.HoleCount( 0 ); ++hole )
+                    {
+                        std::vector<ROUTER_POINT> window;
+                        appendSourceRounded( window, island.CHole( 0, hole ) );
+                        if( window.size() >= 3 )
+                            area.polygonHoles.push_back( std::move( window ) );
                     }
-                    if( found )
-                        break;
+                    if( area.polygon.size() >= 3 )
+                        terminal.connectionArea =
+                                std::make_shared<const ROUTING_OBSTACLE>( std::move( area ) );
                 }
-                terminal.position = point( landing );
+
+                const VECTOR2I landing = findInteriorPoint( island ).value_or( anchor->Pos() );
+                terminal.position = FLOAT_POINT{ static_cast<double>( landing.x ),
+                                                 static_cast<double>( landing.y ) }
+                                            .RoundToSourceGridYDown();
                 const auto index = aSnapshot.pads.size();
                 aSnapshot.pads.push_back( terminal );
                 // Do not add to planeTargetIndices: that list would let a

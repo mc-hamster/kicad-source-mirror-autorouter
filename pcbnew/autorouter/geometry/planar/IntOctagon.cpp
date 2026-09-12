@@ -97,6 +97,24 @@ INT_OCTAGON INT_OCTAGON::FromBox( const ROUTER_BOX& aBox )
 }
 
 
+INT_OCTAGON INT_OCTAGON::FromSegment( ROUTER_POINT aStart,
+                                      ROUTER_POINT aEnd )
+{
+    const std::int64_t startDifference = subtract( aStart.x, aStart.y );
+    const std::int64_t endDifference = subtract( aEnd.x, aEnd.y );
+    const std::int64_t startSum = add( aStart.x, aStart.y );
+    const std::int64_t endSum = add( aEnd.x, aEnd.y );
+
+    return INT_OCTAGON(
+            std::min( aStart.x, aEnd.x ), std::min( aStart.y, aEnd.y ),
+            std::max( aStart.x, aEnd.x ), std::max( aStart.y, aEnd.y ),
+            std::min( startDifference, endDifference ),
+            std::max( startDifference, endDifference ),
+            std::min( startSum, endSum ),
+            std::max( startSum, endSum ) ).Normalize();
+}
+
+
 bool INT_OCTAGON::IsEmpty() const
 {
     return *this == Empty();
@@ -256,6 +274,29 @@ INT_OCTAGON INT_OCTAGON::Offset( double aDistance ) const
                         add( lowerRightDiagonalX, diagonalWidth ),
                         subtract( lowerLeftDiagonalX, diagonalWidth ),
                         add( upperRightDiagonalX, diagonalWidth ) ).Normalize();
+}
+
+
+INT_OCTAGON INT_OCTAGON::OffsetOnGrid( double aDistance, std::int64_t aGrid ) const
+{
+    if( aGrid <= 1 )
+        return Offset( aDistance );
+
+    const long double grid = static_cast<long double>( aGrid );
+    const long double sourceDistance = static_cast<long double>( aDistance ) / grid;
+    const std::int64_t width = javaRound( static_cast<double>( sourceDistance ) ) * aGrid;
+
+    if( width == 0 )
+        return *this;
+
+    const std::int64_t diagonalWidth =
+            javaRound( static_cast<double>( std::sqrt( 2.0L ) * sourceDistance ) ) * aGrid;
+    return INT_OCTAGON( subtract( leftX, width ), subtract( bottomY, width ),
+                        add( rightX, width ), add( topY, width ),
+                        subtract( upperLeftDiagonalX, diagonalWidth ),
+                        add( lowerRightDiagonalX, diagonalWidth ),
+                        subtract( lowerLeftDiagonalX, diagonalWidth ),
+                        add( upperRightDiagonalX, diagonalWidth ) ).NormalizeOnGrid( aGrid );
 }
 
 
@@ -734,6 +775,70 @@ INT_OCTAGON INT_OCTAGON::Normalize() const
         return Empty();
 
     return { newLx, newLy, newRx, newUy, newUlx, newLrx, newLlx, newUrx };
+}
+
+
+INT_OCTAGON INT_OCTAGON::NormalizeOnGrid( std::int64_t aGrid ) const
+{
+    if( aGrid <= 1 )
+        return Normalize();
+    if( IsEmpty() )
+        return Empty();
+
+    const auto toSource = [aGrid]( std::int64_t aCoordinate )
+    {
+        const long double scaled = static_cast<long double>( aCoordinate )
+                                   / static_cast<long double>( aGrid );
+        const long double rounded = std::floor( scaled + 0.5L );
+        if( rounded < static_cast<long double>( std::numeric_limits<std::int64_t>::min() )
+            || rounded > static_cast<long double>( std::numeric_limits<std::int64_t>::max() ) )
+        {
+            throw std::overflow_error( "IntOctagon source-grid coordinate overflow" );
+        }
+        return static_cast<std::int64_t>( rounded );
+    };
+    const auto fromSource = [aGrid]( std::int64_t aCoordinate )
+    {
+        return narrow( INTEGER( aCoordinate ) * aGrid );
+    };
+
+    const INT_OCTAGON normalized = INT_OCTAGON(
+            toSource( leftX ), toSource( bottomY ),
+            toSource( rightX ), toSource( topY ),
+            toSource( upperLeftDiagonalX ),
+            toSource( lowerRightDiagonalX ),
+            toSource( lowerLeftDiagonalX ),
+            toSource( upperRightDiagonalX ) ).Normalize();
+    if( normalized.IsEmpty() )
+        return Empty();
+
+    return { fromSource( normalized.leftX ),
+             fromSource( normalized.bottomY ),
+             fromSource( normalized.rightX ),
+             fromSource( normalized.topY ),
+             fromSource( normalized.upperLeftDiagonalX ),
+             fromSource( normalized.lowerRightDiagonalX ),
+             fromSource( normalized.lowerLeftDiagonalX ),
+             fromSource( normalized.upperRightDiagonalX ) };
+}
+
+
+INT_OCTAGON INT_OCTAGON::IntersectionOnGrid(
+        const INT_OCTAGON& aOther, std::int64_t aGrid ) const
+{
+    return INT_OCTAGON( std::max( leftX, aOther.leftX ),
+                        std::max( bottomY, aOther.bottomY ),
+                        std::min( rightX, aOther.rightX ),
+                        std::min( topY, aOther.topY ),
+                        std::max( upperLeftDiagonalX,
+                                  aOther.upperLeftDiagonalX ),
+                        std::min( lowerRightDiagonalX,
+                                  aOther.lowerRightDiagonalX ),
+                        std::max( lowerLeftDiagonalX,
+                                  aOther.lowerLeftDiagonalX ),
+                        std::min( upperRightDiagonalX,
+                                  aOther.upperRightDiagonalX ) )
+            .NormalizeOnGrid( aGrid );
 }
 
 

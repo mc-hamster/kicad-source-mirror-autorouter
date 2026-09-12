@@ -5,8 +5,31 @@
 
 #include "MazeSearchEngine90Degree.h"
 
+#include <memory>
+
 namespace KICAD_AUTOROUTER
 {
+/** Persistent physical ShapeSearchTree state owned by one AutorouteEngine.
+ *
+ * Freerouting does not rebuild its MinAreaTree for every connection.  Complete
+ * expansion rooms are temporary, but inserting and removing them changes the
+ * surviving binary-tree topology.  Later searches consequently observe that
+ * mutation history even when the set of physical leaves is unchanged.  Keep
+ * the physical leaf handles beside the tree so board-item additions/removals
+ * can be synchronized without throwing that history away.
+ */
+struct PERSISTENT_45_DEGREE_TREE_STATE
+{
+    struct PHYSICAL_LEAF
+    {
+        SHAPE_TREE_ENTRY entry;
+        MIN_AREA_TREE::HANDLE handle = MIN_AREA_TREE::NONE;
+    };
+
+    std::shared_ptr<MIN_AREA_TREE> tree = std::make_shared<MIN_AREA_TREE>();
+    std::vector<PHYSICAL_LEAF> physicalLeaves;
+};
+
 class MAZE_SEARCH_ENGINE_45_DEGREE
 {
 public:
@@ -28,6 +51,7 @@ public:
             const ROOM_VIA_SETTINGS& aVia, int aMaxExpanded, int& aExpanded,
             ROOM_SEARCH_METRICS& aMetrics, const ROUTER_CANCEL_CALLBACK& aCancel = {},
             const ROUTER_SEARCH_PROGRESS_CALLBACK& aProgress = {},
-            bool aSourceTraceRooms = false );
+            bool aSourceTraceRooms = false,
+            PERSISTENT_45_DEGREE_TREE_STATE* aPersistentTree = nullptr );
 };
 } // namespace KICAD_AUTOROUTER

@@ -39,27 +39,47 @@ bool overlaps( const ROUTER_BOX& aLeft, const ROUTER_BOX& aRight )
 } // namespace
 
 
-DRILL_PAGE_ARRAY::DRILL_PAGE_ARRAY( const ROUTER_BOX& aBounds, std::int64_t aMaxPageWidth ) :
+DRILL_PAGE_ARRAY::DRILL_PAGE_ARRAY( const ROUTER_BOX& aBounds,
+                                    std::int64_t aMaxPageWidth,
+                                    std::int64_t aCoordinateUnit ) :
         m_bounds( aBounds )
 {
-    if( INT_BOX::Dimension( aBounds ) != 2 || aMaxPageWidth <= 0 )
+    if( INT_BOX::Dimension( aBounds ) != 2 || aMaxPageWidth <= 0
+        || aCoordinateUnit <= 0 )
         throw std::invalid_argument( "Drill pages require positive bounds and page width" );
     if( ( aBounds.minX < 0 && aBounds.maxX > std::numeric_limits<std::int64_t>::max() + aBounds.minX )
         || ( aBounds.minY < 0 && aBounds.maxY > std::numeric_limits<std::int64_t>::max() + aBounds.minY ) )
         throw std::length_error( "Drill page bounds exceed coordinate arithmetic" );
     const std::int64_t width = std::max<std::int64_t>( 1, aBounds.maxX - aBounds.minX );
     const std::int64_t height = std::max<std::int64_t>( 1, aBounds.maxY - aBounds.minY );
-    const std::int64_t maxPage = std::max<std::int64_t>( 1, aMaxPageWidth );
+    const std::int64_t sourceWidth = std::max<std::int64_t>(
+            1, width / aCoordinateUnit );
+    const std::int64_t sourceHeight = std::max<std::int64_t>(
+            1, height / aCoordinateUnit );
+    const std::int64_t sourceMaxPage = std::max<std::int64_t>(
+            1, aMaxPageWidth / aCoordinateUnit );
 
-    const double columns = std::ceil( width / static_cast<double>( maxPage ) );
-    const double rows = std::ceil( height / static_cast<double>( maxPage ) );
+    // DrillPageArray performs these divisions in Freerouting's integer board
+    // coordinate system.  KiCad IU are finer than that system, so doing the
+    // final ceil in IU creates page borders and centroids which cannot exist
+    // in the reference router.  Keep the class reusable for native-unit
+    // callers (the default unit is one), but construct routing pages in the
+    // pinned source's 0.1 um units.
+    const double columns = std::ceil(
+            sourceWidth / static_cast<double>( sourceMaxPage ) );
+    const double rows = std::ceil(
+            sourceHeight / static_cast<double>( sourceMaxPage ) );
     if( columns > std::numeric_limits<int>::max() || rows > std::numeric_limits<int>::max()
         || columns * rows > m_pages.max_size() )
         throw std::length_error( "Drill page dimensions exceed addressable storage" );
     m_columns = static_cast<int>( columns );
     m_rows = static_cast<int>( rows );
-    m_pageWidth = width / m_columns + ( width % m_columns != 0 );
-    m_pageHeight = height / m_rows + ( height % m_rows != 0 );
+    const std::int64_t sourcePageWidth = sourceWidth / m_columns
+            + ( sourceWidth % m_columns != 0 );
+    const std::int64_t sourcePageHeight = sourceHeight / m_rows
+            + ( sourceHeight % m_rows != 0 );
+    m_pageWidth = sourcePageWidth * aCoordinateUnit;
+    m_pageHeight = sourcePageHeight * aCoordinateUnit;
 
     m_pages.reserve( static_cast<std::size_t>( m_columns ) * m_rows );
     for( int row = 0; row < m_rows; ++row )

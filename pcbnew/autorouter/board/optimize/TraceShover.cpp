@@ -5,11 +5,58 @@
 #include "TraceShover.h"
 #include "../../geometry/planar/IntBox.h"
 
+#include <algorithm>
+
 namespace KICAD_AUTOROUTER
 {
 namespace
 {
 using namespace PLANAR;
+
+int sideOf( ROUTER_POINT aPoint, const ROUTING_SHOVE_DIRECTION& aDirection )
+{
+    const __int128 dx = static_cast<__int128>( aDirection.lineEnd.x )
+                        - aDirection.lineStart.x;
+    const __int128 dy = static_cast<__int128>( aDirection.lineEnd.y )
+                        - aDirection.lineStart.y;
+    const __int128 determinant =
+            dx * ( static_cast<__int128>( aPoint.y ) - aDirection.lineStart.y )
+            - dy * ( static_cast<__int128>( aPoint.x ) - aDirection.lineStart.x );
+    return determinant > 0 ? 1 : determinant < 0 ? -1 : 0;
+}
+
+
+bool followsDirection( const POLYLINE& aOriginal, const POLYLINE& aCandidate,
+                       const ROUTING_SHOVE_DIRECTION* aDirection )
+{
+    if( !aDirection || aDirection->side == 0 )
+        return true;
+
+    const auto originalCorners = aOriginal.IntegralCorners();
+    const auto candidateCorners = aCandidate.IntegralCorners();
+    if( !originalCorners || !candidateCorners )
+        return false;
+
+    // TraceShover substitutes only the intersecting trace pieces.  Existing
+    // corners outside that interval may legitimately lie on either side of
+    // the shove line, so constrain only contour corners introduced by the
+    // replacement.
+    for( const ROUTER_POINT& corner : *candidateCorners )
+    {
+        if( std::find( originalCorners->begin(), originalCorners->end(), corner )
+            != originalCorners->end() )
+        {
+            continue;
+        }
+
+        if( sideOf( corner, *aDirection ) == -aDirection->side )
+            return false;
+    }
+
+    return true;
+}
+
+
 std::optional<POLYLINE> springOver( const POLYLINE& polyline,
                                     const std::vector<TRACE_SHOVER::OBSTACLE>& obstacles,
                                     int depth, const ROUTER_CANCEL_CALLBACK& cancel,
@@ -65,18 +112,37 @@ std::optional<POLYLINE> springOver( const POLYLINE& polyline,
 }
 }
 TRACE_SHOVER::RESULT TRACE_SHOVER::SpringOverObstacles( const PLANAR::POLYLINE& polyline,
-        const std::vector<OBSTACLE>& obstacles, const ROUTER_CANCEL_CALLBACK& cancel, int depth )
+        const std::vector<OBSTACLE>& obstacles, const ROUTER_CANCEL_CALLBACK& cancel,
+        int depth, const ROUTING_SHOVE_DIRECTION* direction )
 {
     RESULT result;
     if( polyline.Empty() || depth < 0 || depth > 20 ) return result;
     if( cancel && cancel() ) { result.cancelled = true; return result; }
     auto ccw = springOver( polyline, obstacles, depth, cancel, result );
     if( result.cancelled ) return result;
-    if( ccw && !result.changed ) { result.polyline = std::move( ccw ); return result; }
+    if( ccw && !result.changed )
+    {
+        if( followsDirection( polyline, *ccw, direction ) )
+            result.polyline = std::move( ccw );
+        return result;
+    }
     auto cw = springOver( polyline.Reverse(), obstacles, depth, cancel, result );
     if( result.cancelled ) return result;
-    if( cw && ( !ccw || cw->LengthApprox() <= ccw->LengthApprox() ) ) result.polyline = cw->Reverse();
-    else result.polyline = std::move( ccw );
+    std::optional<POLYLINE> clockwise = cw ? std::optional<POLYLINE>( cw->Reverse() )
+                                           : std::nullopt;
+    const bool ccwAllowed = ccw && followsDirection( polyline, *ccw, direction );
+    const bool cwAllowed = clockwise
+                           && followsDirection( polyline, *clockwise, direction );
+    if( cwAllowed
+        && ( !ccwAllowed
+             || clockwise->LengthApprox() <= ccw->LengthApprox() ) )
+    {
+        result.polyline = std::move( clockwise );
+    }
+    else if( ccwAllowed )
+    {
+        result.polyline = std::move( ccw );
+    }
     return result;
 }
 } // namespace KICAD_AUTOROUTER

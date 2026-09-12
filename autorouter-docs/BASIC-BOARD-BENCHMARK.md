@@ -1,9 +1,23 @@
 # Three small online boards: routing benchmark
 
-**Historical baseline.** The latest [production host-validation/repair results](PARITY-CLOSURE-CHECKLIST.md)
-complete all three boards with zero new KiCad DRC violations. The 555 still fails
-the via-count quality gate. Keep the original measurements below as before/after
-evidence, not as the current build's performance.
+**Historical baseline.** The latest [parity-closure results](PARITY-CLOSURE-CHECKLIST.md)
+complete all three boards with zero new KiCad DRC violations and pass the strict
+comparator on all nine board/repeat pairs. Keep the original measurements below
+as before/after evidence, not as the current build's performance.
+
+The fresh three-repeat closure run is in the ignored build directory at
+`build/autorouter/online-simple-parity-closure-repeat3-2026-09-10/`. Results
+are deterministic across all repeats:
+
+| Board | Missing, reference / native | New KiCad DRC, reference / native | Vias, reference / native | Track length, mm, reference / native | Median core time, s, reference / native |
+|---|---:|---:|---:|---:|---:|
+| 5 V regulator | 0 / 0 | 0 / 0 | 0 / 0 | 319.203 / 323.262 | 0.380 / 10.398 |
+| 555 astable oscillator | 0 / 0 | 10 / 0 | 7 / 5 | 184.248 / 87.2094 | 1.820 / 15.149 |
+| Two-transistor astable oscillator | 0 / 0 | 0 / 0 | 0 / 0 | 152.435 / 152.435 | 0.260 / 2.305 |
+
+This closes the original three-board correctness/quality smoke failure. It
+does not establish broad-corpus or performance parity: native is currently
+about 8-27 times slower than the reference on these small cases.
 
 Date: 2026-09-07. This is a measured comparison, not a claim of parity.
 No production routing algorithm was changed for these measurements.

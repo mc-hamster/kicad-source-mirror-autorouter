@@ -20,8 +20,35 @@ int signum( double aValue )
 }
 
 
+std::string octagonSupports( const PLANAR::INT_OCTAGON& aOctagon )
+{
+    return std::to_string( aOctagon.leftX ) + ','
+           + std::to_string( aOctagon.bottomY ) + ','
+           + std::to_string( aOctagon.rightX ) + ','
+           + std::to_string( aOctagon.topY ) + ','
+           + std::to_string( aOctagon.upperLeftDiagonalX ) + ','
+           + std::to_string( aOctagon.lowerRightDiagonalX ) + ','
+           + std::to_string( aOctagon.lowerLeftDiagonalX ) + ','
+           + std::to_string( aOctagon.upperRightDiagonalX );
+}
+
+
+ROUTER_POINT roundLocatorPoint( FLOAT_POINT aPoint,
+                                std::int64_t aCoordinateUnitIU )
+{
+    // Production coordinates are KiCad y-down internal units.  The source
+    // performs Math.round in its y-up coordinate system, which differs by
+    // one source unit for negative half-way values.  Unit-scale geometry
+    // tests are authored directly in the source coordinate convention.
+    return aCoordinateUnitIU > 1
+                   ? aPoint.RoundToGridJavaYDown( aCoordinateUnitIU )
+                   : aPoint.RoundToGridJava( aCoordinateUnitIU );
+}
+
+
 std::optional<ROUTER_POINT> nearestIntegralPoint(
-        const PLANAR::INT_OCTAGON& aShape, ROUTER_POINT aFrom )
+        const PLANAR::INT_OCTAGON& aShape, ROUTER_POINT aFrom,
+        std::int64_t aCoordinateUnitIU )
 {
     if( aShape.Dimension() < 0 )
         return std::nullopt;
@@ -34,7 +61,10 @@ std::optional<ROUTER_POINT> nearestIntegralPoint(
     if( !simplex )
         return std::nullopt;
 
-    return FOUND_CONNECTION_LOCATOR_ANY_ANGLE::NearestIntegralPoint( *simplex, aFrom );
+    const auto nearest = simplex->NearestPointApprox(
+            static_cast<double>( aFrom.x ), static_cast<double>( aFrom.y ) );
+    return roundLocatorPoint(
+            { nearest.first, nearest.second }, aCoordinateUnitIU );
 }
 
 
@@ -131,7 +161,8 @@ bool horizontalFirstToDoor( const PLANAR::INT_OCTAGON& aDoor,
 bool appendFortyFiveDegreeMove( std::vector<ROUTER_POINT>& aPoints,
                                 ROUTER_POINT aTarget, bool aHorizontalFirst,
                                 const PLANAR::INT_OCTAGON* aRequiredRoom = nullptr,
-                                bool aOrthogonal = false )
+                                bool aOrthogonal = false,
+                                std::int64_t aCoordinateUnitIU = 1 )
 {
     if( aPoints.empty() )
         return false;
@@ -141,13 +172,19 @@ bool appendFortyFiveDegreeMove( std::vector<ROUTER_POINT>& aPoints,
                                  static_cast<double>( from.y ) };
     const FLOAT_POINT toFloat{ static_cast<double>( aTarget.x ),
                                static_cast<double>( aTarget.y ) };
-    ROUTER_POINT corner = FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
-            fromFloat, toFloat, aHorizontalFirst, aOrthogonal ).Round();
+    const auto round = [&]( FLOAT_POINT aPoint )
+    {
+        return roundLocatorPoint( aPoint, aCoordinateUnitIU );
+    };
+    ROUTER_POINT corner = round(
+            FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
+                    fromFloat, toFloat, aHorizontalFirst, aOrthogonal ) );
 
     if( aRequiredRoom && !aRequiredRoom->Contains( corner ) )
     {
-        corner = FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
-                fromFloat, toFloat, !aHorizontalFirst, aOrthogonal ).Round();
+        corner = round(
+                FOUND_CONNECTION_LOCATOR_45_DEGREE::CalculateAdditionalCorner(
+                        fromFloat, toFloat, !aHorizontalFirst, aOrthogonal ) );
 
         if( !aRequiredRoom->Contains( corner ) )
             return false;
@@ -241,7 +278,8 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
 std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::LocateOctagonal(
         ROUTER_POINT aStart, const std::vector<OCTAGONAL_CORRIDOR_STEP>& aSteps,
         double aCompensatedTraceHalfWidth, double aTraceWidthTolerance,
-        bool aOrthogonal )
+        bool aOrthogonal, std::int64_t aCoordinateUnitIU,
+        START_ENDPOINT_LOCATOR aStartEndpointLocator )
 {
     if( aSteps.empty() )
         return std::vector<ROUTER_POINT>{ aStart };
@@ -284,7 +322,8 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
         return points;
     }
 
-    const ROUTER_POINT destination = aSteps.back().section.Middle().Round();
+    const ROUTER_POINT destination =
+            roundLocatorPoint( aSteps.back().section.Middle(), aCoordinateUnitIU );
     std::vector<ROUTER_POINT> reversePoints{ destination };
     const auto fail = [&]( const char* aReason, std::size_t aReverseIndex )
             -> std::optional<std::vector<ROUTER_POINT>>
@@ -311,12 +350,13 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
         const double shrinkOffset = aCompensatedTraceHalfWidth
                                     + ( step.obstacleRoom
                                                 ? 0.0 : aTraceWidthTolerance );
-        PLANAR::INT_OCTAGON shrunkenRoom = step.room.Offset( -shrinkOffset );
+        PLANAR::INT_OCTAGON shrunkenRoom = step.room.OffsetOnGrid(
+                -shrinkOffset, aCoordinateUnitIU );
         std::optional<ROUTER_POINT> enteredRoomAt;
         if( shrunkenRoom.Dimension() == 2 )
         {
             const auto nearestRoom = nearestIntegralPoint(
-                    shrunkenRoom, reversePoints.back() );
+                    shrunkenRoom, reversePoints.back(), aCoordinateUnitIU );
             if( !nearestRoom )
                 return fail( "nearest_room", reverseIndex );
             enteredRoomAt = *nearestRoom;
@@ -329,7 +369,7 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
             if( !appendFortyFiveDegreeMove(
                         reversePoints, *nearestRoom,
                         horizontalFirstFromDoor( fromDoor, from, to ),
-                        nullptr, aOrthogonal ) )
+                        nullptr, aOrthogonal, aCoordinateUnitIU ) )
                 return fail( "enter_room", reverseIndex );
         }
         else
@@ -342,7 +382,24 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
 
         if( reverseIndex == 0 )
         {
-            nextPoint = aStart;
+            // The source uses the start-item/room intersection only to seed
+            // A*.  FoundConnectionLocator later chooses the point on that
+            // exact connection shape which is nearest to the backtracked
+            // approach.  Reusing the seed centroid here can terminate a new
+            // trace in the middle of an existing trace instead of at its pin
+            // endpoint, changing both normalization and every later room.
+            if( aStartEndpointLocator )
+            {
+                const auto endpoint = aStartEndpointLocator(
+                        reversePoints.back(), step.room );
+                if( !endpoint )
+                    return fail( "start_endpoint", reverseIndex );
+                nextPoint = *endpoint;
+            }
+            else
+            {
+                nextPoint = aStart;
+            }
         }
         else
         {
@@ -353,20 +410,24 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
 
             if( toDoor->Dimension() == 2 )
             {
-                PLANAR::INT_OCTAGON shrunkenDoor = toDoor->Offset( -shrinkOffset );
+                PLANAR::INT_OCTAGON shrunkenDoor = toDoor->OffsetOnGrid(
+                        -shrinkOffset, aCoordinateUnitIU );
                 if( shrunkenDoor.Dimension() < 0 )
                     shrunkenDoor = *toDoor;
                 const auto nearest = nearestIntegralPoint(
-                        shrunkenDoor, reversePoints.back() );
+                        shrunkenDoor, reversePoints.back(), aCoordinateUnitIU );
                 if( !nearest )
                     return fail( "nearest_door", reverseIndex );
                 nextPoint = *nearest;
             }
             else
             {
-                nextPoint = previous.section.NearestSegmentPoint(
+                const FLOAT_POINT nearestDoorPoint =
+                        previous.section.NearestSegmentPoint(
                         { static_cast<double>( reversePoints.back().x ),
-                          static_cast<double>( reversePoints.back().y ) } ).Round();
+                          static_cast<double>( reversePoints.back().y ) } );
+                nextPoint = roundLocatorPoint( nearestDoorPoint,
+                                               aCoordinateUnitIU );
 
                 // An acute corner at the far side of a one-dimensional door
                 // can leave insufficient trace width.  Freerouting switches
@@ -384,7 +445,8 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
                                    < aCompensatedTraceHalfWidth
                                              + aTraceWidthTolerance )
                     {
-                        nextPoint = previous.section.Middle().Round();
+                        nextPoint = roundLocatorPoint(
+                                previous.section.Middle(), aCoordinateUnitIU );
                     }
                 }
             }
@@ -400,7 +462,7 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
                 ? &shrunkenRoom : nullptr;
         if( !appendFortyFiveDegreeMove( reversePoints, nextPoint,
                                         horizontalFirst, requiredRoom,
-                                        aOrthogonal ) )
+                                        aOrthogonal, aCoordinateUnitIU ) )
             return fail( "leave_room", reverseIndex );
 
         const ROUTER_BOX roomBounds = step.room.BoundingBox();
@@ -409,7 +471,9 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
                 "LOCATOR_45_STEP",
                 { { "reverse_index", std::to_string( reverseIndex ) },
                   { "room_bounds", autorouterDecisionBounds( roomBounds ) },
+                  { "room_supports", octagonSupports( step.room ) },
                   { "shrunken_bounds", autorouterDecisionBounds( shrunkenBounds ) },
+                  { "shrunken_supports", octagonSupports( shrunkenRoom ) },
                   { "entered_room_at", enteredRoomAt
                                                    ? std::to_string( enteredRoomAt->x ) + ','
                                                              + std::to_string( enteredRoomAt->y )
@@ -420,6 +484,9 @@ std::optional<std::vector<ROUTER_POINT>> FOUND_CONNECTION_LOCATOR_45_DEGREE::Loc
                                                   ? autorouterDecisionBounds(
                                                             toDoor->BoundingBox() )
                                                   : "" },
+                  { "to_door_supports", toDoor
+                                                    ? octagonSupports( *toDoor )
+                                                    : "" },
                   { "to_section",
                     reverseIndex > 0
                             ? std::to_string( aSteps[reverseIndex - 1].section.a.x ) + ','

@@ -289,6 +289,26 @@ BOOST_AUTO_TEST_CASE( ExpandedTraceSegmentKeepsDiagonalFreeSpaceWedges )
     BOOST_CHECK( !sweep->IntersectsSegment( cornerPass, 1 ) );
 }
 
+BOOST_AUTO_TEST_CASE( TraceConnectionSegmentKeepsExactOctagonalDimension )
+{
+    const auto horizontal = INT_OCTAGON::FromSegment( { -7, 11 }, { 13, 11 } );
+    BOOST_CHECK_EQUAL( horizontal.Dimension(), 1 );
+    BOOST_CHECK( horizontal.Contains( { -7, 11 } ) );
+    BOOST_CHECK( horizontal.Contains( { 13, 11 } ) );
+    BOOST_CHECK( !horizontal.Contains( { 0, 12 } ) );
+
+    const auto diagonal = INT_OCTAGON::FromSegment( { -9, -4 }, { 8, 13 } );
+    BOOST_CHECK_EQUAL( diagonal.Dimension(), 1 );
+    BOOST_CHECK_EQUAL( diagonal.upperLeftDiagonalX, -5 );
+    BOOST_CHECK_EQUAL( diagonal.lowerRightDiagonalX, -5 );
+    BOOST_CHECK( diagonal.Contains( { 1, 6 } ) );
+    BOOST_CHECK( !diagonal.Contains( { 1, 7 } ) );
+
+    const auto point = INT_OCTAGON::FromSegment( { 5, -3 }, { 5, -3 } );
+    BOOST_CHECK_EQUAL( point.Dimension(), 0 );
+    BOOST_CHECK( point == INT_OCTAGON::FromBox( { 5, -3, 5, -3 } ) );
+}
+
 BOOST_AUTO_TEST_CASE( SpringOverHonorsRecursionCancellationAndFixedObstacles )
 {
     const auto path = POLYLINE::FromPoints( { { -100, 0 }, { 100, 0 } } );
@@ -302,6 +322,26 @@ BOOST_AUTO_TEST_CASE( SpringOverHonorsRecursionCancellationAndFixedObstacles )
     BOOST_CHECK_EQUAL( result.recursiveSteps, 2 ); // one wrap in each direction
     BOOST_CHECK( result.polyline->FirstCorner() == path.FirstCorner() );
     BOOST_CHECK( result.polyline->LastCorner() == path.LastCorner() );
+    const ROUTING_SHOVE_DIRECTION left{ { -100, 0 }, { 100, 0 }, 1 };
+    const ROUTING_SHOVE_DIRECTION right{ { -100, 0 }, { 100, 0 }, -1 };
+    const auto leftResult = TRACE_SHOVER::SpringOverObstacles(
+            path, { obstacle }, {}, 1, &left );
+    const auto rightResult = TRACE_SHOVER::SpringOverObstacles(
+            path, { obstacle }, {}, 1, &right );
+    BOOST_REQUIRE( leftResult.polyline );
+    BOOST_REQUIRE( rightResult.polyline );
+    const auto leftCorners = leftResult.polyline->IntegralCorners();
+    const auto rightCorners = rightResult.polyline->IntegralCorners();
+    BOOST_REQUIRE( leftCorners );
+    BOOST_REQUIRE( rightCorners );
+    BOOST_CHECK( std::any_of( leftCorners->begin(), leftCorners->end(),
+                             []( ROUTER_POINT aPoint ) { return aPoint.y > 0; } ) );
+    BOOST_CHECK( std::none_of( leftCorners->begin(), leftCorners->end(),
+                              []( ROUTER_POINT aPoint ) { return aPoint.y < 0; } ) );
+    BOOST_CHECK( std::any_of( rightCorners->begin(), rightCorners->end(),
+                             []( ROUTER_POINT aPoint ) { return aPoint.y < 0; } ) );
+    BOOST_CHECK( std::none_of( rightCorners->begin(), rightCorners->end(),
+                              []( ROUTER_POINT aPoint ) { return aPoint.y > 0; } ) );
     result = TRACE_SHOVER::SpringOverObstacles( path, { obstacle }, [] { return true; } );
     BOOST_CHECK( result.cancelled ); BOOST_CHECK( !result.polyline );
     obstacle.canSpringOver = false;

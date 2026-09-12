@@ -32,6 +32,10 @@
 #include <string_view>
 #include <vector>
 
+#if defined( __APPLE__ ) || defined( __linux__ )
+#include <execinfo.h>
+#endif
+
 #include <wx/init.h>
 #include <wx/filename.h>
 
@@ -761,6 +765,11 @@ int main( int argc, char** argv )
     catch( const std::exception& exception )
     {
         std::cerr << exception.what() << '\n';
+#if defined( __APPLE__ ) || defined( __linux__ )
+        void* frames[64];
+        const int frameCount = backtrace( frames, std::size( frames ) );
+        backtrace_symbols_fd( frames, frameCount, STDERR_FILENO );
+#endif
         if( pgmStarted )
             Pgm().Destroy();
         if( wxStarted )

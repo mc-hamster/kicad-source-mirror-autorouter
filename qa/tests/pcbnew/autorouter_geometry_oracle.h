@@ -453,7 +453,10 @@ inline std::string CheckRecord( const std::string& record )
         const auto nearest = polyline.NearestPointApprox( queryX, queryY );
         if( !nearest )
             throw std::runtime_error( "nonempty polyline has no nearest point" );
-        actual << ' ' << nearest->first << ' ' << nearest->second;
+        const auto canonicalZero = []( double aValue )
+        { return aValue == 0 ? 0.0 : aValue; };
+        actual << ' ' << canonicalZero( nearest->first )
+               << ' ' << canonicalZero( nearest->second );
         for( const ROUTER_POINT& probe : probes )
             actual << ' ' << ( polyline.Contains( POINT( probe ) ) ? 1 : 0 );
         const auto printPolylineLines = [&]( const POLYLINE& value )
@@ -505,8 +508,10 @@ inline std::string CheckRecord( const std::string& record )
         actual << ' ';
         PrintLine( actual, *translatedLine );
         const auto projection = probeLine.ProjectionApprox( queryX, queryY );
-        actual << ' ' << probeLine.SignedDistance( queryX, queryY )
-               << ' ' << projection.first << ' ' << projection.second;
+        actual << ' ' << canonicalZero(
+                               probeLine.SignedDistance( queryX, queryY ) )
+               << ' ' << canonicalZero( projection.first )
+               << ' ' << canonicalZero( projection.second );
         actual << ' ';
         Print( actual, probeLine.PerpendicularProjection( POINT( probes[0] ) ) );
     }

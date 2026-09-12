@@ -102,7 +102,8 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayer
     const double rows = std::ceil( ( static_cast<double>( via.bounds.maxY ) - via.bounds.minY ) / via.pageWidth );
     if( columns * rows > maxExpanded )
         return std::nullopt;
-    DRILL_PAGE_ARRAY pages( via.bounds, via.pageWidth );
+    DRILL_PAGE_ARRAY pages( via.bounds, via.pageWidth,
+                            FREEROUTING_COORDINATE_UNIT_IU );
     if( via.stopAtFirstDrill )
         pages.AddFanoutCandidates( via.fanoutCenter, via.fanoutMinDistance,
                                    via.fanoutMaxDistance );
@@ -273,7 +274,7 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayer
     // Item.compareTo() orders Freerouting's board items by descending
     // insertion ID.  Each item's tree shapes are then visited in physical
     // layer order.  Complete every source room before queueing target doors.
-    const auto itemKey = []( const ROOM_TERMINAL& aTerminal )
+    const auto fallbackItemKey = []( const ROOM_TERMINAL& aTerminal )
     {
         return std::tuple{ aTerminal.owner, aTerminal.start.x, aTerminal.start.y,
                            aTerminal.end.x, aTerminal.end.y };
@@ -282,27 +283,45 @@ std::optional<ROOM_MULTILAYER_PATH> MAZE_SEARCH_ENGINE_ANY_ANGLE::FindMultilayer
                       [&]( const START_ITEM_SHAPE& aLeft,
                            const START_ITEM_SHAPE& aRight )
                       {
-                          const auto left = itemKey( *aLeft.terminal );
-                          const auto right = itemKey( *aRight.terminal );
-                          if( left != right )
-                              return left > right;
+                          const ROOM_TERMINAL& left = *aLeft.terminal;
+                          const ROOM_TERMINAL& right = *aRight.terminal;
+                          if( left.itemId != 0 || right.itemId != 0 )
+                          {
+                              if( left.itemId != right.itemId )
+                                  return left.itemId > right.itemId;
+                          }
+                          else
+                          {
+                              const auto leftKey = fallbackItemKey( left );
+                              const auto rightKey = fallbackItemKey( right );
+                              if( leftKey != rightKey )
+                                  return leftKey > rightKey;
+                          }
+                          if( left.treeEntryIndex != right.treeEntryIndex )
+                              return left.treeEntryIndex < right.treeEntryIndex;
                           return aLeft.layer < aRight.layer;
                       } );
 
     int nextItemId = 1;
-    std::optional<decltype( itemKey( ROOM_TERMINAL{} ) )> previousItem;
+    const ROOM_TERMINAL* previousTerminal = nullptr;
     for( START_ITEM_SHAPE& shape : startShapes )
     {
-        const auto key = itemKey( *shape.terminal );
-        if( !previousItem || key != *previousItem )
+        const auto sameItem = [&]( const ROOM_TERMINAL& aLeft,
+                                   const ROOM_TERMINAL& aRight )
+        {
+            if( aLeft.itemId != 0 || aRight.itemId != 0 )
+                return aLeft.itemId != 0 && aLeft.itemId == aRight.itemId;
+            return fallbackItemKey( aLeft ) == fallbackItemKey( aRight );
+        };
+        if( !previousTerminal || !sameItem( *shape.terminal, *previousTerminal ) )
         {
             shape.itemId = nextItemId++;
-            previousItem = key;
         }
         else
         {
             shape.itemId = nextItemId - 1;
         }
+        previousTerminal = shape.terminal;
 
         if( stopped() )
             return std::nullopt;

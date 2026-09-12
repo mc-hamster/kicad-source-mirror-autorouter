@@ -34,6 +34,16 @@ struct FLOAT_POINT
     double WeightedDistance( FLOAT_POINT aOther, double aHorizontal,
                              double aVertical ) const;
     ROUTER_POINT Round() const;
+    ROUTER_POINT RoundToGridJava( std::int64_t aGrid ) const;
+    /** Apply Java rounding after reflecting a y-down coordinate to the
+     * source router's y-up system, then reflect the result back. */
+    ROUTER_POINT RoundToGridJavaYDown( std::int64_t aGrid ) const;
+    /** Round as Freerouting does after KiCad coordinates have been scaled
+     * into native internal units. */
+    ROUTER_POINT RoundToSourceGrid() const;
+    /** Apply the same Java rounding after reflecting KiCad's y-down value to
+     * Freerouting's y-up coordinate system, then reflect the result back. */
+    ROUTER_POINT RoundToSourceGridYDown() const;
     ROUTER_POINT RoundToTheRight( ROUTER_POINT aDirection ) const;
     ROUTER_POINT RoundToGrid( std::int64_t aHorizontalGrid,
                               std::int64_t aVerticalGrid ) const;

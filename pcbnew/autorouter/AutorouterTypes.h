@@ -50,6 +50,9 @@ namespace KICAD_AUTOROUTER
 inline constexpr double FREEROUTING_COORDINATE_UNIT_IU = 100.0;
 inline constexpr double FREEROUTING_TRACE_WIDTH_TOLERANCE_IU =
         2.0 * FREEROUTING_COORDINATE_UNIT_IU;
+/** ClearanceMatrix.clearance_safety_margin is 16 source coordinates. */
+inline constexpr std::int64_t FREEROUTING_CLEARANCE_SAFETY_MARGIN_IU =
+        16 * static_cast<std::int64_t>( FREEROUTING_COORDINATE_UNIT_IU );
 
 /** A board coordinate used by the routing engine (KiCad IU, not floating point). */
 struct ROUTER_POINT
@@ -63,6 +66,20 @@ struct ROUTER_POINT
     }
 
     bool operator!=( const ROUTER_POINT& aOther ) const { return !( *this == aOther ); }
+};
+
+
+/** Directional constraint used by Freerouting's TraceShover.check().
+ *
+ * side uses the native determinant convention: +1 is left of the oriented
+ * line and -1 is right.  A Freerouting source-side request is negated at the
+ * y-up to KiCad y-down boundary because reflection reverses handedness.
+ */
+struct ROUTING_SHOVE_DIRECTION
+{
+    ROUTER_POINT lineStart;
+    ROUTER_POINT lineEnd;
+    int side = 0;
 };
 
 
@@ -85,6 +102,21 @@ enum class ROUTER_OBSTACLE_KIND
     RECTANGLE,
     SEGMENT,
     POLYGON
+};
+
+
+/** Trace-angle restriction used to construct a found connection.
+ *
+ * Freerouting applies this board rule again during forced insertion when it
+ * converts a spring-over contour to a box, an octagon, or leaves the exact
+ * convex shape untouched.  Carry it on the detached route so insertion does
+ * not have to infer the search mode from a coincidentally orthogonal edge.
+ */
+enum class ROUTER_ANGLE_RESTRICTION
+{
+    NINETY_DEGREE,
+    FORTYFIVE_DEGREE,
+    ANY_ANGLE
 };
 
 
@@ -308,6 +340,9 @@ inline std::int64_t MaximumViaDiameter( const std::vector<ROUTING_VIA_LAYER_GEOM
 }
 
 
+struct ROUTING_OBSTACLE;
+
+
 struct ROUTING_PAD
 {
     int                    netCode = 0;
@@ -418,6 +453,13 @@ struct ROUTING_PAD
     bool             fanoutViaAttachSmdAllowed = false;
     ROUTER_VIA_TYPE  fanoutViaType = ROUTER_VIA_TYPE::AUTO;
     std::vector<ROUTING_VIA_LAYER_GEOMETRY> fanoutViaLayerGeometry;
+    // A KiCad post-refill ratsnest endpoint can name one exact filled-zone
+    // island.  Freerouting routes to a ConductionArea's finite connection
+    // shape, not to an arbitrary sampled point inside it.  Keep that exact
+    // detached region on the synthetic pad so the default pair-search path
+    // has the same two-dimensional target semantics.  Ordinary pads and the
+    // broad plane sampling controls leave this null.
+    std::shared_ptr<const ROUTING_OBSTACLE> connectionArea;
 };
 
 
@@ -433,6 +475,14 @@ struct ROUTING_TERMINAL
     // remain point targets, matching DrillItem.getTraceConnectionShape().
     // The detached snapshot owns this immutable value through shared storage.
     std::shared_ptr<const struct ROUTING_OBSTACLE> connectionArea;
+    // Worker-local equivalent of Freerouting Item identity and the item's
+    // search-tree entry number.  A connected component may contain several
+    // pins, vias and PolylineTrace items which all share the same representative
+    // padIndex.  Room initialization is nevertheless ordered by descending
+    // Item id and ascending tree-entry number; collapsing that identity into
+    // padIndex lets an earlier pin room swallow later trace-specific rooms.
+    std::uint64_t itemId = 0;
+    std::size_t treeEntryIndex = std::numeric_limits<std::size_t>::max();
 };
 
 
@@ -747,6 +797,34 @@ inline std::int64_t ViaStyleClearanceOnLayer( const ROUTING_EDGE_STYLE& aStyle, 
 }
 
 
+/** Geometry of one transient PolylineTrace state during forced insertion.
+ *
+ * Freerouting inserts a found connection one span at a time. Each insertion,
+ * combine, normalization and pull-tight operation mutates the persistent
+ * ShapeSearchTree even when the transient item is subsequently deleted. A
+ * final ROUTING_CONNECTION alone cannot reproduce that mutation history.
+ * Keep snapshots deliberately separate from ROUTING_CONNECTION so the replay
+ * record cannot recursively contain itself.
+ */
+struct ROUTING_TRACE_GEOMETRY_SNAPSHOT
+{
+    std::vector<ROUTER_NODE>        nodes;
+    std::vector<ROUTING_EDGE_STYLE> edgeStyles;
+};
+
+
+/** One successful insertForcedTracePolyline lifecycle step. */
+struct ROUTING_TRACE_INSERTION_STEP
+{
+    ROUTING_TRACE_GEOMETRY_SNAPSHOT insertedSpan;
+    ROUTING_TRACE_GEOMETRY_SNAPSHOT combinedBeforeTighten;
+    ROUTING_TRACE_GEOMETRY_SNAPSHOT tightenedResult;
+    // normalize() may split a rewound insertion at an existing keep point;
+    // pullTight then changes only the suffix item selected at the endpoint.
+    std::optional<std::size_t> normalizedSplitNode;
+};
+
+
 /** A route produced for one electrical connection. */
 struct ROUTING_CONNECTION
 {
@@ -777,6 +855,19 @@ struct ROUTING_CONNECTION
     // board, but it is not protected source copper.  Kept last so existing
     // aggregate initializers retain their field mapping.
     bool                    isAutorouterOwned = false;
+    // FoundConnectionLocator constructs a public start-to-target route, while
+    // Freerouting inserts its result items in backtrack order (target first).
+    // This marker lets FoundConnectionInserter reproduce that order without
+    // reversing the public route or its from/to ownership contract.
+    bool                    insertionBacktracksFromTarget = false;
+    // Appended for aggregate-initializer compatibility.  Ordinary KiCad
+    // routing uses Freerouting's 45-degree mode unless the room frontier
+    // explicitly selected its orthogonal or unrestricted-angle variant.
+    ROUTER_ANGLE_RESTRICTION angleRestriction =
+            ROUTER_ANGLE_RESTRICTION::FORTYFIVE_DEGREE;
+    // Appended for aggregate-initializer compatibility. Empty for imported
+    // host copper and routes not materialized through the forced inserter.
+    std::vector<ROUTING_TRACE_INSERTION_STEP> traceInsertionSteps;
 };
 
 
@@ -941,6 +1032,7 @@ inline void ClearRouteGeometry( ROUTING_CONNECTION& aConnection )
 {
     aConnection.nodes.clear();
     aConnection.edgeStyles.clear();
+    aConnection.traceInsertionSteps.clear();
 }
 
 

@@ -271,8 +271,17 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
     {
         for( const ROUTING_NET& net : snapshot->nets )
         {
-            autorouterDebugLog( "Host snapshot net code=" + std::to_string( net.netCode )
-                                + " name=" + net.name );
+            std::string detail = "Host snapshot net code=" + std::to_string( net.netCode )
+                                 + " name=" + net.name + " pads=";
+            for( std::size_t pad : net.padIndices )
+                detail += std::to_string( pad ) + ',';
+            detail += " plane-targets=";
+            for( std::size_t pad : net.planeTargetIndices )
+                detail += std::to_string( pad ) + ',';
+            detail += " connections=";
+            for( const auto& [from, to] : net.connections )
+                detail += '(' + std::to_string( from ) + ',' + std::to_string( to ) + ')';
+            autorouterDebugLog( detail );
         }
     }
     const auto routingStarted = CLOCK::now();
@@ -314,6 +323,23 @@ ROUTING_RESULT KICAD_ROUTING_SESSION::Run( const AUTOROUTER_SETTINGS& settings,
         repairSettings.enableFanout = false;
         auto repairSnapshot = KICAD_BOARD_ADAPTER(
                 candidate.get(), jobOwnedTracks ).CreateSnapshot( repairSettings );
+        if( autorouterDebugEnabled() && repairSnapshot )
+        {
+            for( const ROUTING_NET& net : repairSnapshot->nets )
+            {
+                std::string detail = "Repair snapshot net code="
+                                     + std::to_string( net.netCode ) + " pads=";
+                for( std::size_t pad : net.padIndices )
+                    detail += std::to_string( pad ) + ',';
+                detail += " plane-targets=";
+                for( std::size_t pad : net.planeTargetIndices )
+                    detail += std::to_string( pad ) + ',';
+                detail += " connections=";
+                for( const auto& [from, to] : net.connections )
+                    detail += '(' + std::to_string( from ) + ',' + std::to_string( to ) + ')';
+                autorouterDebugLog( detail );
+            }
+        }
         const auto repairStarted = CLOCK::now();
         auto repair = ROUTING_PIPELINE().Run( *repairSnapshot, repairSettings, cancel, recordProgress );
         routingMs += std::chrono::duration_cast<std::chrono::milliseconds>(

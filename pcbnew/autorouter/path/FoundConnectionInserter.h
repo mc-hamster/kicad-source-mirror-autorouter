@@ -77,7 +77,8 @@ public:
                           const std::vector<ROUTING_CONNECTION>& aRipups,
                           ROUTING_OCCUPANCY& aOccupancy, const MAZE_SEARCH_ENGINE& aEngine,
                           const ROUTER_CANCEL_CALLBACK& aCancel = {},
-                          bool aAllowRipupFallback = true );
+                          bool aAllowRipupFallback = true,
+                          const ROUTING_SHOVE_DIRECTION* aShoveDirection = nullptr );
 
     static void Append( const ROUTING_CONNECTION& aConnection,
                         std::int64_t aTrackWidth,
